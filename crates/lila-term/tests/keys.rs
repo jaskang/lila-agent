@@ -1,6 +1,6 @@
 //! Keys the window binds for itself must still reach a terminal as typing.
 
-use gpui::{AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, Styled, TestAppContext, VisualTestContext, Window, div};
+use gpui::{AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, Render, Styled, TestAppContext, VisualTestContext, Window, div};
 
 struct Probe {
     focus: FocusHandle,
