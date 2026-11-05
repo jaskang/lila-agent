@@ -49,6 +49,7 @@ fn event_label(kind: &str) -> &str {
         "nudged" => "提醒",
         "stalled" => "无回应",
         "answered" => "回答",
+        "fresh_session" => "新会话",
         other => other,
     }
 }

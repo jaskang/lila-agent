@@ -72,6 +72,9 @@ max_working = 1
 stall_minutes = 5
 # Fix cycles two members may bounce one chain between them before the PM decides.
 max_rounds = 3
+# Start a member's CLI again before work from an unrelated chain, so its
+# context stays small. Rework in the same chain keeps the session. Never the PM.
+fresh_session = true
 "#
     )
 }

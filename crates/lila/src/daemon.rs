@@ -57,11 +57,14 @@ struct Live {
     /// `Member::launch_key` of what it was started with (unknown for one
     /// started before lilad was), to tell it runs on settings since changed.
     launched: Option<u64>,
+    /// The chain (root task) of the last task this session was given; unknown
+    /// for a session started before lilad was.
+    chain: Option<String>,
 }
 
 impl Default for Live {
     fn default() -> Self {
-        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None }
+        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None, chain: None }
     }
 }
 
@@ -817,6 +820,7 @@ impl<T: Terminals> Daemon<T> {
             return;
         }
         // Notes first: they are information the member should have before new work.
+        let mut noted: Vec<String> = Vec::new();
         for msg in self.store.outbox(pid).unwrap_or_default() {
             let Some(live) = self.projects[pid].live.get(&msg.member).cloned() else {
                 let _ = self.store.pop_outbox(msg.id);
@@ -826,8 +830,12 @@ impl<T: Terminals> Daemon<T> {
             match self.term.send(t, &msg.text, None) {
                 Ok(()) => {
                     let _ = self.store.pop_outbox(msg.id);
+                    noted.push(msg.member.clone());
                 }
-                Err(e) => self.say(format!("{pid}: note to {} not sent yet: {e:#}", msg.member)),
+                Err(e) => {
+                    noted.push(msg.member.clone());
+                    self.say(format!("{pid}: note to {} not sent yet: {e:#}", msg.member));
+                }
             }
         }
 
@@ -861,6 +869,16 @@ impl<T: Terminals> Daemon<T> {
             let Some(task) = tasks.iter().find(|(t, _)| t.id == tid).map(|(t, _)| t.clone()) else { continue };
             let live = self.projects[pid].live[&mid].clone();
             let Some(terminal) = live.terminal else { continue };
+            let chain = self.store.ancestors(pid, &tid).ok().and_then(|a| a.last().map(|t| t.id.clone())).unwrap_or_else(|| tid.clone());
+            let proj = &self.projects[pid];
+            let fresh = proj.team.settings.fresh_session && proj.team.member(&mid).is_some_and(|m| !m.is_owner);
+            if fresh && live.chain.as_ref().is_some_and(|c| *c != chain) {
+                // A note just typed would be lost with the session: wait until it is read.
+                if !noted.contains(&mid) {
+                    self.fresh_session(pid, &mid, &tid, now);
+                }
+                continue;
+            }
             let text = message::task_delivery(&task, &task_file_rel(&task.id));
             // Type only if it is still idle. hc's `if` knows `idle` and `working`
             // only; `done` (finished while unseen) takes input like idle, unguarded.
@@ -869,7 +887,9 @@ impl<T: Terminals> Daemon<T> {
                 Ok(()) => {
                     self.failed_sends.remove(&tid);
                     let _ = self.store.transition(pid, &tid, Transition::Deliver, &Actor::Member("lilad".into()), &format!("to {terminal}"), now);
-                    self.projects.get_mut(pid).unwrap().live.get_mut(&mid).unwrap().free_since = now;
+                    let live = self.projects.get_mut(pid).unwrap().live.get_mut(&mid).unwrap();
+                    live.free_since = now;
+                    live.chain = Some(chain);
                     self.say(format!("{pid}: delivered {tid} to {mid}"));
                 }
                 Err(e) => {
@@ -880,6 +900,23 @@ impl<T: Terminals> Daemon<T> {
                     }
                 }
             }
+        }
+    }
+
+    /// Starts a free member's CLI again so `tid` (from another chain) gets an
+    /// empty context. It holds no open task, so nothing goes back to the queue;
+    /// `tid` is delivered once the new session reports idle.
+    fn fresh_session(&mut self, pid: &str, mid: &str, tid: &str, now: i64) {
+        let Some(old) = self.projects[pid].live[mid].terminal.clone() else { return };
+        if let Err(e) = self.term.kill(&old) {
+            self.say(format!("{pid}: kill {mid} ({old}): {e:#}"));
+        }
+        self.member_gone(pid, mid, &format!("new session for {tid}"), now, false);
+        let _ = self.store.event(pid, Some(tid), "lilad", "fresh_session", &format!("{mid} starts a new session for {tid}"), now);
+        if let Err(e) = self.start_member(pid, mid, now) {
+            let text = format!("{mid} could not be started again for {tid}: {e:#}. Run `lila up` once it is fixed.");
+            self.say(format!("{pid}: {text}"));
+            let _ = self.store.add_inbox(pid, "lost", Some(mid), None, &text, &[], now);
         }
     }
 

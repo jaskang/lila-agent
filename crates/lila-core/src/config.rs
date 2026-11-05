@@ -127,11 +127,14 @@ pub struct Settings {
     /// How many times two members may send work back and forth in one chain
     /// (engineer → tester → engineer is one round) before the owner decides.
     pub max_rounds: u32,
+    /// Start a member's CLI afresh before it gets work from another chain
+    /// than its last task (keeps long-lived contexts small). Never the PM.
+    pub fresh_session: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { max_working: 1, stall_minutes: 5, startup_timeout_secs: 20, max_chain_depth: 8, max_rounds: 3 }
+        Settings { max_working: 1, stall_minutes: 5, startup_timeout_secs: 20, max_chain_depth: 8, max_rounds: 3, fresh_session: true }
     }
 }
 

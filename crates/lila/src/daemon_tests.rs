@@ -586,3 +586,70 @@ fn a_missing_member_prompt_file_is_an_error() {
     let e = w.call(None, "project.up", json!({})).unwrap_err();
     assert!(format!("{e:#}").contains("read prompt"), "{e:#}");
 }
+
+#[test]
+fn work_from_another_chain_starts_a_new_session() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "ok"}));
+    // Rework in the same chain keeps the session (it remembers what it did).
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Fix login typo", "parent": "T1"}));
+    assert_eq!(w.state("T2"), TaskState::Delivered);
+    assert!(w.d.term.kills.is_empty());
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "ok"}));
+
+    // Unrelated work: the engineer's CLI starts again, and T3 waits for the new session.
+    let old = w.terminal("engineer");
+    let t3 = w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build search"}));
+    assert_eq!(t3["state"], "queued");
+    assert_eq!(w.d.term.kills, std::slice::from_ref(&old));
+    assert_ne!(w.terminal("engineer"), old);
+    assert!(w.inbox_kinds().is_empty(), "a planned restart raises no alarm");
+    assert!(!w.sends_to("owner").iter().any(|s| s.contains("engineer ended")));
+    w.status("engineer", "idle");
+    assert_eq!(w.state("T3"), TaskState::Delivered);
+    assert!(w.sends_to("engineer").iter().any(|s| s.contains("<lila task=\"T3\"")));
+    let events = w.d.store.events("shop", None, 50).unwrap();
+    assert!(events.iter().any(|e| e.kind == "fresh_session"), "{events:?}");
+
+    // The PM keeps its conversation with the person.
+    w.ok(None, "task.new", json!({"to": "owner", "title": "Plan A"}));
+    w.ok(Some("owner"), "task.done", json!({"id": "T4", "summary": "ok"}));
+    w.ok(None, "task.new", json!({"to": "owner", "title": "Plan B"}));
+    assert_eq!(w.state("T5"), TaskState::Delivered);
+    assert_eq!(w.d.term.kills.len(), 1);
+}
+
+#[test]
+fn fresh_sessions_can_be_turned_off() {
+    let mut w = world_with(&format!("{PROJECT}\n[settings]\nfresh_session = false\n"));
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "A"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "ok"}));
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "B"}));
+    assert_eq!(w.state("T2"), TaskState::Delivered);
+    assert!(w.d.term.kills.is_empty());
+}
+
+#[test]
+fn a_waiting_note_is_read_before_a_new_session() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "A"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "ok"}));
+    w.status("engineer", "blocked");
+    // A note and unrelated work arrive while it sits in a dialog.
+    w.d.store.push_outbox("shop", "engineer", "<lila note about=\"T1\">thanks</lila>", w.now).unwrap();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "B"}));
+    assert!(w.d.term.kills.is_empty());
+    w.status("engineer", "idle");
+    assert!(w.d.term.kills.is_empty(), "the note went in; the restart waits until it was read");
+    assert!(w.sends_to("engineer").iter().any(|s| s.contains("thanks")));
+    w.status("engineer", "working");
+    w.status("engineer", "idle");
+    assert_eq!(w.d.term.kills.len(), 1);
+}
