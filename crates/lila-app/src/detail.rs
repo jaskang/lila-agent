@@ -1,7 +1,8 @@
 //! The task detail panel: what a task asks, who has it, what came of it, its
 //! history, and the person's actions on it (append, cancel, open its terminal).
 
-use crate::app::{LilaApp, dot, s, status_color};
+use crate::app::LilaApp;
+use crate::ui::{dot, s, status_color};
 use crate::data;
 use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::input::Input;
@@ -156,7 +157,7 @@ impl LilaApp {
             .absolute()
             .top_0()
             .right_0()
-            .bottom_0()
+            .bottom(px(26.))
             .w(px(560.))
             .bg(theme.popover)
             .text_color(theme.popover_foreground)

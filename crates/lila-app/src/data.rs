@@ -7,6 +7,26 @@ use serde_json::{Value, json};
 pub struct Project {
     pub id: String,
     pub cwd: String,
+    /// The checked-out git branch, if the folder is a repository.
+    pub branch: Option<String>,
+}
+
+/// The branch `.git/HEAD` points at (a short commit id when detached).
+fn git_branch(cwd: &str) -> Option<String> {
+    let head = std::fs::read_to_string(std::path::Path::new(cwd).join(".git").join("HEAD")).ok()?;
+    let head = head.trim();
+    Some(match head.strip_prefix("ref: refs/heads/") {
+        Some(b) => b.to_owned(),
+        None => head.chars().take(7).collect(),
+    })
+}
+
+/// `/Users/me/x` as `~/x`.
+pub fn tilde(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&home) => format!("~{}", &path[home.len()..]),
+        _ => path.to_owned(),
+    }
 }
 
 #[derive(Clone, Default)]
@@ -30,7 +50,7 @@ pub fn caller(p: &Project) -> Value {
 
 fn projects_from_db(paths: &Paths) -> Vec<Project> {
     let Ok(store) = lila_store::Store::open(&paths.db()) else { return Vec::new() };
-    store.projects().unwrap_or_default().into_iter().map(|p| Project { id: p.id, cwd: p.cwd }).collect()
+    store.projects().unwrap_or_default().into_iter().map(|p| Project { branch: git_branch(&p.cwd), id: p.id, cwd: p.cwd }).collect()
 }
 
 pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>) -> Snapshot {
@@ -81,7 +101,7 @@ pub fn create_and_start(paths: &Paths, dir: &std::path::Path) -> anyhow::Result<
     } else {
         lila::roles::install_defaults(&paths.roles())?;
     }
-    let p = Project { id: String::new(), cwd: dir.to_string_lossy().to_string() };
+    let p = Project { id: String::new(), cwd: dir.to_string_lossy().to_string(), branch: None };
     let v = act(paths, &p, "project.up", json!({}), true)?;
     Ok(v["project"].as_str().unwrap_or_default().to_owned())
 }

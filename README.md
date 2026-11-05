@@ -6,7 +6,7 @@
 
 设计见 [docs/design.md](docs/design.md)，技术验证见 [docs/spikes.md](docs/spikes.md)，各阶段记录见 [docs/m1.md](docs/m1.md)（编排）和 [docs/m2.md](docs/m2.md)（桌面应用）。
 
-![lila-app](docs/images/m2-working.png)
+![lila-app](docs/images/m2-redesign-working.png)
 
 ## 安装
 

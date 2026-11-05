@@ -1,7 +1,8 @@
 //! Writing tasks from the window: a new task for any member, and rewriting
 //! one that is still queued.
 
-use crate::app::{LilaApp, dot, s, status_color};
+use crate::app::LilaApp;
+use crate::ui::{dot, s, status_color};
 use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui::component::scroll::ScrollableElement;
@@ -131,17 +132,8 @@ impl LilaApp {
         Some(
             v_flex()
                 .id("compose")
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .w(px(560.))
-                .bg(theme.popover)
+                .size_full()
                 .text_color(theme.popover_foreground)
-                .border_l_1()
-                .border_color(theme.border)
-                .shadow_lg()
-                .occlude()
                 .child(
                     h_flex()
                         .h(px(40.))

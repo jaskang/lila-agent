@@ -5,11 +5,13 @@ mod app;
 mod compose;
 mod data;
 mod detail;
+mod ui;
 
 use gpui::*;
 
 fn main() {
-    gpui::application().run(|cx: &mut App| {
+    // The component icons (Lucide) come from gpui-kit's bundled assets.
+    gpui::application().with_assets(gpui::assets::Assets).run(|cx: &mut App| {
         gpui::init(cx);
         gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
