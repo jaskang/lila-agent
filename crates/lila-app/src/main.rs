@@ -13,6 +13,7 @@ fn main() {
     // The component icons (Lucide) come from gpui-kit's bundled assets.
     gpui::application().with_assets(gpui::assets::Assets).run(|cx: &mut App| {
         gpui::init(cx);
+        lila_term::view::init(cx);
         gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         let options = WindowOptions {

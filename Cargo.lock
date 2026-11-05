@@ -3840,6 +3840,7 @@ dependencies = [
  "fancy-regex",
  "ghostty-sys",
  "gpui-kit",
+ "gpui-pre",
  "png 0.17.16",
  "serde_json",
  "tracing",

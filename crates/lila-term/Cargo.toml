@@ -16,3 +16,8 @@ gpui = { package = "gpui-kit", version = "=0.9.0", default-features = false }
 png = "0.17"
 serde_json.workspace = true
 tracing = "0.1"
+
+[dev-dependencies]
+# GPUI's test harness (TestAppContext, #[gpui::test]) for the key tests; the
+# gpui-kit feature of the same name pulls in gpui-fast, which conflicts.
+test-gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"] }

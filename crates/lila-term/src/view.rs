@@ -85,6 +85,21 @@ fn grid_size(bounds: Size<Pixels>, cell: Size<Pixels>) -> (u16, u16) {
     (cols, rows)
 }
 
+/// The key context terminals render in.
+pub const KEY_CONTEXT: &str = "Terminal";
+
+/// Keys the window binds that a terminal must get as typing instead. gpui-kit's
+/// Root binds Tab / Shift-Tab to focus moves and ⌘C to copying its own text
+/// selection; inside a terminal they go to the program (and ⌘C copies the
+/// terminal's selection, see `key_down`). Call once, after `gpui_kit::init`.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("tab", NoAction, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-tab", NoAction, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-c", NoAction, Some(KEY_CONTEXT)),
+    ]);
+}
+
 pub struct TerminalView {
     pub address: String,
     grid: Rc<RefCell<Grid>>,
@@ -540,6 +555,7 @@ impl Render for TerminalView {
             .size_full()
             .relative()
             .bg(hsla(vt::theme().bg))
+            .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .when(!observe, |d| {
                 d.on_key_down(cx.listener(Self::key_down))
