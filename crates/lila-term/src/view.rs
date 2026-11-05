@@ -361,30 +361,6 @@ fn mouse_at(g: &Grid, p: Point<Pixels>) -> ((f32, f32), (u32, u32, f32, f32)) {
     ((x * s, y * s), (g.vt.cols as u32, g.vt.rows as u32, f32::from(g.cell.width) * s, f32::from(g.cell.height) * s))
 }
 
-#[cfg(test)]
-mod scroll_tests {
-    use super::{macos_wheel_steps, scroll_steps};
-    use gpui::TouchPhase;
-
-    #[test]
-    fn a_slow_wheel_notch_still_scrolls_three_lines() {
-        assert_eq!(macos_wheel_steps(0.1), 3);
-        assert_eq!(macos_wheel_steps(-0.1), -3);
-        assert_eq!(macos_wheel_steps(2.0), 6);
-        assert_eq!(macos_wheel_steps(0.0), 0);
-    }
-
-    #[test]
-    fn touchpad_moves_add_up_to_lines() {
-        let mut acc = 0.0;
-        assert_eq!(scroll_steps(&mut acc, TouchPhase::Started, 0.0, 40.0), 0);
-        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, 0.4, 40.0), 0);
-        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, 0.4, 40.0), 0);
-        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, 0.4, 40.0), 1);
-        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, -2.5, 40.0), -2);
-        assert_eq!(scroll_steps(&mut acc, TouchPhase::Ended, 5.0, 40.0), 0);
-    }
-}
 
 /// What a key press sends to the program: the key described to libghostty,
 /// which encodes it in the mode the program asked for (herdr-app's key_bytes,
@@ -736,4 +712,29 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         let _ = line.paint(p, cell.height, TextAlign::Left, None, window, cx);
     }
     grid.borrow_mut().cursor_at = frame.cursor_cell.map(|(x, y)| Bounds::new(at(x as usize, y as usize), cell));
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::{macos_wheel_steps, scroll_steps};
+    use gpui::TouchPhase;
+
+    #[test]
+    fn a_slow_wheel_notch_still_scrolls_three_lines() {
+        assert_eq!(macos_wheel_steps(0.1), 3);
+        assert_eq!(macos_wheel_steps(-0.1), -3);
+        assert_eq!(macos_wheel_steps(2.0), 6);
+        assert_eq!(macos_wheel_steps(0.0), 0);
+    }
+
+    #[test]
+    fn touchpad_moves_add_up_to_lines() {
+        let mut acc = 0.0;
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Started, 0.0, 40.0), 0);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, 0.4, 40.0), 0);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, 0.4, 40.0), 0);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, 0.4, 40.0), 1);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, -2.5, 40.0), -2);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Ended, 5.0, 40.0), 0);
+    }
 }
