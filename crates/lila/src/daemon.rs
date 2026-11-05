@@ -584,6 +584,10 @@ impl<T: Terminals> Daemon<T> {
         }
         let id = req(params, "id")?;
         let item = self.store.inbox_item(&pid, id)?.ok_or_else(|| anyhow!("no inbox item {id}"))?;
+        // A second click (or a second window) on something already handled: nothing to do.
+        if item.resolved_ms.is_some() {
+            return Ok(json!({"id": item.id, "resolved": true, "already": true}));
+        }
         let text = s(params, "text");
         if item.kind == "question" {
             let text = text.ok_or_else(|| anyhow!("{} is a question; give an answer", item.id))?;

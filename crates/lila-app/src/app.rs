@@ -273,6 +273,9 @@ impl LilaApp {
         if let Some(input) = self.answers.get(&id) {
             input.update(cx, |s, cx| s.set_value("", window, cx));
         }
+        // Gone at once, so a quick second click has nothing to press.
+        self.snap.inbox.retain(|i| i["id"] != id.as_str());
+        cx.notify();
         self.act("answer", json!({"id": id, "text": text}), false, cx);
     }
 

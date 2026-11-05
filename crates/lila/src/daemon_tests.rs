@@ -528,3 +528,18 @@ fn the_fingerprint_moves_on_writes_and_live_changes_only() {
     w.ok(Some("owner"), "task.new", json!({"to": "tester", "title": "x"}));
     assert_ne!(w.d.fingerprint(), b, "a write is news");
 }
+
+#[test]
+fn answering_twice_is_harmless() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "ask", json!({"question": "Which DB?"}));
+    w.ok(None, "answer", json!({"id": "Q1", "text": "Postgres"}));
+    let again = w.ok(None, "answer", json!({"id": "Q1", "text": "MySQL"}));
+    assert_eq!(again["already"], true);
+    let answers: Vec<String> = w.sends_to("owner").into_iter().filter(|t| t.contains("<lila answer")).collect();
+    assert_eq!(answers.len(), 1, "the owner hears one answer: {answers:?}");
+    assert!(answers[0].contains("Postgres"));
+    assert!(w.call(None, "answer", json!({"id": "Q9"})).is_err(), "an unknown item is still an error");
+}
