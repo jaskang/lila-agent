@@ -9,6 +9,19 @@ pub struct Project {
     pub cwd: String,
     /// The checked-out git branch, if the folder is a repository.
     pub branch: Option<String>,
+    /// `title` in project.toml: what the window calls it.
+    pub title: Option<String>,
+}
+
+impl Project {
+    pub fn label(&self) -> String {
+        self.title.clone().unwrap_or_else(|| self.id.clone())
+    }
+}
+
+fn title(cwd: &str) -> Option<String> {
+    let text = std::fs::read_to_string(std::path::Path::new(cwd).join(".lila").join("project.toml")).ok()?;
+    lila_core::ProjectConfig::parse(&text).ok()?.title.filter(|t| !t.trim().is_empty())
 }
 
 /// The branch `.git/HEAD` points at (a short commit id when detached).
@@ -52,12 +65,12 @@ pub fn caller(p: &Project) -> Value {
 
 fn projects_from_db(paths: &Paths) -> Vec<Project> {
     let Ok(store) = lila_store::Store::open(&paths.db()) else { return Vec::new() };
-    store.projects().unwrap_or_default().into_iter().map(|p| Project { branch: git_branch(&p.cwd), id: p.id, cwd: p.cwd }).collect()
+    store.projects().unwrap_or_default().into_iter().map(|p| Project { branch: git_branch(&p.cwd), title: title(&p.cwd), id: p.id, cwd: p.cwd }).collect()
 }
 
 pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>) -> Snapshot {
     let mut snap = Snapshot { daemon: lila::client::is_running(paths), projects: projects_from_db(paths), ..Default::default() };
-    let Some(p) = selected.and_then(|id| snap.projects.iter().find(|p| p.id == id)).or(snap.projects.first()).cloned() else { return snap };
+    let Some(p) = selected.and_then(|id| snap.projects.iter().find(|p| p.id == id)).cloned() else { return snap };
     snap.project = Some(p.id.clone());
     if !snap.daemon {
         return snap;
@@ -104,9 +117,31 @@ pub fn create_and_start(paths: &Paths, dir: &std::path::Path) -> anyhow::Result<
     } else {
         lila::roles::install_defaults(&paths.roles())?;
     }
-    let p = Project { id: String::new(), cwd: dir.to_string_lossy().to_string(), branch: None };
+    let p = Project { id: String::new(), cwd: dir.to_string_lossy().to_string(), branch: None, title: None };
     let v = act(paths, &p, "project.up", json!({}), true)?;
     Ok(v["project"].as_str().unwrap_or_default().to_owned())
+}
+
+/// The project tabs open in the window, kept across launches.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct Tabs {
+    pub open: Vec<String>,
+    pub selected: Option<String>,
+}
+
+fn tabs_file(paths: &Paths) -> std::path::PathBuf {
+    paths.state.join("app-tabs.json")
+}
+
+pub fn load_tabs(paths: &Paths) -> Option<Tabs> {
+    serde_json::from_str(&std::fs::read_to_string(tabs_file(paths)).ok()?).ok()
+}
+
+pub fn save_tabs(paths: &Paths, tabs: &Tabs) {
+    let _ = std::fs::create_dir_all(&paths.state);
+    if let Ok(text) = serde_json::to_string(tabs) {
+        let _ = std::fs::write(tabs_file(paths), text);
+    }
 }
 
 /// HH:MM in local time.

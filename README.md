@@ -69,7 +69,7 @@ lila down                     # 停止成员（任务会保留）
 
   Codex 的沙箱会拦截 `lila` 用来连接 lilad 的 Unix socket。这时 `lila` 会自动改为通过项目里的 `.lila/spool/` 收发文件，所以不需要给 Codex 开网络，也不需要逐条批准。
 
-- **项目**：仓库内的 `.lila/project.toml`，包括成员列表、可选的 `[assign]` 指派规则和 `[settings]`（`max_working`、`stall_minutes`、`startup_timeout_secs`、`max_chain_depth`、`max_rounds`）。`.lila/tasks/` 存放任务正文，`.lila/spool/` 是给沙箱用的文件通道，两者都已加入 `.lila/.gitignore`。
+- **项目**：仓库内的 `.lila/project.toml`，包括可选的显示名 `title`、成员列表（每个成员可以覆盖角色的 `runtime`、`model`、`effort`，用 `prompt_file` 指向 `.lila/prompts/` 下自己的提示词；窗口里的「项目设置」会写这些）、可选的 `[assign]` 指派规则和 `[settings]`（`max_working`、`stall_minutes`、`startup_timeout_secs`、`max_chain_depth`、`max_rounds`）。`.lila/tasks/` 存放任务正文，`.lila/spool/` 是给沙箱用的文件通道，两者都已加入 `.lila/.gitignore`。
 
 - **PM**：项目里负责统筹、和你对话的成员由 `owner = "<成员 id>"` 指定（`lila init` 写的是 `pm`）。不写时先找 `pm`，再找 `owner`，所以改名之前建的项目照常能用。
 

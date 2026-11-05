@@ -195,6 +195,9 @@ count = 1            # 设为 2 会生成 engineer-1、engineer-2
 [[members]]
 id   = "tester"
 role = "tester"
+# 成员可以覆盖角色的设置（窗口里的「项目设置」写的就是这些）：
+# runtime = "codex"; model = "gpt-6.1-sol"; effort = "medium"
+# prompt_file = "prompts/tester.md"   # 相对 .lila/，代替角色的提示词
 
 [assign]             # 覆盖角色的 can_assign；owner 默认可以指派给所有人
 engineer  = ["tester", "architect"]

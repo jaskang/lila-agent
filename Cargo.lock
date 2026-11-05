@@ -3793,6 +3793,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml 1.2.0+spec-1.1.0",
+ "toml_edit 0.25.18+spec-1.1.0",
 ]
 
 [[package]]
@@ -3806,12 +3807,14 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-macos",
  "lila",
+ "lila-core",
  "lila-store",
  "lila-term",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "png 0.17.16",
+ "serde",
  "serde_json",
 ]
 
@@ -7154,6 +7157,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.2+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.5",
 ]
 

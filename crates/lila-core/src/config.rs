@@ -74,6 +74,43 @@ pub struct MemberSpec {
     /// More than one expands into `<id>-1`, `<id>-2`, ...
     #[serde(default = "default_count")]
     pub count: u32,
+    /// Set over the role's, for this member only (the project settings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<Runtime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// This member's own prompt instead of the role's, relative to `.lila/`
+    /// (`prompts/<id>.md`). The caller reads it: see `Team::set_prompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_file: Option<String>,
+}
+
+impl MemberSpec {
+    /// The member ids this entry expands into.
+    pub fn ids(&self) -> Vec<String> {
+        if self.count == 1 { vec![self.id.clone()] } else { (1..=self.count).map(|n| format!("{}-{n}", self.id)).collect() }
+    }
+
+    /// The role with this entry's overrides applied. Another runtime drops the
+    /// role's `extra_args`, which are flags for its own CLI.
+    pub fn apply(&self, role: &Role) -> Role {
+        let mut role = role.clone();
+        if let Some(r) = self.runtime
+            && r != role.file.runtime
+        {
+            role.file.runtime = r;
+            role.file.extra_args.clear();
+        }
+        if let Some(m) = &self.model {
+            role.file.model = m.clone();
+        }
+        if let Some(e) = &self.effort {
+            role.file.effort = Some(e.clone()).filter(|e| !e.is_empty());
+        }
+        role
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,7 +138,11 @@ impl Default for Settings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
+    /// The project's id: terminal names, the database, `lila` commands. Fixed once registered.
     pub name: String,
+    /// What the window calls it; any text. Without it, `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// The member who plans and talks to the person (the PM). Without it: `pm`, else `owner`.
     #[serde(default)]
     pub owner: Option<String>,
@@ -137,8 +178,21 @@ pub fn validate_id(id: &str) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Member {
     pub id: String,
+    /// The role with the project's overrides for this member applied.
     pub role: Role,
     pub is_owner: bool,
+}
+
+impl Member {
+    /// Changes when what this member is started with changes (CLI, model,
+    /// effort, flags, its prompt), so a running member can be told it is on old settings.
+    pub fn launch_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let f = &self.role.file;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (f.runtime.to_string(), &f.model, &f.effort, &f.extra_args, &f.env, &self.role.prompt).hash(&mut h);
+        h.finish()
+    }
 }
 
 /// A project's members, expanded and checked against the roles.
@@ -164,9 +218,13 @@ impl Team {
             if spec.count == 0 {
                 return Err(format!("member {:?}: count must be at least 1", spec.id));
             }
-            let ids: Vec<String> =
-                if spec.count == 1 { vec![spec.id.clone()] } else { (1..=spec.count).map(|n| format!("{}-{n}", spec.id)).collect() };
-            for id in ids {
+            if let Some(m) = &spec.model
+                && m.trim().is_empty()
+            {
+                return Err(format!("member {:?}: model is empty", spec.id));
+            }
+            let role = spec.apply(role);
+            for id in spec.ids() {
                 validate_id(&id).map_err(|e| format!("member {id:?}: {e}"))?;
                 if members.iter().any(|m: &Member| m.id == id) {
                     return Err(format!("member {id:?} is listed twice"));
@@ -213,6 +271,14 @@ impl Team {
             }
         }
         Ok(Team { project: config.name.clone(), owner, members, assign, settings: config.settings.clone() })
+    }
+
+    /// Gives the members of one `[[members]]` entry their own prompt.
+    pub fn set_prompt(&mut self, spec: &MemberSpec, prompt: &str) {
+        let ids = spec.ids();
+        for m in self.members.iter_mut().filter(|m| ids.contains(&m.id)) {
+            m.role.prompt = prompt.to_owned();
+        }
     }
 
     pub fn member(&self, id: &str) -> Option<&Member> {
@@ -356,6 +422,30 @@ role = "architect"
         assert_eq!(old.owner, "owner", "projects from before the rename keep working");
         let named = format!("owner = \"tester\"\n{PROJECT}");
         assert_eq!(Team::build(&ProjectConfig::parse(&named).unwrap(), &roles()).unwrap().owner, "tester");
+    }
+
+    #[test]
+    fn members_override_their_role() {
+        let text = PROJECT.replace(
+            "id = \"tester\"\nrole = \"tester\"",
+            "id = \"tester\"\nrole = \"tester\"\nruntime = \"codex\"\nmodel = \"gpt-x\"\neffort = \"low\"\nprompt_file = \"prompts/tester.md\"",
+        );
+        let cfg = ProjectConfig::parse(&format!("title = \"商店\"\n{text}")).unwrap();
+        assert_eq!(cfg.title.as_deref(), Some("商店"));
+        let mut roles = roles();
+        roles.get_mut("tester").unwrap().file.extra_args = vec!["--claude-only".into()];
+        let mut team = Team::build(&cfg, &roles).unwrap();
+        let before = team.member("tester").unwrap().launch_key();
+        let t = &team.member("tester").unwrap().role;
+        assert_eq!((t.file.runtime, t.file.model.as_str(), t.file.effort.as_deref()), (Runtime::Codex, "gpt-x", Some("low")));
+        assert!(t.file.extra_args.is_empty(), "another CLI drops the role's flags");
+        assert_eq!(team.member("engineer-1").unwrap().role.file.model, "m", "others keep the role's");
+        let spec = cfg.members.iter().find(|m| m.id == "tester").unwrap();
+        team.set_prompt(spec, "Test everything.");
+        assert_eq!(team.member("tester").unwrap().role.prompt, "Test everything.");
+        assert_ne!(team.member("tester").unwrap().launch_key(), before);
+        let empty = text.replace("model = \"gpt-x\"", "model = \" \"");
+        assert!(Team::build(&ProjectConfig::parse(&empty).unwrap(), &roles).unwrap_err().contains("model is empty"));
     }
 
     #[test]

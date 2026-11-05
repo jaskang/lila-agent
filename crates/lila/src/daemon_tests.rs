@@ -543,3 +543,46 @@ fn answering_twice_is_harmless() {
     assert!(answers[0].contains("Postgres"));
     assert!(w.call(None, "answer", json!({"id": "Q9"})).is_err(), "an unknown item is still an error");
 }
+
+#[test]
+fn new_settings_mark_running_members_until_restarted() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    let t = w.ok(None, "task.new", json!({"to": "engineer", "title": "Fix it"}))["id"].as_str().unwrap().to_owned();
+    w.ok(Some("engineer"), "task.start", json!({"id": t}));
+
+    // The person gives the engineer another model and its own prompt.
+    let toml = PROJECT.replace("id = \"engineer\"\nrole = \"engineer\"", "id = \"engineer\"\nrole = \"engineer\"\nmodel = \"claude-haiku-5-5\"\nprompt_file = \"prompts/engineer.md\"");
+    std::fs::create_dir_all(w.repo.join(".lila/prompts")).unwrap();
+    std::fs::write(w.repo.join(".lila/prompts/engineer.md"), "Be brief.").unwrap();
+    std::fs::write(w.repo.join(".lila/project.toml"), toml).unwrap();
+    let r = w.ok(None, "project.reload", json!({}));
+    assert_eq!(r["stale"], json!(["engineer"]));
+    let status = w.ok(None, "status", json!({}));
+    let stale: Vec<&str> = status["members"].as_array().unwrap().iter().filter(|m| m["stale"] == true).map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(stale, ["engineer"]);
+    assert!(w.call(Some("owner"), "member.restart", json!({"member": "engineer"})).is_err(), "only the person restarts");
+
+    let old = w.terminal("engineer");
+    w.ok(None, "member.restart", json!({"member": "engineer"}));
+    assert!(w.d.term.kills.contains(&old));
+    let run = w.d.term.runs.last().unwrap();
+    let argv: Vec<&str> = run["argv"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+    assert!(argv.windows(2).any(|p| p == ["--model", "claude-haiku-5-5"]), "{argv:?}");
+    let prompt = std::fs::read_to_string(argv[argv.iter().position(|a| *a == "--append-system-prompt-file").unwrap() + 1]).unwrap();
+    assert!(prompt.starts_with("Be brief."), "{prompt}");
+    assert_eq!(w.state(&t), TaskState::Queued, "its task goes back to the queue");
+    assert!(w.ok(None, "project.reload", json!({}))["stale"].as_array().unwrap().is_empty());
+    w.status("engineer", "idle");
+    assert!(w.sends_to("engineer").iter().any(|s| s.contains(&t)), "and is delivered again");
+}
+
+#[test]
+fn a_missing_member_prompt_file_is_an_error() {
+    let toml = PROJECT.replace("id = \"tester\"\nrole = \"tester\"", "id = \"tester\"\nrole = \"tester\"\nprompt_file = \"prompts/tester.md\"");
+    let mut w = world_with(&toml);
+    std::fs::create_dir_all(w.repo.join("src")).unwrap();
+    let e = w.call(None, "project.up", json!({})).unwrap_err();
+    assert!(format!("{e:#}").contains("read prompt"), "{e:#}");
+}

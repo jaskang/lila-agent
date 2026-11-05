@@ -1,6 +1,7 @@
-//! How the window looks: a quiet chrome sidebar (the team, grouped by what
-//! needs attention), project tabs over a terminal card, a side panel with the
-//! inbox, the task board and activity one under another, and a status bar.
+//! How the window looks: a quiet chrome sidebar (every project, then the
+//! team grouped by what needs attention), tabs for the open projects over a
+//! terminal card, a side panel with the inbox, the task board and activity one
+//! under another, and a status bar.
 
 use crate::app::LilaApp;
 use crate::data;
@@ -126,6 +127,8 @@ impl LilaApp {
     pub fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let shown = self.shown_member().map(|m| s(&m, "id"));
+        let selected = self.selected.clone();
+        let projects = self.snap.projects.clone();
         let members = self.members();
         let count = members.len();
         let paused = self.snap.status.as_ref().is_some_and(|s| s["paused"] == true);
@@ -153,8 +156,25 @@ impl LilaApp {
                     .pr_3()
                     .gap_2()
                     .child(div().size(px(22.)).rounded(px(6.)).bg(theme.primary).text_color(theme.primary_foreground).text_xs().font_bold().flex().items_center().justify_center().child("L"))
-                    .child(div().font_semibold().child("Lila")),
+                    .child(div().font_semibold().child("Lila"))
+                    .child(div().flex_1())
+                    .child(Button::new("new-project").ghost().xsmall().icon(IconName::FolderOpen).tooltip("新建项目…").on_click(cx.listener(|this, _, _, cx| this.new_project(cx)))),
             )
+            .child(h_flex().px_4().pt_2().pb_1().child(label("项目", cx)))
+            .children(projects.into_iter().map(|p| {
+                let active = selected.as_deref() == Some(&p.id);
+                let (status, inbox) = self.project_summary(&p.id);
+                let id = p.id.clone();
+                row(SharedString::from(format!("project-{}", p.id)), active, cx)
+                    .child(avatar(&p.id, cx))
+                    .child(div().text_sm().truncate().min_w_0().child(p.label()))
+                    .child(div().flex_1())
+                    .when_some(status, |d, st| d.child(status_mark(st, cx)))
+                    .when(inbox > 0, |d| d.child(Tag::danger().xsmall().rounded_full().child(inbox.to_string())))
+                    .when_some(p.branch.clone().filter(|_| inbox == 0 && status.is_none()), |d, b| d.child(div().text_xs().text_color(theme.muted_foreground).truncate().max_w(px(110.)).child(b)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_project(id.clone(), cx)))
+            }))
+            .child(div().mx_4().my_3().h(px(1.)).bg(theme.sidebar_border))
             .when(count > 0, |d| d.child(h_flex().px_4().pt_2().pb_1().gap_1().child(label("成员", cx)).child(div().text_xs().text_color(theme.muted_foreground.opacity(0.7)).child(count.to_string()))))
             .child(
                 v_flex().flex_1().min_h_0().overflow_y_scrollbar().gap_1().children(groups.into_iter().map(|(_, name, list)| {
@@ -167,9 +187,11 @@ impl LilaApp {
                             let doing = Some(s(&m, "msg")).filter(|x| !x.is_empty()).or_else(|| m["task"]["title"].as_str().map(String::from)).unwrap_or_else(|| s(&m, "role"));
                             let queued = m["queued"].as_u64().unwrap_or(0);
                             let click = id.clone();
+                            let stale = m["stale"] == true;
                             row(SharedString::from(format!("member-{id}")), shown.as_deref() == Some(&id), cx)
                                 .child(Icon::new(IconName::Bot).small().text_color(color))
                                 .child(div().text_sm().flex_none().child(id.clone()))
+                                .when(stale, |d| d.child(Tag::warning().xsmall().child("待重启")))
                                 .child(div().text_xs().text_color(theme.muted_foreground).truncate().min_w_0().flex_1().child(format!("· {doing}")))
                                 .when(queued > 0, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(format!("+{queued}"))))
                                 .child(status_mark(&status, cx))
@@ -195,15 +217,16 @@ impl LilaApp {
                                 .child(div().text_sm().child(if paused { "恢复派发" } else { "暂停派发" }))
                                 .on_click(cx.listener(move |this, _, _, cx| this.act(if paused { "resume" } else { "pause" }, json!({}), false, cx))),
                         )
-                    }),
+                    })
+                    .child(row("new-project-row", false, cx).child(Icon::new(IconName::Plus).small()).child(div().text_sm().child("新建项目…")).on_click(cx.listener(|this, _, _, cx| this.new_project(cx)))),
             )
     }
 
-    /// The bar over the terminal: one tab per project, then the window's actions.
+    /// The bar over the terminal: one tab per open project, then the window's actions.
     fn tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let selected = self.project().map(|p| p.id);
-        let projects = self.snap.projects.clone();
+        let projects: Vec<data::Project> = self.tabs.iter().filter_map(|id| self.snap.projects.iter().find(|p| &p.id == id).cloned()).collect();
         let has_project = selected.is_some();
         drag_bar(h_flex().id("tab-bar"), cx)
             .h(px(44.))
@@ -226,16 +249,23 @@ impl LilaApp {
                     .when(active, |d| d.bg(theme.secondary).border_color(theme.border))
                     .when(!active, |d| d.border_color(gpui::transparent_black()).text_color(theme.muted_foreground).hover(|d| d.bg(theme.secondary.opacity(0.5))))
                     .child(avatar(&p.id, cx).size(px(16.)).rounded(px(4.)))
-                    .child(div().text_sm().child(p.id.clone()))
+                    .child(div().text_sm().truncate().max_w(px(180.)).child(p.label()))
                     .when_some(status, |d, st| d.child(status_mark(st, cx)))
                     .when(inbox > 0, |d| d.child(Tag::danger().xsmall().rounded_full().child(inbox.to_string())))
                     .when(n < 9 && inbox == 0, |d| d.child(div().text_xs().text_color(theme.muted_foreground.opacity(0.7)).child(format!("⌘{}", n + 1))))
+                    .child({
+                        let close = p.id.clone();
+                        Button::new(SharedString::from(format!("tab-close-{}", p.id))).ghost().xsmall().icon(IconName::Close).tooltip("关闭标签 (⌘W)，团队继续运行").on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_tab(&close, cx);
+                        }))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.select_project(click.clone(), cx)))
             }))
-            .child(Button::new("bar-new-project").ghost().small().icon(IconName::Plus).tooltip("新建项目…").on_click(cx.listener(|this, _, _, cx| this.new_project(cx))))
             .child(div().flex_1())
             .when(has_project, |d| {
                 d.child(Button::new("bar-new-task").ghost().small().icon(IconName::Plus).label("新建任务").on_click(cx.listener(|this, _, window, cx| this.compose(None, None, window, cx))))
+                    .child(Button::new("bar-settings").ghost().small().icon(IconName::Settings).tooltip("项目设置 (⌘,)").on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))))
             })
             .when(!self.right_open, |d| {
                 let inbox = self.snap.inbox.len();
@@ -265,6 +295,15 @@ impl LilaApp {
                 Some(view) => div().flex_1().min_h_0().child(view).into_any_element(),
                 None => placeholder("正在连接 herdr-core…".into(), cx).into_any_element(),
             },
+            (None, None) if self.project().is_none() && !self.snap.projects.is_empty() => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .text_color(theme.muted_foreground)
+                .child(Icon::new(IconName::FolderOpen).large().text_color(theme.muted_foreground))
+                .child("从左侧选一个项目打开。")
+                .into_any_element(),
             (None, None) if self.project().is_none() => v_flex()
                 .flex_1()
                 .items_center()
@@ -299,10 +338,21 @@ impl LilaApp {
                 .border_color(theme.border)
                 .child(Icon::new(IconName::Bot).small().text_color(status_color(&status, cx)))
                 .child(div().text_sm().font_semibold().child(s(m, "id")))
-                .child(div().text_xs().text_color(theme.muted_foreground).child(format!("{} · {}", s(m, "role"), s(m, "model"))))
+                .child(div().text_xs().text_color(theme.muted_foreground).child(match m["effort"].as_str() {
+                    Some(e) => format!("{} · {} · {e}", s(m, "role"), s(m, "model")),
+                    None => format!("{} · {}", s(m, "role"), s(m, "model")),
+                }))
                 .child(div().text_xs().text_color(theme.muted_foreground.opacity(0.7)).truncate().child(cwd.clone()))
                 .child(div().flex_1())
                 .child(div().text_xs().text_color(theme.muted_foreground).truncate().max_w(px(380.)).child(s(m, "msg")))
+                .when(m["stale"] == true, |d| {
+                    let id = s(m, "id");
+                    d.child(div().text_xs().text_color(theme.yellow).child("设置已改")).child(
+                        Button::new("restart-member").xsmall().outline().icon(IconName::RefreshCw).label("重启").tooltip("用新设置重启它：当前对话会丢失，手上的任务会重新派给它").on_click(cx.listener(move |this, _, _, cx| {
+                            this.act("member.restart", json!({"member": id}), false, cx)
+                        })),
+                    )
+                })
                 .child(div().text_xs().text_color(status_color(&status, cx)).child(status_label(&status)))
                 .child(status_mark(&status, cx))
         });
@@ -585,7 +635,7 @@ impl LilaApp {
             .when(waiting > 0, |d| d.child(div().text_xs().text_color(theme.red).child(format!("{waiting} 个在等你"))))
             .when(paused, |d| d.child(div().text_xs().text_color(theme.yellow).child("已暂停派发")))
             .child(div().flex_1())
-            .child(item("⌘N 新建任务 · ⌘1–9 切换项目 · ⌘I 概览 · Esc 关闭面板".into()))
+            .child(item("⌘N 新建任务 · ⌘1–9 切换标签 · ⌘W 关闭标签 · ⌘, 设置 · ⌘I 概览 · Esc 关闭面板".into()))
     }
 }
 

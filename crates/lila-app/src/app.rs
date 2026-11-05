@@ -17,8 +17,14 @@ use std::time::Duration;
 pub struct LilaApp {
     paths: Paths,
     pub snap: Snapshot,
-    /// The project shown; `None` follows the first one.
+    /// The project shown: one of `tabs`, or none.
     pub selected: Option<String>,
+    /// The projects open as tabs, in order.
+    pub tabs: Vec<String>,
+    /// The saved tabs were restored (after the first snapshot).
+    restored: bool,
+    /// The project settings form, while open.
+    pub settings: Option<crate::settings::Form>,
     /// The member whose terminal fills the middle; `None` is the owner.
     pub member: Option<String>,
     core: Option<Arc<Core>>,
@@ -110,17 +116,36 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, settings: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
-        if self.selected.is_none() {
-            self.selected = snap.projects.first().map(|p| p.id.clone());
+        // First look: the tabs open last time (else the first project).
+        if !self.restored {
+            self.restored = true;
+            let saved = data::load_tabs(&self.paths);
+            let known = |id: &String| snap.projects.iter().any(|p| &p.id == id);
+            self.tabs = match &saved {
+                Some(t) => t.open.iter().filter(|id| known(id)).cloned().collect(),
+                None => snap.projects.first().map(|p| vec![p.id.clone()]).unwrap_or_default(),
+            };
+            let pick = saved.and_then(|t| t.selected).filter(|id| self.tabs.contains(id)).or_else(|| self.tabs.first().cloned());
+            self.snap.projects = snap.projects.clone();
+            if let Some(id) = pick {
+                self.select_project(id, cx);
+                return;
+            }
+        }
+        // A project that went away closes its tab.
+        let before = self.tabs.len();
+        self.tabs.retain(|id| snap.projects.iter().any(|p| &p.id == id));
+        if self.tabs.len() != before {
+            self.save_tabs();
         }
         if let Some(id) = &snap.project {
             self.cache.insert(id.clone(), Snapshot { detail: None, ..snap.clone() });
             // Fetched for the project shown before a switch: keep it for later, fetch the shown one.
-            if snap.project != self.selected && snap.projects.iter().any(|p| Some(&p.id) == self.selected.as_ref()) {
+            if snap.project != self.selected {
                 self.refresh_now();
                 return;
             }
@@ -145,18 +170,56 @@ impl LilaApp {
         let _ = self.kick.try_send(());
     }
 
+    fn save_tabs(&self) {
+        data::save_tabs(&self.paths, &data::Tabs { open: self.tabs.clone(), selected: self.selected.clone() });
+    }
+
+    /// Opens a project from the sidebar: its tab (added after the others) comes forward.
+    pub fn open_project(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.tabs.contains(&id) {
+            self.tabs.push(id.clone());
+        }
+        self.select_project(id, cx);
+    }
+
+    /// Closes a project's tab (its team keeps running). The tab beside it comes forward.
+    pub fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(ix) = self.tabs.iter().position(|t| t == id) else { return };
+        self.tabs.remove(ix);
+        if self.selected.as_deref() == Some(id) {
+            match self.tabs.get(ix).or(self.tabs.last()).cloned() {
+                Some(next) => self.select_project(next, cx),
+                None => {
+                    self.member = None;
+                    self.close_task(cx);
+                    self.draft = None;
+                    self.settings = None;
+                    self.selected = None;
+                    self.snap = Snapshot { daemon: self.snap.daemon, projects: std::mem::take(&mut self.snap.projects), ..Default::default() };
+                }
+            }
+        }
+        self.save_tabs();
+        cx.notify();
+    }
+
     /// Shows another project: its last snapshot at once, then fresh data.
     pub fn select_project(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.tabs.contains(&id) {
+            self.tabs.push(id.clone());
+        }
         if self.selected.as_deref() == Some(&id) {
             self.refresh_now();
             return;
         }
+        self.settings = None;
         self.member = None;
         self.close_task(cx);
         self.draft = None;
         let cached = self.cache.get(&id).cloned().unwrap_or_else(|| Snapshot { project: Some(id.clone()), ..Default::default() });
         self.snap = Snapshot { daemon: self.snap.daemon, projects: std::mem::take(&mut self.snap.projects), ..cached };
         self.selected = Some(id);
+        self.save_tabs();
         self.refresh_now();
         cx.notify();
     }
@@ -176,6 +239,10 @@ impl LilaApp {
             None
         };
         (status, snap.inbox.len())
+    }
+
+    pub fn paths(&self) -> &Paths {
+        &self.paths
     }
 
     pub fn project(&self) -> Option<Project> {
@@ -323,10 +390,10 @@ impl LilaApp {
 impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let compose = self.compose_panel(cx);
+        let compose = self.compose_panel(cx).or_else(|| self.settings_panel(cx));
         let detail = if compose.is_some() { None } else { self.task.as_ref().and(self.snap.detail.clone()) };
         let loading = compose.is_none() && self.task.is_some() && detail.is_none();
-        let overlay = |d: Div| d.absolute().top_0().right_0().bottom(px(26.)).w(px(560.)).bg(theme.popover).border_l_1().border_color(theme.border).shadow_lg().occlude();
+        let overlay = |d: Div| d.absolute().top_0().right_0().bottom(px(26.)).w(px(600.)).bg(theme.popover).border_l_1().border_color(theme.border).shadow_lg().occlude();
         v_flex()
             .size_full()
             .relative()
@@ -352,8 +419,9 @@ impl LilaApp {
     /// Window-wide keys. A focused terminal keeps everything but ⌘ chords (other than ⌘C/⌘V).
     fn shortcut(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
-        if k.key == "escape" && (self.task.is_some() || self.draft.is_some()) {
+        if k.key == "escape" && (self.task.is_some() || self.draft.is_some() || self.settings.is_some()) {
             self.draft = None;
+            self.settings = None;
             self.close_task(cx);
             cx.stop_propagation();
             return;
@@ -363,14 +431,19 @@ impl LilaApp {
         }
         match k.key.as_str() {
             "n" if self.project().is_some() => self.compose(None, None, window, cx),
+            "w" => match self.selected.clone() {
+                Some(id) => self.close_tab(&id, cx),
+                None => return,
+            },
+            "," if self.project().is_some() => self.open_settings(window, cx),
             "i" => {
                 self.right_open = !self.right_open;
                 cx.notify();
             }
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
                 let n = (d.as_bytes()[0] - b'1') as usize;
-                if let Some(p) = self.snap.projects.get(n) {
-                    self.select_project(p.id.clone(), cx);
+                if let Some(id) = self.tabs.get(n).cloned() {
+                    self.select_project(id, cx);
                 }
             }
             _ => return,

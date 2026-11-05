@@ -54,11 +54,14 @@ struct Live {
     reported: bool,
     free_since: i64,
     started_ms: Option<i64>,
+    /// `Member::launch_key` of what it was started with (unknown for one
+    /// started before lilad was), to tell it runs on settings since changed.
+    launched: Option<u64>,
 }
 
 impl Default for Live {
     fn default() -> Self {
-        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None }
+        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None }
     }
 }
 
@@ -105,7 +108,15 @@ pub fn load_team(cwd: &Path, roles_dir: &Path) -> Result<Team> {
     let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let cfg = ProjectConfig::parse(&text).map_err(anyhow::Error::msg)?;
     let roles = roles::load(roles_dir)?;
-    Team::build(&cfg, &roles).map_err(|e| anyhow!("{}: {e}", path.display()))
+    let mut team = Team::build(&cfg, &roles).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    for spec in &cfg.members {
+        if let Some(file) = &spec.prompt_file {
+            let p = cwd.join(".lila").join(file);
+            let prompt = std::fs::read_to_string(&p).with_context(|| format!("member {}: read prompt {}", spec.id, p.display()))?;
+            team.set_prompt(spec, &prompt);
+        }
+    }
+    Ok(team)
 }
 
 fn terminal_name(project: &str, member: &str) -> String {
@@ -172,6 +183,8 @@ impl<T: Terminals> Daemon<T> {
             "ping" => Ok(json!({"pong": true, "pid": std::process::id()})),
             "project.up" => self.project_up(&caller, params, now),
             "project.down" => self.project_down(&caller, now),
+            "project.reload" => self.project_reload(&caller),
+            "member.restart" => self.member_restart(&caller, params, now),
             "projects" => Ok(json!(self.projects.iter().map(|(id, p)| json!({"id": id, "cwd": p.cwd})).collect::<Vec<_>>())),
             "status" => self.status(&caller),
             "task.new" => self.task_new(&caller, params, now),
@@ -305,7 +318,7 @@ impl<T: Terminals> Daemon<T> {
         }))?;
         self.store.set_member(pid, mid, &member.role.id, Some(&addr), Some(now))?;
         let live = self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap();
-        *live = Live { terminal: Some(addr.clone()), status: AgentStatus::Unknown, started_ms: Some(now), free_since: now, ..Live::default() };
+        *live = Live { terminal: Some(addr.clone()), status: AgentStatus::Unknown, started_ms: Some(now), free_since: now, launched: Some(member.launch_key()), ..Live::default() };
         self.live_version += 1;
         let shown: Vec<String> = launch.argv.iter().map(|a| if a.chars().count() > 80 { format!("{}…", a.chars().take(40).collect::<String>()) } else { a.clone() }).collect();
         self.store.event(pid, None, "lilad", "member_started", &format!("{mid} in {addr}: {}", shown.join(" ")), now)?;
@@ -330,6 +343,47 @@ impl<T: Terminals> Daemon<T> {
         let program = which(&name, &path).ok_or_else(|| anyhow!("{name:?} is not on PATH for role {}; add its folder to the role's env.PATH", role.id))?;
         env.insert("PATH".into(), path);
         Ok((program, env))
+    }
+
+    /// Reads project.toml and the roles again (after the settings changed).
+    /// Running members keep running; `status` marks those on old settings `stale`.
+    fn project_reload(&mut self, caller: &Value) -> Result<Value> {
+        let (pid, actor) = self.who(caller)?;
+        if actor != Actor::Human {
+            bail!("only the person reloads a project");
+        }
+        let cwd = self.projects[&pid].cwd.clone();
+        self.load_project(&pid, &cwd)?;
+        self.live_version += 1;
+        let stale: Vec<String> = self.stale_members(&pid);
+        Ok(json!({"project": pid, "stale": stale}))
+    }
+
+    /// Running members started with other settings than the project has now.
+    fn stale_members(&self, pid: &str) -> Vec<String> {
+        let proj = &self.projects[pid];
+        proj.team.members.iter().filter(|m| proj.live.get(&m.id).is_some_and(|l| l.terminal.is_some() && l.launched.is_some_and(|k| k != m.launch_key()))).map(|m| m.id.clone()).collect()
+    }
+
+    /// Stops one member and starts it again with the current settings. Its
+    /// open task goes back to the queue and is delivered again.
+    fn member_restart(&mut self, caller: &Value, params: &Value, now: i64) -> Result<Value> {
+        let (pid, actor) = self.who(caller)?;
+        if actor != Actor::Human {
+            bail!("only the person restarts a member");
+        }
+        let mid = req(params, "member")?.to_owned();
+        let member = self.projects[&pid].team.member(&mid).cloned().ok_or_else(|| anyhow!("no member {mid:?} in project {pid}"))?;
+        self.member_env(&member.role)?;
+        if let Some(t) = self.projects[&pid].live[&mid].terminal.clone() {
+            if let Err(e) = self.term.kill(&t) {
+                self.say(format!("{pid}: kill {mid} ({t}): {e:#}"));
+            }
+            self.member_gone(&pid, &mid, "restarted with new settings", now, false);
+        }
+        let addr = self.start_member(&pid, &mid, now)?;
+        self.pump(&pid, now);
+        Ok(json!({"project": pid, "member": mid, "terminal": addr}))
     }
 
     fn project_down(&mut self, caller: &Value, now: i64) -> Result<Value> {
@@ -364,10 +418,11 @@ impl<T: Terminals> Daemon<T> {
                 let live = &proj.live[&m.id];
                 let current = tasks.iter().find(|(t, _)| t.to == m.id && t.state.is_active()).map(|(t, _)| json!({"id": t.id, "title": t.title, "state": t.state.as_str()}));
                 let queued = tasks.iter().filter(|(t, _)| t.to == m.id && t.state == TaskState::Queued).count();
+                let stale = live.terminal.is_some() && live.launched.is_some_and(|k| k != m.launch_key());
                 json!({
                     "id": m.id, "role": m.role.file.name, "runtime": m.role.file.runtime.to_string(), "model": m.role.file.model,
                     "owner": m.is_owner, "terminal": live.terminal, "status": live.status.as_str(), "kind": live.kind, "msg": live.msg,
-                    "task": current, "queued": queued,
+                    "task": current, "queued": queued, "stale": stale, "effort": m.role.file.effort,
                 })
             })
             .collect();

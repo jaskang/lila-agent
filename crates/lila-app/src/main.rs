@@ -5,6 +5,7 @@ mod app;
 mod compose;
 mod data;
 mod detail;
+mod settings;
 mod ui;
 
 use gpui::*;
@@ -42,6 +43,16 @@ fn main() {
                                 eprintln!("[lila-app] {} switch to {id}", data::clock_ms());
                                 view.update(cx, |v, cx| v.select_project(id, cx));
                             }
+                        })
+                        .detach();
+                }
+                // Open the shown project's settings once it has loaded.
+                if std::env::var_os("LILA_APP_SETTINGS").is_some() {
+                    let view = view.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.open_settings(window, cx)));
                         })
                         .detach();
                 }

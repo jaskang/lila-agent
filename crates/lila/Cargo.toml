@@ -22,6 +22,7 @@ lila-store = { path = "../lila-store" }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+toml_edit = "0.25"
 
 [dev-dependencies]
 tempfile.workspace = true

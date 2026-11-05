@@ -16,8 +16,10 @@ async-channel = "2"
 futures = "0.3"
 gpui = { package = "gpui-kit", version = "=0.9.0" }
 lila = { path = "../lila" }
+lila-core = { path = "../lila-core" }
 lila-store = { path = "../lila-store" }
 lila-term = { path = "../lila-term" }
+serde.workspace = true
 serde_json.workspace = true
 # `shots`: the window saves a PNG of itself every 2 s to $LILA_APP_SHOT (checks without screen-recording rights).
 shots-gpui = { package = "gpui-pre", version = "=0.3.11", optional = true, features = ["test-support"] }
