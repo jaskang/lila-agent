@@ -11,6 +11,8 @@ pub struct Project {
     pub branch: Option<String>,
     /// `title` in project.toml: what the window calls it.
     pub title: Option<String>,
+    /// Its `.lila/project.toml` is gone: registered, but lilad can't load it.
+    pub missing: bool,
 }
 
 impl Project {
@@ -65,7 +67,7 @@ pub fn caller(p: &Project) -> Value {
 
 fn projects_from_db(paths: &Paths) -> Vec<Project> {
     let Ok(store) = lila_store::Store::open(&paths.db()) else { return Vec::new() };
-    store.projects().unwrap_or_default().into_iter().map(|p| Project { branch: git_branch(&p.cwd), title: title(&p.cwd), id: p.id, cwd: p.cwd }).collect()
+    store.projects().unwrap_or_default().into_iter().map(|p| Project { branch: git_branch(&p.cwd), title: title(&p.cwd), missing: !std::path::Path::new(&p.cwd).join(".lila/project.toml").exists(), id: p.id, cwd: p.cwd }).collect()
 }
 
 pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>) -> Snapshot {
@@ -117,7 +119,7 @@ pub fn create_and_start(paths: &Paths, dir: &std::path::Path) -> anyhow::Result<
     } else {
         lila::roles::install_defaults(&paths.roles())?;
     }
-    let p = Project { id: String::new(), cwd: dir.to_string_lossy().to_string(), branch: None, title: None };
+    let p = Project { id: String::new(), cwd: dir.to_string_lossy().to_string(), branch: None, title: None, missing: false };
     let v = act(paths, &p, "project.up", json!({}), true)?;
     Ok(v["project"].as_str().unwrap_or_default().to_owned())
 }

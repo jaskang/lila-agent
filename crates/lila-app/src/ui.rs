@@ -179,7 +179,11 @@ impl LilaApp {
                     .child(div().flex_1())
                     .when_some(status, |d, st| d.child(status_mark(st, cx)))
                     .when(inbox > 0, |d| d.child(Tag::danger().xsmall().rounded_full().child(inbox.to_string())))
-                    .when_some(p.branch.clone().filter(|_| inbox == 0 && status.is_none()), |d, b| d.child(div().text_xs().text_color(theme.muted_foreground).truncate().max_w(px(110.)).child(b)))
+                    .when(p.missing, |d| d.child(Tag::warning().xsmall().child("缺少配置")).tooltip({
+                        let path = data::tilde(&format!("{}/.lila/project.toml", p.cwd));
+                        move |window, cx| gpui::component::tooltip::Tooltip::new(format!("找不到 {path}。在这个文件夹里运行 lila init 重新创建。")).build(window, cx)
+                    }))
+                    .when_some(p.branch.clone().filter(|_| !p.missing && inbox == 0 && status.is_none()), |d, b| d.child(div().text_xs().text_color(theme.muted_foreground).truncate().max_w(px(110.)).child(b)))
                     .on_click(cx.listener(move |this, _, _, cx| this.open_project(id.clone(), cx)))
                     .context_menu(self.project_menu(&p, cx))
             }))

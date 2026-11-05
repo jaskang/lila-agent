@@ -171,9 +171,14 @@ impl LilaApp {
                     for r in &changed {
                         lila::roles::save(&dir, r)?;
                     }
-                    // Members on old role settings are marked until restarted.
-                    let failed: Vec<String> = projects.iter().filter(|p| data::act(&paths, p, "project.reload", json!({}), false).is_err()).map(|p| p.label()).collect();
-                    anyhow::Ok((!failed.is_empty()).then(|| format!("角色已保存，但 {} 没能重新读取；重启 lilad 后生效。", failed.join("、"))))
+                    // Members on old role settings are marked until restarted. A project
+                    // without its .lila/project.toml was never loaded: nothing to reload.
+                    let failed: Vec<String> = projects
+                        .iter()
+                        .filter(|p| std::path::Path::new(&p.cwd).join(".lila/project.toml").exists())
+                        .filter_map(|p| data::act(&paths, p, "project.reload", json!({}), false).err().map(|e| format!("{}（{e:#}）", p.label())))
+                        .collect();
+                    anyhow::Ok((!failed.is_empty()).then(|| format!("角色已保存，但这些项目没能重新读取：{}。重启 lilad 后生效。", failed.join("；"))))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
