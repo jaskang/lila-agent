@@ -10,7 +10,7 @@ use gpui::component::scroll::ScrollableElement;
 use gpui::component::spinner::Spinner;
 use gpui::component::tab::{Tab, TabBar};
 use gpui::component::tag::Tag;
-use gpui::component::{ActiveTheme, Icon, IconName, Selectable, Sizable, StyledExt, h_flex, v_flex};
+use gpui::component::{ActiveTheme, Icon, IconName, InteractiveElementExt, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::*;
 use serde_json::{Value, json};
@@ -90,6 +90,26 @@ fn row(id: impl Into<ElementId>, active: bool, cx: &App) -> Stateful<Div> {
         .when(!active, |d| d.hover(|d| d.bg(t.sidebar_accent.opacity(0.6))))
 }
 
+/// The width the macOS traffic lights take at the start of the sidebar's top row.
+pub const TRAFFIC_LIGHTS: f32 = 78.;
+
+/// A top bar that moves the window like a title bar: press and move to drag,
+/// double-click to zoom (as the system setting says). A press that doesn't move
+/// stays a click for the buttons inside.
+pub fn drag_bar(bar: Stateful<Div>, cx: &mut Context<LilaApp>) -> Stateful<Div> {
+    bar.window_control_area(WindowControlArea::Drag)
+        .on_double_click(|_, window, _| window.titlebar_double_click())
+        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.drag_armed = true))
+        .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag_armed = false))
+        .on_mouse_down_out(cx.listener(|this, _, _, _| this.drag_armed = false))
+        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, _| {
+            if this.drag_armed && ev.pressed_button == Some(MouseButton::Left) {
+                this.drag_armed = false;
+                window.start_window_move();
+            }
+        }))
+}
+
 /// The order a member's state is listed in: what needs you first.
 fn group_of(status: &str) -> (usize, &'static str) {
     match status {
@@ -127,10 +147,11 @@ impl LilaApp {
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
             .child(
-                h_flex()
+                drag_bar(h_flex().id("sidebar-top"), cx)
                     .h(px(44.))
                     .flex_none()
-                    .px_3()
+                    .pl(px(TRAFFIC_LIGHTS))
+                    .pr_3()
                     .gap_2()
                     .child(div().size(px(22.)).rounded(px(6.)).bg(theme.primary).text_color(theme.primary_foreground).text_xs().font_bold().flex().items_center().justify_center().child("L"))
                     .child(div().font_semibold().child("Lila"))
@@ -206,7 +227,7 @@ impl LilaApp {
         let members = self.members();
         let inbox = self.snap.inbox.len();
         let has_project = self.project().is_some();
-        h_flex()
+        drag_bar(h_flex().id("tab-bar"), cx)
             .h(px(44.))
             .flex_none()
             .px_2()
@@ -373,7 +394,7 @@ impl LilaApp {
             .size_full()
             .bg(theme.sidebar)
             .child(
-                h_flex().h(px(44.)).flex_none().px_2().child(
+                drag_bar(h_flex().id("right-top"), cx).h(px(44.)).flex_none().px_2().child(
                     TabBar::new("right-tabs")
                         .segmented()
                         .small()

@@ -28,11 +28,13 @@ struct Grid {
     marked: Option<String>,
     cursor_at: Option<Bounds<Pixels>>,
     observe: bool,
+    scale: f32,
 }
 
 impl Grid {
     fn fit(&mut self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
         self.cell = cell;
+        self.scale = scale;
         let dev = device_cell(cell, scale);
         if (cols, rows) == (self.vt.cols, self.vt.rows) && dev == self.vt_cell {
             return;
@@ -90,7 +92,8 @@ pub struct TerminalView {
     /// Why the stream ended (exited, lost, attach error).
     ended: Option<String>,
     title: Option<String>,
-    scroll_rest: f32,
+    /// Touchpad movement not yet a whole line (per axis, reset at each gesture).
+    scrolled: Point<f32>,
     selecting: bool,
     _reader: Option<Task<()>>,
 }
@@ -110,8 +113,9 @@ impl TerminalView {
             marked: None,
             cursor_at: None,
             observe,
+            scale: window.scale_factor(),
         }));
-        let mut view = TerminalView { address, grid, focus: cx.focus_handle(), ended: None, title: None, scroll_rest: 0.0, selecting: false, _reader: None };
+        let mut view = TerminalView { address, grid, focus: cx.focus_handle(), ended: None, title: None, scrolled: point(0.0, 0.0), selecting: false, _reader: None };
         view.attach(window, cx);
         view
     }
@@ -249,20 +253,25 @@ impl TerminalView {
         }
     }
 
+    /// Wheel and touchpad, as herdr-app (and Ghostty) scroll: a program that tracks
+    /// the mouse gets wheel buttons, a full-screen one arrow keys, and the
+    /// shell's screen scrolls its history.
     fn scroll(&mut self, ev: &ScrollEvent, _w: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         let mut g = self.grid.borrow_mut();
-        let lines = match ev.delta {
-            ScrollDelta::Lines(p) => p.y,
-            ScrollDelta::Pixels(p) => f32::from(p.y) / f32::from(g.cell.height),
-        };
-        self.scroll_rest += lines;
-        let n = self.scroll_rest.trunc() as isize;
-        if n == 0 {
+        let (cell, cols, rows) = (g.cell, g.vt.cols, g.vt.rows);
+        let steps = scroll_delta_steps(&mut self.scrolled, ev.delta, ev.touch_phase, cell, cols, rows);
+        let n = steps.y;
+        if steps.x == 0 && n == 0 {
             return;
         }
-        self.scroll_rest -= n as f32;
-        if g.vt.alt_screen() {
+        if g.vt.mouse_tracking() {
+            let ((x, y), size) = mouse_at(&g, ev.position);
+            let out = scroll_mouse_bytes(&mut g.vt, steps, x, y, size);
+            g.send(&out);
+        } else if n == 0 {
+            return;
+        } else if g.vt.alt_screen() {
             let key = if n > 0 { GHOSTTY_KEY_ARROW_UP } else { GHOSTTY_KEY_ARROW_DOWN };
             let mut out = Vec::new();
             for _ in 0..n.unsigned_abs() {
@@ -270,7 +279,7 @@ impl TerminalView {
             }
             g.send(&out);
         } else {
-            g.vt.scroll_viewport(-n);
+            g.vt.scroll_viewport(-(n as isize));
         }
         cx.notify();
     }
@@ -288,6 +297,92 @@ impl TerminalView {
         let (w, h) = (f32::from(g.cell.width), f32::from(g.cell.height));
         g.vt.select(step, col, row, x, y, w, h);
         cx.notify();
+    }
+}
+
+// ---- scrolling (herdr-app's terminal.rs) ----
+
+fn scroll_delta_steps(scrolled: &mut Point<f32>, delta: ScrollDelta, phase: TouchPhase, cell: Size<Pixels>, cols: u16, rows: u16) -> Point<i32> {
+    let lines = match delta {
+        // As in Ghostty, a sideways notch moves one column; a vertical one, three lines.
+        ScrollDelta::Lines(p) if cfg!(target_os = "macos") => return point(macos_wheel_steps(p.x) / 3, macos_wheel_steps(p.y)),
+        ScrollDelta::Lines(p) => p,
+        ScrollDelta::Pixels(p) => point(p.x / cell.width, p.y / cell.height),
+    };
+    point(scroll_steps(&mut scrolled.x, phase, lines.x, cols as f32), scroll_steps(&mut scrolled.y, phase, lines.y, rows as f32))
+}
+
+/// Whole lines for one touchpad event: small moves add up to a line before one
+/// scrolls, each gesture starts from nothing, and it stays under a screen so
+/// turning back is quick.
+fn scroll_steps(scrolled: &mut f32, phase: TouchPhase, lines: f32, rows: f32) -> i32 {
+    match phase {
+        TouchPhase::Started => {
+            *scrolled = 0.0;
+            0
+        }
+        TouchPhase::Moved => {
+            let before = scrolled.trunc() as i32;
+            *scrolled += lines;
+            let after = scrolled.trunc() as i32;
+            *scrolled %= rows.max(1.0);
+            after - before
+        }
+        _ => 0,
+    }
+}
+
+/// Lines for a macOS mouse wheel event, as Ghostty scrolls them: macOS reports a
+/// slow notch as a fraction of a tick (often 0.1), so an event counts as at least
+/// one tick, times Ghostty's default multiplier of 3.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_wheel_steps(ticks: f32) -> i32 {
+    if ticks == 0.0 {
+        return 0;
+    }
+    (ticks.signum() * ticks.abs().max(1.0) * 3.0).trunc() as i32
+}
+
+fn scroll_mouse_bytes(vt: &mut Vt, steps: Point<i32>, x: f32, y: f32, size: (u32, u32, f32, f32)) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (steps, positive, negative) in [(steps.y, GHOSTTY_MOUSE_BUTTON_FOUR, GHOSTTY_MOUSE_BUTTON_FIVE), (steps.x, GHOSTTY_MOUSE_BUTTON_SIX, GHOSTTY_MOUSE_BUTTON_SEVEN)] {
+        let button = if steps > 0 { positive } else { negative };
+        for _ in 0..steps.unsigned_abs() {
+            out.extend(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), 0, x, y, size, false));
+        }
+    }
+    out
+}
+
+/// A pointer position and the grid for mouse reports, in device pixels.
+fn mouse_at(g: &Grid, p: Point<Pixels>) -> ((f32, f32), (u32, u32, f32, f32)) {
+    let s = g.scale;
+    let (x, y) = (f32::from(p.x - g.origin.x).max(0.0), f32::from(p.y - g.origin.y).max(0.0));
+    ((x * s, y * s), (g.vt.cols as u32, g.vt.rows as u32, f32::from(g.cell.width) * s, f32::from(g.cell.height) * s))
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::{macos_wheel_steps, scroll_steps};
+    use gpui::TouchPhase;
+
+    #[test]
+    fn a_slow_wheel_notch_still_scrolls_three_lines() {
+        assert_eq!(macos_wheel_steps(0.1), 3);
+        assert_eq!(macos_wheel_steps(-0.1), -3);
+        assert_eq!(macos_wheel_steps(2.0), 6);
+        assert_eq!(macos_wheel_steps(0.0), 0);
+    }
+
+    #[test]
+    fn touchpad_moves_add_up_to_lines() {
+        let mut acc = 0.0;
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Started, 0.0, 40.0), 0);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, 0.4, 40.0), 0);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, 0.4, 40.0), 0);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, 0.4, 40.0), 1);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Moved, -2.5, 40.0), -2);
+        assert_eq!(scroll_steps(&mut acc, TouchPhase::Ended, 5.0, 40.0), 0);
     }
 }
 

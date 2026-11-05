@@ -48,6 +48,8 @@ pub struct LilaApp {
     /// The side panel (inbox, tasks, activity): shown, and which tab.
     pub right_open: bool,
     pub right_tab: RightTab,
+    /// A press on a top bar that becomes a window drag once the mouse moves.
+    pub drag_armed: bool,
     /// The task open in the detail panel.
     pub task: Option<String>,
     append: Option<Entity<InputState>>,
@@ -112,7 +114,7 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, right_tab: RightTab::Tasks, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, _poll: poll }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, right_tab: RightTab::Tasks, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {

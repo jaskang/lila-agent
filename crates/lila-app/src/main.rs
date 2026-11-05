@@ -17,7 +17,9 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions { title: Some("Lila".into()), ..Default::default() }),
+            // No separate title bar: the traffic lights sit in the sidebar's top row
+            // and the top row of every column drags the window (see ui::drag_bar).
+            titlebar: Some(TitlebarOptions { title: Some("Lila".into()), appears_transparent: true, traffic_light_position: Some(point(px(14.), px(15.))) }),
             ..Default::default()
         };
         let (_window, _view) = gpui::open_window(options, cx, |window, cx| {

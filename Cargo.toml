@@ -21,3 +21,14 @@ tempfile = "3"
 # GPUI and the terminal parse megabytes per frame: optimize dependencies in dev builds.
 [profile.dev.package."*"]
 opt-level = 2
+
+# "*" covers only non-members: the terminal walks every cell each frame, so
+# it is optimized in dev builds too (unoptimized, scrolling stutters).
+[profile.dev.package.lila-term]
+opt-level = 2
+
+[profile.dev.package.ghostty-sys]
+opt-level = 2
+
+[profile.dev.package.lila-app]
+opt-level = 1
