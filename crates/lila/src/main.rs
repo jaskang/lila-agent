@@ -230,8 +230,12 @@ fn run() -> Result<()> {
         Cmd::Resume => out(call("resume", json!({}))?, &|_| "resumed".into()),
         Cmd::Daemon { cmd: DaemonCmd::Run } => daemon::serve(paths.clone(), client::hc_bin())?,
         Cmd::Daemon { cmd: DaemonCmd::Stop } => {
-            call("stop", json!({}))?;
-            println!("lilad stopped; members keep running");
+            if client::daemon_state(&paths)? {
+                call("stop", json!({}))?;
+                println!("lilad stopped; members keep running");
+            } else {
+                println!("lilad is not running; nothing to stop");
+            }
         }
         Cmd::Daemon { cmd: DaemonCmd::Status } => {
             if client::daemon_state(&paths)? {
