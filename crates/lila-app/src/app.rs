@@ -22,17 +22,22 @@ pub struct LilaApp {
     /// The project shown; `None` follows the first one.
     selected: Option<String>,
     /// The member whose terminal fills the middle; `None` is the owner.
-    member: Option<String>,
+    pub member: Option<String>,
     core: Option<Arc<Core>>,
     core_error: Option<String>,
     terminals: HashMap<String, Entity<TerminalView>>,
     answers: HashMap<String, Entity<InputState>>,
     /// The last action's error, shown until the next one.
     notice: Option<String>,
+    /// The task open in the detail panel.
+    pub task: Option<String>,
+    append: Option<Entity<InputState>>,
+    /// The task whose "cancel" was pressed once (press again to confirm).
+    pub confirm_cancel: Option<String>,
     _poll: Task<()>,
 }
 
-fn s(v: &Value, key: &str) -> String {
+pub fn s(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or_default().to_owned()
 }
 
@@ -41,8 +46,8 @@ impl LilaApp {
         let paths = Paths::from_env();
         let poll = cx.spawn_in(window, async move |this, cx| {
             loop {
-                let Ok((paths, selected)) = this.update(cx, |this, _| (this.paths.clone(), this.selected.clone())) else { return };
-                let snap = cx.background_executor().spawn(async move { data::fetch(&paths, selected.as_deref()) }).await;
+                let Ok((paths, selected, task)) = this.update(cx, |this, _| (this.paths.clone(), this.selected.clone(), this.task.clone())) else { return };
+                let snap = cx.background_executor().spawn(async move { data::fetch(&paths, selected.as_deref(), task.as_deref()) }).await;
                 if this.update(cx, |this, cx| this.apply(snap, cx)).is_err() {
                     return;
                 }
@@ -60,7 +65,7 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, _poll: poll }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, task: None, append: None, confirm_cancel: None, _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
@@ -69,16 +74,21 @@ impl LilaApp {
         }
         let open: Vec<String> = snap.inbox.iter().map(|i| s(i, "id")).collect();
         self.answers.retain(|id, _| open.contains(id));
+        // A detail fetched for another task (the panel moved on meanwhile) is dropped.
+        let mut snap = snap;
+        if snap.detail.as_ref().and_then(|d| d["id"].as_str()) != self.task.as_deref() {
+            snap.detail = self.snap.detail.take().filter(|d| d["id"].as_str() == self.task.as_deref());
+        }
         self.snap = snap;
         cx.notify();
     }
 
-    fn project(&self) -> Option<Project> {
+    pub fn project(&self) -> Option<Project> {
         let id = self.selected.as_deref()?;
         self.snap.projects.iter().find(|p| p.id == id).cloned()
     }
 
-    fn members(&self) -> Vec<Value> {
+    pub fn members(&self) -> Vec<Value> {
         self.snap.status.as_ref().and_then(|s| s["members"].as_array().cloned()).unwrap_or_default()
     }
 
@@ -90,7 +100,7 @@ impl LilaApp {
     }
 
     /// Runs one request off the UI thread, then refreshes.
-    fn act(&mut self, method: &'static str, params: Value, autostart: bool, cx: &mut Context<Self>) {
+    pub fn act(&mut self, method: &'static str, params: Value, autostart: bool, cx: &mut Context<Self>) {
         let Some(project) = self.project() else { return };
         let paths = self.paths.clone();
         self.notice = None;
@@ -104,6 +114,41 @@ impl LilaApp {
             });
         })
         .detach();
+    }
+
+    /// Shows a task in the detail panel; its details load with the next poll (and now).
+    pub fn open_task(&mut self, id: String, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.task.as_deref() != Some(&id) {
+            self.snap.detail = None;
+            self.confirm_cancel = None;
+        }
+        self.task = Some(id.clone());
+        let (paths, project) = (self.paths.clone(), self.project());
+        cx.spawn(async move |this, cx| {
+            let Some(p) = project else { return };
+            let v = cx.background_executor().spawn(async move { data::act(&paths, &p, "task.show", json!({"id": id}), false) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(v) = v
+                    && this.task.as_deref() == v["id"].as_str()
+                {
+                    this.snap.detail = Some(v);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn close_task(&mut self, cx: &mut Context<Self>) {
+        self.task = None;
+        self.snap.detail = None;
+        self.confirm_cancel = None;
+        cx.notify();
+    }
+
+    pub fn append_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        self.append.get_or_insert_with(|| cx.new(|cx| InputState::new(window, cx).placeholder("补充要求或修正…"))).clone()
     }
 
     /// Pick a folder, make it a project if needed, start its team.
@@ -151,7 +196,7 @@ impl LilaApp {
     }
 }
 
-fn status_color(status: &str, cx: &App) -> Hsla {
+pub fn status_color(status: &str, cx: &App) -> Hsla {
     let t = cx.theme();
     match status {
         "working" => t.blue,
@@ -174,7 +219,7 @@ fn status_label(status: &str) -> &'static str {
     }
 }
 
-fn dot(color: Hsla) -> Div {
+pub fn dot(color: Hsla) -> Div {
     div().size(px(8.)).flex_none().rounded_full().bg(color)
 }
 
@@ -243,7 +288,7 @@ impl LilaApp {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected = Some(id.clone());
                         this.member = None;
-                        cx.notify();
+                        this.close_task(cx);
                     }))
             }))
             .child(section("团队", None, cx))
@@ -252,7 +297,7 @@ impl LilaApp {
                     let id = s(&m, "id");
                     let status = s(&m, "status");
                     let active = shown.as_deref() == Some(&id);
-                    let task = m["task"].as_object().map(|t| format!("{} {}", t["id"].as_str().unwrap_or(""), t["title"].as_str().unwrap_or("")));
+                    let task = m["task"].as_object().map(|t| (t["id"].as_str().unwrap_or("").to_owned(), t["title"].as_str().unwrap_or("").to_owned()));
                     let msg = s(&m, "msg");
                     let queued = m["queued"].as_u64().unwrap_or(0);
                     let click = id.clone();
@@ -277,10 +322,12 @@ impl LilaApp {
                                 .child(div().text_sm().font_medium().child(id.clone()))
                                 .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(s(&m, "role")))
                                 .child(div().flex_1())
-                                .child(div().text_xs().text_color(status_color(&status, cx)).child(status_label(&status)))
+                                .child(div().text_xs().text_color(if matches!(status.as_str(), "gone" | "unknown") { theme.muted_foreground } else { status_color(&status, cx) }).child(status_label(&status)))
                                 .when(queued > 0, |d| d.child(Tag::secondary().small().child(format!("+{queued}")))),
                         )
-                        .when_some(task, |d, t| d.child(div().pl_4().text_xs().truncate().child(t)))
+                        .when_some(task, |d, (tid, title)| {
+                            d.child(h_flex().pl_4().gap_1().text_xs().child(crate::detail::task_link(&tid, "member", cx)).child(div().truncate().child(title)))
+                        })
                         .when(!msg.is_empty(), |d| d.child(div().pl_4().text_xs().text_color(theme.muted_foreground).truncate().child(format!("↳ {msg}"))))
                 })),
             )
@@ -395,29 +442,34 @@ impl LilaApp {
                     .child(div().text_xs().text_color(theme.muted_foreground).child(format!("{title} · {}", rows.len())))
                     .children(rows.into_iter().map(|t| {
                         let state = s(&t, "state");
-                        let tag = match state.as_str() {
-                            "blocked" => Tag::danger(),
-                            "done" => Tag::success(),
-                            "queued" => Tag::secondary(),
-                            _ => Tag::info(),
-                        };
+                        let id = s(&t, "id");
+                        let open = id.clone();
+                        let active = self.task.as_deref() == Some(id.as_str());
                         h_flex()
+                            .id(SharedString::from(format!("board-{id}")))
                             .gap_2()
+                            .px_1()
+                            .rounded_sm()
                             .text_sm()
-                            .child(tag.small().child(s(&t, "id")))
+                            .cursor_pointer()
+                            .when(active, |d| d.bg(theme.list_active))
+                            .hover(|d| d.bg(theme.list_hover))
+                            .on_click(cx.listener(move |this, _, window, cx| this.open_task(open.clone(), window, cx)))
+                            .child(crate::detail::state_tag(&state).small().child(id.clone()))
                             .child(div().text_xs().text_color(theme.muted_foreground).flex_none().child(format!("{}→{}", s(&t, "from"), s(&t, "to"))))
                             .child(div().truncate().child(s(&t, "title")))
                     }))
             }))
             .child(section("动态", None, cx))
-            .child(v_flex().px_3().pb_3().gap_0p5().children(log.into_iter().rev().take(30).map(|e| {
-                let task = e["task"].as_str().map(|t| format!("{t} ")).unwrap_or_default();
+            .child(v_flex().px_3().pb_3().gap_0p5().children(log.into_iter().rev().take(30).enumerate().map(|(n, e)| {
+                let task = e["task"].as_str().map(String::from);
                 h_flex()
                     .gap_2()
                     .text_xs()
                     .child(div().flex_none().text_color(theme.muted_foreground).child(data::clock(e["at_ms"].as_i64().unwrap_or(0))))
                     .child(div().flex_none().font_medium().child(s(&e, "actor")))
-                    .child(div().truncate().text_color(theme.muted_foreground).child(format!("{task}{} {}", s(&e, "kind"), s(&e, "detail"))))
+                    .when_some(task, |d, t| d.child(crate::detail::task_link(&t, &format!("log{n}"), cx)))
+                    .child(div().truncate().text_color(theme.muted_foreground).child(format!("{} {}", s(&e, "kind"), s(&e, "detail"))))
             })))
     }
 
@@ -452,7 +504,8 @@ impl LilaApp {
                     .gap_2()
                     .child(tag.small().child(label))
                     .child(div().text_xs().text_color(theme.muted_foreground).child(id.clone()))
-                    .when_some(member.clone(), |d, m| d.child(div().text_xs().text_color(theme.muted_foreground).child(m))),
+                    .when_some(member.clone(), |d, m| d.child(div().text_xs().text_color(theme.muted_foreground).child(m)))
+                    .when_some(item["task"].as_str().map(String::from), |d, t| d.child(div().text_xs().child(crate::detail::task_link(&t, &format!("inbox-{card_id}"), cx)))),
             )
             .child(div().text_sm().child(s(&item, "text")))
             .when(!options.is_empty(), |d| {
@@ -509,12 +562,46 @@ fn placeholder(text: String, cx: &App) -> impl IntoElement {
 impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        h_flex()
+        let detail = self.task.as_ref().and(self.snap.detail.clone());
+        let loading = self.task.is_some() && detail.is_none();
+        div()
             .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(self.sidebar(cx))
-            .child(self.center(window, cx))
-            .child(self.right(window, cx))
+            .relative()
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" && this.task.is_some() {
+                    this.close_task(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                h_flex()
+                    .size_full()
+                    .bg(theme.background)
+                    .text_color(theme.foreground)
+                    .child(self.sidebar(cx))
+                    .child(self.center(window, cx))
+                    .child(self.right(window, cx)),
+            )
+            .when_some(detail, |d, t| d.child(self.detail_panel(t, window, cx)))
+            .when(loading, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .w(px(560.))
+                        .bg(theme.popover)
+                        .border_l_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .occlude()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme.muted_foreground)
+                        .child("正在读取任务…"),
+                )
+            })
     }
 }

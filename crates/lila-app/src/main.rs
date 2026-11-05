@@ -3,6 +3,7 @@
 
 mod app;
 mod data;
+mod detail;
 
 use gpui::*;
 
@@ -19,7 +20,13 @@ fn main() {
         let (_window, _view) = gpui::open_window(options, cx, |window, cx| {
             let view = cx.new(|cx| app::LilaApp::new(window, cx));
             #[cfg(feature = "shots")]
-            shots::start(window, cx);
+            {
+                shots::start(window, cx);
+                // Checks without a mouse: open this task's panel on start.
+                if let Ok(task) = std::env::var("LILA_APP_OPEN_TASK") {
+                    view.update(cx, |v, _| v.task = Some(task));
+                }
+            }
             view
         })
         .expect("open the Lila window");

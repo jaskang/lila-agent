@@ -18,6 +18,8 @@ pub struct Snapshot {
     pub tasks: Vec<Value>,
     pub inbox: Vec<Value>,
     pub log: Vec<Value>,
+    /// `task.show` of the open task: body, children, events, files.
+    pub detail: Option<Value>,
     pub error: Option<String>,
 }
 
@@ -31,7 +33,7 @@ fn projects_from_db(paths: &Paths) -> Vec<Project> {
     store.projects().unwrap_or_default().into_iter().map(|p| Project { id: p.id, cwd: p.cwd }).collect()
 }
 
-pub fn fetch(paths: &Paths, selected: Option<&str>) -> Snapshot {
+pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>) -> Snapshot {
     let mut snap = Snapshot { daemon: lila::client::is_running(paths), projects: projects_from_db(paths), ..Default::default() };
     let Some(p) = selected.and_then(|id| snap.projects.iter().find(|p| p.id == id)).or(snap.projects.first()).cloned() else { return snap };
     if !snap.daemon {
@@ -52,7 +54,17 @@ pub fn fetch(paths: &Paths, selected: Option<&str>) -> Snapshot {
     snap.tasks = call("task.ls", json!({"all": true})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
     snap.inbox = call("inbox", json!({})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
     snap.log = call("log", json!({"limit": 40})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    if let Some(id) = task {
+        snap.detail = call("task.show", json!({"id": id})).ok();
+    }
     snap
+}
+
+/// Opens a file (relative paths from the project folder) with the system's default app.
+pub fn open_path(project_cwd: &str, path: &str) {
+    let p = std::path::Path::new(path);
+    let full = if p.is_absolute() { p.to_path_buf() } else { std::path::Path::new(project_cwd).join(p) };
+    let _ = std::process::Command::new("open").arg(full).spawn();
 }
 
 /// One action as the person. `autostart`: start lilad first if needed (`project.up`).
