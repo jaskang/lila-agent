@@ -108,6 +108,16 @@ impl LilaApp {
                 let (cwd, file) = (cwd.clone(), file.clone());
                 d.child(Button::new("detail-file").small().ghost().label("打开任务文件").on_click(move |_, _, _| data::open_path(&cwd, &file)))
             })
+            .when(state == "queued" && self.rewrite.is_none(), |d| {
+                let task = t.clone();
+                d.child(Button::new("detail-rewrite").small().ghost().label("改写").on_click(cx.listener(move |this, _, window, cx| this.start_rewrite(&task, window, cx))))
+            })
+            .when(open, |d| {
+                let (to, parent) = (to.clone(), id.clone());
+                d.child(Button::new("detail-subtask").small().ghost().label("派子任务").on_click(cx.listener(move |this, _, window, cx| {
+                    this.compose(Some(to.clone()), Some(parent.clone()), window, cx)
+                })))
+            })
             .when(open, |d| {
                 let tid = id.clone();
                 if confirming {
@@ -138,6 +148,7 @@ impl LilaApp {
         let children: Vec<Value> = t["children"].as_array().cloned().unwrap_or_default();
         let events: Vec<Value> = t["events"].as_array().cloned().unwrap_or_default();
 
+        let rewrite = self.rewrite_form(&id, cx);
         let append_hint = if state == "queued" { "还在排队：追加的内容会直接写进任务，送达时一起发出。".to_owned() } else { format!("已经送达：追加的内容会作为更新发给 {to}。") };
 
         v_flex()
@@ -179,7 +190,9 @@ impl LilaApp {
                     .when_some(outcome, |d, (accent, text)| {
                         d.child(div().p_2().rounded_md().border_l_2().border_color(accent).bg(accent.opacity(0.12)).text_sm().child(text))
                     })
-                    .child(block("说明", cx).child(if body.trim().is_empty() {
+                    .child(block("说明", cx).child(if let Some(form) = rewrite {
+                        form
+                    } else if body.trim().is_empty() {
                         div().text_sm().text_color(theme.muted_foreground).child("（没有正文）").into_any_element()
                     } else {
                         div().text_sm().child(TextView::markdown(SharedString::from(format!("body-{id}")), body.clone())).into_any_element()

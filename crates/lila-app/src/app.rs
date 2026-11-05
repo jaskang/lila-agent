@@ -36,6 +36,10 @@ pub struct LilaApp {
     append: Option<Entity<InputState>>,
     /// The task whose "cancel" was pressed once (press again to confirm).
     pub confirm_cancel: Option<String>,
+    /// The new-task form, while open.
+    pub draft: Option<crate::compose::Draft>,
+    /// A queued task being rewritten in the detail panel.
+    pub rewrite: Option<crate::compose::Rewrite>,
     _poll: Task<()>,
     _previews: Task<()>,
 }
@@ -127,7 +131,7 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, task: None, append: None, confirm_cancel: None, previews: HashMap::new(), _poll: poll, _previews: previews }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, previews: HashMap::new(), _poll: poll, _previews: previews }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
@@ -178,11 +182,38 @@ impl LilaApp {
         .detach();
     }
 
-    /// Shows a task in the detail panel; its details load with the next poll (and now).
+    /// Like `act`, then `done` with the result. Errors go to the open form, else the notice.
+    pub fn request(&mut self, method: &'static str, params: Value, cx: &mut Context<Self>, done: impl FnOnce(&mut Self, Value, &mut Context<Self>) + 'static) {
+        let Some(project) = self.project() else { return };
+        let paths = self.paths.clone();
+        self.notice = None;
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { data::act(&paths, &project, method, params, false) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match r {
+                    Ok(v) => done(this, v, cx),
+                    Err(e) => match &mut this.draft {
+                        Some(d) => d.error = Some(format!("{e:#}")),
+                        None => this.notice = Some(format!("{e:#}")),
+                    },
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn open_task(&mut self, id: String, _window: &mut Window, cx: &mut Context<Self>) {
+        self.show_task(id, cx);
+    }
+
+    /// Shows a task in the detail panel; its details load with the next poll (and now).
+    pub fn show_task(&mut self, id: String, cx: &mut Context<Self>) {
+        self.draft = None;
         if self.task.as_deref() != Some(&id) {
             self.snap.detail = None;
             self.confirm_cancel = None;
+            self.rewrite = None;
         }
         self.task = Some(id.clone());
         let (paths, project) = (self.paths.clone(), self.project());
@@ -206,6 +237,7 @@ impl LilaApp {
         self.task = None;
         self.snap.detail = None;
         self.confirm_cancel = None;
+        self.rewrite = None;
         cx.notify();
     }
 
@@ -561,7 +593,15 @@ impl LilaApp {
             .child(section("需要你", Some(inbox_count), cx))
             .when(inbox_empty, |d| d.child(div().px_3().pb_2().text_sm().text_color(theme.muted_foreground).child("没有需要你处理的事")))
             .children(cards)
-            .child(section("任务", None, cx))
+            .child(
+                h_flex()
+                    .pr_3()
+                    .child(section("任务", None, cx))
+                    .child(div().flex_1())
+                    .when(self.project().is_some(), |d| {
+                        d.child(Button::new("new-task").xsmall().ghost().label("新建任务…").on_click(cx.listener(|this, _, window, cx| this.compose(None, None, window, cx))))
+                    }),
+            )
             .children(groups.into_iter().filter(|(_, rows)| !rows.is_empty()).map(|(title, rows)| {
                 v_flex()
                     .px_3()
@@ -690,13 +730,15 @@ fn placeholder(text: String, cx: &App) -> impl IntoElement {
 impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let detail = self.task.as_ref().and(self.snap.detail.clone());
-        let loading = self.task.is_some() && detail.is_none();
+        let compose = self.compose_panel(cx);
+        let detail = if compose.is_some() { None } else { self.task.as_ref().and(self.snap.detail.clone()) };
+        let loading = compose.is_none() && self.task.is_some() && detail.is_none();
         div()
             .size_full()
             .relative()
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                if ev.keystroke.key == "escape" && this.task.is_some() {
+                if ev.keystroke.key == "escape" && (this.task.is_some() || this.draft.is_some()) {
+                    this.draft = None;
                     this.close_task(cx);
                     cx.stop_propagation();
                 }
@@ -713,6 +755,7 @@ impl Render for LilaApp {
                             .child(resizable_panel().size(px(380.)).size_range(px(300.)..px(720.)).fixed().child(self.right(window, cx).into_any_element())),
                     ),
             )
+            .children(compose)
             .when_some(detail, |d, t| d.child(self.detail_panel(t, window, cx)))
             .when(loading, |d| {
                 d.child(

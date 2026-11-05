@@ -2,6 +2,7 @@
 //! answer what needs you, follow the task board.
 
 mod app;
+mod compose;
 mod data;
 mod detail;
 
@@ -25,6 +26,9 @@ fn main() {
                 // Checks without a mouse: open this task's panel on start.
                 if let Ok(task) = std::env::var("LILA_APP_OPEN_TASK") {
                     view.update(cx, |v, _| v.task = Some(task));
+                }
+                if let Ok(to) = std::env::var("LILA_APP_COMPOSE") {
+                    view.update(cx, |v, cx| v.compose(Some(to).filter(|t| !t.is_empty()), None, window, cx));
                 }
             }
             view
