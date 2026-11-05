@@ -32,6 +32,8 @@ pub fn tilde(path: &str) -> String {
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub daemon: bool,
+    /// The project the rest was fetched for.
+    pub project: Option<String>,
     pub projects: Vec<Project>,
     /// `status` of the selected project: members, open tasks, inbox count.
     pub status: Option<Value>,
@@ -56,6 +58,7 @@ fn projects_from_db(paths: &Paths) -> Vec<Project> {
 pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>) -> Snapshot {
     let mut snap = Snapshot { daemon: lila::client::is_running(paths), projects: projects_from_db(paths), ..Default::default() };
     let Some(p) = selected.and_then(|id| snap.projects.iter().find(|p| p.id == id)).or(snap.projects.first()).cloned() else { return snap };
+    snap.project = Some(p.id.clone());
     if !snap.daemon {
         return snap;
     }

@@ -169,11 +169,7 @@ impl LilaApp {
                     .child(div().flex_1())
                     .when(inbox > 0, |d| d.child(Tag::danger().xsmall().rounded_full().child(inbox.to_string())))
                     .when_some(p.branch.clone().filter(|_| inbox == 0), |d, b| d.child(div().text_xs().text_color(theme.muted_foreground).truncate().max_w(px(110.)).child(b)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.selected = Some(id.clone());
-                        this.member = None;
-                        this.close_task(cx);
-                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_project(id.clone(), cx)))
             }))
             .child(div().mx_4().my_3().h(px(1.)).bg(theme.sidebar_border))
             .child(

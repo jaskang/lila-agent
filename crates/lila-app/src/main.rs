@@ -32,6 +32,19 @@ fn main() {
                 if let Ok(task) = std::env::var("LILA_APP_OPEN_TASK") {
                     view.update(cx, |v, _| v.task = Some(task));
                 }
+                // Switch through these projects (comma-separated), one every 3 s.
+                if let Ok(list) = std::env::var("LILA_APP_SWITCH") {
+                    let view = view.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            for id in list.split(',').map(str::to_owned) {
+                                cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
+                                eprintln!("[lila-app] {} switch to {id}", data::clock_ms());
+                                let _ = view.update(cx, |v, cx| v.select_project(id, cx));
+                            }
+                        })
+                        .detach();
+                }
                 if let Ok(to) = std::env::var("LILA_APP_COMPOSE") {
                     view.update(cx, |v, cx| v.compose(Some(to).filter(|t| !t.is_empty()), None, window, cx));
                 }

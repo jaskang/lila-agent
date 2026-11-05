@@ -59,6 +59,10 @@ pub struct LilaApp {
     pub draft: Option<crate::compose::Draft>,
     /// A queued task being rewritten in the detail panel.
     pub rewrite: Option<crate::compose::Rewrite>,
+    /// Refreshes now, without waiting for lilad to say something changed.
+    kick: async_channel::Sender<()>,
+    /// The last snapshot of each project, shown at once when switching back to it.
+    cache: HashMap<String, Snapshot>,
     _poll: Task<()>,
 }
 
@@ -68,6 +72,7 @@ impl LilaApp {
         // lilad says when anything changed; refresh then. A slow poll covers a
         // daemon that is down or restarting.
         let (wake_tx, wake) = async_channel::unbounded::<()>();
+        let (kick, kicked) = async_channel::unbounded::<()>();
         let watch_paths = paths.clone();
         std::thread::spawn(move || {
             loop {
@@ -90,17 +95,27 @@ impl LilaApp {
                 let Ok((paths, selected, task)) = this.update(cx, |this, _| (this.paths.clone(), this.selected.clone(), this.task.clone())) else { return };
                 let snap = cx.background_executor().spawn(async move { data::fetch(&paths, selected.as_deref(), task.as_deref()) }).await;
                 if std::env::var_os("LILA_APP_DEBUG").is_some() {
-                    eprintln!("[lila-app] {} refreshed: {} tasks", data::clock_ms(), snap.tasks.len());
+                    eprintln!("[lila-app] {} refreshed {}: {} tasks", data::clock_ms(), snap.project.as_deref().unwrap_or("-"), snap.tasks.len());
                 }
                 if this.update(cx, |this, cx| this.apply(snap, cx)).is_err() {
                     return;
                 }
+                if kicked.try_recv().is_ok() {
+                    while kicked.try_recv().is_ok() {}
+                    continue;
+                }
                 let woken = std::pin::pin!(wake.recv());
+                let asked = std::pin::pin!(kicked.recv());
                 let timeout = std::pin::pin!(cx.background_executor().timer(Duration::from_secs(5)));
-                futures::future::select(woken, timeout).await;
-                // Changes come in bursts (a delivery, then a status): take them together.
-                cx.background_executor().timer(Duration::from_millis(80)).await;
+                match futures::future::select(futures::future::select(woken, asked), timeout).await {
+                    futures::future::Either::Left((futures::future::Either::Right(_), _)) => {}
+                    _ => {
+                        // Changes come in bursts (a delivery, then a status): take them together.
+                        cx.background_executor().timer(Duration::from_millis(80)).await;
+                    }
+                }
                 while wake.try_recv().is_ok() {}
+                while kicked.try_recv().is_ok() {}
             }
         });
         cx.spawn(async move |this, cx| {
@@ -114,17 +129,25 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, right_tab: RightTab::Tasks, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, _poll: poll }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, right_tab: RightTab::Tasks, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
         if self.selected.is_none() {
             self.selected = snap.projects.first().map(|p| p.id.clone());
         }
+        if let Some(id) = &snap.project {
+            self.cache.insert(id.clone(), Snapshot { detail: None, ..snap.clone() });
+            // Fetched for the project shown before a switch: keep it for later, fetch the shown one.
+            if snap.project != self.selected && snap.projects.iter().any(|p| Some(&p.id) == self.selected.as_ref()) {
+                self.refresh_now();
+                return;
+            }
+        }
         let open: Vec<String> = snap.inbox.iter().map(|i| s(i, "id")).collect();
         self.answers.retain(|id, _| open.contains(id));
         // Something new needs the person: bring the inbox forward.
-        if snap.inbox.iter().any(|i| !self.snap.inbox.iter().any(|o| o["id"] == i["id"])) && snap.status.is_some() {
+        if snap.project == self.snap.project && snap.inbox.iter().any(|i| !self.snap.inbox.iter().any(|o| o["id"] == i["id"])) && snap.status.is_some() {
             self.right_open = true;
             self.right_tab = RightTab::Inbox;
         }
@@ -134,6 +157,27 @@ impl LilaApp {
             snap.detail = self.snap.detail.take().filter(|d| d["id"].as_str() == self.task.as_deref());
         }
         self.snap = snap;
+        cx.notify();
+    }
+
+    /// Fetches everything again right away.
+    pub fn refresh_now(&self) {
+        let _ = self.kick.try_send(());
+    }
+
+    /// Shows another project: its last snapshot at once, then fresh data.
+    pub fn select_project(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(&id) {
+            self.refresh_now();
+            return;
+        }
+        self.member = None;
+        self.close_task(cx);
+        self.draft = None;
+        let cached = self.cache.get(&id).cloned().unwrap_or_else(|| Snapshot { project: Some(id.clone()), ..Default::default() });
+        self.snap = Snapshot { daemon: self.snap.daemon, projects: std::mem::take(&mut self.snap.projects), ..cached };
+        self.selected = Some(id);
+        self.refresh_now();
         cx.notify();
     }
 
@@ -164,6 +208,7 @@ impl LilaApp {
                 if let Err(e) = r {
                     this.notice = Some(format!("{e:#}"));
                 }
+                this.refresh_now();
                 cx.notify();
             });
         })
@@ -244,10 +289,7 @@ impl LilaApp {
             let r = cx.background_executor().spawn(async move { data::create_and_start(&paths, &dir) }).await;
             let _ = this.update(cx, |this, cx| {
                 match r {
-                    Ok(id) if !id.is_empty() => {
-                        this.selected = Some(id);
-                        this.member = None;
-                    }
+                    Ok(id) if !id.is_empty() => this.select_project(id, cx),
                     Ok(_) => {}
                     Err(e) => this.notice = Some(format!("{e:#}")),
                 }
