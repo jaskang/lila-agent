@@ -153,7 +153,7 @@ macOS 没有 `timeout` 命令，可以这样让程序跑一会儿再停：`prog 
 
 ## 分支
 
-分支依次叠加：`main` → `docs/design-and-m0` → `m1-orchestration` → `m1-followups` → `m2-gui` → `m3`（当前分支）。远端（`origin`，`git@github.com:jaskang/lila-agent.git`）上只有 `main`，而且本地 `main` 还比它多 1 个提交；其他分支有没有推送，以 `git branch -vv` 为准。
+分支依次叠加：`main` → `docs/design-and-m0` → `m1-orchestration` → `m1-followups` → `m2-gui` → `m3`（当前分支）。所有分支都已推送到 `origin`（`git@github.com:jaskang/lila-agent.git`），2026-11-05 晚。还没开 PR。
 
 ## 等用户亲手验证的
 
