@@ -147,6 +147,7 @@ fn up_starts_every_member_with_its_command() {
     assert!(prompt.contains("## As the owner"));
     assert_eq!(owner["labels"], json!({"lila.project": "shop", "lila.member": "owner"}));
     assert_eq!(owner["env"]["LILA_MEMBER"], "owner");
+    assert_eq!(owner["env"]["LILA_ROOT"], w.repo.to_string_lossy().as_ref());
     assert!(owner["env"]["PATH"].as_str().unwrap().starts_with("/opt/lila/bin:"), "members can run lila");
     assert_eq!(owner["name"], "lila-shop-owner");
     assert_eq!(owner["no_parent"], true);
@@ -434,4 +435,77 @@ fn delivers_to_a_member_that_finished_a_turn_unseen() {
     w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "x"}));
     assert_eq!(w.state("T1"), TaskState::Delivered, "`done` takes input like `idle`");
     assert_eq!(w.d.term.sends.last().unwrap().2, None, "and is sent without an `if` hc would reject");
+}
+
+#[test]
+fn queued_tasks_are_rewritten_and_delivered_ones_get_updates() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    w.status("engineer", "working");
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Add multiply", "body": "with asserts"}));
+    assert_eq!(w.state("T1"), TaskState::Queued);
+    let v = w.ok(Some("owner"), "task.edit", json!({"id": "T1", "append": "Do not commit."}));
+    assert_eq!(v["update_sent"], false);
+    let file = std::fs::read_to_string(w.repo.join(".lila/tasks/T1.md")).unwrap();
+    assert!(file.contains("with asserts\n\n## Update from owner\n\nDo not commit."), "{file}");
+    w.status("engineer", "idle");
+    let typed = w.sends_to("engineer").pop().unwrap();
+    assert!(typed.contains("Do not commit."), "the delivered text has the edit: {typed}");
+
+    // Delivered: only appends, and they reach the member as a note.
+    let err = w.call(Some("owner"), "task.edit", json!({"id": "T1", "title": "x"})).unwrap_err().to_string();
+    assert!(err.contains("already delivered"), "{err}");
+    w.ok(Some("owner"), "task.edit", json!({"id": "T1", "append": "Also handle floats."}));
+    assert!(w.sends_to("engineer").pop().unwrap().contains("Update to T1 \"Add multiply\" from owner: Also handle floats."));
+    assert!(w.call(Some("tester"), "task.edit", json!({"id": "T1", "append": "x"})).unwrap_err().to_string().contains("only owner"));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "ok"}));
+    assert!(w.call(Some("owner"), "task.edit", json!({"id": "T1", "append": "x"})).unwrap_err().to_string().contains("is done"));
+}
+
+#[test]
+fn back_and_forth_stops_after_max_rounds() {
+    let mut w = world_with(&format!("{PROJECT}\n[settings]\nmax_rounds = 1\nmax_working = 9\n"));
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build"}));
+    w.ok(Some("engineer"), "task.new", json!({"to": "tester", "title": "Check", "parent": "T1"}));
+    w.ok(Some("tester"), "task.new", json!({"to": "engineer", "title": "Fix 1", "parent": "T2"}));
+    w.ok(Some("engineer"), "task.new", json!({"to": "tester", "title": "Check again", "parent": "T3"}));
+    let err = w.call(Some("tester"), "task.new", json!({"to": "engineer", "title": "Fix 2", "parent": "T4"})).unwrap_err().to_string();
+    assert!(err.contains("back and forth 1 times") && err.contains("lila task block T4"), "{err}");
+    // A different pair is not a bounce: the owner can always re-plan.
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Re-plan", "parent": "T4"}));
+}
+
+#[test]
+fn sandboxed_members_talk_through_the_spool() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    let dir = spool_dir(&w.repo);
+    assert!(dir.is_dir(), "`up` creates it");
+    let gi = std::fs::read_to_string(w.repo.join(".lila/.gitignore")).unwrap();
+    assert!(gi.contains("tasks/") && gi.contains("spool/"));
+    let caller = json!({"cwd": w.repo.to_string_lossy(), "project": "shop", "member": "owner"});
+    let id = crate::client::write_spool(&dir, "task.new", &json!({"caller": caller, "to": "engineer", "title": "via spool"})).unwrap();
+    let bad = crate::client::write_spool(&dir, "task.done", &json!({"caller": caller, "id": "T9", "summary": "s"})).unwrap();
+    w.d.process_spool(w.now);
+    let v = crate::client::await_spool(&dir, &id, std::time::Duration::from_secs(1)).unwrap();
+    assert_eq!((v["id"].as_str(), v["state"].as_str()), (Some("T1"), Some("delivered")));
+    let err = crate::client::await_spool(&dir, &bad, std::time::Duration::from_secs(1)).unwrap_err().to_string();
+    assert!(err.contains("no task T9"), "{err}");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "requests and replies are cleaned up");
+    let stop = crate::client::write_spool(&dir, "stop", &json!({})).unwrap();
+    w.d.process_spool(w.now);
+    assert!(crate::client::await_spool(&dir, &stop, std::time::Duration::from_secs(1)).is_err());
+}
+
+#[test]
+fn spool_requests_time_out_without_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = crate::client::write_spool(dir.path(), "status", &json!({})).unwrap();
+    let err = crate::client::await_spool(dir.path(), &id, std::time::Duration::from_millis(300)).unwrap_err().to_string();
+    assert!(err.contains("did not answer"), "{err}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the unanswered request is withdrawn");
 }

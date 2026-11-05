@@ -91,11 +91,14 @@ pub struct Settings {
     pub startup_timeout_secs: u64,
     /// Longest parent chain (T1 → T2 → ...) before new subtasks are refused.
     pub max_chain_depth: u32,
+    /// How many times two members may send work back and forth in one chain
+    /// (engineer → tester → engineer is one round) before the owner decides.
+    pub max_rounds: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { max_working: 1, stall_minutes: 5, startup_timeout_secs: 20, max_chain_depth: 8 }
+        Settings { max_working: 1, stall_minutes: 5, startup_timeout_secs: 20, max_chain_depth: 8, max_rounds: 3 }
     }
 }
 

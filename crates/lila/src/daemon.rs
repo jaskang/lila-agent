@@ -172,6 +172,7 @@ impl<T: Terminals> Daemon<T> {
             "task.done" => self.task_move(&caller, params, Transition::Done, now),
             "task.block" => self.task_move(&caller, params, Transition::Block, now),
             "task.cancel" => self.task_move(&caller, params, Transition::Cancel, now),
+            "task.edit" => self.task_edit(&caller, params, now),
             "task.show" => self.task_show(&caller, params),
             "task.ls" => self.task_ls(&caller, params),
             "ask" => self.ask(&caller, params, now),
@@ -227,6 +228,7 @@ impl<T: Terminals> Daemon<T> {
         self.store.upsert_project(&pid, &root_s, now)?;
         self.load_project(&pid, &root)?;
         std::fs::create_dir_all(root.join(".lila").join("tasks"))?;
+        std::fs::create_dir_all(spool_dir(&root))?;
         ensure_gitignore(&root)?;
 
         let mut started = Vec::new();
@@ -278,6 +280,7 @@ impl<T: Terminals> Daemon<T> {
         let (program, mut env) = self.member_env(&member.role)?;
         launch.argv[0] = program.to_string_lossy().to_string();
         env.insert("LILA_PROJECT".into(), pid.to_owned());
+        env.insert("LILA_ROOT".into(), cwd.clone());
         env.insert("LILA_MEMBER".into(), mid.to_owned());
         if let Some(h) = std::env::var_os("LILA_HOME") {
             env.insert("LILA_HOME".into(), h.to_string_lossy().to_string());
@@ -387,6 +390,19 @@ impl<T: Terminals> Daemon<T> {
                 bail!("task chain under {p} is already {max_depth} deep; report to the owner with `lila task block` instead of creating more subtasks");
             }
         }
+        if let (Some(p), Actor::Member(from)) = (&parent, &actor) {
+            let chain: Vec<(String, String)> = self.store.ancestors(&pid, p)?.into_iter().map(|t| (t.from.to_string(), t.to)).collect();
+            let parent_task = self.store.task(&pid, p)?.expect("checked above");
+            let mut chain_with_parent = vec![(parent_task.from.to_string(), parent_task.to.clone())];
+            chain_with_parent.extend(chain);
+            let max = self.projects[&pid].team.settings.max_rounds;
+            let rounds = lila_core::task::rounds(from, &to, &chain_with_parent);
+            if rounds > max {
+                bail!(
+                    "{from} and {to} have already sent this work back and forth {max} times; stop and run `lila task block {p} --reason \"<what keeps failing>\"` so the owner can decide"
+                );
+            }
+        }
         let new = NewTask {
             title: req(params, "title")?.trim().to_owned(),
             body: s(params, "body").unwrap_or_default().to_owned(),
@@ -460,6 +476,47 @@ impl<T: Terminals> Daemon<T> {
             }
         }
         Ok(())
+    }
+
+    /// Changes a task you assigned. Queued: rewritten in place. Already delivered:
+    /// what was typed can't change, so `append` goes to the member as an update.
+    fn task_edit(&mut self, caller: &Value, params: &Value, now: i64) -> Result<Value> {
+        let (pid, actor) = self.who(caller)?;
+        let id = req(params, "id")?;
+        let task = self.store.task(&pid, id)?.ok_or_else(|| anyhow!("no task {id} in project {pid}"))?;
+        let owner = self.projects[&pid].team.owner.clone();
+        if actor != Actor::Human && actor != Actor::Member(owner.clone()) && actor != task.from {
+            bail!("only {} (who assigned it) or the owner can edit {}", task.from, task.id);
+        }
+        if !task.state.is_open() {
+            bail!("{} is {}; create a new task instead", task.id, task.state);
+        }
+        let (title, body, append) = (s(params, "title"), s(params, "body"), s(params, "append"));
+        if title.is_none() && body.is_none() && append.is_none() {
+            bail!("nothing to change: give --title, --body or --append");
+        }
+        let delivered = task.state != TaskState::Queued;
+        if delivered && (title.is_some() || body.is_some()) {
+            bail!("{} was already delivered to {}; its text can't be replaced. Use --append to send them an update", task.id, task.to);
+        }
+        let mut new_body = body.map(String::from).unwrap_or_else(|| task.body.clone());
+        if let Some(a) = append {
+            new_body = format!("{}\n\n## Update from {actor}\n\n{}", new_body.trim_end(), a.trim());
+        }
+        let new_title = title.map(|t| t.trim().to_owned()).unwrap_or_else(|| task.title.clone());
+        self.store.set_task_text(&pid, &task.id, &new_title, &new_body, now)?;
+        let updated = self.store.task(&pid, &task.id)?.expect("exists");
+        write_task_file(&self.projects[&pid].cwd, &updated)?;
+        let detail = append.map(|a| format!("appended: {a}")).unwrap_or_else(|| "rewrote the task".into());
+        self.store.event(&pid, Some(&task.id), actor.as_str(), "edited", &detail, now)?;
+        if delivered && let Some(a) = append {
+            let text = message::note(&task.id, &format!("Update to {} \"{}\" from {actor}: {}", task.id, new_title, a.trim()));
+            self.store.push_outbox(&pid, &task.to, &text, now)?;
+        }
+        self.pump(&pid, now);
+        let mut v = task_json(&updated);
+        v["update_sent"] = json!(delivered);
+        Ok(v)
     }
 
     fn task_show(&self, caller: &Value, params: &Value) -> Result<Value> {
@@ -811,12 +868,66 @@ fn split_brief(brief: &str) -> (String, String) {
 }
 
 fn ensure_gitignore(root: &Path) -> Result<()> {
+    // Task files and the spool are run state; project.toml is configuration and stays tracked.
     let path = root.join(".lila").join(".gitignore");
-    if !path.exists() {
-        // Task files are run state; project.toml is configuration and stays tracked.
-        std::fs::write(path, "tasks/\n")?;
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    let before = text.clone();
+    for line in ["tasks/", "spool/"] {
+        if !text.lines().any(|l| l.trim() == line) {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    if text != before {
+        std::fs::write(path, text)?;
     }
     Ok(())
+}
+
+/// `.lila/spool/` in a project: the file channel for sandboxed members (codex
+/// workspace-write) that may not open the lilad socket. `<id>.req.json` in,
+/// `<id>.reply.json` out; both written to a temporary name and renamed.
+pub fn spool_dir(root: &Path) -> PathBuf {
+    root.join(".lila").join("spool")
+}
+
+impl<T: Terminals> Daemon<T> {
+    /// Answers every pending spool request in every project.
+    pub fn process_spool(&mut self, now: i64) {
+        let roots: Vec<PathBuf> = self.projects.values().map(|p| p.cwd.clone()).collect();
+        for root in roots {
+            let dir = spool_dir(&root);
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let mut reqs: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.to_string_lossy().ends_with(".req.json")).collect();
+            reqs.sort();
+            for path in reqs {
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                let _ = std::fs::remove_file(&path);
+                let reply = match serde_json::from_str::<Value>(&text) {
+                    Ok(req) => {
+                        let method = req["method"].as_str().unwrap_or_default();
+                        if method == "stop" {
+                            json!({"error": "lilad can't be stopped through the spool"})
+                        } else {
+                            match self.handle(method, &req["params"], now) {
+                                Ok(v) => json!({"result": v}),
+                                Err(e) => json!({"error": format!("{e:#}")}),
+                            }
+                        }
+                    }
+                    Err(e) => json!({"error": format!("bad spool request: {e}")}),
+                };
+                let name = path.file_name().unwrap().to_string_lossy().replace(".req.json", "");
+                let tmp = dir.join(format!("{name}.reply.tmp"));
+                if std::fs::write(&tmp, reply.to_string()).is_ok() {
+                    let _ = std::fs::rename(&tmp, dir.join(format!("{name}.reply.json")));
+                }
+            }
+        }
+    }
 }
 
 pub fn task_file_rel(id: &str) -> String {
@@ -855,6 +966,8 @@ enum Input {
     /// A fresh `events.subscribe` snapshot and when it was taken.
     Snapshot(Value, i64),
     Tick,
+    /// Look for spool requests (fast: sandboxed members wait on them).
+    Spool,
     Stop,
 }
 
@@ -934,6 +1047,16 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
         }
     });
 
+    let tx_spool = tx.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if tx_spool.send(Input::Spool).is_err() {
+                return;
+            }
+        }
+    });
+
     let tx_tick = tx.clone();
     std::thread::spawn(move || {
         loop {
@@ -969,6 +1092,7 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
             }
             Input::Hc(line) => daemon.on_event(&line, now),
             Input::Tick => daemon.tick(now),
+            Input::Spool => daemon.process_spool(now),
             Input::Stop => break,
         }
     }

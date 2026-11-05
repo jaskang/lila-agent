@@ -40,7 +40,7 @@ Work arrives in your input as:
 1. When you begin, run `lila task start T12`.
 2. When finished, run `lila task done T12 --summary "<one line>"`. Add `--file <path>` for each deliverable or long report; put long text in a file and pass its path instead of pasting it.
 3. If you cannot continue, run `lila task block T12 --reason "<exactly what you need>"`. Do not guess and do not wait silently.
-4. To hand work to a teammate: `lila task new --to <member> --title "<title>" --body "<details>" --parent T12`. For long details write a file and use `--body-file <path>`.
+4. To hand work to a teammate: `lila task new --to <member> --title "<title>" --body "<details>" --parent T12`. For long details write a file and use `--body-file <path>`. To correct or add to a task you already assigned, use `lila task edit T13 --append "<what changed>"`, never a separate correction task.
 5. Lila tells you about other tasks with `<lila note …>` and delivers answers with `<lila answer …>`. They are information for you, not new tasks, unless they say so.
 
 Every task you receive must end with `lila task done` or `lila task block`. `lila status` shows the team and open tasks; `lila task show T12` shows one task. Never edit files under `.lila/` by hand.

@@ -132,6 +132,15 @@ pub fn apply(state: TaskState, t: Transition) -> Result<TaskState, String> {
     Ok(next)
 }
 
+/// Rounds two members have bounced a chain between them, counting a new task
+/// `from → to` under `ancestors` (nearest parent first). Engineer → tester,
+/// tester → engineer is one round; any other hand-off in between ends the streak.
+pub fn rounds(from: &str, to: &str, ancestors: &[(String, String)]) -> u32 {
+    let pair = |a: &str, b: &str| (a == from && b == to) || (a == to && b == from);
+    let streak = 1 + ancestors.iter().take_while(|(a, b)| pair(a, b)).count() as u32;
+    streak / 2
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     /// `T12`, numbered per project.
@@ -179,6 +188,19 @@ mod tests {
         assert!(apply(Blocked, T::Block).unwrap_err().contains("already blocked"));
         assert!(apply(Cancelled, T::Cancel).is_err());
         assert!(apply(Blocked, T::Requeue).is_err());
+    }
+
+    #[test]
+    fn rounds_count_back_and_forth_between_the_same_pair() {
+        let chain = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        // owner → engineer, then engineer hands to the tester: no round yet.
+        assert_eq!(rounds("engineer", "tester", &chain(&[("owner", "engineer")])), 0);
+        // tester sends a fix back: one round.
+        assert_eq!(rounds("tester", "engineer", &chain(&[("engineer", "tester"), ("owner", "engineer")])), 1);
+        let four = chain(&[("engineer", "tester"), ("tester", "engineer"), ("engineer", "tester"), ("owner", "engineer")]);
+        assert_eq!(rounds("tester", "engineer", &four), 2);
+        // A different hand-off breaks the streak.
+        assert_eq!(rounds("tester", "engineer", &chain(&[("engineer", "tester"), ("architect", "engineer"), ("tester", "engineer")])), 1);
     }
 
     #[test]

@@ -31,6 +31,7 @@ lila status                   # 谁在做什么
 lila inbox                    # 需要你的事：Owner 的提问、终端里的权限确认、完成报告
 lila answer Q3 "用 Stripe"     # 回答问题（不带文字则表示忽略这条）
 lila log                      # 最近的动态
+lila task edit T5 --append "…" # 给已派出的任务补充要求
 lila task ls --all            # 所有任务
 lila pause / lila resume      # 暂停 / 恢复派发
 lila down                     # 停止成员（任务会保留）
@@ -50,9 +51,9 @@ lila down                     # 停止成员（任务会保留）
   env = { PATH = "/opt/node/bin" }
   ```
 
-  默认的 tester（Codex）带着 `-c sandbox_workspace_write.network_access=true`：Codex 的沙箱会拦截 `lila` 用来连接 lilad 的 Unix socket，开启这项后才能连上，但 agent 也因此能访问网络。不想开的话，删掉这一行，之后每次 `lila` 命令都需要你手动批准。
+  Codex 的沙箱会拦截 `lila` 用来连接 lilad 的 Unix socket。这时 `lila` 会自动改为通过项目里的 `.lila/spool/` 收发文件，所以不需要给 Codex 开网络，也不需要逐条批准。
 
-- **项目**：仓库内的 `.lila/project.toml`，包括成员列表、可选的 `[assign]` 指派规则和 `[settings]`（`max_working`、`stall_minutes`、`startup_timeout_secs`、`max_chain_depth`）。`.lila/tasks/` 存放任务正文，已加入 `.lila/.gitignore`。
+- **项目**：仓库内的 `.lila/project.toml`，包括成员列表、可选的 `[assign]` 指派规则和 `[settings]`（`max_working`、`stall_minutes`、`startup_timeout_secs`、`max_chain_depth`、`max_rounds`）。`.lila/tasks/` 存放任务正文，`.lila/spool/` 是给沙箱用的文件通道，两者都已加入 `.lila/.gitignore`。
 
 - `LILA_HOME=<目录>` 会把配置、数据库和 socket 全部放进这个目录，适合用来做实验。
 
@@ -65,6 +66,7 @@ lila task start T12
 lila task done T12 --summary "…" [--file path]
 lila task block T12 --reason "…"
 lila task new --to tester --title "…" --body "…" --parent T12
+lila task edit T13 --append "…"          # 修正或补充已派出的任务
 lila ask "…" --option A --option B      # 仅 Owner 可用
 ```
 

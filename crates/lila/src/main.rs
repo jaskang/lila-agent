@@ -110,6 +110,19 @@ enum TaskCmd {
         #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
         priority: i64,
     },
+    /// Change a task you assigned: rewrite it while queued, or --append an update once delivered.
+    Edit {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<std::path::PathBuf>,
+        /// Added under "Update from <you>"; sent to the member if it already has the task.
+        #[arg(long)]
+        append: Option<String>,
+    },
     Start {
         id: String,
     },
@@ -251,6 +264,17 @@ fn task(cmd: TaskCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out) ->
                 format!("{} → {}: {} ({when})", v["id"].as_str().unwrap_or("?"), v["to"].as_str().unwrap_or("?"), v["title"].as_str().unwrap_or(""))
             });
         }
+        TaskCmd::Edit { id, title, body, body_file, append } => {
+            let body = match body_file {
+                Some(f) => Some(std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?),
+                None => body,
+            };
+            let v = call("task.edit", json!({"id": id, "title": title, "body": body, "append": append}))?;
+            out(v, &|v| {
+                let how = if v["update_sent"] == true { format!("the update goes to {}", v["to"].as_str().unwrap_or("?")) } else { "rewritten before delivery".into() };
+                format!("{} edited; {how}", v["id"].as_str().unwrap_or("?"))
+            });
+        }
         TaskCmd::Start { id } => out(call("task.start", json!({"id": id}))?, &|v| format!("{} in progress", v["id"].as_str().unwrap_or("?"))),
         TaskCmd::Done { id, summary, files } => out(call("task.done", json!({"id": id, "summary": summary, "files": files}))?, &|v| {
             let to = if v["from"] == "human" { "the person".to_string() } else { v["from"].as_str().unwrap_or("?").to_string() };
@@ -332,6 +356,8 @@ role = "tester"
 max_working = 1
 # Minutes a member may sit idle on an open task before a reminder.
 stall_minutes = 5
+# Fix cycles two members may bounce one chain between them before the owner decides.
+max_rounds = 3
 "#
     )
 }

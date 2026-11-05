@@ -323,6 +323,30 @@ impl Store {
         Ok(self.task(project, &task.id)?.expect("exists"))
     }
 
+    /// Replaces a task's title and body (only while it is queued: what was typed cannot change).
+    pub fn set_task_text(&self, project: &str, id: &str, title: &str, body: &str, now: i64) -> Result<()> {
+        self.db.execute(
+            "UPDATE tasks SET title = ?3, body = ?4, updated_ms = ?5 WHERE project = ?1 AND id = ?2",
+            params![project, id.to_ascii_uppercase(), title, body, now],
+        )?;
+        Ok(())
+    }
+
+    /// Parent, grandparent, ... of a task (nearest first).
+    pub fn ancestors(&self, project: &str, id: &str) -> Result<Vec<Task>> {
+        let mut out = Vec::new();
+        let mut cur = self.task(project, id)?.and_then(|t| t.parent);
+        while let Some(p) = cur {
+            let Some(t) = self.task(project, &p)? else { break };
+            if out.len() > 1000 {
+                bail!("task parent chain loops at {p}");
+            }
+            cur = t.parent.clone();
+            out.push(t);
+        }
+        Ok(out)
+    }
+
     pub fn set_nudged(&self, project: &str, id: &str, now: i64) -> Result<()> {
         self.db.execute("UPDATE tasks SET nudged_ms = ?3 WHERE project = ?1 AND id = ?2", params![project, id, now])?;
         Ok(())
@@ -527,6 +551,17 @@ mod tests {
         s.create_task("shop", new("c", Some("T2")), 1).unwrap();
         assert_eq!(s.depth("shop", "T1").unwrap(), 0);
         assert_eq!(s.depth("shop", "T3").unwrap(), 2);
+        let ids: Vec<String> = s.ancestors("shop", "T3").unwrap().into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["T2", "T1"]);
+    }
+
+    #[test]
+    fn task_text_can_change() {
+        let mut s = store();
+        s.create_task("shop", new("a", None), 1).unwrap();
+        s.set_task_text("shop", "t1", "New title", "New body", 5).unwrap();
+        let t = s.task("shop", "T1").unwrap().unwrap();
+        assert_eq!((t.title.as_str(), t.body.as_str(), t.updated_ms), ("New title", "New body", 5));
     }
 
     #[test]

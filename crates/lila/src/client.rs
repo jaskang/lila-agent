@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub fn hc_bin() -> String {
@@ -20,16 +21,13 @@ pub fn caller() -> Value {
 
 fn try_request(paths: &Paths, method: &str, params: &Value) -> Result<Value, (bool, anyhow::Error)> {
     let sock = paths.socket().map_err(|e| (false, e))?;
-    let mut conn = UnixStream::connect(&sock).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            // A sandbox (codex workspace-write) refusing the socket, not a stopped daemon.
-            return (false, anyhow!(
-                "a sandbox blocks the lilad socket {}: allow this agent network access (codex: -c sandbox_workspace_write.network_access=true) or approve lila commands ({e})",
-                sock.display()
-            ));
-        }
-        (true, anyhow!("cannot reach lilad at {}: {e}", sock.display()))
-    })?;
+    let mut conn = match UnixStream::connect(&sock) {
+        Ok(c) => c,
+        // A sandbox (codex workspace-write) refusing the socket, not a stopped daemon:
+        // go through the project's spool folder, which the sandbox may write.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return spool_request(method, params).map_err(|e| (false, e)),
+        Err(e) => return Err((true, anyhow!("cannot reach lilad at {}: {e}", sock.display()))),
+    };
     conn.set_read_timeout(Some(Duration::from_secs(120))).ok();
     let line = json!({"method": method, "params": params});
     writeln!(conn, "{line}").map_err(|e| (false, e.into()))?;
@@ -56,6 +54,50 @@ pub fn request(paths: &Paths, method: &str, mut params: Value, autostart: bool) 
         Err((true, e)) => Err(e.context("lilad is not running; `lila up` starts it")),
         Err((false, e)) => Err(e),
     }
+}
+
+/// The project folder a member works in: `LILA_ROOT` (set by lilad), else `.lila/` above the cwd.
+fn project_root() -> Option<PathBuf> {
+    if let Some(r) = std::env::var_os("LILA_ROOT").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(r));
+    }
+    crate::paths::find_project_root(&std::env::current_dir().ok()?)
+}
+
+fn spool_request(method: &str, params: &Value) -> Result<Value> {
+    let root = project_root().ok_or_else(|| anyhow!("the lilad socket is blocked (sandbox) and there is no .lila/ folder here to use instead"))?;
+    let dir = crate::daemon::spool_dir(&root);
+    let id = write_spool(&dir, method, params)?;
+    let timeout = Duration::from_secs(std::env::var("LILA_SPOOL_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(60));
+    await_spool(&dir, &id, timeout)
+}
+
+pub fn write_spool(dir: &Path, method: &str, params: &Value) -> Result<String> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let id = format!("{nanos}-{}", std::process::id());
+    let tmp = dir.join(format!("{id}.req.tmp"));
+    std::fs::write(&tmp, json!({"method": method, "params": params}).to_string()).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, dir.join(format!("{id}.req.json")))?;
+    Ok(id)
+}
+
+pub fn await_spool(dir: &Path, id: &str, timeout: Duration) -> Result<Value> {
+    let reply = dir.join(format!("{id}.reply.json"));
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(&reply) {
+            let _ = std::fs::remove_file(&reply);
+            let v: Value = serde_json::from_str(&text).map_err(|e| anyhow!("bad spool reply: {e}"))?;
+            if let Some(e) = v.get("error") {
+                bail!("{}", e.as_str().unwrap_or("error"));
+            }
+            return Ok(v["result"].clone());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_file(dir.join(format!("{id}.req.json")));
+    bail!("lilad did not answer through {} within {}s; is it running? (`lila daemon status` from your own shell)", dir.display(), timeout.as_secs())
 }
 
 pub fn is_running(paths: &Paths) -> bool {

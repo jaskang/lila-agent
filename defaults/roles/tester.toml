@@ -3,7 +3,3 @@ runtime = "codex"
 model = "gpt-6.1-sol"
 effort = "high"
 can_assign = ["engineer"]
-# Codex's workspace-write sandbox blocks the Unix socket `lila` talks to lilad
-# over, so every `lila task ...` would need your approval. This lets it through,
-# but it also gives the agent network access. Remove it to approve by hand.
-extra_args = ["-c", "sandbox_workspace_write.network_access=true"]
