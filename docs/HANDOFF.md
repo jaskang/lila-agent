@@ -1,121 +1,186 @@
 # 交接说明（给接手的模型）
 
-写于 2026-11-05。用户用中文交流，回复也用中文。先读这份，再按需读 `docs/design.md`（总体设计）、`docs/m1.md`（编排层的发现和待办）、`docs/m2.md`（GUI 的说明）。
+更新于 2026-11-05 晚。用户用中文交流，回复也用中文。用户会换一台电脑继续，新电脑上没有上一台的 Claude 记忆，所以该知道的都写在这里。
+
+先读这份。需要细节时再读：
+- `docs/design.md`：总体设计
+- `docs/m1.md`：编排层的发现和待办
+- `docs/m2.md`：GUI 第一版
+- `docs/m3.md`：M3 的顺序、做了什么，以及用户提出的界面意见
 
 ## 这是什么
 
 Lila 是一个管理编程 agent 团队的桌面工具。
 
-- **角色**：每个角色有模型、努力程度和预设提示词。默认五个（另有设计师 `designer`，Opus 5.5 high，M3 加入；PM 不再兼设计）：
-  - `pm`：项目经理，Claude Opus 5.5 high。每个项目有且只有一个，角色不能删。
-  - `architect`：Claude Opus 5.5 high。
-  - `engineer`：Claude Sonnet 5.5 high。
-  - `tester`：Codex `gpt-6.1-sol` high。
-- **项目**：一个 PM 加若干成员。成员之间可以按指派规则互相派任务、交付。
+- **角色**：每个角色有 CLI、模型、努力程度和预设提示词，放在 `~/.config/lila/roles/`。默认五个：
+  - `pm`：PM（项目经理），Claude Opus 5.5 high。负责拆任务、分派、跟进、向用户汇报。每个项目有且只有一个，这个角色不能删。
+  - `designer`：设计师，Opus 5.5 high。负责流程、界面状态、文案、交互，做完交给开发。
+  - `architect`：架构师，Opus 5.5 high。
+  - `engineer`：开发工程师，Sonnet 5.5 high。
+  - `tester`：测试工程师，Codex `gpt-6.1-sol` high。
+- **项目**：一个 PM 加若干成员。成员之间按指派规则互相派任务、交付。
+  - 每个成员可以设 `count`，同时开几个：`engineer`、`engineer-2`……
 - **用户只和 PM 对话**。PM 负责规划和分派，遇到阻塞或需要人做决定时报告给用户。
 - **界面仿照 Herdr app**：能看到每个成员在做什么，可以直接操作成员的终端。
 
-## 硬性约束
+## 硬性约束（用户明确说过）
 
-- **用户只有订阅，没有 API key。** 用户是 Claude Pro，ChatGPT 用登录态。所有模型调用都必须通过官方 CLI（`claude`、`codex`），成员就是跑在终端里的 CLI。
-- **真跑 agent 的测试要省额度**：Claude 用 Haiku，codex 加 `-c model_reasoning_effort=low`。
-- **不要参考 tern 的设计**，用户明确说过。
-- **v1 的约定**：成员共用一个工作目录，以后再上 worktree；成员可以直接互相派任务；项目配置放在仓库里的 `.lila/project.toml`。
+- **用户只有订阅，没有 API key。** Claude 是 Pro 订阅，ChatGPT 用登录态。所有模型调用都必须通过官方 CLI（`claude`、`codex`），成员就是跑在终端里的 CLI。不要提出需要 key 的方案。
+- **真跑 agent 的测试要省额度**：Claude 用 Haiku，codex 加 `-c model_reasoning_effort=low`，放在单独的 `LILA_HOME` 里。
+- **不要参考 tern 的设计。**
+- **v1 的约定**：
+  - 成员共用一个工作目录，以后再上 worktree；
+  - 成员可以直接互相派任务；
+  - 项目配置放在仓库里的 `.lila/project.toml`。
+- **工作方式**：
+  - 提交信息用英文，末尾加 `Co-Authored-By` 署名行。
+  - 只在用户要求时提交；推送前先问。
+  - 用户给界面意见时，改完要截图自查，再说明哪些点不了、需要用户亲手试。
 
-## 技术栈
-
-- Rust 1.99.1（`rust-toolchain.toml`）。
-- 窗口：GPUI，通过 `gpui-kit 0.9.0`。它锁定 crates.io 上的 `gpui-pre =0.3.11`，不是 herdr-app 打过补丁的 0.3.8。
-- 终端渲染：libghostty-vt，作为子模块放在 `vendor/ghostty`。
-- 终端进程：herdr-core（`hc` 0.1.18）。
-- 从 herdr-app（Apache-2.0）移植了一部分代码，来源记在 `THIRD-PARTY.md`。herdr-app 源码副本在 `/private/tmp/claude-501/-Users-jarax-codes-lila-agent/bfe302d2-da84-4c2c-a019-9ece5695916c/scratchpad/ext/app`（临时目录，可能已被清掉）。
-
-## 构建和运行
+## 新电脑上的准备
 
 ```sh
+git clone git@github.com:jaskang/lila-agent.git && cd lila-agent
+git checkout m3                                   # 当前分支
 git submodule update --init --depth 1 vendor/ghostty
-export ZIG=$(brew --prefix zig@0.16)/bin/zig      # libghostty 要 Zig 0.16（brew 的 keg-only 包）
-cargo test --workspace
-cargo clippy --workspace --all-targets            # 保持零警告
-cargo clippy -p lila-app --features shots         # shots 特性也要过
+brew install zig@0.16                             # keg-only，不在 PATH 上
+export ZIG=$(brew --prefix zig@0.16)/bin/zig      # libghostty 要 Zig 0.16
+cargo test --workspace                            # 首次会编译 libghostty，要几分钟
 cargo install --path crates/lila                  # 窗口通过 lila 命令启动 lilad
 cargo run -p lila-app
 ```
 
-- 改了 `crates/lila` 以后，要重新 `cargo build -p lila` 或 `cargo install`。正在运行的 lilad 还是旧版本，要先 `lila daemon stop` 再启动团队。成员终端不受影响，新的 lilad 起来后会重新接上它们。
-- 在本机 shell 里 `lila` 可能不在 PATH 上，可以用 `target/debug/lila`。
+- Rust 版本由 `rust-toolchain.toml` 固定为 1.99.1，rustup 会自动装。
+- 还需要 herdr-core 的 `hc` 0.1.18（上一台装在 `~/.local/bin/hc`；也可以用 `LILA_HC` 指定路径），以及已经登录的 `claude` 和 `codex`。`herdr-app` 只用来对比样式，可以不装。
+- **不随仓库走的东西**：
+  - 角色目录 `~/.config/lila/roles/`：新电脑第一次 `lila init` 或 `lila up` 时会装上默认的五个角色。
+  - 数据库 `~/.local/share/lila/lila.db`：任务、收件箱、动态都在里面，所以新电脑上是空的。
+  - 窗口标签 `~/.local/state/lila/app-tabs.json`。
+- 上一台电脑上用来看效果的项目是 `~/temp`，以及 `creator-studio`（它的 `.lila/` 被删了，打开时会自动重建）。新电脑上要用 `lila init` 或窗口里的「新建项目」另建。
+
+## 技术栈
+
+- 窗口：GPUI，通过 `gpui-kit 0.9.0`。它锁定 crates.io 上的 `gpui-pre =0.3.11`，不是 herdr-app 打过补丁的 0.3.8。
+  - gpui-kit 的组件源码在 `~/.cargo/registry/src/*/gpui-component-0.9.0/src/`。查 API 时直接读这里，比如 select、menu、checkbox、switch、button_group。
+  - 图标只有 gpui-kit 打包的那一部分能显示，名单见 `target/debug/build/gpui-kit-assets-*/out/icon_name.rs` 里 `__component_icon_names` 之后的部分。比如 `Trash` 不在其中，用了会显示空白。
+- 终端渲染：libghostty-vt，作为子模块放在 `vendor/ghostty`。
+- 终端进程：herdr-core（`hc` 0.1.18）。
+- 从 herdr-app（Apache-2.0）移植了一部分代码，来源记在 `THIRD-PARTY.md`。
 
 ## 代码地图
 
 | crate | 内容 |
 |---|---|
-| `lila-core` | 纯逻辑：`config.rs`（角色、ProjectConfig、MemberSpec 覆盖、Team::build、Member::launch_key）、`task.rs`（状态机）、`prompt.rs`（系统提示词 + 协议）、`runtime.rs`（claude/codex 启动参数）、`dispatch.rs`、`message.rs` |
+| `lila-core` | 纯逻辑。`config.rs`：角色、ProjectConfig、MemberSpec 覆盖、`expand_ids`、Team::build、launch_key。`task.rs`：状态机。`prompt.rs`：系统提示词和协议。`runtime.rs`：claude/codex 启动参数。`dispatch.rs`：派发决策，`max_working` 为 0 表示不限。`message.rs`。 |
 | `lila-store` | SQLite（rusqlite bundled）：projects、members、tasks、task_events、artifacts、inbox、outbox |
 | `hc-client` | herdr-core JSON-RPC 客户端 |
-| `lila` | CLI + lilad：`daemon.rs`（`Daemon::handle` 处理所有请求，测试在 `daemon_tests.rs`，用 Fake 终端）、`client.rs`、`settings.rs`（项目设置读写，toml_edit 保留注释）、`roles.rs`、`init.rs`、`paths.rs`、`skill.md`（agent 协议说明） |
-| `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（从 herdr-app 移植）。`view.rs` 处理按键、IME、选择、复制粘贴、滚动。`tests/keys.rs` 用无界面 GPUI 测 Tab 能到达终端 |
-| `lila-app` | 窗口：`app.rs`（状态、刷新循环、动作、快捷键）、`ui.rs`（侧栏、标签栏、终端卡片、右侧概览、状态栏）、`detail.rs`（任务详情）、`compose.rs`（新建/改写任务）、`settings.rs`（项目设置面板）、`data.rs`（从 lilad 拉数据、标签持久化）、`build.rs`（链接成 15.5 SDK，见下） |
+| `lila` | CLI 和 lilad，详见下一行 |
+| ↳ `daemon.rs` | `Daemon::handle` 处理所有请求；测试在 `daemon_tests.rs`，用 Fake 终端 |
+| ↳ `settings.rs` | 项目设置读写：成员、count、指派规则、`[settings]`，用 toml_edit 保留注释 |
+| ↳ `roles.rs` | 角色读写删、默认角色、旧版默认文件升级 |
+| ↳ 其他 | `init.rs`（默认项目模板）、`client.rs`、`paths.rs`、`skill.md`（agent 协议说明） |
+| `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app）。`view.rs` 处理按键、IME、选择、复制粘贴、滚动、搜索、链接 |
+| `lila-app` | 窗口，详见下一行 |
+| ↳ 主体 | `app.rs`：状态、刷新循环、快捷键、对话框位置、缺配置自动重建。`ui.rs`：侧栏、项目右键菜单、标签栏、终端卡片、右侧概览、状态栏。`data.rs`：拉数据、标签持久化、`restore_config` |
+| ↳ 设置 | `dialog.rs`：设置对话框外壳（导航、分组行、分段控件、步进器、拖动）。`settings.rs`：项目设置四页，以及分组的模型 Select。`prefs.rs`：全局设置，即角色库和关于 |
+| ↳ 其他 | `detail.rs`（任务详情）、`compose.rs`（新建/改写任务）、`build.rs`（链接成 15.5 SDK） |
 
 ### 关键机制
 
 - **lilad 是唯一写状态的进程。**
   - 它跑在一个名叫 `lilad` 的 hc 终端里，启动时带 `no_parent`。
-  - 和 CLI、窗口之间用 unix socket 通信，每行一个 JSON。路径太长时，socket 退到 `$TMPDIR/lila-<fnv>.sock`。
-  - 订阅接口 `subscribe` 会推送 `{"event":"changed"}`。窗口收到推送后合并 80ms 再刷新，另外每 5 秒兜底刷新一次。
-- **成员状态**来自 herdr 的 OSC 7501 状态协议：idle / working / done / blocked / error，外加 `msg`。
-- **codex 沙箱进不了 socket**（EPERM），所以改走文件通道 `.lila/spool/`。
-- **信任对话框不报状态**。成员启动 20 秒还没报告状态，就在收件箱里提醒用户。
-- **hc 的 `terminal.send` 的 `if` 参数只接受 `idle` 或 `working`**。Fake 终端也做了同样的校验。
-- **成员可以覆盖角色设置**：`[[members]]` 里可以写 `runtime`、`model`、`effort`、`prompt_file`（相对 `.lila/` 的路径）。`project.toml` 还可以写显示名 `title`，项目编号 `name` 固定不变。
-  - `project.reload` 重新读取配置。还在用旧设置运行的成员，在 `status` 里标记 `stale: true`。
-  - `member.restart` 杀掉成员再用新设置重启，它手上的任务回到队列，再重新派给它。
-  - 判断"旧设置"靠 `Live.launched`，它只存在内存里。lilad 重启前就在运行的成员，这个值未知，所以不会被标 stale。
-- **macOS 红绿灯**：`build.rs` 加了链接参数 `-platform_version macos 11.0 15.5`。用新 SDK 链接时，AppKit 会画更大、间距更宽的新版按钮，和 Herdr（15.5 SDK）不一致。红绿灯位置是 `(12, 14)`，侧栏标志从 84px 开始（`ui::TRAFFIC_LIGHTS`）。
-- **gpui-kit 的 Root 会抢 Tab、Shift-Tab 和 ⌘C**。终端用 `Terminal` 按键上下文把它们绑定成 `NoAction`，见 `lila_term::view::init`。
+  - 和 CLI、窗口之间用 unix socket 通信，每行一个 JSON：`{"method":…,"params":{…,"caller":{"cwd","project","member"}}}`。
+  - 订阅接口 `subscribe` 会推送变化；窗口收到后合并 80ms 再刷新，另外每 5 秒兜底刷新一次。
+- **成员状态**来自 OSC 7501：idle / working / done / blocked / error，外加 `msg`。
+- **codex 沙箱进不了 socket**，所以走文件通道 `.lila/spool/`。
+- **信任对话框不报状态**：成员启动后超过 `startup_timeout_secs`（默认 20 秒）还没报告状态，就提醒用户。
+- **hc 的 `terminal.send` 的 `if` 参数只接受 `idle` 或 `working`。**
+- **换任务时开新会话**（`[settings] fresh_session`，默认开）：
+  - 非 PM 成员拿到另一条链的任务前，先重启它的 CLI。链的根是没有父任务的那个任务。
+  - 同一条链上的返工沿用原会话。
+  - 刚打进去的通知要先读完才重启。
+  - 「上一条链」只记在内存里。
+- **成员覆盖角色设置**：`[[members]]` 里可以写 `runtime`、`model`、`effort`、`prompt_file`、`count`。
+  - `project.reload` 重新读取配置：
+    - 还在用旧设置运行的成员标 `stale`；
+    - 配置里没有了的成员会被停掉，它没做完的任务取消，并通知派活的人和 PM；
+    - 已登记、但 lilad 没载入的项目，这时会被载入，不启动成员。
+  - `member.restart` 用新设置重启一个成员。
+- **`max_working`**：默认改成 0，表示不限。同时工作多少由各成员的 `count` 决定。窗口保存项目设置时，会删掉旧配置里的 `max_working`。
+- **默认角色升级**：`defaults/roles/previous/` 存着旧版默认文件。用户角色目录里的文件如果和某个旧版一模一样，`install_defaults` 就把它换成新版；改过的不动。
+- **macOS 红绿灯**：`build.rs` 用 `-platform_version macos 11.0 15.5` 链接，红绿灯位置是 `(12, 14)`，侧栏标志从 84px 开始。
+- **gpui-kit 的 Root 会抢 Tab、Shift-Tab 和 ⌘C**：终端用 `Terminal` 按键上下文把它们绑定成 `NoAction`。
+
+## 界面现状（用户的意见都已落实）
+
+- **侧栏**：
+  - 「项目」小标题右边的 `+` 用来新建项目；红绿灯那一行没有按钮。
+  - 项目行右键菜单：新建任务…、项目设置…、在访达中显示、关闭标签。顶部标签也有同样的右键菜单。
+  - 侧栏底部是「启动团队」「暂停/恢复派发」和「设置」，其中「设置」打开全局设置。
+  - 缺少配置的项目标「缺少配置」，打开时自动重建。
+- **标签栏**：只有打开的项目标签，没有按钮。
+- **设置是两个分开的居中对话框**，用户确认过保持两个：
+  - **全局设置**（侧栏「设置」或 ⌘,）：
+    - 角色：增删改。PM 角色不能删，有项目在用的角色不能删。
+    - 关于。
+  - **项目设置**（右键或 ⇧⌘,）：
+    - 通用；
+    - 成员：列表加编辑区，有模型、努力程度、同时工作（count，PM 固定 1）、提示词、移出团队、添加成员（没有 PM 角色可选）；
+    - 指派规则：勾选表；
+    - 运行规则：换任务开新会话、无回应提醒、返工上限、子任务层数、启动等待。
+  - 对话框表面在深色主题下比背景亮一档，带阴影。关闭按钮在右上角，可以拖动标题区移动对话框。
+  - 模型选择是一个分组的 Select，分「Claude Code」「ChatGPT · Codex」两组，组决定 CLI。
+  - 分段控件（努力程度）选中项用主色填满。
+- **快捷键**：⌘N 新建任务、⌘1–9 切换标签、⌘W 关闭标签、⌘, 全局设置、⇧⌘, 项目设置、⌘I 右侧面板、Esc 关闭对话框或面板。
 
 ## 无法点鼠标时怎么验证
 
-这个 shell 没有屏幕录制权限，也不能点击窗口。`cargo build -p lila-app --features shots` 之后可以用这些环境变量：
+上一台电脑的 shell 没有屏幕录制权限，也不能点击窗口。`cargo build -p lila-app --features shots` 之后可以用这些环境变量：
 
-- `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG。画面不包含系统的红绿灯；红绿灯的尺寸会打在 stderr 里（`close button WxH at (x, y)`）。
+- `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG，画面不含红绿灯。
 - `LILA_APP_SWITCH=a,b,...`：每 3 秒切换到下一个项目。
-- `LILA_APP_SETTINGS=general|members|assign|rules`：启动 1.5 秒后打开项目设置的那一页。再加 `LILA_APP_SETTINGS_ADD=<角色>` 会顺便加一个新成员。
+- `LILA_APP_SETTINGS=general|members|assign|rules`：打开项目设置的那一页；再加 `LILA_APP_SETTINGS_ADD=<角色>` 会加一个新成员。
 - `LILA_APP_PREFS=roles|about`：打开全局设置的那一页。
-- `LILA_APP_OPEN_TASK=T3`：打开任务详情。
-- `LILA_APP_COMPOSE=<成员>`：打开新建任务表单。
-- `LILA_APP_DEBUG=1`：每次刷新打一行日志。
-- `herdr-app shot file.png`：截 Herdr 的窗口，用来对比样式。
+- `LILA_APP_OPEN_TASK=T3`、`LILA_APP_COMPOSE=<成员>`、`LILA_APP_DEBUG=1`。
 
-macOS 上没有 `timeout` 命令。要让程序在后台跑一会儿再停，可以这样：
-`prog & P=$!; perl -e 'select(undef,undef,undef,5)'; kill $P`。
+截图时用临时的 `LILA_HOME`，不碰用户的真实数据：
+1. 新建一个目录，在里面 `git init`；
+2. 运行 `LILA_HOME=<home> target/debug/lila init`；
+3. 用 sqlite3 往 `<home>/data/lila.db` 的 `projects` 表插入一行 `(id, cwd, created_ms)`，表结构在 `lila-store` 的 SCHEMA 里；
+4. 运行窗口截图。
 
-本机有两个项目可以用来看效果：`temp`（`~/temp`，成员 id 还是旧的 `owner`）和 `creator-studio`。不要乱改它们的配置。测试时生成的 `~/.local/state/lila/app-tabs.json` 记得删掉。
+macOS 没有 `timeout` 命令，可以这样让程序跑一会儿再停：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; kill $P`。截图可以用 `sips -c H W --cropOffset Y X` 裁剪后再看。
 
-## 分支和提交
+## 分支
 
-所有分支都还没推送。分支依次叠加：
+分支依次叠加：`main` → `docs/design-and-m0` → `m1-orchestration` → `m1-followups` → `m2-gui` → `m3`（当前分支）。远端（`origin`，`git@github.com:jaskang/lila-agent.git`）上只有 `main`，而且本地 `main` 还比它多 1 个提交；其他分支有没有推送，以 `git branch -vv` 为准。
 
-- `main` → `docs/design-and-m0` → `m1-orchestration` → `m1-followups` → `m2-gui` → `m3`（当前分支）。M3 的顺序和进度见 `docs/m3.md`。
-- `m2-gui` 最新的提交是 `61302f9`，加了项目设置、左侧项目列表和顶部打开的标签。
-- 提交信息用英文，末尾加 `Co-Authored-By` 署名行。只在用户要求时提交；推送前要先问。
+## 等用户亲手验证的
 
-## 最近完成，等用户实际试用
+下面这些都过了测试和截图，但要用鼠标、键盘或真实环境确认：
 
-下面这些都过了测试和截图，但需要用户在窗口里亲手点一下确认：
+- **终端**：Tab 和 Shift-Tab、平滑滚动、中文输入法、复制粘贴、⌘点击打开链接。
+- **窗口**：
+  - 拖动面板宽度；
+  - 标签的打开、关闭和启动时恢复；
+  - 项目和标签上的右键菜单。
+- **设置对话框**：
+  - 拖动对话框、模型 Select 的弹出列表、勾选表、− / +、添加或移出成员、保存；
+  - 全局设置里新建和删除角色。
+- **lilad 相关**，前提是先重装 lila，再 `lila daemon stop` 换成新的 lilad：
+  - 换任务时开新会话；
+  - 移出成员时停终端、取消任务；
+  - 缺配置的项目重新载入。
 
-- 终端里的 Tab 和 Shift-Tab。
-- 平滑滚动。
-- 标题栏拖动窗口，红绿灯的大小和位置。
-- 切换项目不再等待：切换时立即拉取，并缓存每个项目上次的快照。
-- 左侧项目列表；顶部标签的打开、关闭（⌘W）和启动时恢复。
-- 右侧概览纵向排列：需要你 / 任务 / 动态。
-- 项目设置的保存、`project.reload`，以及成员「待重启」和「重启」按钮。前提是用户先重装 lila 并重启 lilad。
-- 还没在真实窗口里验证过：中文输入法、复制粘贴、拖动面板宽度。
-- 终端搜索和链接已接上视图：标题行放大镜 / ⌘F 搜索，Enter / ⌘G 下一处，⇧Enter / ⇧⌘G 上一处，Esc 关闭；⌘悬停预览链接，⌘点击用系统默认应用打开，相对文件路径以项目目录为准。GPUI 输入分发测试和真实窗口搜索截图通过；最终打开浏览器/文件和真实输入法还待用户验证。当前工作区测试共 118 个，见 `docs/m2.md`。
+## 待办
 
-## 待办（用户还没要求做的）
-
-- 订阅额度用完时成员会怎样：还没观察到过（见 `docs/m1.md`）。
-- 终端：Option 当 Alt 用（herdr 是靠它打过补丁的 gpui_macos 实现的）、kitty 图片。
-- 新建项目向导（设计 §10.2，M3 第 3 项）。角色库已在全局设置里，还缺「预览最终提示词」。
-- 项目编号本身的改名：现在只能改显示名，改编号会牵涉数据库和终端名。
+- **M3 剩下的**（顺序见 `docs/m3.md`）：
+  - 第 3 项：新建项目向导，选目录 → 选角色 → 写简介 → 启动；
+  - 第 5 项：用量统计；
+  - 第 6 项：每成员独立 worktree，要先和用户确定合并方式；
+  - 第 7 项：远程机器。
+- **角色库**：还缺「预览最终提示词」。
+- **未观察到的情况**：订阅额度用完时成员会怎样（见 `docs/m1.md`）。
+- **终端**：Option 当 Alt 用、kitty 图片。
+- **项目编号改名**：现在只能改显示名，改编号会牵涉数据库和终端名。
+- **从列表移除项目**：已经提议放进右键菜单，用户还没表态。

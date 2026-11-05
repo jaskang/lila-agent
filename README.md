@@ -4,7 +4,7 @@
 
 每个成员都是官方 CLI（`claude` / `codex`）的交互会话，用你的订阅登录，不需要 API key。
 
-设计见 [docs/design.md](docs/design.md)，技术验证见 [docs/spikes.md](docs/spikes.md)，各阶段记录见 [docs/m1.md](docs/m1.md)（编排）和 [docs/m2.md](docs/m2.md)（桌面应用）。
+设计见 [docs/design.md](docs/design.md)，技术验证见 [docs/spikes.md](docs/spikes.md)，各阶段记录见 [docs/m1.md](docs/m1.md)（编排）、[docs/m2.md](docs/m2.md)（桌面应用）和 [docs/m3.md](docs/m3.md)（增强）。接手开发先读 [docs/HANDOFF.md](docs/HANDOFF.md)。
 
 ![lila-app](docs/images/m2-redesign-working.png)
 
@@ -26,17 +26,19 @@ ZIG=$(brew --prefix zig@0.16)/bin/zig cargo install --path crates/lila-app
 lila-app
 ```
 
-没有项目时，点窗口里的「新建项目…」选一个代码仓库：Lila 会创建 `.lila/project.toml` 并启动默认团队，不需要用命令行。
+没有项目时，点窗口里的「新建项目…」（侧栏「项目」右边的 `+`）选一个代码仓库：Lila 会创建 `.lila/project.toml` 并启动默认团队，不需要用命令行。登记过、但 `.lila/project.toml` 不在了的项目，打开时会自动用默认团队重新创建。
 
 窗口左边是团队和每个成员正在做什么，中间是选中成员的终端（默认 PM，可以直接在里面对话），右边是需要你的事、任务看板和动态。
 
 终端内按 ⌘F 搜索历史，Enter / ⇧Enter 跳转匹配，Esc 关闭搜索；按住 ⌘ 悬停可预览链接，⌘点击打开网页或文件。
 
+设置分两处：侧栏底部「设置」（⌘,）是全局设置（角色库、关于）；在项目上右键「项目设置…」（⇧⌘,）是这个项目的设置（名称、成员、指派规则、运行规则）。项目右键菜单里还有「新建任务…」（⌘N）。
+
 ## 使用
 
 ```sh
 cd ~/codes/shop
-lila init                     # 生成 .lila/project.toml（默认团队：pm、architect、engineer、tester）
+lila init                     # 生成 .lila/project.toml（默认团队：pm、designer、architect、engineer、tester）
 lila up --brief "做一个登录页：邮箱 + 密码"
 ```
 
@@ -60,7 +62,7 @@ lila down                     # 停止成员（任务会保留）
 - **角色**：`~/.config/lila/roles/<id>.toml` + `<id>.md`（提示词）。`lila roles` 列出全部，`lila roles init` 补齐缺少的默认角色（不会覆盖已有文件）。
 
   ```toml
-  name = "工程师"
+  name = "开发工程师"
   runtime = "claude"          # claude | codex
   model = "claude-sonnet-5-5"
   effort = "high"
@@ -71,9 +73,9 @@ lila down                     # 停止成员（任务会保留）
 
   Codex 的沙箱会拦截 `lila` 用来连接 lilad 的 Unix socket。这时 `lila` 会自动改为通过项目里的 `.lila/spool/` 收发文件，所以不需要给 Codex 开网络，也不需要逐条批准。
 
-- **项目**：仓库内的 `.lila/project.toml`，包括可选的显示名 `title`、成员列表（每个成员可以覆盖角色的 `runtime`、`model`、`effort`，用 `prompt_file` 指向 `.lila/prompts/` 下自己的提示词；窗口里的「项目设置」会写这些）、可选的 `[assign]` 指派规则和 `[settings]`（`max_working`、`stall_minutes`、`startup_timeout_secs`、`max_chain_depth`、`max_rounds`）。`.lila/tasks/` 存放任务正文，`.lila/spool/` 是给沙箱用的文件通道，两者都已加入 `.lila/.gitignore`。
+- **项目**：仓库内的 `.lila/project.toml`，包括可选的显示名 `title`、成员列表（每个成员可以覆盖角色的 `runtime`、`model`、`effort`，用 `prompt_file` 指向 `.lila/prompts/` 下自己的提示词；窗口里的「项目设置」会写这些）、成员的 `count`（同时开几个：`engineer`、`engineer-2`……）、可选的 `[assign]` 指派规则和 `[settings]`（`fresh_session`、`stall_minutes`、`startup_timeout_secs`、`max_chain_depth`、`max_rounds`；`max_working` 默认 0 表示不限，窗口保存时会去掉它）。`.lila/tasks/` 存放任务正文，`.lila/spool/` 是给沙箱用的文件通道，两者都已加入 `.lila/.gitignore`。
 
-- **PM**：项目里负责统筹、和你对话的成员由 `owner = "<成员 id>"` 指定（`lila init` 写的是 `pm`）。不写时先找 `pm`，再找 `owner`，所以改名之前建的项目照常能用。
+- **PM**：项目经理，负责统筹、和你对话，每个项目有且只有一个，`pm` 角色不能删除。由 `owner = "<成员 id>"` 指定（`lila init` 写的是 `pm`）。不写时先找 `pm`，再找 `owner`，所以改名之前建的项目照常能用。
 
 - `LILA_HOME=<目录>` 会把配置、数据库和 socket 全部放进这个目录，适合用来做实验。
 
