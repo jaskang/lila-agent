@@ -113,11 +113,27 @@ pub fn daemon_state(paths: &Paths) -> Result<bool> {
     }
 }
 
+/// The `lila` program: this one, a `lila` beside this program (lila-app in the
+/// same folder), or `lila` on PATH. lilad and every member run it.
+pub fn lila_bin() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if exe.file_stem().is_some_and(|n| n == "lila") {
+        return Ok(exe);
+    }
+    if let Some(sibling) = exe.parent().map(|d| d.join("lila"))
+        && sibling.is_file()
+    {
+        return Ok(sibling);
+    }
+    crate::paths::which("lila", &std::env::var("PATH").unwrap_or_default())
+        .ok_or_else(|| anyhow!("the `lila` command is not installed; run `cargo install --path crates/lila` in the lila-agent repo"))
+}
+
 /// Runs `lila daemon run` in its own herdr-core terminal, so it outlives this shell
 /// and you can watch it with `hc read lilad`.
 pub fn start_daemon(paths: &Paths) -> Result<()> {
     paths.ensure()?;
-    let exe = std::env::current_exe()?;
+    let exe = lila_bin()?;
     let mut env = json!({"PATH": std::env::var("PATH").unwrap_or_default()});
     if let Some(h) = std::env::var_os("LILA_HOME") {
         env["LILA_HOME"] = json!(h.to_string_lossy());

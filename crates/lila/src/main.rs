@@ -1,7 +1,7 @@
 //! `lila`: run an agent team on herdr-core. The person uses it to start projects
 //! and answer the inbox; members use it to start, finish, block and hand on tasks.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use lila::paths::Paths;
 use lila::{client, daemon, roles};
@@ -291,71 +291,13 @@ fn task(cmd: TaskCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out) ->
 
 fn init(paths: &Paths, name: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let file = cwd.join(".lila").join("project.toml");
-    if file.exists() {
-        bail!("{} already exists", file.display());
-    }
-    let name = match name {
-        Some(n) => n,
-        None => slug(&cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into())),
-    };
-    lila_core::config::validate_id(&name).map_err(|e| anyhow::anyhow!("project name {name:?}: {e}; pass --name"))?;
-    std::fs::create_dir_all(file.parent().unwrap())?;
-    std::fs::write(&file, default_project(&name))?;
-    let written = roles::install_defaults(&paths.roles())?;
-    println!("created {}", file.display());
-    if !written.is_empty() {
-        println!("installed roles in {}: {}", paths.roles().display(), written.join(", "));
+    let out = lila::init::init_project(paths, &cwd, name)?;
+    println!("created {}", out.file.display());
+    if !out.roles_installed.is_empty() {
+        println!("installed roles in {}: {}", paths.roles().display(), out.roles_installed.join(", "));
     }
     println!("next: edit the team if you like, then `lila up --brief \"what you want built\"`");
     Ok(())
-}
-
-fn slug(s: &str) -> String {
-    let mut out: String = s.to_ascii_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    while out.contains("--") {
-        out = out.replace("--", "-");
-    }
-    let out = out.trim_matches('-').to_string();
-    let out = if out.starts_with(|c: char| c.is_ascii_lowercase()) { out } else { format!("p-{out}") };
-    out.chars().take(24).collect::<String>().trim_end_matches('-').to_string()
-}
-
-fn default_project(name: &str) -> String {
-    format!(
-        r#"name = "{name}"
-owner = "owner"
-
-[[members]]
-id = "owner"
-role = "owner"
-
-[[members]]
-id = "architect"
-role = "architect"
-
-[[members]]
-id = "engineer"
-role = "engineer"
-
-[[members]]
-id = "tester"
-role = "tester"
-
-# Who may hand work to whom (the owner may assign to anyone).
-# Without an entry, a member follows its role's `can_assign`.
-# [assign]
-# engineer = ["tester"]
-
-[settings]
-# Non-owner members working at once. Raise it if your subscription allows.
-max_working = 1
-# Minutes a member may sit idle on an open task before a reminder.
-stall_minutes = 5
-# Fix cycles two members may bounce one chain between them before the owner decides.
-max_rounds = 3
-"#
-    )
 }
 
 // ---------------- text output ----------------
@@ -515,26 +457,3 @@ fn local_offset_secs() -> i64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn slugs() {
-        assert_eq!(slug("My Shop!"), "my-shop");
-        assert_eq!(slug("lila-agent"), "lila-agent");
-        assert_eq!(slug("2048"), "p-2048");
-    }
-
-    #[test]
-    fn default_project_builds_with_default_roles() {
-        let dir = tempfile::tempdir().unwrap();
-        roles::install_defaults(dir.path()).unwrap();
-        let roles = roles::load(dir.path()).unwrap();
-        let cfg = lila_core::ProjectConfig::parse(&default_project("shop")).unwrap();
-        let team = lila_core::Team::build(&cfg, &roles).unwrap();
-        assert_eq!(team.members.len(), 4);
-        assert_eq!(team.assign["engineer"], ["tester"]);
-        assert_eq!(team.assign["tester"], ["engineer"]);
-    }
-}

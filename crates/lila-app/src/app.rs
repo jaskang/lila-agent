@@ -106,6 +106,30 @@ impl LilaApp {
         .detach();
     }
 
+    /// Pick a folder, make it a project if needed, start its team.
+    fn new_project(&mut self, cx: &mut Context<Self>) {
+        let paths = self.paths.clone();
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("用这个文件夹".into()) });
+        self.notice = None;
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(dirs))) = picked.await else { return };
+            let Some(dir) = dirs.into_iter().next() else { return };
+            let r = cx.background_executor().spawn(async move { data::create_and_start(&paths, &dir) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match r {
+                    Ok(id) if !id.is_empty() => {
+                        this.selected = Some(id);
+                        this.member = None;
+                    }
+                    Ok(_) => {}
+                    Err(e) => this.notice = Some(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn answer(&mut self, id: String, text: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(input) = self.answers.get(&id) {
             input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -195,7 +219,13 @@ impl LilaApp {
                     .child(dot(if self.snap.daemon { theme.green } else { theme.border }))
                     .child(div().text_xs().text_color(theme.muted_foreground).child(if self.snap.daemon { "lilad 运行中" } else { "lilad 未运行" })),
             )
-            .child(section("项目", None, cx))
+            .child(
+                h_flex()
+                    .pr_2()
+                    .child(section("项目", None, cx))
+                    .child(div().flex_1())
+                    .child(Button::new("new-project").xsmall().ghost().label("新建项目…").on_click(cx.listener(|this, _, _, cx| this.new_project(cx)))),
+            )
             .children(projects.into_iter().map(|p| {
                 let active = selected.as_deref() == Some(&p.id);
                 let id = p.id.clone();
@@ -298,10 +328,17 @@ impl LilaApp {
                 Some(view) => div().flex_1().min_h_0().child(view).into_any_element(),
                 None => placeholder("正在连接 herdr-core…".into(), cx).into_any_element(),
             },
+            (None, None) if self.project().is_none() => v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .text_color(theme.muted_foreground)
+                .child("还没有项目。选一个代码仓库，Lila 会在里面创建 .lila/project.toml 并启动默认团队。")
+                .child(Button::new("new-project-big").primary().label("新建项目…").on_click(cx.listener(|this, _, _, cx| this.new_project(cx))))
+                .into_any_element(),
             (None, None) => {
-                let why = if self.project().is_none() {
-                    "还没有项目：在仓库里运行 `lila init`，然后 `lila up`。"
-                } else if !self.snap.daemon {
+                let why = if !self.snap.daemon {
                     "lilad 没有运行：点左下角「启动团队」。"
                 } else {
                     "这个成员没有在运行：点左下角「启动团队」。"

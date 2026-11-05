@@ -16,14 +16,17 @@
 cargo install --path crates/lila
 ```
 
-桌面应用（需要 Zig 0.16 来编译 libghostty）：
+桌面应用（需要 Zig 0.16 来编译 libghostty）。`lila-app` 依赖 `lila` 命令来启动 lilad，两个都要装：
 
 ```sh
 git submodule update --init --depth 1
 brew install zig@0.16
+cargo install --path crates/lila
 ZIG=$(brew --prefix zig@0.16)/bin/zig cargo install --path crates/lila-app
 lila-app
 ```
+
+没有项目时，点窗口里的「新建项目…」选一个代码仓库：Lila 会创建 `.lila/project.toml` 并启动默认团队，不需要用命令行。
 
 窗口左边是团队和每个成员正在做什么，中间是选中成员的终端（默认 Owner，可以直接在里面对话），右边是需要你的事、任务看板和动态。
 

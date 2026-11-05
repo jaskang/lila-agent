@@ -61,6 +61,19 @@ pub fn act(paths: &Paths, p: &Project, method: &str, mut params: Value, autostar
     lila::client::request(paths, method, params, autostart)
 }
 
+/// Makes `dir` a Lila project if it is not one yet, then starts its team
+/// (and lilad). Returns the project id.
+pub fn create_and_start(paths: &Paths, dir: &std::path::Path) -> anyhow::Result<String> {
+    if lila::paths::find_project_root(dir).is_none() {
+        lila::init::init_project(paths, dir, None)?;
+    } else {
+        lila::roles::install_defaults(&paths.roles())?;
+    }
+    let p = Project { id: String::new(), cwd: dir.to_string_lossy().to_string() };
+    let v = act(paths, &p, "project.up", json!({}), true)?;
+    Ok(v["project"].as_str().unwrap_or_default().to_owned())
+}
+
 /// HH:MM in local time.
 pub fn clock(ms: i64) -> String {
     use std::sync::OnceLock;
