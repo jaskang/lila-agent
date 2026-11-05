@@ -79,7 +79,8 @@ cargo run -p lila-app
 
 - `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG。画面不包含系统的红绿灯；红绿灯的尺寸会打在 stderr 里（`close button WxH at (x, y)`）。
 - `LILA_APP_SWITCH=a,b,...`：每 3 秒切换到下一个项目。
-- `LILA_APP_SETTINGS=members|assign|rules`：启动 1.5 秒后打开项目设置的那一页。再加 `LILA_APP_SETTINGS_ADD=<角色>` 会顺便加一个新成员。
+- `LILA_APP_SETTINGS=general|members|assign|rules`：启动 1.5 秒后打开项目设置的那一页。再加 `LILA_APP_SETTINGS_ADD=<角色>` 会顺便加一个新成员。
+- `LILA_APP_PREFS=roles|about`：打开全局设置的那一页。
 - `LILA_APP_OPEN_TASK=T3`：打开任务详情。
 - `LILA_APP_COMPOSE=<成员>`：打开新建任务表单。
 - `LILA_APP_DEBUG=1`：每次刷新打一行日志。
@@ -116,5 +117,5 @@ macOS 上没有 `timeout` 命令。要让程序在后台跑一会儿再停，可
 
 - 订阅额度用完时成员会怎样：还没观察到过（见 `docs/m1.md`）。
 - 终端：Option 当 Alt 用（herdr 是靠它打过补丁的 gpui_macos 实现的）、kitty 图片。
-- 角色库编辑器（编辑全局角色），新建项目向导（设计 §10.2，M3）。
+- 新建项目向导（设计 §10.2，M3 第 3 项）。角色库已在全局设置里，还缺「预览最终提示词」。
 - 项目编号本身的改名：现在只能改显示名，改编号会牵涉数据库和终端名。

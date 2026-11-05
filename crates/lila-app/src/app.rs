@@ -25,6 +25,8 @@ pub struct LilaApp {
     restored: bool,
     /// The project settings form, while open.
     pub settings: Option<crate::settings::Form>,
+    /// The global settings (role library), while open.
+    pub prefs: Option<crate::prefs::Prefs>,
     /// The member whose terminal fills the middle; `None` is the owner.
     pub member: Option<String>,
     core: Option<Arc<Core>>,
@@ -116,7 +118,7 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, settings: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, settings: None, prefs: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
@@ -397,7 +399,8 @@ impl LilaApp {
 impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let compose = self.compose_panel(cx).or_else(|| self.settings_panel(cx));
+        let compose = self.compose_panel(cx);
+        let dialog = self.settings_dialog(cx).or_else(|| self.prefs_dialog(cx));
         let detail = if compose.is_some() { None } else { self.task.as_ref().and(self.snap.detail.clone()) };
         let loading = compose.is_none() && self.task.is_some() && detail.is_none();
         let overlay = |d: Div| d.absolute().top_0().right_0().bottom(px(26.)).w(px(600.)).bg(theme.popover).border_l_1().border_color(theme.border).shadow_lg().occlude();
@@ -419,6 +422,7 @@ impl Render for LilaApp {
             .children(compose.map(|c| overlay(div()).child(c)))
             .when_some(detail, |d, t| d.child(self.detail_panel(t, window, cx)))
             .when(loading, |d| d.child(overlay(div()).flex().items_center().justify_center().text_color(theme.muted_foreground).child("正在读取任务…")))
+            .children(dialog)
     }
 }
 
@@ -426,14 +430,28 @@ impl LilaApp {
     /// Window-wide keys. The terminal handles copy, paste and find; other ⌘ chords bubble here.
     fn shortcut(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
-        if k.key == "escape" && (self.task.is_some() || self.draft.is_some() || self.settings.is_some()) {
-            self.draft = None;
+        if k.key == "escape" && (self.settings.is_some() || self.prefs.is_some()) {
             self.settings = None;
+            self.prefs = None;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if k.key == "escape" && (self.task.is_some() || self.draft.is_some()) {
+            self.draft = None;
             self.close_task(cx);
             cx.stop_propagation();
             return;
         }
         if !k.modifiers.platform || k.modifiers.control || k.modifiers.alt {
+            return;
+        }
+        // ⇧⌘, the project's settings; ⌘, Lila's.
+        if k.modifiers.shift {
+            if matches!(k.key.as_str(), "," | "<") && self.project().is_some() {
+                self.open_settings(window, cx);
+                cx.stop_propagation();
+            }
             return;
         }
         match k.key.as_str() {
@@ -442,7 +460,7 @@ impl LilaApp {
                 Some(id) => self.close_tab(&id, cx),
                 None => return,
             },
-            "," if self.project().is_some() => self.open_settings(window, cx),
+            "," => self.open_prefs(crate::prefs::PrefPage::Roles, window, cx),
             "i" => {
                 self.right_open = !self.right_open;
                 cx.notify();

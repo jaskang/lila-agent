@@ -5,6 +5,8 @@ mod app;
 mod compose;
 mod data;
 mod detail;
+mod dialog;
+mod prefs;
 mod settings;
 mod ui;
 
@@ -59,6 +61,17 @@ fn main() {
                                     v.add_member(&role, window, cx);
                                 }
                             }));
+                        })
+                        .detach();
+                }
+                // Open the global settings: `roles` or `about`.
+                if let Ok(page) = std::env::var("LILA_APP_PREFS") {
+                    let view = view.clone();
+                    let page = if page == "about" { crate::prefs::PrefPage::About } else { crate::prefs::PrefPage::Roles };
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.open_prefs(page, window, cx)));
                         })
                         .detach();
                 }

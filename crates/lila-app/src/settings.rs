@@ -1,17 +1,20 @@
-//! Project settings in the window, in three pages: the members (added,
-//! removed, and each one's CLI, model, effort and prompt), who may hand work
-//! to whom, and the team's rules (`[settings]`). Saved with `lila::settings`
-//! into the repo's `.lila/`; lilad reads it again on save.
+//! Project settings, a dialog in four pages: general (the name), the members
+//! (added, removed, and each one's CLI, model, effort and prompt), who may
+//! hand work to whom, and the team's rules (`[settings]`). Saved with
+//! `lila::settings` into the repo's `.lila/`; lilad reads it again on save.
 
 use crate::app::LilaApp;
 use crate::data::{self, Project};
+use crate::dialog::{self, Act, Nav, Shell, block, group, row, stepper, value_text};
 use crate::ui::s;
 use gpui::component::button::{Button, ButtonVariants};
+use gpui::component::checkbox::Checkbox;
 use gpui::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui::component::scroll::ScrollableElement;
 use gpui::component::switch::Switch;
 use gpui::component::tag::Tag;
-use gpui::component::{ActiveTheme, Disableable, IconName, Sizable, StyledExt, h_flex, v_flex};
+use gpui::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::*;
 use lila::settings::{MemberSettings, ProjectSettings};
@@ -19,12 +22,12 @@ use lila_core::{Runtime, Settings};
 use serde_json::json;
 
 /// Models offered per CLI; any other can be typed in.
-const CLAUDE_MODELS: &[&str] = &["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"];
-const CODEX_MODELS: &[&str] = &["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna"];
+pub const CLAUDE_MODELS: &[&str] = &["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"];
+pub const CODEX_MODELS: &[&str] = &["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-luna"];
 /// `--effort` (claude) and `model_reasoning_effort` (codex) both take these.
-const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
-fn models(runtime: Runtime) -> &'static [&'static str] {
+pub fn models(runtime: Runtime) -> &'static [&'static str] {
     match runtime {
         Runtime::Claude => CLAUDE_MODELS,
         Runtime::Codex => CODEX_MODELS,
@@ -33,6 +36,7 @@ fn models(runtime: Runtime) -> &'static [&'static str] {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
+    General,
     Members,
     Assign,
     Rules,
@@ -43,9 +47,10 @@ impl Page {
     #[cfg(feature = "shots")]
     pub fn parse(s: &str) -> Page {
         match s {
+            "members" => Page::Members,
             "assign" => Page::Assign,
             "rules" => Page::Rules,
-            _ => Page::Members,
+            _ => Page::General,
         }
     }
 }
@@ -61,8 +66,6 @@ enum Rule {
 }
 
 impl Rule {
-    const ALL: [Rule; 5] = [Rule::MaxWorking, Rule::StallMinutes, Rule::MaxRounds, Rule::MaxDepth, Rule::StartupSecs];
-
     fn get(self, s: &Settings) -> i64 {
         match self {
             Rule::MaxWorking => s.max_working.into(),
@@ -102,10 +105,10 @@ impl Rule {
     /// Title, unit, explanation.
     fn text(self) -> (&'static str, &'static str, &'static str) {
         match self {
-            Rule::MaxWorking => ("同时工作的成员", "人", "PM 以外，同时在做任务的成员上限。订阅额度够用可以调高，任务会更快，额度也用得更快。"),
-            Rule::StallMinutes => ("无回应提醒", "分钟", "成员手上有任务、却停下来这么久没有汇报，就提醒它一次；还不回应就告诉 PM。"),
-            Rule::MaxRounds => ("来回返工上限", "轮", "两个成员在一条任务链上来回退回（比如开发 → 测试 → 开发）超过这个轮数，就交给 PM 决定。"),
-            Rule::MaxDepth => ("子任务层数上限", "层", "任务链 T1 → T2 → T3 … 最多能有几层，防止无限拆分。"),
+            Rule::MaxWorking => ("同时工作的成员", "人", "PM 以外，同时在做任务的成员上限。额度够用可以调高：任务更快，额度也用得更快。"),
+            Rule::StallMinutes => ("无回应提醒", "分钟", "成员手上有任务却停下这么久没汇报，就提醒它一次；还不回应就告诉 PM。"),
+            Rule::MaxRounds => ("来回返工上限", "轮", "两个成员在一条任务链上来回退回超过这个轮数，就交给 PM 决定。"),
+            Rule::MaxDepth => ("子任务层数上限", "层", "任务链 T1 → T2 → T3 … 最多几层，防止无限拆分。"),
             Rule::StartupSecs => ("启动等待", "秒", "成员启动后这么久还没报告状态，就在收件箱提醒你（多半卡在信任目录或登录）。"),
         }
     }
@@ -130,24 +133,10 @@ pub struct Form {
     pub title: Entity<InputState>,
     pub members: Vec<MemberForm>,
     pub page: Page,
+    /// The member open on the members page.
+    pub selected: usize,
     pub error: Option<String>,
     pub saving: bool,
-}
-
-/// One member's form as it is drawn (read out so the listeners can borrow the app).
-struct MemberSnapshot {
-    base: MemberSettings,
-    runtime: Runtime,
-    model: String,
-    effort: Option<String>,
-    model_input: Entity<InputState>,
-    prompt: Entity<TextareaState>,
-    id_input: Option<Entity<InputState>>,
-    is_owner: bool,
-}
-
-fn field(title: &str, cx: &App) -> Div {
-    v_flex().gap_1().child(div().text_xs().font_semibold().text_color(cx.theme().muted_foreground).child(title.to_owned()))
 }
 
 fn member_form(m: &MemberSettings, new: bool, window: &mut Window, cx: &mut Context<LilaApp>) -> MemberForm {
@@ -156,14 +145,52 @@ fn member_form(m: &MemberSettings, new: bool, window: &mut Window, cx: &mut Cont
         runtime: m.runtime,
         model: cx.new(|cx| InputState::new(window, cx).placeholder("模型名").default_value(m.model.clone())),
         effort: m.effort.clone(),
-        prompt: cx.new(|cx| TextareaState::new(window, cx).rows(10).default_value(m.prompt.clone())),
+        prompt: cx.new(|cx| TextareaState::new(window, cx).rows(12).default_value(m.prompt.clone())),
         id: new.then(|| cx.new(|cx| InputState::new(window, cx).placeholder("成员编号").default_value(m.id.clone()))),
     }
 }
 
+/// CLI as a segmented control; `pick` gets the chosen one.
+pub fn runtime_control(id: String, runtime: Runtime, pick: impl Fn(&mut LilaApp, Runtime, &mut Window, &mut Context<LilaApp>) + 'static, cx: &mut Context<LilaApp>) -> AnyElement {
+    let selected = if runtime == Runtime::Codex { 1 } else { 0 };
+    dialog::segmented(&id, &["Claude Code", "Codex"], selected, move |this, i, window, cx| pick(this, if i == 1 { Runtime::Codex } else { Runtime::Claude }, window, cx), cx)
+}
+
+/// Effort as a segmented control, "默认" first.
+pub fn effort_control(id: String, effort: Option<&str>, pick: impl Fn(&mut LilaApp, Option<String>) + 'static, cx: &mut Context<LilaApp>) -> AnyElement {
+    let mut options = vec!["默认"];
+    options.extend(EFFORTS);
+    let selected = effort.and_then(|e| EFFORTS.iter().position(|x| *x == e)).map(|p| p + 1).unwrap_or(0);
+    dialog::segmented(&id, &options, selected, move |this, i, _, _| pick(this, if i == 0 { None } else { Some(EFFORTS[i - 1].to_owned()) }), cx)
+}
+
+/// The model: a text field, and a menu of the usual ones for this CLI.
+pub fn model_control(id: String, runtime: Runtime, input: &Entity<InputState>, current: &str, pick: impl Fn(&mut LilaApp, &str, &mut Window, &mut Context<LilaApp>) + Clone + 'static, cx: &mut Context<LilaApp>) -> AnyElement {
+    let weak = cx.entity().downgrade();
+    let current = current.trim().to_owned();
+    h_flex()
+        .w(px(300.))
+        .gap_1()
+        .child(div().flex_1().child(Input::new(input).small()))
+        .child(Button::new(SharedString::from(id)).outline().small().icon(IconName::ChevronDown).tooltip("常用模型").dropdown_menu(move |mut menu, _, _| {
+            for m in models(runtime) {
+                let (weak, pick, m) = (weak.clone(), pick.clone(), *m);
+                menu = menu.item(PopupMenuItem::new(m).checked(current == m).on_click(move |_, window, cx| {
+                    let pick = pick.clone();
+                    let _ = weak.update(cx, |this, cx| {
+                        pick(this, m, window, cx);
+                        cx.notify();
+                    });
+                }));
+            }
+            menu
+        }))
+        .into_any_element()
+}
+
 impl LilaApp {
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_settings_at(Page::Members, window, cx);
+        self.open_settings_at(Page::General, window, cx);
     }
 
     pub fn open_settings_at(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
@@ -177,10 +204,11 @@ impl LilaApp {
             }
         };
         self.draft = None;
+        self.prefs = None;
         self.close_task(cx);
         let title = cx.new(|cx| InputState::new(window, cx).placeholder(base.name.clone()).default_value(base.title.clone()));
         let members = base.members.iter().map(|m| member_form(m, false, window, cx)).collect();
-        self.settings = Some(Form { project, value: base.clone(), base, title, members, page, error: None, saving: false });
+        self.settings = Some(Form { project, value: base.clone(), base, title, members, page, selected: 0, error: None, saving: false });
         cx.notify();
     }
 
@@ -198,14 +226,12 @@ impl LilaApp {
         let model = if m.base.role_runtime == runtime { m.base.role_model.clone() } else { models(runtime)[0].to_owned() };
         let input = m.model.clone();
         input.update(cx, |s, cx| s.set_value(model, window, cx));
-        cx.notify();
     }
 
     fn pick_model(&mut self, ix: usize, model: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(m) = self.settings_member(ix) else { return };
         let input = m.model.clone();
         input.update(cx, |s, cx| s.set_value(model.to_owned(), window, cx));
-        cx.notify();
     }
 
     fn reset_prompt(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -223,6 +249,8 @@ impl LilaApp {
                 let form = member_form(&m, true, window, cx);
                 if let Some(f) = self.settings.as_mut() {
                     f.members.push(form);
+                    f.selected = f.members.len() - 1;
+                    f.page = Page::Members;
                 }
             }
             Err(e) => f.error = Some(format!("{e:#}")),
@@ -236,6 +264,7 @@ impl LilaApp {
         match f.value.remove_member(&id) {
             Ok(()) => {
                 f.members.remove(ix);
+                f.selected = f.selected.min(f.members.len().saturating_sub(1));
             }
             Err(e) => f.error = Some(format!("{e:#}")),
         }
@@ -316,353 +345,349 @@ impl LilaApp {
         cx.notify();
     }
 
-    fn members_page(&mut self, running: &[String], cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn general_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(f) = self.settings.as_ref() else { return div().into_any_element() };
+        let (title, name, cwd) = (f.title.clone(), f.base.name.clone(), data::tilde(&f.project.cwd));
+        dialog::scroll(
+            "settings-general",
+            vec![
+                group(None, vec![row("项目名称", Some("窗口里显示的名字，可以用中文。".into()), div().w(px(300.)).child(Input::new(&title).small()), cx)], cx),
+                group(
+                    Some("位置"),
+                    vec![
+                        row("项目编号", Some("命令行和终端名用的是它，创建后不能改。".into()), value_text(name, cx), cx),
+                        row("目录", None, value_text(cwd, cx), cx),
+                        row("配置文件", Some("这里的设置都写在这个文件里，可以随代码一起提交。".into()), value_text(".lila/project.toml", cx), cx),
+                    ],
+                    cx,
+                ),
+            ],
+        )
+    }
+
+    fn members_page(&mut self, running: &[String], cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let Some(f) = self.settings.as_ref() else { return Vec::new() };
+        let Some(f) = self.settings.as_ref() else { return div().into_any_element() };
         let owner = f.value.owner.clone();
+        let selected = f.selected.min(f.members.len().saturating_sub(1));
         let roles: Vec<(String, String)> = f.value.roles.iter().map(|r| (r.id.clone(), r.file.name.clone())).collect();
-        let rows: Vec<(usize, MemberSnapshot)> = f
+        struct Item {
+            id: String,
+            role: String,
+            new: bool,
+            changed: bool,
+            owner: bool,
+            running: bool,
+        }
+        let items: Vec<Item> = f
             .members
             .iter()
-            .enumerate()
-            .map(|(ix, m)| {
-                (
-                    ix,
-                    MemberSnapshot {
-                        base: m.base.clone(),
-                        runtime: m.runtime,
-                        model: m.model.read(cx).value().to_string(),
-                        effort: m.effort.clone(),
-                        model_input: m.model.clone(),
-                        prompt: m.prompt.clone(),
-                        id_input: m.id.clone(),
-                        is_owner: m.base.ids().contains(&owner),
-                    },
-                )
+            .zip(&f.value.members)
+            .map(|(m, v)| {
+                let model = m.model.read(cx).value().trim().to_owned();
+                let own_prompt = m.prompt.read(cx).value().trim() != m.base.role_prompt.trim();
+                Item {
+                    id: v.id.clone(),
+                    role: m.base.role_name.clone(),
+                    new: m.id.is_some(),
+                    changed: m.runtime != m.base.role_runtime || model != m.base.role_model || m.effort != m.base.role_effort || own_prompt,
+                    owner: v.ids().contains(&owner),
+                    running: v.ids().iter().any(|i| running.contains(i)),
+                }
             })
             .collect();
 
-        let mut out: Vec<AnyElement> = rows
-            .into_iter()
-            .map(|(ix, MemberSnapshot { base, runtime, model, effort, model_input, prompt, id_input, is_owner })| {
-                let own_prompt = prompt.read(cx).value().trim() != base.role_prompt.trim();
-                let changed = runtime != base.role_runtime || model.trim() != base.role_model || effort != base.role_effort || own_prompt;
-                let is_running = running.iter().any(|r| *r == base.id || r.starts_with(&format!("{}-", base.id)));
-                let is_new = id_input.is_some();
-                let chip = |id: String, text: String, on: bool| Button::new(SharedString::from(id)).xsmall().when(on, |b| b.primary()).when(!on, |b| b.outline()).label(text);
-                v_flex()
-                    .p_3()
-                    .gap_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(if is_new { theme.primary.opacity(0.6) } else { theme.border })
-                    .bg(theme.background)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .map(|d| match &id_input {
-                                Some(input) => d.child(div().w(px(180.)).child(Input::new(input).small())),
-                                None => d.child(div().font_semibold().child(base.id.clone())),
-                            })
-                            .when(base.count > 1, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(format!("×{}", base.count))))
-                            .child(div().text_xs().text_color(theme.muted_foreground).child(format!("角色：{}", base.role_name)))
-                            .when(is_owner, |d| d.child(Tag::secondary().xsmall().child("PM")))
-                            .child(div().flex_1())
-                            .when(is_new, |d| d.child(Tag::success().xsmall().child("新成员")))
-                            .when(changed && !is_new, |d| d.child(Tag::info().xsmall().child("已改")))
-                            .when(!is_owner, |d| {
-                                d.child(
-                                    Button::new(SharedString::from(format!("remove-{ix}")))
-                                        .xsmall()
-                                        .ghost()
-                                        .label("移出")
-                                        .tooltip(if is_running { "移出团队：保存后停掉它的终端，没做完的任务会取消" } else { "移出团队" })
-                                        .on_click(cx.listener(move |this, _, _, cx| this.remove_member(ix, cx))),
-                                )
-                            }),
-                    )
-                    .child(
-                        field("运行方式", cx).child(
-                            h_flex()
-                                .gap_1()
-                                .child(chip(format!("rt-{ix}-claude"), "Claude Code".into(), runtime == Runtime::Claude).on_click(cx.listener(move |this, _, window, cx| this.pick_runtime(ix, Runtime::Claude, window, cx))))
-                                .child(chip(format!("rt-{ix}-codex"), "Codex".into(), runtime == Runtime::Codex).on_click(cx.listener(move |this, _, window, cx| this.pick_runtime(ix, Runtime::Codex, window, cx)))),
-                        ),
-                    )
-                    .child(
-                        field("模型", cx)
-                            .child(h_flex().gap_1().flex_wrap().children(models(runtime).iter().map(|m| {
-                                let pick = *m;
-                                chip(format!("model-{ix}-{m}"), m.to_string(), model.trim() == *m).on_click(cx.listener(move |this, _, window, cx| this.pick_model(ix, pick, window, cx)))
-                            })))
-                            .child(Input::new(&model_input).small()),
-                    )
-                    .child(
-                        field("努力程度", cx).child(
-                            h_flex()
-                                .gap_1()
-                                .flex_wrap()
-                                .child(chip(format!("effort-{ix}-default"), "CLI 默认".into(), effort.is_none()).on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(m) = this.settings_member(ix) {
-                                        m.effort = None;
-                                    }
-                                    cx.notify();
-                                })))
-                                .children(EFFORTS.iter().map(|e| {
-                                    let pick = e.to_string();
-                                    chip(format!("effort-{ix}-{e}"), e.to_string(), effort.as_deref() == Some(*e)).on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(m) = this.settings_member(ix) {
-                                            m.effort = Some(pick.clone());
-                                        }
-                                        cx.notify();
-                                    }))
-                                })),
-                        ),
-                    )
-                    .child(
-                        field("预设提示词", cx)
-                            .child(Textarea::new(&prompt))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(if own_prompt { format!("只给这个成员用，保存在 .lila/prompts/{}.md", base.id) } else { format!("和角色「{}」的默认提示词一样", base.role_name) })
-                                    .child(div().flex_1())
-                                    .when(own_prompt, |d| d.child(Button::new(SharedString::from(format!("prompt-reset-{ix}"))).xsmall().ghost().label("恢复角色默认").on_click(cx.listener(move |this, _, window, cx| this.reset_prompt(ix, window, cx))))),
-                            ),
-                    )
-                    .when(changed && is_running, |d| d.child(div().text_xs().text_color(theme.yellow).child("它正在运行：保存后要重启它才会用上新设置。")))
-                    .when(is_new, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child("保存后不会自动启动：点侧栏的「启动团队」。编号用小写字母、数字、- 和 _，以字母开头。")))
-                    .into_any_element()
-            })
-            .collect();
+        let weak = cx.entity().downgrade();
+        let list = v_flex()
+            .w(px(200.))
+            .flex_none()
+            .h_full()
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                v_flex().id("member-list").flex_1().min_h_0().overflow_y_scrollbar().p_2().gap_0p5().children(items.iter().enumerate().map(|(ix, it)| {
+                    let active = ix == selected;
+                    h_flex()
+                        .id(SharedString::from(format!("member-item-{ix}")))
+                        .px_2()
+                        .py_1p5()
+                        .gap_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(active, |d| d.bg(theme.accent).text_color(theme.accent_foreground))
+                        .when(!active, |d| d.hover(|d| d.bg(theme.accent.opacity(0.5))))
+                        .child(Icon::new(IconName::Bot).small().text_color(if it.running { theme.green } else { theme.muted_foreground }))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_sm().font_medium().truncate().child(if it.id.is_empty() { "（未命名）".to_owned() } else { it.id.clone() }))
+                                .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(it.role.clone())),
+                        )
+                        .when(it.owner, |d| d.child(Tag::secondary().xsmall().child("PM")))
+                        .when(it.new, |d| d.child(Tag::success().xsmall().child("新")))
+                        .when(it.changed && !it.new, |d| d.child(dot(theme.blue)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(f) = this.settings.as_mut() {
+                                f.selected = ix;
+                            }
+                            cx.notify();
+                        }))
+                })),
+            )
+            .child(
+                div().p_2().border_t_1().border_color(theme.border).child(Button::new("add-member").ghost().small().w_full().icon(IconName::Plus).label("添加成员").dropdown_menu(move |mut menu, _, _| {
+                    menu = menu.label("按角色添加");
+                    for (id, name) in &roles {
+                        let (weak, id) = (weak.clone(), id.clone());
+                        menu = menu.item(PopupMenuItem::new(format!("{name}  ·  {id}")).on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| this.add_member(&id, window, cx));
+                        }));
+                    }
+                    menu
+                })),
+            );
 
-        out.push(
-            v_flex()
-                .gap_2()
-                .p_3()
-                .rounded_lg()
-                .border_1()
-                .border_dashed()
-                .border_color(theme.border)
-                .child(div().text_xs().font_semibold().text_color(theme.muted_foreground).child("添加成员"))
-                .child(h_flex().gap_1().flex_wrap().children(roles.into_iter().map(|(id, name)| {
-                    let pick = id.clone();
-                    Button::new(SharedString::from(format!("add-{id}"))).xsmall().outline().icon(IconName::Plus).label(format!("{name}（{id}）")).on_click(cx.listener(move |this, _, window, cx| this.add_member(&pick, window, cx)))
-                })))
-                .child(div().text_xs().text_color(theme.muted_foreground).child("新成员先照搬角色的设置，添加后可以在上面的卡片里改。"))
-                .into_any_element(),
-        );
-        out
+        let editor = match items.get(selected) {
+            Some(it) => self.member_editor(selected, it.owner, it.running, cx),
+            None => div().p_6().text_color(theme.muted_foreground).child("还没有成员。").into_any_element(),
+        };
+        h_flex().size_full().child(list).child(v_flex().flex_1().min_w_0().h_full().child(editor)).into_any_element()
     }
 
-    fn assign_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn member_editor(&mut self, ix: usize, is_owner: bool, is_running: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let Some(f) = self.settings.as_ref() else { return Vec::new() };
+        let Some(m) = self.settings.as_ref().and_then(|f| f.members.get(ix)) else { return div().into_any_element() };
+        let (base, runtime, effort, model_input, prompt, id_input) = (m.base.clone(), m.runtime, m.effort.clone(), m.model.clone(), m.prompt.clone(), m.id.clone());
+        let model = model_input.read(cx).value().to_string();
+        let own_prompt = prompt.read(cx).value().trim() != base.role_prompt.trim();
+        let changed = runtime != base.role_runtime || model.trim() != base.role_model || effort != base.role_effort || own_prompt;
+        let shown_id = self.settings.as_ref().and_then(|f| f.value.members.get(ix)).map(|v| v.id.clone()).unwrap_or_default();
+
+        let header = h_flex()
+            .gap_3()
+            .child(div().size(px(36.)).flex_none().rounded_lg().bg(theme.accent).flex().items_center().justify_center().child(Icon::new(IconName::Bot).text_color(theme.accent_foreground)))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(h_flex().gap_2().child(div().text_base().font_semibold().child(shown_id)).when(base.count > 1, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(format!("×{}", base.count)))).when(is_owner, |d| d.child(Tag::secondary().xsmall().child("PM"))))
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(format!("角色：{}（{}）{}", base.role_name, base.role, if is_running { " · 正在运行" } else { "" }))),
+            )
+            .when(!is_owner, |d| {
+                d.child(Button::new(SharedString::from(format!("remove-{ix}"))).outline().small().label("移出团队").tooltip(if is_running { "保存后停掉它的终端，没做完的任务会取消" } else { "保存后从项目里去掉" }).on_click(cx.listener(move |this, _, _, cx| this.remove_member(ix, cx))))
+            });
+
+        let mut rows = Vec::new();
+        if let Some(input) = &id_input {
+            rows.push(row("成员编号", Some("小写字母、数字、- 和 _，以字母开头。".into()), div().w(px(300.)).child(Input::new(input).small()), cx));
+        }
+        rows.push(row("运行方式", None, runtime_control(format!("rt-{ix}"), runtime, move |this, r, window, cx| this.pick_runtime(ix, r, window, cx), cx), cx));
+        rows.push(row("模型", (model.trim() != base.role_model).then(|| format!("角色默认 {}", base.role_model)), model_control(format!("models-{ix}"), runtime, &model_input, &model, move |this, m, window, cx| this.pick_model(ix, m, window, cx), cx), cx));
+        rows.push(row(
+            "努力程度",
+            (effort != base.role_effort).then(|| format!("角色默认 {}", base.role_effort.as_deref().unwrap_or("CLI 默认"))),
+            effort_control(
+                format!("effort-{ix}"),
+                effort.as_deref(),
+                move |this, e| {
+                    if let Some(m) = this.settings_member(ix) {
+                        m.effort = e;
+                    }
+                },
+                cx,
+            ),
+            cx,
+        ));
+        let prompt_row = block(
+            "预设提示词",
+            Some(if own_prompt { format!("只给这个成员用，保存在 .lila/prompts/{}.md", base.id) } else { format!("和角色「{}」的默认提示词一样", base.role_name) }),
+            Textarea::new(&prompt),
+            own_prompt.then(|| Button::new(SharedString::from(format!("prompt-reset-{ix}"))).ghost().xsmall().icon(IconName::Undo2).label("恢复角色默认").on_click(cx.listener(move |this, _, window, cx| this.reset_prompt(ix, window, cx))).into_any_element()),
+            cx,
+        );
+
+        let mut body = vec![header.into_any_element(), group(Some("运行"), rows, cx), group(Some("提示词"), vec![prompt_row], cx)];
+        if changed && is_running {
+            body.push(notice(IconName::Info, theme.yellow, "它正在运行：保存后，侧栏和终端标题会出现「重启」，重启后才用上新设置。", cx));
+        }
+        if id_input.is_some() {
+            body.push(notice(IconName::Info, theme.muted_foreground, "新成员保存后不会自动启动：点侧栏的「启动团队」。", cx));
+        }
+        dialog::scroll(SharedString::from(format!("member-editor-{ix}")), body)
+    }
+
+    fn assign_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(f) = self.settings.as_ref() else { return div().into_any_element() };
         let v = &f.value;
         let ids = v.member_ids();
-        let rows: Vec<(String, Vec<String>, bool)> = ids.iter().map(|m| (m.clone(), v.targets(m), v.assign.contains_key(m))).collect();
         let owner = v.owner.clone();
-        let mut out = vec![div().text_xs().text_color(theme.muted_foreground).child("每一行是一个成员可以把任务派给谁。没改过的行跟着角色的默认规则走；你和 PM 可以派给任何人。").into_any_element()];
-        for (from, targets, own) in rows {
-            let is_owner = from == owner;
-            let chips: Vec<AnyElement> = ids
-                .iter()
-                .filter(|t| **t != from)
-                .map(|to| {
-                    let on = targets.contains(to);
-                    let (a, b) = (from.clone(), to.clone());
-                    Button::new(SharedString::from(format!("assign-{from}-{to}")))
-                        .xsmall()
-                        .when(on, |x| x.primary())
-                        .when(!on, |x| x.outline())
-                        .label(to.clone())
-                        .disabled(is_owner)
-                        .on_click(cx.listener(move |this, _, _, cx| this.settings_edit(cx, |v| v.set_target(&a, &b, !on))))
-                        .into_any_element()
-                })
-                .collect();
-            let reset = from.clone();
-            out.push(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(div().font_semibold().child(from.clone()))
-                            .child(div().text_xs().text_color(theme.muted_foreground).child("可以派给"))
-                            .when(is_owner, |d| d.child(Tag::secondary().xsmall().child("PM · 所有人")))
-                            .child(div().flex_1())
-                            .when(own, |d| {
-                                d.child(Tag::info().xsmall().child("已改")).child(
-                                    Button::new(SharedString::from(format!("assign-reset-{from}")))
-                                        .xsmall()
-                                        .ghost()
-                                        .icon(IconName::Undo2)
-                                        .tooltip("恢复角色默认")
-                                        .on_click(cx.listener(move |this, _, _, cx| this.settings_edit(cx, |v| v.reset_targets(&reset)))),
-                                )
-                            }),
-                    )
-                    .child(h_flex().gap_1().flex_wrap().children(chips))
-                    .when(targets.is_empty() && !is_owner, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child("不能派任务：做完只向派活的人汇报。")))
-                    .into_any_element(),
-            );
-        }
-        out
-    }
-
-    fn rules_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let theme = cx.theme().clone();
-        let Some(f) = self.settings.as_ref() else { return Vec::new() };
-        let (now, was) = (f.value.settings.clone(), f.base.settings.clone());
-        let card = || v_flex().p_3().gap_1().rounded_lg().border_1().border_color(theme.border).bg(theme.background);
-        let mut out: Vec<AnyElement> = Rule::ALL
+        let rows: Vec<(String, Vec<String>, bool)> = ids.iter().map(|m| (m.clone(), v.targets(m), v.assign.contains_key(m))).collect();
+        const NAME: f32 = 130.;
+        const CELL: f32 = 84.;
+        let head = h_flex()
+            .h(px(36.))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().w(px(NAME)).flex_none().px_3().text_xs().text_color(theme.muted_foreground).child("派活的人 ↓"))
+            .children(ids.iter().map(|to| div().w(px(CELL)).flex_none().text_xs().font_medium().text_center().truncate().child(to.clone())))
+            .child(div().flex_1());
+        let body: Vec<AnyElement> = rows
             .into_iter()
-            .map(|rule| {
-                let (title, unit, about) = rule.text();
-                let v = rule.get(&now);
-                let (lo, hi) = rule.range();
-                let step = rule.step();
-                let key = format!("{rule:?}");
-                card()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(div().font_semibold().child(title))
-                            .when(v != rule.get(&was), |d| d.child(Tag::info().xsmall().child("已改")))
-                            .child(div().flex_1())
-                            .child(Button::new(SharedString::from(format!("{key}-down"))).xsmall().outline().icon(IconName::Minus).disabled(v <= lo).on_click(cx.listener(move |this, _, _, cx| this.settings_edit(cx, |s| rule.set(&mut s.settings, v - step)))))
-                            .child(div().w(px(64.)).text_center().child(format!("{v} {unit}")))
-                            .child(Button::new(SharedString::from(format!("{key}-up"))).xsmall().outline().icon(IconName::Plus).disabled(v >= hi).on_click(cx.listener(move |this, _, _, cx| this.settings_edit(cx, |s| rule.set(&mut s.settings, v + step))))),
-                    )
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(about))
+            .enumerate()
+            .map(|(n, (from, targets, own))| {
+                let is_owner = from == owner;
+                let reset = from.clone();
+                h_flex()
+                    .h(px(40.))
+                    .when(n % 2 == 1, |d| d.bg(theme.muted.opacity(0.35)))
+                    .child(h_flex().w(px(NAME)).flex_none().px_3().gap_1().child(div().text_sm().font_medium().truncate().child(from.clone())).when(is_owner, |d| d.child(Tag::secondary().xsmall().child("PM"))))
+                    .children(ids.iter().map(|to| {
+                        let cell = div().w(px(CELL)).flex_none().flex().justify_center();
+                        if *to == from {
+                            return cell.child(div().text_xs().text_color(theme.muted_foreground.opacity(0.5)).child("—")).into_any_element();
+                        }
+                        let (a, b) = (from.clone(), to.clone());
+                        cell.child(Checkbox::new(SharedString::from(format!("assign-{from}-{to}"))).checked(is_owner || targets.contains(to)).disabled(is_owner).on_click(cx.listener(move |this, on: &bool, _, cx| {
+                            let on = *on;
+                            this.settings_edit(cx, |v| v.set_target(&a, &b, on))
+                        })))
+                        .into_any_element()
+                    }))
+                    .child(div().flex_1())
+                    .child(div().w(px(110.)).flex_none().flex().justify_end().pr_2().when(own, |d| {
+                        d.child(Button::new(SharedString::from(format!("assign-reset-{from}"))).ghost().xsmall().icon(IconName::Undo2).label("恢复默认").on_click(cx.listener(move |this, _, _, cx| this.settings_edit(cx, |v| v.reset_targets(&reset)))))
+                    }))
                     .into_any_element()
             })
             .collect();
-        let fresh = now.fresh_session;
-        out.insert(
-            1,
-            card()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().font_semibold().child("换任务时开新会话"))
-                        .when(fresh != was.fresh_session, |d| d.child(Tag::info().xsmall().child("已改")))
-                        .child(div().flex_1())
-                        .child(Switch::new("fresh-session").checked(fresh).on_click(cx.listener(move |this, on: &bool, _, cx| {
-                            let on = *on;
-                            this.settings_edit(cx, |s| s.settings.fresh_session = on)
-                        }))),
-                )
-                .child(div().text_xs().text_color(theme.muted_foreground).child("成员要做另一条任务链的活时，先重启它的 CLI，上下文从零开始；同一条链上的返工沿用原会话。PM 不受影响。"))
-                .into_any_element(),
-        );
-        out
+        let table = v_flex().rounded_lg().border_1().border_color(theme.border).bg(theme.background).overflow_hidden().child(head).children(body);
+        dialog::scroll(
+            "settings-assign",
+            vec![
+                table.into_any_element(),
+                v_flex()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("勾选表示这一行的成员可以把任务派给那一列的成员。")
+                    .child("没改过的行跟着角色的默认规则走（加了新成员会自动带上）；改过的行可以恢复默认。你和 PM 可以派给任何人。")
+                    .into_any_element(),
+            ],
+        )
     }
 
-    pub fn settings_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn rule_row(&mut self, rule: Rule, now: &Settings, was: &Settings, cx: &mut Context<Self>) -> AnyElement {
+        let (title, unit, about) = rule.text();
+        let v = rule.get(now);
+        let (lo, hi) = rule.range();
+        let step = rule.step();
+        let down: Option<Act> = (v > lo).then(|| Box::new(move |this: &mut LilaApp, cx: &mut Context<LilaApp>| this.settings_edit(cx, |s| rule.set(&mut s.settings, v - step))) as Act);
+        let up: Option<Act> = (v < hi).then(|| Box::new(move |this: &mut LilaApp, cx: &mut Context<LilaApp>| this.settings_edit(cx, |s| rule.set(&mut s.settings, v + step))) as Act);
+        let title = if v != rule.get(was) { format!("{title}  ·  已改") } else { title.to_owned() };
+        let control = stepper(&format!("{rule:?}"), format!("{v} {unit}"), down, up, cx);
+        row(title, Some(about.to_owned()), control, cx)
+    }
+
+    fn rules_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(f) = self.settings.as_ref() else { return div().into_any_element() };
+        let (now, was) = (f.value.settings.clone(), f.base.settings.clone());
+        let theme = cx.theme().clone();
+        let working = self.rule_row(Rule::MaxWorking, &now, &was, cx);
+        let stall = self.rule_row(Rule::StallMinutes, &now, &was, cx);
+        let rounds = self.rule_row(Rule::MaxRounds, &now, &was, cx);
+        let depth = self.rule_row(Rule::MaxDepth, &now, &was, cx);
+        let startup = self.rule_row(Rule::StartupSecs, &now, &was, cx);
+        let fresh = now.fresh_session;
+        let fresh_row = row(
+            if fresh != was.fresh_session { "换任务时开新会话  ·  已改" } else { "换任务时开新会话" },
+            Some("成员要做另一条任务链的活时，先重启它的 CLI，上下文从零开始；同一条链上的返工沿用原会话。PM 不受影响。".into()),
+            Switch::new("fresh-session").checked(fresh).on_click(cx.listener(move |this, on: &bool, _, cx| {
+                let on = *on;
+                this.settings_edit(cx, |s| s.settings.fresh_session = on)
+            })),
+            cx,
+        );
+        dialog::scroll(
+            "settings-rules",
+            vec![
+                group(Some("派发"), vec![working, fresh_row], cx),
+                group(Some("防失控"), vec![stall, rounds, depth], cx),
+                group(Some("启动"), vec![startup], cx),
+                div().text_xs().text_color(theme.muted_foreground).child("只保存和默认值不同的部分，写在 .lila/project.toml 的 [settings] 里。").into_any_element(),
+            ],
+        )
+    }
+
+    pub fn settings_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.settings.as_ref()?;
         self.sync_ids(cx);
         let theme = cx.theme().clone();
-        let f = self.settings.as_ref()?;
-        let (title, error, saving, name, label, page) = (f.title.clone(), f.error.clone(), f.saving, f.base.name.clone(), f.project.label(), f.page);
         let running: Vec<String> = self.members().iter().filter(|m| m["status"] != "gone").map(|m| s(m, "id")).collect();
+        let f = self.settings.as_ref()?;
+        let (error, saving, label, page, id) = (f.error.clone(), f.saving, f.project.label(), f.page, f.project.id.clone());
         let kept = f.value.member_ids();
         let stopping: Vec<String> = f.base.member_ids().into_iter().filter(|m| !kept.contains(m) && running.contains(m)).collect();
+        let (count, overrides) = (f.value.member_ids().len(), f.value.assign.len());
+        let dirty = self.settings_value(cx).is_some_and(|(_, v)| self.settings.as_ref().is_some_and(|f| v != f.base));
 
-        let body = match page {
-            Page::Members => {
-                let mut v = vec![
-                    field("项目名称", cx)
-                        .child(Input::new(&title))
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(format!("窗口里显示的名字，可以用中文。项目编号 {name} 不变，命令行和终端名用的是它。")))
-                        .into_any_element(),
-                ];
-                v.extend(self.members_page(&running, cx));
-                v
-            }
-            Page::Assign => self.assign_page(cx),
-            Page::Rules => self.rules_page(cx),
+        let (title, description, body) = match page {
+            Page::General => ("通用", "项目的名字和位置。", self.general_page(cx)),
+            Page::Members => ("成员", "团队里有谁，各自用什么 CLI、模型和提示词。没改过的部分跟着角色走。", self.members_page(&running, cx)),
+            Page::Assign => ("指派规则", "成员之间可以互相派任务。这里决定谁能派给谁。", self.assign_page(cx)),
+            Page::Rules => ("运行规则", "lilad 派发任务、提醒和防止失控时用的数字。", self.rules_page(cx)),
         };
-        let tab = |id: &'static str, text: &'static str, p: Page, cx: &mut Context<Self>| {
-            Button::new(id).small().when(page == p, |b| b.primary()).when(page != p, |b| b.ghost()).label(text).on_click(cx.listener(move |this, _, _, cx| {
+        let note = if let Some(e) = error {
+            Some(h_flex().gap_2().text_color(theme.red).child(Icon::new(IconName::CircleAlert).small()).child(div().truncate().child(e)).into_any_element())
+        } else if !stopping.is_empty() {
+            Some(h_flex().gap_2().text_color(theme.yellow).child(Icon::new(IconName::TriangleAlert).small()).child(div().truncate().child(format!("保存后会停掉 {}，没做完的任务会取消。", stopping.join("、")))).into_any_element())
+        } else if dirty {
+            Some(div().text_color(theme.muted_foreground).child("有未保存的更改").into_any_element())
+        } else {
+            None
+        };
+        let go = |p: Page| -> Act {
+            Box::new(move |this: &mut LilaApp, _| {
                 if let Some(f) = this.settings.as_mut() {
                     f.page = p;
                 }
-                cx.notify();
-            }))
+            })
         };
-
-        Some(
-            v_flex()
-                .id("settings")
-                .size_full()
-                .text_color(theme.popover_foreground)
-                .child(
-                    h_flex()
-                        .h(px(40.))
-                        .px_3()
-                        .flex_none()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(div().font_semibold().child("项目设置"))
-                        .child(div().text_sm().text_color(theme.muted_foreground).truncate().child(label))
-                        .child(div().flex_1())
-                        .child(Button::new("settings-close").small().ghost().label("关闭").on_click(cx.listener(|this, _, _, cx| {
-                            this.settings = None;
-                            cx.notify();
-                        }))),
-                )
-                .child(
-                    h_flex()
-                        .flex_none()
-                        .px_3()
-                        .py_2()
-                        .gap_1()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(tab("page-members", "成员", Page::Members, cx))
-                        .child(tab("page-assign", "指派规则", Page::Assign, cx))
-                        .child(tab("page-rules", "运行规则", Page::Rules, cx)),
-                )
-                .child(
-                    v_flex()
-                        .id(SharedString::from(format!("settings-{page:?}")))
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scrollbar()
-                        .p_4()
-                        .gap_4()
-                        .children(body)
-                        .child(div().text_xs().text_color(theme.muted_foreground).child("只保存和默认值不同的部分，写在仓库的 .lila/project.toml 里，可以随代码一起提交。")),
-                )
-                .child(
-                    v_flex()
-                        .flex_none()
-                        .p_3()
-                        .gap_2()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .when(!stopping.is_empty(), |d| d.child(div().text_xs().text_color(theme.yellow).child(format!("保存后会停掉 {} 的终端，它们没做完的任务会取消，并通知派活的人。", stopping.join("、")))))
-                        .when_some(error, |d, e| d.child(div().p_2().rounded_md().border_l_2().border_color(theme.red).bg(theme.red.opacity(0.12)).text_sm().child(e)))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(Button::new("settings-save").primary().label(if saving { "保存中…" } else { "保存" }).disabled(saving).on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))))
-                                .child(Button::new("settings-cancel").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings = None;
-                                    cx.notify();
-                                }))),
-                        ),
-                )
-                .into_any_element(),
-        )
+        let nav = vec![
+            (Nav { id: "nav-general", icon: IconName::Settings2, label: "通用", active: page == Page::General, badge: None }, go(Page::General)),
+            (Nav { id: "nav-members", icon: IconName::Bot, label: "成员", active: page == Page::Members, badge: Some(count.to_string()) }, go(Page::Members)),
+            (Nav { id: "nav-assign", icon: IconName::Network, label: "指派规则", active: page == Page::Assign, badge: (overrides > 0).then(|| format!("改 {overrides}")) }, go(Page::Assign)),
+            (Nav { id: "nav-rules", icon: IconName::LayoutDashboard, label: "运行规则", active: page == Page::Rules, badge: None }, go(Page::Rules)),
+        ];
+        let heading = v_flex()
+            .gap_1()
+            .child(div().text_xs().text_color(theme.muted_foreground).child("项目设置"))
+            .child(h_flex().gap_2().child(crate::ui::avatar(&id, cx)).child(div().font_semibold().truncate().child(label)))
+            .into_any_element();
+        Some(self.dialog(
+            Shell {
+                id: "project-settings",
+                heading,
+                nav,
+                title: title.into(),
+                description: description.into(),
+                body,
+                note,
+                saving,
+                on_save: Box::new(|this, cx| this.save_settings(cx)),
+                on_close: Box::new(|this, _| this.settings = None),
+            },
+            cx,
+        ))
     }
+}
+
+fn dot(color: Hsla) -> Div {
+    div().size(px(6.)).flex_none().rounded_full().bg(color)
+}
+
+pub fn notice(icon: IconName, color: Hsla, text: &str, cx: &App) -> AnyElement {
+    let t = cx.theme();
+    h_flex().gap_2().px_3().py_2().rounded_md().bg(t.muted.opacity(0.5)).text_xs().child(Icon::new(icon).small().text_color(color)).child(div().flex_1().child(text.to_owned())).into_any_element()
 }

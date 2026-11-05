@@ -1,9 +1,10 @@
 //! Role files on disk, and the defaults shipped in `defaults/roles/`.
 
-use anyhow::{Context, Result};
-use lila_core::{Role, RoleFile};
+use anyhow::{Context, Result, anyhow, bail};
+use lila_core::{ProjectConfig, Role, RoleFile, Runtime, validate_id};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, value};
 
 pub const DEFAULTS: &[(&str, &str, &str)] = &[
     ("pm", include_str!("../../../defaults/roles/pm.toml"), include_str!("../../../defaults/roles/pm.md")),
@@ -54,6 +55,98 @@ pub fn load(dir: &Path) -> Result<BTreeMap<String, Role>> {
     Ok(roles)
 }
 
+/// What the role library edits; `extra_args` and `env` stay as written in the file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleEdit {
+    pub id: String,
+    pub name: String,
+    pub runtime: Runtime,
+    pub model: String,
+    pub effort: Option<String>,
+    pub can_assign: Vec<String>,
+    pub prompt: String,
+}
+
+impl RoleEdit {
+    pub fn of(role: &Role) -> RoleEdit {
+        let f = &role.file;
+        RoleEdit { id: role.id.clone(), name: f.name.clone(), runtime: f.runtime, model: f.model.clone(), effort: f.effort.clone(), can_assign: f.can_assign.clone(), prompt: role.prompt.clone() }
+    }
+}
+
+fn toml_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.toml"))
+}
+
+/// Writes one role (a new one, or over its file keeping comments and other keys).
+pub fn save(dir: &Path, r: &RoleEdit) -> Result<()> {
+    validate_id(&r.id).map_err(|e| anyhow!("role {:?}: {e}", r.id))?;
+    if r.name.trim().is_empty() {
+        bail!("{}: give the role a name", r.id);
+    }
+    if r.model.trim().is_empty() {
+        bail!("{}: pick a model", r.id);
+    }
+    std::fs::create_dir_all(dir)?;
+    let path = toml_path(dir, &r.id);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: DocumentMut = old.parse().with_context(|| format!("parse {}", path.display()))?;
+    doc["name"] = value(r.name.trim());
+    doc["runtime"] = value(r.runtime.to_string());
+    doc["model"] = value(r.model.trim());
+    match r.effort.as_deref().filter(|e| !e.is_empty()) {
+        Some(e) => doc["effort"] = value(e),
+        None => {
+            doc.remove("effort");
+        }
+    }
+    if r.can_assign.is_empty() {
+        doc.remove("can_assign");
+    } else {
+        doc["can_assign"] = value(toml_edit::Array::from_iter(r.can_assign.iter().map(String::as_str)));
+    }
+    let text = doc.to_string();
+    let file: RoleFile = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
+    let prompt_path = dir.join(Role::prompt_file_name(&r.id, &file));
+    std::fs::write(&prompt_path, &r.prompt).with_context(|| format!("write {}", prompt_path.display()))?;
+    if text != old {
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, &text)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(())
+}
+
+/// Removes a role's files. `users` (from [`users`]) must not name it.
+pub fn delete(dir: &Path, id: &str, users: &BTreeMap<String, Vec<String>>) -> Result<()> {
+    if let Some(p) = users.get(id).filter(|p| !p.is_empty()) {
+        bail!("{id} is used by {}; change those members' role first", p.join(", "));
+    }
+    let path = toml_path(dir, id);
+    let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let file: RoleFile = toml::from_str(&text).with_context(|| format!("{}", path.display()))?;
+    let _ = std::fs::remove_file(dir.join(Role::prompt_file_name(id, &file)));
+    std::fs::remove_file(&path)?;
+    Ok(())
+}
+
+/// Role id → the projects (by id) with a member of that role. Projects whose
+/// config can't be read are skipped.
+pub fn users(projects: &[(String, PathBuf)]) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (pid, cwd) in projects {
+        let Ok(text) = std::fs::read_to_string(cwd.join(".lila").join("project.toml")) else { continue };
+        let Ok(cfg) = ProjectConfig::parse(&text) else { continue };
+        for m in cfg.members {
+            let list = out.entry(m.role).or_default();
+            if !list.contains(pid) {
+                list.push(pid.clone());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +169,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("x.toml"), "name = \"x\"\nruntime = \"claude\"\nmodel = \"m\"\n").unwrap();
         assert!(load(dir.path()).unwrap_err().to_string().contains("read prompt"));
+    }
+
+    #[test]
+    fn edits_keep_other_keys_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        install_defaults(dir.path()).unwrap();
+        let path = dir.path().join("engineer.toml");
+        std::fs::write(&path, format!("# mine\n{}extra_args = [\"--verbose\"]\n", std::fs::read_to_string(&path).unwrap())).unwrap();
+        let mut r = RoleEdit::of(&load(dir.path()).unwrap()["engineer"]);
+        r.model = "claude-haiku-5-5".into();
+        r.effort = None;
+        r.can_assign = vec!["tester".into(), "architect".into()];
+        r.prompt = "Small diffs.".into();
+        save(dir.path(), &r).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# mine\n"), "{text}");
+        assert!(text.contains("extra_args = [\"--verbose\"]") && !text.contains("effort"), "{text}");
+        let e = &load(dir.path()).unwrap()["engineer"];
+        assert_eq!((e.file.model.as_str(), e.prompt.as_str()), ("claude-haiku-5-5", "Small diffs."));
+        assert_eq!(e.file.can_assign, ["tester", "architect"]);
+
+        // A new role, then deleting it; a role in use stays.
+        let mut qa = r.clone();
+        qa.id = "qa".into();
+        qa.name = "QA".into();
+        save(dir.path(), &qa).unwrap();
+        assert!(load(dir.path()).unwrap().contains_key("qa"));
+        let users: BTreeMap<String, Vec<String>> = [("engineer".to_string(), vec!["shop".to_string()])].into();
+        assert!(delete(dir.path(), "engineer", &users).unwrap_err().to_string().contains("used by shop"));
+        delete(dir.path(), "qa", &users).unwrap();
+        assert!(!dir.path().join("qa.md").exists() && !load(dir.path()).unwrap().contains_key("qa"));
+        qa.id = "Bad".into();
+        assert!(save(dir.path(), &qa).is_err());
+    }
+
+    #[test]
+    fn users_lists_projects_per_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("shop");
+        std::fs::create_dir_all(repo.join(".lila")).unwrap();
+        std::fs::write(repo.join(".lila/project.toml"), crate::init::default_project("shop")).unwrap();
+        let u = users(&[("shop".into(), repo), ("gone".into(), dir.path().join("nope"))]);
+        assert_eq!(u["tester"], ["shop"]);
+        assert!(!u.contains_key("qa"));
     }
 }

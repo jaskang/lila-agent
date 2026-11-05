@@ -7,6 +7,7 @@ use crate::app::LilaApp;
 use crate::data;
 use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::input::Input;
+use gpui::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui::component::scroll::ScrollableElement;
 use gpui::component::spinner::Spinner;
 use gpui::component::tag::Tag;
@@ -52,7 +53,7 @@ pub fn status_mark(status: &str, cx: &App) -> AnyElement {
 }
 
 /// A rounded letter tile in a color picked from the name.
-fn avatar(name: &str, cx: &App) -> Div {
+pub fn avatar(name: &str, cx: &App) -> Div {
     let t = cx.theme();
     let colors = [t.blue, t.green, t.yellow, t.magenta, t.cyan, t.red];
     let hash = name.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
@@ -156,11 +157,18 @@ impl LilaApp {
                     .pr_3()
                     .gap_2()
                     .child(div().size(px(22.)).rounded(px(6.)).bg(theme.primary).text_color(theme.primary_foreground).text_xs().font_bold().flex().items_center().justify_center().child("L"))
-                    .child(div().font_semibold().child("Lila"))
-                    .child(div().flex_1())
-                    .child(Button::new("new-project").ghost().xsmall().icon(IconName::FolderOpen).tooltip("新建项目…").on_click(cx.listener(|this, _, _, cx| this.new_project(cx)))),
+                    .child(div().font_semibold().child("Lila")),
             )
-            .child(h_flex().px_4().pt_2().pb_1().child(label("项目", cx)))
+            .child(
+                h_flex()
+                    .pl_4()
+                    .pr_3()
+                    .pt_1()
+                    .pb_0p5()
+                    .child(label("项目", cx))
+                    .child(div().flex_1())
+                    .child(Button::new("new-project").ghost().xsmall().icon(IconName::Plus).tooltip("新建项目…").on_click(cx.listener(|this, _, _, cx| this.new_project(cx)))),
+            )
             .children(projects.into_iter().map(|p| {
                 let active = selected.as_deref() == Some(&p.id);
                 let (status, inbox) = self.project_summary(&p.id);
@@ -173,6 +181,7 @@ impl LilaApp {
                     .when(inbox > 0, |d| d.child(Tag::danger().xsmall().rounded_full().child(inbox.to_string())))
                     .when_some(p.branch.clone().filter(|_| inbox == 0 && status.is_none()), |d, b| d.child(div().text_xs().text_color(theme.muted_foreground).truncate().max_w(px(110.)).child(b)))
                     .on_click(cx.listener(move |this, _, _, cx| this.open_project(id.clone(), cx)))
+                    .context_menu(self.project_menu(&p, cx))
             }))
             .child(div().mx_4().my_3().h(px(1.)).bg(theme.sidebar_border))
             .when(count > 0, |d| d.child(h_flex().px_4().pt_2().pb_1().gap_1().child(label("成员", cx)).child(div().text_xs().text_color(theme.muted_foreground.opacity(0.7)).child(count.to_string()))))
@@ -218,8 +227,39 @@ impl LilaApp {
                                 .on_click(cx.listener(move |this, _, _, cx| this.act(if paused { "resume" } else { "pause" }, json!({}), false, cx))),
                         )
                     })
-                    .child(row("new-project-row", false, cx).child(Icon::new(IconName::Plus).small()).child(div().text_sm().child("新建项目…")).on_click(cx.listener(|this, _, _, cx| this.new_project(cx)))),
+                    .child(row("prefs", false, cx).child(Icon::new(IconName::Settings).small()).child(div().text_sm().child("设置")).child(div().flex_1()).child(div().text_xs().text_color(theme.muted_foreground).child("⌘,")).on_click(cx.listener(|this, _, window, cx| this.open_prefs(crate::prefs::PrefPage::Roles, window, cx)))),
             )
+    }
+
+    /// The right-click menu of a project (sidebar row or tab).
+    fn project_menu(&self, p: &data::Project, cx: &mut Context<Self>) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let weak = cx.entity().downgrade();
+        let (id, cwd, open) = (p.id.clone(), p.cwd.clone(), self.tabs.contains(&p.id));
+        move |menu, _, _| {
+            let on = |f: fn(&mut LilaApp, &mut Window, &mut Context<LilaApp>)| {
+                let (weak, id) = (weak.clone(), id.clone());
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.open_project(id.clone(), cx);
+                        f(this, window, cx);
+                    });
+                }
+            };
+            let cwd = cwd.clone();
+            let close = {
+                let (weak, id) = (weak.clone(), id.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = weak.update(cx, |this, cx| this.close_tab(&id, cx));
+                }
+            };
+            menu.item(PopupMenuItem::new("新建任务…").icon(IconName::Plus).on_click(on(|this, window, cx| this.compose(None, None, window, cx))))
+                .item(PopupMenuItem::new("项目设置…").icon(IconName::Settings2).on_click(on(|this, window, cx| this.open_settings(window, cx))))
+                .separator()
+                .item(PopupMenuItem::new("在访达中显示").icon(IconName::FolderOpen).on_click(move |_, _, _| {
+                    let _ = std::process::Command::new("open").arg(&cwd).spawn();
+                }))
+                .when(open, |m| m.item(PopupMenuItem::new("关闭标签").icon(IconName::Close).on_click(close)))
+        }
     }
 
     /// The bar over the terminal: one tab per open project, then the window's actions.
@@ -227,7 +267,6 @@ impl LilaApp {
         let theme = cx.theme().clone();
         let selected = self.project().map(|p| p.id);
         let projects: Vec<data::Project> = self.tabs.iter().filter_map(|id| self.snap.projects.iter().find(|p| &p.id == id).cloned()).collect();
-        let has_project = selected.is_some();
         drag_bar(h_flex().id("tab-bar"), cx)
             .h(px(44.))
             .flex_none()
@@ -261,12 +300,9 @@ impl LilaApp {
                         }))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.select_project(click.clone(), cx)))
+                    .context_menu(self.project_menu(&p, cx))
             }))
             .child(div().flex_1())
-            .when(has_project, |d| {
-                d.child(Button::new("bar-new-task").ghost().small().icon(IconName::Plus).label("新建任务").on_click(cx.listener(|this, _, window, cx| this.compose(None, None, window, cx))))
-                    .child(Button::new("bar-settings").ghost().small().icon(IconName::Settings).tooltip("项目设置 (⌘,)").on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))))
-            })
             .when(!self.right_open, |d| {
                 let inbox = self.snap.inbox.len();
                 d.child(
@@ -489,7 +525,7 @@ impl LilaApp {
         v_flex()
             .px_2()
             .gap_3()
-            .when(empty, |d| d.child(div().px_2().text_sm().text_color(theme.muted_foreground).child("还没有任务。点上方「新建任务」，或者在 PM 的终端里提需求。")))
+            .when(empty, |d| d.child(div().px_2().text_sm().text_color(theme.muted_foreground).child("还没有任务。按 ⌘N 或在左侧项目上右键「新建任务」，也可以在 PM 的终端里提需求。")))
             .children(groups.into_iter().filter(|(_, rows)| !rows.is_empty()).map(|(title, rows)| {
                 v_flex()
                     .gap_0p5()
@@ -644,7 +680,7 @@ impl LilaApp {
             .when(waiting > 0, |d| d.child(div().text_xs().text_color(theme.red).child(format!("{waiting} 个在等你"))))
             .when(paused, |d| d.child(div().text_xs().text_color(theme.yellow).child("已暂停派发")))
             .child(div().flex_1())
-            .child(item("⌘N 新建任务 · ⌘1–9 切换标签 · ⌘W 关闭标签 · ⌘, 设置 · ⌘I 概览 · Esc 关闭面板".into()))
+            .child(item("⌘N 新建任务 · ⌘1–9 切换标签 · ⌘W 关闭标签 · ⌘, 设置 · ⇧⌘, 项目设置 · ⌘I 概览 · Esc 关闭面板".into()))
     }
 }
 
