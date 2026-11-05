@@ -1,6 +1,6 @@
 # Lila
 
-用 [herdr-core](https://github.com/herdrdev/herdr-core) 运行一支由不同模型组成的编码 agent 团队。你只和 PM（产品经理 & 设计师）对话；PM 规划任务并分派给团队；Lila 负责投递任务、传递结果，把需要你的事情放进收件箱。
+用 [herdr-core](https://github.com/herdrdev/herdr-core) 运行一支由不同模型组成的编码 agent 团队。你只和 PM（项目经理）对话；PM 规划任务并分派给团队；Lila 负责投递任务、传递结果，把需要你的事情放进收件箱。
 
 每个成员都是官方 CLI（`claude` / `codex`）的交互会话，用你的订阅登录，不需要 API key。
 

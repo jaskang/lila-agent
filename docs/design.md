@@ -109,13 +109,14 @@ can_assign  = ["tester"]            # 默认可以指派给谁（项目里可覆
 prompt_file = "engineer.md"
 ```
 
-你说的四个角色的默认值：
+默认角色（M3 起五个；PM 是项目经理，每个项目有且只有一个）：
 
 | id | 名称 | runtime | model | effort |
 |---|---|---|---|---|
-| `owner` | Owner（产品经理 & 设计师） | claude | `claude-opus-5-5` | high |
+| `pm` | PM（项目经理） | claude | `claude-opus-5-5` | high |
+| `designer` | 设计师 | claude | `claude-opus-5-5` | high |
 | `architect` | 架构师 | claude | `claude-opus-5-5` | high |
-| `engineer` | 工程师 | claude | `claude-sonnet-5-5` | high |
+| `engineer` | 开发工程师 | claude | `claude-sonnet-5-5` | high |
 | `tester` | 测试工程师 | codex | `gpt-6.1-sol` | high |
 
 你已有的 `~/.config/herdr-core/templates/engineer.md` 和 `tester.md` 的提示词可以直接迁过来；里面的 `hc send` 交接说明改由 Lila 自动注入（见 5.3）。

@@ -7,7 +7,7 @@
 Lila 是一个管理编程 agent 团队的桌面工具。
 
 - **角色**：每个角色有模型、努力程度和预设提示词。默认五个（另有设计师 `designer`，Opus 5.5 high，M3 加入；PM 不再兼设计）：
-  - `pm`：产品经理，Claude Opus 5.5 high。每个项目有且只有一个，角色不能删。
+  - `pm`：项目经理，Claude Opus 5.5 high。每个项目有且只有一个，角色不能删。
   - `architect`：Claude Opus 5.5 high。
   - `engineer`：Claude Sonnet 5.5 high。
   - `tester`：Codex `gpt-6.1-sol` high。

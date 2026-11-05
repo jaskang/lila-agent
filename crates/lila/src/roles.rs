@@ -14,12 +14,14 @@ pub const DEFAULTS: &[(&str, &str, &str)] = &[
     ("tester", include_str!("../../../defaults/roles/tester.toml"), include_str!("../../../defaults/roles/tester.md")),
 ];
 
-/// Files an earlier Lila shipped, by file name. One still exactly like this
-/// was never edited, so it is brought up to the current default.
+/// Files earlier Lilas shipped, by file name (oldest first). One still exactly
+/// like one of these was never edited, so it is brought up to the current default.
 const PREVIOUS: &[(&str, &str)] = &[
-    ("pm.toml", include_str!("../../../defaults/roles/previous/pm.toml")),
-    ("pm.md", include_str!("../../../defaults/roles/previous/pm.md")),
-    ("engineer.toml", include_str!("../../../defaults/roles/previous/engineer.toml")),
+    ("pm.toml", include_str!("../../../defaults/roles/previous/pm.1.toml")),
+    ("pm.md", include_str!("../../../defaults/roles/previous/pm.1.md")),
+    ("engineer.toml", include_str!("../../../defaults/roles/previous/engineer.1.toml")),
+    ("pm.toml", include_str!("../../../defaults/roles/previous/pm.2.toml")),
+    ("pm.md", include_str!("../../../defaults/roles/previous/pm.2.md")),
 ];
 
 /// The role every project's PM has: it can't be deleted.
@@ -35,8 +37,8 @@ pub fn install_defaults(dir: &Path) -> Result<Vec<String>> {
         if toml_path.exists() {
             for (file, now) in [(format!("{id}.toml"), *toml_text), (format!("{id}.md"), *prompt)] {
                 let path = dir.join(&file);
-                let old = PREVIOUS.iter().find(|(f, _)| *f == file).map(|(_, t)| *t);
-                if old.is_some() && std::fs::read_to_string(&path).ok().as_deref() == old {
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                if text != now && PREVIOUS.iter().any(|(f, old)| *f == file && *old == text) {
                     std::fs::write(&path, now)?;
                 }
             }
@@ -190,15 +192,20 @@ mod tests {
     #[test]
     fn untouched_old_defaults_are_updated_and_edits_kept() {
         let dir = tempfile::tempdir().unwrap();
-        for (file, text) in PREVIOUS {
+        // The first defaults, as an early install has them.
+        for (file, text) in &PREVIOUS[..3] {
             std::fs::write(dir.path().join(file), text).unwrap();
         }
         std::fs::write(dir.path().join("engineer.md"), "mine").unwrap();
         std::fs::write(dir.path().join("engineer.toml"), format!("{}# edited\n", PREVIOUS[2].1)).unwrap();
         install_defaults(dir.path()).unwrap();
         let roles = load(dir.path()).unwrap();
-        assert_eq!(roles["pm"].file.name, "PM（产品经理）");
-        assert!(!roles["pm"].prompt.contains("designer in one"));
+        assert_eq!(roles["pm"].file.name, "PM（项目经理）");
+        assert!(roles["pm"].prompt.starts_with("You are the PM (project manager)"));
+        // And the second.
+        std::fs::write(dir.path().join("pm.toml"), PREVIOUS[3].1).unwrap();
+        install_defaults(dir.path()).unwrap();
+        assert_eq!(load(dir.path()).unwrap()["pm"].file.name, "PM（项目经理）");
         assert_eq!(roles["engineer"].file.name, "工程师", "an edited file stays");
         assert_eq!(roles["engineer"].prompt, "mine");
         assert!(roles.contains_key("designer"));
