@@ -8,18 +8,38 @@ use toml_edit::{DocumentMut, value};
 
 pub const DEFAULTS: &[(&str, &str, &str)] = &[
     ("pm", include_str!("../../../defaults/roles/pm.toml"), include_str!("../../../defaults/roles/pm.md")),
+    ("designer", include_str!("../../../defaults/roles/designer.toml"), include_str!("../../../defaults/roles/designer.md")),
     ("architect", include_str!("../../../defaults/roles/architect.toml"), include_str!("../../../defaults/roles/architect.md")),
     ("engineer", include_str!("../../../defaults/roles/engineer.toml"), include_str!("../../../defaults/roles/engineer.md")),
     ("tester", include_str!("../../../defaults/roles/tester.toml"), include_str!("../../../defaults/roles/tester.md")),
 ];
 
-/// Writes the default roles that do not exist yet. Returns the ids written.
+/// Files an earlier Lila shipped, by file name. One still exactly like this
+/// was never edited, so it is brought up to the current default.
+const PREVIOUS: &[(&str, &str)] = &[
+    ("pm.toml", include_str!("../../../defaults/roles/previous/pm.toml")),
+    ("pm.md", include_str!("../../../defaults/roles/previous/pm.md")),
+    ("engineer.toml", include_str!("../../../defaults/roles/previous/engineer.toml")),
+];
+
+/// The role every project's PM has: it can't be deleted.
+pub const PM_ROLE: &str = "pm";
+
+/// Writes the default roles that do not exist yet, and updates default files
+/// nobody edited. Returns the ids of roles written.
 pub fn install_defaults(dir: &Path) -> Result<Vec<String>> {
     std::fs::create_dir_all(dir)?;
     let mut written = Vec::new();
     for (id, toml_text, prompt) in DEFAULTS {
         let toml_path = dir.join(format!("{id}.toml"));
         if toml_path.exists() {
+            for (file, now) in [(format!("{id}.toml"), *toml_text), (format!("{id}.md"), *prompt)] {
+                let path = dir.join(&file);
+                let old = PREVIOUS.iter().find(|(f, _)| *f == file).map(|(_, t)| *t);
+                if old.is_some() && std::fs::read_to_string(&path).ok().as_deref() == old {
+                    std::fs::write(&path, now)?;
+                }
+            }
             continue;
         }
         std::fs::write(&toml_path, toml_text)?;
@@ -119,6 +139,9 @@ pub fn save(dir: &Path, r: &RoleEdit) -> Result<()> {
 
 /// Removes a role's files. `users` (from [`users`]) must not name it.
 pub fn delete(dir: &Path, id: &str, users: &BTreeMap<String, Vec<String>>) -> Result<()> {
+    if id == PM_ROLE {
+        bail!("every project has a PM; the {PM_ROLE} role stays");
+    }
     if let Some(p) = users.get(id).filter(|p| !p.is_empty()) {
         bail!("{id} is used by {}; change those members' role first", p.join(", "));
     }
@@ -154,14 +177,32 @@ mod tests {
     #[test]
     fn defaults_parse_and_install_once() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(install_defaults(dir.path()).unwrap().len(), 4);
+        assert_eq!(install_defaults(dir.path()).unwrap().len(), 5);
         std::fs::write(dir.path().join("pm.md"), "custom").unwrap();
         assert!(install_defaults(dir.path()).unwrap().is_empty());
         let roles = load(dir.path()).unwrap();
-        assert_eq!(roles.len(), 4);
+        assert_eq!(roles.len(), 5);
         assert_eq!(roles["pm"].prompt, "custom");
         assert_eq!(roles["tester"].file.model, "gpt-6.1-sol");
         assert_eq!(roles["engineer"].file.can_assign, ["tester"]);
+    }
+
+    #[test]
+    fn untouched_old_defaults_are_updated_and_edits_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, text) in PREVIOUS {
+            std::fs::write(dir.path().join(file), text).unwrap();
+        }
+        std::fs::write(dir.path().join("engineer.md"), "mine").unwrap();
+        std::fs::write(dir.path().join("engineer.toml"), format!("{}# edited\n", PREVIOUS[2].1)).unwrap();
+        install_defaults(dir.path()).unwrap();
+        let roles = load(dir.path()).unwrap();
+        assert_eq!(roles["pm"].file.name, "PM（产品经理）");
+        assert!(!roles["pm"].prompt.contains("designer in one"));
+        assert_eq!(roles["engineer"].file.name, "工程师", "an edited file stays");
+        assert_eq!(roles["engineer"].prompt, "mine");
+        assert!(roles.contains_key("designer"));
+        assert!(delete(dir.path(), "pm", &BTreeMap::new()).is_err());
     }
 
     #[test]

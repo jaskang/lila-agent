@@ -72,7 +72,7 @@ pub struct QueuedTask {
 }
 
 /// (task, member) pairs to deliver now, at most one per member, highest priority
-/// first, without exceeding `max_working` busy non-owner members. The owner is
+/// first, without exceeding `max_working` busy non-owner members (0: no limit). The owner is
 /// never limited: it is the one planning.
 pub fn pick_deliveries(members: &[MemberView], queued: &[QueuedTask], max_working: u32) -> Vec<(String, String)> {
     let mut busy = members.iter().filter(|m| !m.is_owner && m.busy).count() as u32;
@@ -86,7 +86,7 @@ pub fn pick_deliveries(members: &[MemberView], queued: &[QueuedTask], max_workin
             continue;
         }
         if !m.is_owner {
-            if busy >= max_working {
+            if max_working > 0 && busy >= max_working {
                 continue;
             }
             busy += 1;

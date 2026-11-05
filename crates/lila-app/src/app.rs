@@ -27,6 +27,10 @@ pub struct LilaApp {
     pub settings: Option<crate::settings::Form>,
     /// The global settings (role library), while open.
     pub prefs: Option<crate::prefs::Prefs>,
+    /// Where the open dialog was dragged to, from the window's center.
+    pub dialog_offset: Point<Pixels>,
+    /// While dragging a dialog: where the press was and the offset then.
+    pub dialog_drag: Option<(Point<Pixels>, Point<Pixels>)>,
     /// The member whose terminal fills the middle; `None` is the owner.
     pub member: Option<String>,
     core: Option<Arc<Core>>,
@@ -118,7 +122,7 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, settings: None, prefs: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, settings: None, prefs: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {

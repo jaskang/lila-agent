@@ -40,6 +40,21 @@ pub struct Shell {
     pub on_close: Act,
 }
 
+/// A color a step lighter in a dark theme (raised surfaces), unchanged in a light one.
+pub fn raised(c: Hsla, step: f32, cx: &App) -> Hsla {
+    if cx.theme().is_dark() { Hsla { l: (c.l + step).min(1.), ..c } } else { c }
+}
+
+/// The dialog's own surface: above the dimmed window.
+pub fn surface(cx: &App) -> Hsla {
+    raised(cx.theme().popover, 0.06, cx)
+}
+
+/// Cards on the dialog's surface.
+pub fn card(cx: &App) -> Hsla {
+    raised(cx.theme().popover, 0.095, cx)
+}
+
 /// A scrolling column for a page's content.
 pub fn scroll(id: impl Into<ElementId>, children: Vec<AnyElement>) -> AnyElement {
     v_flex().id(id).flex_1().min_h_0().overflow_y_scrollbar().px_6().py_5().gap_5().children(children).into_any_element()
@@ -57,7 +72,7 @@ pub fn group(title: Option<&str>, rows: Vec<AnyElement>, cx: &App) -> AnyElement
                 .rounded_lg()
                 .border_1()
                 .border_color(t.border)
-                .bg(t.background)
+                .bg(card(cx))
                 .children(rows.into_iter().enumerate().map(|(i, r)| div().when(i + 1 < n, |d| d.border_b_1().border_color(t.border.opacity(0.6))).child(r))),
         )
         .into_any_element()
@@ -117,7 +132,7 @@ pub fn stepper(id: &str, text: String, down: Option<Act>, up: Option<Act>, cx: &
         .rounded_md()
         .border_1()
         .border_color(t.border)
-        .bg(t.background)
+        .bg(surface(cx))
         .child(button(format!("{id}-down"), IconName::Minus, down, cx))
         .child(div().w(px(76.)).text_center().text_sm().child(text))
         .child(button(format!("{id}-up"), IconName::Plus, up, cx))
@@ -125,11 +140,18 @@ pub fn stepper(id: &str, text: String, down: Option<Act>, up: Option<Act>, cx: &
 }
 
 impl LilaApp {
+    /// Starts moving the open dialog with the mouse (a press on its header or navigation top).
+    fn drag_dialog(&mut self, ev: &MouseDownEvent) {
+        self.dialog_drag = Some((ev.position, self.dialog_offset));
+    }
+
     pub fn dialog(&mut self, shell: Shell, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
         let Shell { id, heading, nav, title, description, body, note, saving, on_save, on_close } = shell;
         let on_close: std::rc::Rc<Act> = std::rc::Rc::new(on_close);
-        let close2 = on_close.clone();
+        let (close_x, close_cancel) = (on_close.clone(), on_close);
+        let offset = self.dialog_offset;
+        let (surface, nav_bg) = (surface(cx), raised(t.sidebar, 0.03, cx));
         let nav_items: Vec<AnyElement> = nav
             .into_iter()
             .map(|(n, f)| {
@@ -153,50 +175,80 @@ impl LilaApp {
                     .into_any_element()
             })
             .collect();
+        // Two shadows: a wide soft one that lifts the card off the dimmed window, a tight one for its edge.
+        let shadows = vec![
+            BoxShadow { color: gpui::black().opacity(0.55), offset: point(px(0.), px(24.)), blur_radius: px(64.), spread_radius: px(0.), inset: false },
+            BoxShadow { color: gpui::black().opacity(0.35), offset: point(px(0.), px(2.)), blur_radius: px(8.), spread_radius: px(0.), inset: false },
+        ];
         div()
             .id(SharedString::from(format!("{id}-backdrop")))
             .absolute()
             .inset_0()
-            .bg(gpui::black().opacity(0.5))
+            .bg(gpui::black().opacity(0.62))
             .occlude()
             .flex()
             .items_center()
             .justify_center()
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                let Some((start, from)) = this.dialog_drag else { return };
+                if ev.pressed_button != Some(MouseButton::Left) {
+                    this.dialog_drag = None;
+                    return;
+                }
+                this.dialog_offset = from + (ev.position - start);
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dialog_drag = None))
             .child(
                 h_flex()
                     .id(id)
+                    .relative()
+                    .left(offset.x)
+                    .top(offset.y)
                     .w(px(WIDTH))
                     .max_w(relative(0.94))
                     .h(px(HEIGHT))
                     .max_h(relative(0.9))
                     .rounded_xl()
-                    .overflow_hidden()
                     .border_1()
-                    .border_color(t.border)
-                    .bg(t.popover)
+                    .border_color(t.foreground.opacity(0.16))
+                    .bg(surface)
                     .text_color(t.popover_foreground)
-                    .shadow_2xl()
+                    .shadow(shadows)
                     .occlude()
-                    .child(v_flex().w(px(210.)).flex_none().h_full().bg(t.sidebar).border_r_1().border_color(t.sidebar_border).p_3().gap_1().child(div().px_2().pt_1().pb_3().child(heading)).children(nav_items))
+                    .child(
+                        v_flex()
+                            .w(px(210.))
+                            .flex_none()
+                            .h_full()
+                            .rounded_l_xl()
+                            .bg(nav_bg)
+                            .border_r_1()
+                            .border_color(t.sidebar_border)
+                            .p_3()
+                            .gap_1()
+                            .child(div().id(SharedString::from(format!("{id}-grip-nav"))).px_2().pt_1().pb_3().on_mouse_down(MouseButton::Left, cx.listener(|this, ev, _, _| this.drag_dialog(ev))).child(heading))
+                            .children(nav_items),
+                    )
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
                             .h_full()
                             .child(
-                                h_flex()
+                                v_flex()
+                                    .id(SharedString::from(format!("{id}-grip")))
                                     .flex_none()
-                                    .px_6()
+                                    .pl_6()
+                                    .pr_12()
                                     .pt_5()
                                     .pb_4()
-                                    .gap_4()
+                                    .gap_1()
                                     .border_b_1()
                                     .border_color(t.border)
-                                    .child(v_flex().flex_1().min_w_0().gap_1().child(div().text_lg().font_semibold().child(title)).child(div().text_xs().text_color(t.muted_foreground).child(description)))
-                                    .child(Button::new(SharedString::from(format!("{id}-x"))).ghost().small().icon(IconName::Close).tooltip("关闭 (Esc)").on_click(cx.listener(move |this, _, _, cx| {
-                                        on_close(this, cx);
-                                        cx.notify();
-                                    }))),
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, _, _| this.drag_dialog(ev)))
+                                    .child(div().text_lg().font_semibold().child(title))
+                                    .child(div().text_xs().text_color(t.muted_foreground).child(description)),
                             )
                             .child(v_flex().flex_1().min_h_0().child(body))
                             .child(
@@ -209,12 +261,16 @@ impl LilaApp {
                                     .border_color(t.border)
                                     .child(div().flex_1().min_w_0().text_xs().children(note))
                                     .child(Button::new(SharedString::from(format!("{id}-cancel"))).ghost().label("取消").on_click(cx.listener(move |this, _, _, cx| {
-                                        close2(this, cx);
+                                        close_cancel(this, cx);
                                         cx.notify();
                                     })))
                                     .child(Button::new(SharedString::from(format!("{id}-save"))).primary().label(if saving { "保存中…" } else { "保存" }).disabled(saving).on_click(cx.listener(move |this, _, _, cx| on_save(this, cx)))),
                             ),
-                    ),
+                    )
+                    .child(div().absolute().top_3().right_3().child(Button::new(SharedString::from(format!("{id}-x"))).ghost().small().icon(IconName::Close).tooltip("关闭 (Esc)").on_click(cx.listener(move |this, _, _, cx| {
+                        close_x(this, cx);
+                        cx.notify();
+                    })))),
             )
             .into_any_element()
     }

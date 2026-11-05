@@ -7,7 +7,7 @@
 
 use crate::roles;
 use anyhow::{Context, Result, anyhow, bail};
-use lila_core::{ProjectConfig, Role, Runtime, Settings, Team, validate_id};
+use lila_core::{ProjectConfig, Role, Runtime, Settings, Team, expand_ids, validate_id};
 use std::collections::BTreeMap;
 use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, value};
@@ -58,9 +58,9 @@ impl MemberSettings {
         self.prompt.trim() != self.role_prompt.trim()
     }
 
-    /// The member ids this entry stands for (`count` > 1: `<id>-1`, `<id>-2`, ...).
+    /// The member ids this entry stands for (`count` > 1: `<id>`, `<id>-2`, ...).
     pub fn ids(&self) -> Vec<String> {
-        if self.count <= 1 { vec![self.id.clone()] } else { (1..=self.count).map(|n| format!("{}-{n}", self.id)).collect() }
+        expand_ids(&self.id, self.count.max(1))
     }
 }
 
@@ -135,8 +135,16 @@ impl ProjectSettings {
         self.assign.remove(from);
     }
 
+    /// The PM's role: a project has exactly one member of it.
+    pub fn owner_role(&self) -> Option<&str> {
+        self.entry_of(&self.owner).map(|m| m.role.as_str())
+    }
+
     /// Adds a member with `role`; its id is the role's, or `<role>2`, `<role>3`, ... if taken.
     pub fn add_member(&mut self, role: &str) -> Result<String> {
+        if self.owner_role() == Some(role) {
+            bail!("a project has one PM; it is already {}", self.owner);
+        }
         let r = self.roles.iter().find(|r| r.id == role).ok_or_else(|| anyhow!("no role {role:?}"))?.clone();
         let ids = self.member_ids();
         let taken = |id: &str| ids.iter().any(|i| i == id) || self.members.iter().any(|m| m.id == id);
@@ -153,6 +161,30 @@ impl ProjectSettings {
         let new = m.ids();
         let rename = |s: &str| old.iter().position(|o| o == s).map(|p| new[p].clone()).unwrap_or_else(|| s.to_owned());
         self.assign = std::mem::take(&mut self.assign).into_iter().map(|(k, v)| (rename(&k), v.iter().map(|t| rename(t)).collect())).collect();
+    }
+
+    /// How many of entry `ix` work at once (the PM's stays 1). Rules naming
+    /// members that go away go with them.
+    pub fn set_count(&mut self, ix: usize, count: u32) {
+        let Some(m) = self.members.get(ix) else { return };
+        if m.ids().contains(&self.owner) {
+            return;
+        }
+        let before = m.ids();
+        let rows: Vec<(String, Vec<String>)> = self.assign.keys().map(|k| (k.clone(), self.targets(k))).collect();
+        self.members[ix].count = count.clamp(1, 9);
+        let after = self.members[ix].ids();
+        let gone: Vec<&String> = before.iter().filter(|i| !after.contains(i)).collect();
+        self.assign.clear();
+        for (k, row) in rows {
+            if gone.contains(&&k) {
+                continue;
+            }
+            let row: Vec<String> = row.into_iter().filter(|t| !gone.contains(&t)).collect();
+            if row != self.role_targets(&k) {
+                self.assign.insert(k, row);
+            }
+        }
     }
 
     /// Removes a `[[members]]` entry (not the PM's) and every rule naming it.
@@ -266,6 +298,14 @@ pub fn save(root: &Path, roles_dir: &Path, s: &ProjectSettings) -> Result<()> {
         }
     }
     for m in &s.members {
+        let entry = entries.iter_mut().find(|t| t.get("id").and_then(|v| v.as_str()) == Some(m.id.as_str())).expect("just added");
+        if m.count > 1 {
+            entry["count"] = value(i64::from(m.count));
+        } else {
+            entry.remove("count");
+        }
+    }
+    for m in &s.members {
         let entry = entries.iter_mut().find(|t| t.get("id").and_then(|v| v.as_str()) == Some(m.id.as_str())).ok_or_else(|| anyhow!("member {} is no longer in project.toml", m.id))?;
         let model = m.model.trim();
         if model.is_empty() {
@@ -313,13 +353,16 @@ pub fn save(root: &Path, roles_dir: &Path, s: &ProjectSettings) -> Result<()> {
 
     // [settings]: keys already written are kept up to date; others only when not the default.
     let defaults = Settings::default();
-    let numbers: [(&str, i64, i64); 5] = [
-        ("max_working", s.settings.max_working.into(), defaults.max_working.into()),
+    let numbers: [(&str, i64, i64); 4] = [
         ("stall_minutes", s.settings.stall_minutes as i64, defaults.stall_minutes as i64),
         ("startup_timeout_secs", s.settings.startup_timeout_secs as i64, defaults.startup_timeout_secs as i64),
         ("max_chain_depth", s.settings.max_chain_depth.into(), defaults.max_chain_depth.into()),
         ("max_rounds", s.settings.max_rounds.into(), defaults.max_rounds.into()),
     ];
+    // How many work at once is each member's `count` now; an old cap would hide that.
+    if let Some(t) = doc.get_mut("settings").and_then(Item::as_table_mut) {
+        t.remove("max_working");
+    }
     let has = |doc: &DocumentMut, k: &str| doc.get("settings").and_then(|t| t.get(k)).is_some();
     let put = |doc: &mut DocumentMut, k: &str, v: Item, differs: bool| {
         if has(doc, k) || differs {
@@ -475,8 +518,9 @@ mod team_tests {
         assert!(t.contains("# Who may hand work to whom"), "comments stay:\n{t}");
         let cfg = ProjectConfig::parse(&t).unwrap();
         let ids: Vec<&str> = cfg.members.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["pm", "engineer", "tester", "engineer2"], "{t}");
-        assert_eq!(cfg.members[3].model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(ids, ["pm", "designer", "engineer", "tester", "engineer2"], "{t}");
+        assert_eq!(cfg.members[4].model.as_deref(), Some("claude-haiku-5-5"));
+        assert!(s.add_member("pm").is_err(), "one PM per project");
         let team = crate::daemon::load_team(&root, &roles_dir).unwrap();
         assert_eq!(team.assign["tester"], ["engineer", "engineer2"], "the new engineer follows its role's rules");
     }
@@ -488,7 +532,7 @@ mod team_tests {
         let before = text(&root);
         let engineer = s.targets("engineer");
         assert!(engineer.contains(&"tester".to_string()), "{engineer:?}");
-        assert_eq!(s.targets("pm"), ["architect", "engineer", "tester"]);
+        assert_eq!(s.targets("pm"), ["designer", "architect", "engineer", "tester"]);
         // Off and on again is the role's row: nothing written.
         s.set_target("engineer", "tester", false);
         s.set_target("engineer", "tester", true);
@@ -516,17 +560,44 @@ mod team_tests {
     fn settings_keep_their_comments() {
         let (_tmp, root, roles_dir) = setup();
         let mut s = load(&root, &roles_dir).unwrap();
-        s.settings.max_working = 2;
+        s.settings.stall_minutes = 9;
         s.settings.fresh_session = false;
         s.settings.max_chain_depth = 5;
         save(&root, &roles_dir, &s).unwrap();
         let t = text(&root);
-        assert!(t.contains("# Members other than the PM working at once. Raise it if your subscription allows.\nmax_working = 2\n"), "{t}");
+        assert!(t.contains("# Minutes a member may sit idle on an open task before a reminder.\nstall_minutes = 9\n"), "{t}");
         assert!(t.contains("fresh_session = false"), "{t}");
         assert!(t.contains("max_chain_depth = 5"), "{t}");
         assert!(!t.contains("startup_timeout_secs"), "defaults not written: {t}");
         let cfg = ProjectConfig::parse(&t).unwrap();
-        assert_eq!((cfg.settings.max_working, cfg.settings.fresh_session, cfg.settings.max_chain_depth), (2, false, 5));
+        assert_eq!((cfg.settings.stall_minutes, cfg.settings.fresh_session, cfg.settings.max_chain_depth), (9, false, 5));
+    }
+
+    #[test]
+    fn counts_and_the_old_cap() {
+        let (_tmp, root, roles_dir) = setup();
+        // A project from before: one non-PM member at a time.
+        std::fs::write(project_file(&root), format!("{}max_working = 1\n", text(&root))).unwrap();
+        let mut s = load(&root, &roles_dir).unwrap();
+        let eng = s.members.iter().position(|m| m.id == "engineer").unwrap();
+        s.set_count(eng, 2);
+        assert!(s.targets("tester").contains(&"engineer-2".to_string()));
+        s.set_target("tester", "engineer-2", false);
+        let pm = s.members.iter().position(|m| m.id == "pm").unwrap();
+        s.set_count(pm, 3);
+        assert_eq!(s.members[pm].count, 1, "one PM");
+        save(&root, &roles_dir, &s).unwrap();
+        let t = text(&root);
+        assert!(t.contains("id = \"engineer\"\nrole = \"engineer\"\ncount = 2\n"), "{t}");
+        assert!(!t.contains("max_working"), "the cap goes: counts say it now\n{t}");
+        let team = crate::daemon::load_team(&root, &roles_dir).unwrap();
+        assert_eq!(team.assign["tester"], ["engineer"]);
+        // Back to one: engineer-2 and the rule about it go.
+        let mut s = load(&root, &roles_dir).unwrap();
+        s.set_count(eng, 1);
+        assert!(s.assign.is_empty(), "{:?}", s.assign);
+        save(&root, &roles_dir, &s).unwrap();
+        assert!(!text(&root).contains("\ncount = "), "{}", text(&root));
     }
 
     #[test]

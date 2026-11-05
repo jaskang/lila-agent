@@ -190,7 +190,7 @@ role = "architect"
 [[members]]
 id   = "engineer"
 role = "engineer"
-count = 1            # 设为 2 会生成 engineer-1、engineer-2
+count = 1            # 同时开几个：设为 2 会生成 engineer、engineer-2
 
 [[members]]
 id   = "tester"

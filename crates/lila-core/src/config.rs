@@ -71,7 +71,7 @@ fn default_count() -> u32 {
 pub struct MemberSpec {
     pub id: String,
     pub role: String,
-    /// More than one expands into `<id>-1`, `<id>-2`, ...
+    /// How many of this member work at once: `<id>`, `<id>-2`, `<id>-3`, ...
     #[serde(default = "default_count")]
     pub count: u32,
     /// Set over the role's, for this member only (the project settings).
@@ -90,7 +90,7 @@ pub struct MemberSpec {
 impl MemberSpec {
     /// The member ids this entry expands into.
     pub fn ids(&self) -> Vec<String> {
-        if self.count == 1 { vec![self.id.clone()] } else { (1..=self.count).map(|n| format!("{}-{n}", self.id)).collect() }
+        expand_ids(&self.id, self.count)
     }
 
     /// The role with this entry's overrides applied. Another runtime drops the
@@ -113,10 +113,17 @@ impl MemberSpec {
     }
 }
 
+/// The member ids a `[[members]]` entry with `count` stands for. The first
+/// keeps the entry's id, so raising the count leaves a running member alone.
+pub fn expand_ids(id: &str, count: u32) -> Vec<String> {
+    std::iter::once(id.to_owned()).chain((2..=count).map(|n| format!("{id}-{n}"))).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
-    /// How many non-owner members may be working on a task at once (subscription limits).
+    /// At most this many non-owner members working at once; 0: no limit
+    /// (each member's `count` says how many of it run). Not in the window.
     pub max_working: u32,
     /// A member that went quiet with an open task this long gets one reminder, then is reported stalled.
     pub stall_minutes: u64,
@@ -134,7 +141,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { max_working: 1, stall_minutes: 5, startup_timeout_secs: 20, max_chain_depth: 8, max_rounds: 3, fresh_session: true }
+        Settings { max_working: 0, stall_minutes: 5, startup_timeout_secs: 20, max_chain_depth: 8, max_rounds: 3, fresh_session: true }
     }
 }
 
@@ -374,19 +381,19 @@ role = "architect"
     fn expands_counts_and_resolves_role_rules() {
         let team = Team::build(&ProjectConfig::parse(PROJECT).unwrap(), &roles()).unwrap();
         let ids: Vec<&str> = team.members.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["owner", "engineer-1", "engineer-2", "tester", "architect"]);
-        assert_eq!(team.assign["engineer-1"], ["tester"]);
-        assert_eq!(team.assign["tester"], ["engineer-1", "engineer-2"]);
+        assert_eq!(ids, ["owner", "engineer", "engineer-2", "tester", "architect"]);
+        assert_eq!(team.assign["engineer"], ["tester"]);
+        assert_eq!(team.assign["tester"], ["engineer", "engineer-2"]);
         assert!(team.assign["architect"].is_empty());
         assert!(team.owner().is_owner);
     }
 
     #[test]
     fn explicit_rules_override_roles() {
-        let text = format!("{PROJECT}\n[assign]\narchitect = [\"engineer-1\"]\n");
+        let text = format!("{PROJECT}\n[assign]\narchitect = [\"engineer\"]\n");
         let team = Team::build(&ProjectConfig::parse(&text).unwrap(), &roles()).unwrap();
-        assert_eq!(team.assign["architect"], ["engineer-1"]);
-        assert!(team.check_assign(&Actor::Member("architect".into()), "engineer-1").is_ok());
+        assert_eq!(team.assign["architect"], ["engineer"]);
+        assert!(team.check_assign(&Actor::Member("architect".into()), "engineer").is_ok());
         assert!(team.check_assign(&Actor::Member("architect".into()), "tester").is_err());
     }
 
@@ -396,8 +403,8 @@ role = "architect"
         assert!(team.check_assign(&Actor::Human, "owner").is_ok());
         assert!(team.check_assign(&Actor::Member("owner".into()), "architect").is_ok());
         assert!(team.check_assign(&Actor::Member("owner".into()), "owner").is_err());
-        assert!(team.check_assign(&Actor::Member("engineer-1".into()), "tester").is_ok());
-        let err = team.check_assign(&Actor::Member("engineer-1".into()), "architect").unwrap_err();
+        assert!(team.check_assign(&Actor::Member("engineer".into()), "tester").is_ok());
+        let err = team.check_assign(&Actor::Member("engineer".into()), "architect").unwrap_err();
         assert!(err.contains("allowed: tester"), "{err}");
         assert!(team.check_assign(&Actor::Member("architect".into()), "tester").unwrap_err().contains("may not assign tasks to anyone"));
         assert!(team.check_assign(&Actor::Human, "nobody").is_err());
@@ -409,7 +416,7 @@ role = "architect"
         assert!(Team::build(&ProjectConfig::parse(&no_owner).unwrap(), &roles()).unwrap_err().contains("owner"));
         let bad_role = PROJECT.replace("role = \"tester\"", "role = \"qa\"");
         assert!(Team::build(&ProjectConfig::parse(&bad_role).unwrap(), &roles()).unwrap_err().contains("unknown role"));
-        let bad_assign = format!("{PROJECT}\n[assign]\nengineer-1 = [\"ghost\"]\n");
+        let bad_assign = format!("{PROJECT}\n[assign]\nengineer = [\"ghost\"]\n");
         assert!(Team::build(&ProjectConfig::parse(&bad_assign).unwrap(), &roles()).is_err());
         let reserved = PROJECT.replace("id = \"architect\"", "id = \"human\"");
         assert!(Team::build(&ProjectConfig::parse(&reserved).unwrap(), &roles()).unwrap_err().contains("reserved"));
@@ -442,7 +449,7 @@ role = "architect"
         let t = &team.member("tester").unwrap().role;
         assert_eq!((t.file.runtime, t.file.model.as_str(), t.file.effort.as_deref()), (Runtime::Codex, "gpt-x", Some("low")));
         assert!(t.file.extra_args.is_empty(), "another CLI drops the role's flags");
-        assert_eq!(team.member("engineer-1").unwrap().role.file.model, "m", "others keep the role's");
+        assert_eq!(team.member("engineer").unwrap().role.file.model, "m", "others keep the role's");
         let spec = cfg.members.iter().find(|m| m.id == "tester").unwrap();
         team.set_prompt(spec, "Test everything.");
         assert_eq!(team.member("tester").unwrap().role.prompt, "Test everything.");

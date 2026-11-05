@@ -1,0 +1,5 @@
+name = "设计师"
+runtime = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+can_assign = ["engineer"]

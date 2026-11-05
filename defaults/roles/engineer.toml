@@ -1,4 +1,4 @@
-name = "工程师"
+name = "开发工程师"
 runtime = "claude"
 model = "claude-sonnet-5-5"
 effort = "high"

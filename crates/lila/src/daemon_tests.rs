@@ -188,7 +188,7 @@ fn brief_goes_to_the_owner_once_it_reports_idle() {
 
 #[test]
 fn full_handoff_flow_respects_the_working_limit() {
-    let mut w = world();
+    let mut w = world_with(&format!("{PROJECT}\n[settings]\nmax_working = 1\n"));
     w.up();
     w.all_idle();
     // Owner plans two tasks; only one non-owner member may work at a time.

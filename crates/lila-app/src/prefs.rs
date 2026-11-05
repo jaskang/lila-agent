@@ -5,7 +5,7 @@
 use crate::app::LilaApp;
 use crate::data;
 use crate::dialog::{self, Act, Nav, Shell, block, group, row, value_text};
-use crate::settings::{effort_control, model_control, models, notice, runtime_control};
+use crate::settings::{ModelSelect, effort_control, model_control, model_select, notice, selected_model};
 use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::checkbox::Checkbox;
 use gpui::component::input::{Input, InputState, Textarea, TextareaState};
@@ -30,11 +30,11 @@ pub struct RoleForm {
     /// As loaded (`None`: added in this dialog).
     pub base: Option<RoleEdit>,
     pub id: String,
-    pub runtime: Runtime,
     pub effort: Option<String>,
     pub can_assign: Vec<String>,
     pub name: Entity<InputState>,
-    pub model: Entity<InputState>,
+    /// The model, and so the CLI.
+    pub model: ModelSelect,
     pub prompt: Entity<TextareaState>,
     /// Added in this dialog: its id can still be typed.
     pub id_input: Option<Entity<InputState>>,
@@ -56,11 +56,10 @@ fn role_form(r: &RoleEdit, new: bool, window: &mut Window, cx: &mut Context<Lila
     RoleForm {
         base: (!new).then(|| r.clone()),
         id: r.id.clone(),
-        runtime: r.runtime,
         effort: r.effort.clone(),
         can_assign: r.can_assign.clone(),
         name: cx.new(|cx| InputState::new(window, cx).placeholder("显示名，比如 工程师").default_value(r.name.clone())),
-        model: cx.new(|cx| InputState::new(window, cx).placeholder("模型名").default_value(r.model.clone())),
+        model: model_select(&r.model, r.runtime, window, cx),
         prompt: cx.new(|cx| TextareaState::new(window, cx).rows(14).default_value(r.prompt.clone())),
         id_input: new.then(|| cx.new(|cx| InputState::new(window, cx).placeholder("角色编号").default_value(r.id.clone()))),
     }
@@ -68,11 +67,13 @@ fn role_form(r: &RoleEdit, new: bool, window: &mut Window, cx: &mut Context<Lila
 
 impl RoleForm {
     fn value(&self, cx: &App) -> RoleEdit {
+        let fallback = self.base.as_ref().map(|b| (b.runtime, b.model.clone())).unwrap_or((Runtime::Claude, String::new()));
+        let (runtime, model) = selected_model(&self.model, cx).unwrap_or(fallback);
         RoleEdit {
             id: self.id_input.as_ref().map(|i| i.read(cx).value().trim().to_owned()).unwrap_or_else(|| self.id.clone()),
             name: self.name.read(cx).value().trim().to_owned(),
-            runtime: self.runtime,
-            model: self.model.read(cx).value().trim().to_owned(),
+            runtime,
+            model,
             effort: self.effort.clone(),
             can_assign: self.can_assign.clone(),
             prompt: self.prompt.read(cx).value().to_string(),
@@ -103,6 +104,7 @@ impl LilaApp {
         let forms = list.iter().map(|r| role_form(r, false, window, cx)).collect();
         self.settings = None;
         self.draft = None;
+        self.dialog_offset = Point::default();
         self.prefs = Some(Prefs { page, roles: forms, deleted: Vec::new(), selected: 0, users, error: None, saving: false });
         cx.notify();
     }
@@ -117,6 +119,7 @@ impl LilaApp {
         let taken: Vec<String> = p.roles.iter().map(|r| r.value(cx).id).collect();
         let id = (2..).map(|n| format!("{}{n}", src.id)).find(|id| !taken.contains(id)).expect("a free id");
         let r = RoleEdit { id, name: format!("{}（副本）", src.name), ..src };
+        // A copy is kept as its own new role, with the template's model chosen.
         let form = role_form(&r, true, window, cx);
         if let Some(p) = self.prefs.as_mut() {
             p.roles.push(form);
@@ -247,7 +250,8 @@ impl LilaApp {
         let Some(p) = self.prefs.as_ref() else { return div().into_any_element() };
         let Some(r) = p.roles.get(ix) else { return div().into_any_element() };
         let v = r.value(cx);
-        let (name_input, model_input, prompt, id_input, runtime, effort, can_assign) = (r.name.clone(), r.model.clone(), r.prompt.clone(), r.id_input.clone(), r.runtime, r.effort.clone(), r.can_assign.clone());
+        let (name_input, select, prompt, id_input, effort, can_assign) = (r.name.clone(), r.model.clone(), r.prompt.clone(), r.id_input.clone(), r.effort.clone(), r.can_assign.clone());
+        let is_pm = v.id == lila::roles::PM_ROLE;
         let used = p.users.get(&r.id).cloned().filter(|_| r.base.is_some()).unwrap_or_default();
         let others: Vec<(String, String)> = p.roles.iter().enumerate().filter(|(i, _)| *i != ix).map(|(_, o)| (o.value(cx).id, o.name.read(cx).value().to_string())).collect();
         let is_default = lila::roles::DEFAULTS.iter().any(|(d, _, _)| *d == v.id);
@@ -267,53 +271,27 @@ impl LilaApp {
                     .outline()
                     .small()
                     .label("删除角色")
-                    .disabled(!used.is_empty())
-                    .tooltip(if used.is_empty() { "保存后删除它的文件".to_owned() } else { format!("{} 在用它，先把那些成员换成别的角色", used.join("、")) })
+                    .disabled(is_pm || !used.is_empty())
+                    .tooltip(if is_pm {
+                        "每个项目都有且只有一个 PM，这个角色不能删除".to_owned()
+                    } else if used.is_empty() {
+                        "保存后删除它的文件".to_owned()
+                    } else {
+                        format!("{} 在用它，先把那些成员换成别的角色", used.join("、"))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| this.delete_role(ix, cx))),
             );
 
         let mut rows = Vec::new();
         if let Some(input) = &id_input {
-            rows.push(row("角色编号", Some("项目配置里 role = 写的就是它。小写字母、数字、- 和 _。".into()), div().w(px(300.)).child(Input::new(input).small()), cx));
+            rows.push(row("角色编号", Some("项目配置里写的 role".into()), div().w(px(250.)).child(Input::new(input).small()), cx));
         }
-        rows.push(row("名称", Some("界面里显示的名字。".into()), div().w(px(300.)).child(Input::new(&name_input).small()), cx));
-        rows.push(row(
-            "运行方式",
-            None,
-            runtime_control(
-                format!("role-rt-{ix}"),
-                runtime,
-                move |this, rt, window, cx| {
-                    let Some(r) = this.pref_role(ix) else { return };
-                    if r.runtime == rt {
-                        return;
-                    }
-                    r.runtime = rt;
-                    let input = r.model.clone();
-                    input.update(cx, |s, cx| s.set_value(models(rt)[0].to_owned(), window, cx));
-                },
-                cx,
-            ),
-            cx,
-        ));
-        rows.push(row(
-            "模型",
-            None,
-            model_control(
-                format!("role-models-{ix}"),
-                runtime,
-                &model_input,
-                &v.model,
-                move |this, m, window, cx| {
-                    if let Some(r) = this.pref_role(ix) {
-                        let input = r.model.clone();
-                        input.update(cx, |s, cx| s.set_value(m.to_owned(), window, cx));
-                    }
-                },
-                cx,
-            ),
-            cx,
-        ));
+        rows.push(row("名称", Some("界面里显示的名字。".into()), div().w(px(250.)).child(Input::new(&name_input).small()), cx));
+        let cli = match v.runtime {
+            Runtime::Claude => "Claude Code",
+            Runtime::Codex => "Codex（ChatGPT）",
+        };
+        rows.push(row("模型", Some(cli.into()), model_control(&select), cx));
         rows.push(row(
             "努力程度",
             None,
@@ -344,7 +322,13 @@ impl LilaApp {
         }));
         let assign_row = block("默认可以派给", Some("项目里没单独设置指派规则时，这个角色的成员可以把任务派给哪些角色的成员。PM 总是可以派给所有人。".into()), assign, None, cx);
 
-        let mut body = vec![header.into_any_element(), group(Some("运行"), rows, cx), group(Some("协作"), vec![assign_row], cx), group(Some("提示词"), vec![block("预设提示词", Some("每个用这个角色、又没有自己提示词的成员都会用它。Lila 会在后面接上协作协议。".into()), Textarea::new(&prompt), None, cx)], cx)];
+        let mut body = vec![header.into_any_element(), group(Some("运行"), rows, cx)];
+        if is_pm {
+            body.push(notice(IconName::Info, theme.muted_foreground, "每个项目都有且只有一个 PM：它和你对话，可以把任务派给任何人。", cx));
+        } else {
+            body.push(group(Some("协作"), vec![assign_row], cx));
+        }
+        body.extend([group(Some("提示词"), vec![block("预设提示词", Some("每个用这个角色、又没有自己提示词的成员都会用它。Lila 会在后面接上协作协议。".into()), Textarea::new(&prompt), None, cx)], cx)]);
         if is_default {
             body.push(notice(IconName::Info, theme.muted_foreground, "这是 Lila 自带的角色。改动保存在你的角色目录里，Lila 升级不会覆盖。", cx));
         }

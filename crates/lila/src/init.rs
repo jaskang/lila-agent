@@ -49,6 +49,10 @@ id = "pm"
 role = "pm"
 
 [[members]]
+id = "designer"
+role = "designer"
+
+[[members]]
 id = "architect"
 role = "architect"
 
@@ -65,9 +69,10 @@ role = "tester"
 # [assign]
 # engineer = ["tester"]
 
+# `count = 2` on a member runs two of it (engineer, engineer-2): more work at
+# once, and more of your subscription used.
+
 [settings]
-# Members other than the PM working at once. Raise it if your subscription allows.
-max_working = 1
 # Minutes a member may sit idle on an open task before a reminder.
 stall_minutes = 5
 # Fix cycles two members may bounce one chain between them before the PM decides.
@@ -98,7 +103,9 @@ mod tests {
         let roles = roles::load(dir.path()).unwrap();
         let cfg = lila_core::ProjectConfig::parse(&default_project("shop")).unwrap();
         let team = lila_core::Team::build(&cfg, &roles).unwrap();
-        assert_eq!(team.members.len(), 4);
+        assert_eq!(team.members.len(), 5);
+        assert_eq!(team.assign["designer"], ["engineer"]);
+        assert_eq!(team.settings.max_working, 0, "no cap: each member's count decides");
         assert_eq!(team.assign["engineer"], ["tester"]);
         assert_eq!(team.assign["tester"], ["engineer"]);
     }
@@ -111,7 +118,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         let c = init_project(&paths, &repo, None).unwrap();
         assert_eq!(c.name, "my-repo");
-        assert_eq!(c.roles_installed.len(), 4);
+        assert_eq!(c.roles_installed.len(), 5);
         assert!(init_project(&paths, &repo, None).unwrap_err().to_string().contains("already exists"));
     }
 }
