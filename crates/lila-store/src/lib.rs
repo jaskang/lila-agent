@@ -200,6 +200,12 @@ impl Store {
         Ok(Store { db })
     }
 
+    /// Rows this connection has changed since it opened: goes up on every write,
+    /// so the daemon can tell watchers that something changed.
+    pub fn total_changes(&self) -> u64 {
+        self.db.total_changes()
+    }
+
     // ---------- projects ----------
 
     /// Registers a project, or confirms an existing one. One id per folder.

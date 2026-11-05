@@ -509,3 +509,22 @@ fn spool_requests_time_out_without_a_daemon() {
     assert!(err.contains("did not answer"), "{err}");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the unanswered request is withdrawn");
 }
+
+#[test]
+fn the_fingerprint_moves_on_writes_and_live_changes_only() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    let a = w.d.fingerprint();
+    w.ok(None, "status", json!({}));
+    w.ok(None, "task.ls", json!({"all": true}));
+    w.ok(None, "inbox", json!({}));
+    assert_eq!(w.d.fingerprint(), a, "reads change nothing");
+    w.status("engineer", "idle");
+    assert_eq!(w.d.fingerprint(), a, "the same status again changes nothing");
+    w.status("engineer", "working");
+    let b = w.d.fingerprint();
+    assert_ne!(b, a, "a status change is news");
+    w.ok(Some("owner"), "task.new", json!({"to": "tester", "title": "x"}));
+    assert_ne!(w.d.fingerprint(), b, "a write is news");
+}

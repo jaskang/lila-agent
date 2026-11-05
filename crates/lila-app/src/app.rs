@@ -44,14 +44,42 @@ pub fn s(v: &Value, key: &str) -> String {
 impl LilaApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let paths = Paths::from_env();
+        // lilad says when anything changed; refresh then. A slow poll covers a
+        // daemon that is down or restarting.
+        let (wake_tx, wake) = async_channel::unbounded::<()>();
+        let watch_paths = paths.clone();
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(events) = lila::client::subscribe(&watch_paths) {
+                    let _ = wake_tx.send_blocking(());
+                    for _ in events {
+                        if wake_tx.send_blocking(()).is_err() {
+                            return;
+                        }
+                    }
+                }
+                if wake_tx.is_closed() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
         let poll = cx.spawn_in(window, async move |this, cx| {
             loop {
                 let Ok((paths, selected, task)) = this.update(cx, |this, _| (this.paths.clone(), this.selected.clone(), this.task.clone())) else { return };
                 let snap = cx.background_executor().spawn(async move { data::fetch(&paths, selected.as_deref(), task.as_deref()) }).await;
+                if std::env::var_os("LILA_APP_DEBUG").is_some() {
+                    eprintln!("[lila-app] {} refreshed: {} tasks", data::clock_ms(), snap.tasks.len());
+                }
                 if this.update(cx, |this, cx| this.apply(snap, cx)).is_err() {
                     return;
                 }
-                cx.background_executor().timer(Duration::from_millis(1000)).await;
+                let woken = std::pin::pin!(wake.recv());
+                let timeout = std::pin::pin!(cx.background_executor().timer(Duration::from_secs(5)));
+                futures::future::select(woken, timeout).await;
+                // Changes come in bursts (a delivery, then a status): take them together.
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                while wake.try_recv().is_ok() {}
             }
         });
         cx.spawn(async move |this, cx| {

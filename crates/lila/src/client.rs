@@ -100,6 +100,21 @@ pub fn await_spool(dir: &Path, id: &str, timeout: Duration) -> Result<Value> {
     bail!("lilad did not answer through {} within {}s; is it running? (`lila daemon status` from your own shell)", dir.display(), timeout.as_secs())
 }
 
+/// Hears from lilad whenever anything changes: one `{"event":"changed","seq":N}` per change.
+/// The iterator ends when lilad goes away.
+pub fn subscribe(paths: &Paths) -> Result<impl Iterator<Item = Value>> {
+    let sock = paths.socket()?;
+    let mut conn = UnixStream::connect(&sock).with_context(|| format!("cannot reach lilad at {}", sock.display()))?;
+    writeln!(conn, "{}", json!({"method": "subscribe", "params": {}}))?;
+    let mut lines = BufReader::new(conn).lines();
+    let first = lines.next().ok_or_else(|| anyhow!("lilad closed the subscription"))??;
+    let v: Value = serde_json::from_str(&first)?;
+    if let Some(e) = v.get("error") {
+        bail!("{}", e.as_str().unwrap_or("error"));
+    }
+    Ok(lines.map_while(Result::ok).filter_map(|l| serde_json::from_str(&l).ok()))
+}
+
 pub fn is_running(paths: &Paths) -> bool {
     try_request(paths, "ping", &json!({})).is_ok()
 }

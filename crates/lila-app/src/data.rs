@@ -110,3 +110,9 @@ pub fn clock(ms: i64) -> String {
     let t = (ms / 1000 + offset).rem_euclid(86_400);
     format!("{:02}:{:02}", t / 3600, t / 60 % 60)
 }
+
+/// Wall clock with milliseconds, for debug logs.
+pub fn clock_ms() -> String {
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    format!("{}:{:02}.{:03}", clock(ms), ms / 1000 % 60, ms % 1000)
+}

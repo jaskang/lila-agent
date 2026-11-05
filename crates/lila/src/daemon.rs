@@ -80,6 +80,8 @@ pub struct Daemon<T: Terminals> {
     pub log: Vec<String>,
     /// The last delivery error per task, so a stuck delivery is logged once, not every tick.
     failed_sends: BTreeMap<String, String>,
+    /// Goes up when what members are doing changes (status, words, terminals): not in the database.
+    live_version: u64,
 }
 
 fn now_ms() -> i64 {
@@ -114,7 +116,7 @@ fn terminal_name(project: &str, member: &str) -> String {
 
 impl<T: Terminals> Daemon<T> {
     pub fn new(store: Store, term: T, paths: Paths, path_env: String, lila_bin: PathBuf) -> Daemon<T> {
-        let mut d = Daemon { store, term, paths, projects: BTreeMap::new(), path_env, lila_bin, log: Vec::new(), failed_sends: BTreeMap::new() };
+        let mut d = Daemon { store, term, paths, projects: BTreeMap::new(), path_env, lila_bin, log: Vec::new(), failed_sends: BTreeMap::new(), live_version: 0 };
         let rows = d.store.projects().unwrap_or_default();
         for p in rows {
             if let Err(e) = d.load_project(&p.id, Path::new(&p.cwd)) {
@@ -122,6 +124,11 @@ impl<T: Terminals> Daemon<T> {
             }
         }
         d
+    }
+
+    /// Changes when anything a viewer shows changed: database writes or live member state.
+    pub fn fingerprint(&self) -> (u64, u64) {
+        (self.store.total_changes(), self.live_version)
     }
 
     fn say(&mut self, line: String) {
@@ -299,6 +306,7 @@ impl<T: Terminals> Daemon<T> {
         self.store.set_member(pid, mid, &member.role.id, Some(&addr), Some(now))?;
         let live = self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap();
         *live = Live { terminal: Some(addr.clone()), status: AgentStatus::Unknown, started_ms: Some(now), free_since: now, ..Live::default() };
+        self.live_version += 1;
         let shown: Vec<String> = launch.argv.iter().map(|a| if a.chars().count() > 80 { format!("{}…", a.chars().take(40).collect::<String>()) } else { a.clone() }).collect();
         self.store.event(pid, None, "lilad", "member_started", &format!("{mid} in {addr}: {}", shown.join(" ")), now)?;
         self.say(format!("{pid}: started {mid} in {addr}"));
@@ -617,7 +625,9 @@ impl<T: Terminals> Daemon<T> {
             if live.terminal.as_deref() != Some(addr) {
                 live.terminal = Some(addr.to_owned());
                 live.started_ms.get_or_insert(now);
+                self.live_version += 1;
             }
+            let live = self.projects.get_mut(&pid).unwrap().live.get_mut(&mid).unwrap();
             live.reported |= rec["reported"].as_bool().unwrap_or(false);
             if live.status == AgentStatus::Gone {
                 live.status = AgentStatus::Unknown;
@@ -668,9 +678,15 @@ impl<T: Terminals> Daemon<T> {
         let live = self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap();
         let old = live.status;
         let new = if status.is_null() { AgentStatus::Unknown } else { AgentStatus::from_word(status["state"].as_str()) };
+        let (kind, msg) = (status["kind"].as_str().map(String::from), status["msg"].as_str().unwrap_or_default().to_owned());
+        let changed = old != new || live.kind != kind || live.msg != msg;
         live.status = new;
-        live.kind = status["kind"].as_str().map(String::from);
-        live.msg = status["msg"].as_str().unwrap_or_default().to_owned();
+        live.kind = kind;
+        live.msg = msg;
+        if changed {
+            self.live_version += 1;
+        }
+        let live = self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap();
         if new.is_free() && !old.is_free() {
             live.free_since = now;
         }
@@ -706,6 +722,8 @@ impl<T: Terminals> Daemon<T> {
         }
         let terminal = live.terminal.take();
         live.status = AgentStatus::Gone;
+        self.live_version += 1;
+        let live = self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap();
         live.reported = false;
         let role = self.projects[pid].team.member(mid).map(|m| m.role.id.clone()).unwrap_or_default();
         let _ = self.store.set_member(pid, mid, &role, None, None);
@@ -975,7 +993,7 @@ enum Input {
 pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
 
     paths.ensure()?;
     let sock = paths.socket()?;
@@ -993,13 +1011,18 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
     eprintln!("[lilad] listening on {} (pid {})", sock.display(), std::process::id());
 
     let (tx, rx) = mpsc::channel::<Input>();
+    // Watchers (lila-app) that asked to hear when anything changes.
+    let watchers: Arc<Mutex<Vec<mpsc::Sender<String>>>> = Arc::default();
 
     // Socket: one JSON request per line, one reply line per request.
+    // `subscribe` turns the connection into a stream of `{"event":"changed"}` lines.
     let tx_sock = tx.clone();
+    let watchers_sock = watchers.clone();
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
             let tx = tx_sock.clone();
+            let watchers = watchers_sock.clone();
             std::thread::spawn(move || {
                 let mut writer = match conn.try_clone() {
                     Ok(w) => w,
@@ -1007,6 +1030,19 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
                 };
                 for line in BufReader::new(conn).lines().map_while(Result::ok) {
                     let reply = match serde_json::from_str::<Value>(&line) {
+                        Ok(req) if req["method"] == "subscribe" => {
+                            let (wtx, wrx) = mpsc::channel::<String>();
+                            watchers.lock().unwrap().push(wtx);
+                            if writeln!(writer, "{}", json!({"result": {"subscribed": true}})).is_err() {
+                                return;
+                            }
+                            for event in wrx {
+                                if writeln!(writer, "{event}").is_err() {
+                                    return;
+                                }
+                            }
+                            return;
+                        }
                         Ok(req) => {
                             let (rtx, rrx) = mpsc::channel();
                             let method = req["method"].as_str().unwrap_or_default().to_owned();
@@ -1067,6 +1103,8 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
         }
     });
 
+    let mut seen = daemon.fingerprint();
+    let mut seq: u64 = 0;
     for input in rx {
         let now = now_ms();
         match input {
@@ -1094,6 +1132,13 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
             Input::Tick => daemon.tick(now),
             Input::Spool => daemon.process_spool(now),
             Input::Stop => break,
+        }
+        let fp = daemon.fingerprint();
+        if fp != seen {
+            seen = fp;
+            seq += 1;
+            let event = json!({"event": "changed", "seq": seq}).to_string();
+            watchers.lock().unwrap().retain(|w| w.send(event.clone()).is_ok());
         }
     }
     let _ = std::fs::remove_file(&sock);

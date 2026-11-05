@@ -3800,6 +3800,8 @@ name = "lila-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
+ "futures",
  "gpui-kit",
  "gpui-pre",
  "gpui-pre-macos",
