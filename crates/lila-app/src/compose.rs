@@ -156,7 +156,7 @@ impl LilaApp {
                         .p_4()
                         .gap_4()
                         .child(div().text_sm().text_color(theme.muted_foreground).child(
-                            "通常把需求交给 Owner，由它拆分和分派；也可以直接派给某个成员。任务以你（human）的名义发出，完成后会出现在收件箱。",
+                            "通常把需求交给 PM，由它拆分和分派；也可以直接派给某个成员。任务以你（human）的名义发出，完成后会出现在收件箱。",
                         ))
                         .child(field("派给", cx).child(h_flex().gap_1().flex_wrap().children(members.iter().map(|m| {
                             let id = s(m, "id");

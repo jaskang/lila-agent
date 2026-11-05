@@ -395,7 +395,7 @@ impl<T: Terminals> Daemon<T> {
         if let Some(p) = &parent {
             self.store.task(&pid, p)?.ok_or_else(|| anyhow!("no task {p} to use as parent"))?;
             if self.store.depth(&pid, p)? + 1 >= max_depth {
-                bail!("task chain under {p} is already {max_depth} deep; report to the owner with `lila task block` instead of creating more subtasks");
+                bail!("task chain under {p} is already {max_depth} deep; report to the PM with `lila task block` instead of creating more subtasks");
             }
         }
         if let (Some(p), Actor::Member(from)) = (&parent, &actor) {
@@ -407,7 +407,7 @@ impl<T: Terminals> Daemon<T> {
             let rounds = lila_core::task::rounds(from, &to, &chain_with_parent);
             if rounds > max {
                 bail!(
-                    "{from} and {to} have already sent this work back and forth {max} times; stop and run `lila task block {p} --reason \"<what keeps failing>\"` so the owner can decide"
+                    "{from} and {to} have already sent this work back and forth {max} times; stop and run `lila task block {p} --reason \"<what keeps failing>\"` so the PM can decide"
                 );
             }
         }
@@ -433,7 +433,7 @@ impl<T: Terminals> Daemon<T> {
         match (&actor, t) {
             (Actor::Human, _) => {}
             (Actor::Member(m), Transition::Cancel) if *m == owner || task.from == actor => {}
-            (Actor::Member(_), Transition::Cancel) => bail!("only {} (who assigned it) or the owner can cancel {}", task.from, task.id),
+            (Actor::Member(_), Transition::Cancel) => bail!("only {} (who assigned it) or the PM can cancel {}", task.from, task.id),
             (Actor::Member(m), _) if *m != task.to => bail!("{} is assigned to {}, not you ({m})", task.id, task.to),
             _ => {}
         }
@@ -494,7 +494,7 @@ impl<T: Terminals> Daemon<T> {
         let task = self.store.task(&pid, id)?.ok_or_else(|| anyhow!("no task {id} in project {pid}"))?;
         let owner = self.projects[&pid].team.owner.clone();
         if actor != Actor::Human && actor != Actor::Member(owner.clone()) && actor != task.from {
-            bail!("only {} (who assigned it) or the owner can edit {}", task.from, task.id);
+            bail!("only {} (who assigned it) or the PM can edit {}", task.from, task.id);
         }
         if !task.state.is_open() {
             bail!("{} is {}; create a new task instead", task.id, task.state);
@@ -562,9 +562,9 @@ impl<T: Terminals> Daemon<T> {
     fn ask(&mut self, caller: &Value, params: &Value, now: i64) -> Result<Value> {
         let (pid, actor) = self.who(caller)?;
         let owner = self.projects[&pid].team.owner.clone();
-        let Actor::Member(m) = &actor else { bail!("`lila ask` is how the owner asks you; you are the person") };
+        let Actor::Member(m) = &actor else { bail!("`lila ask` is how the PM asks you; you are the person") };
         if *m != owner {
-            bail!("only the owner ({owner}) asks the person; report to your assigner with `lila task block` instead");
+            bail!("only the PM ({owner}) asks the person; report to your assigner with `lila task block` instead");
         }
         let item = self.store.add_inbox(&pid, "question", Some(m), s(params, "task"), req(params, "question")?, &strings(params, "options"), now)?;
         self.say(format!("{pid}: {} asked {}: {}", m, item.id, item.text));

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const DEFAULTS: &[(&str, &str, &str)] = &[
-    ("owner", include_str!("../../../defaults/roles/owner.toml"), include_str!("../../../defaults/roles/owner.md")),
+    ("pm", include_str!("../../../defaults/roles/pm.toml"), include_str!("../../../defaults/roles/pm.md")),
     ("architect", include_str!("../../../defaults/roles/architect.toml"), include_str!("../../../defaults/roles/architect.md")),
     ("engineer", include_str!("../../../defaults/roles/engineer.toml"), include_str!("../../../defaults/roles/engineer.md")),
     ("tester", include_str!("../../../defaults/roles/tester.toml"), include_str!("../../../defaults/roles/tester.md")),
@@ -62,11 +62,11 @@ mod tests {
     fn defaults_parse_and_install_once() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(install_defaults(dir.path()).unwrap().len(), 4);
-        std::fs::write(dir.path().join("owner.md"), "custom").unwrap();
+        std::fs::write(dir.path().join("pm.md"), "custom").unwrap();
         assert!(install_defaults(dir.path()).unwrap().is_empty());
         let roles = load(dir.path()).unwrap();
         assert_eq!(roles.len(), 4);
-        assert_eq!(roles["owner"].prompt, "custom");
+        assert_eq!(roles["pm"].prompt, "custom");
         assert_eq!(roles["tester"].file.model, "gpt-6.1-sol");
         assert_eq!(roles["engineer"].file.can_assign, ["tester"]);
     }

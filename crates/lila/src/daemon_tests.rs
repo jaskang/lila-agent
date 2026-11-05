@@ -44,7 +44,7 @@ const PROJECT: &str = r#"
 name = "shop"
 [[members]]
 id = "owner"
-role = "owner"
+role = "pm"
 [[members]]
 id = "engineer"
 role = "engineer"
@@ -144,7 +144,7 @@ fn up_starts_every_member_with_its_command() {
     assert_eq!(argv[1..5], ["--model", "claude-opus-5-5", "--effort", "high"]);
     assert_eq!(argv[5], "--append-system-prompt-file");
     let prompt = std::fs::read_to_string(argv[6]).unwrap();
-    assert!(prompt.contains("## As the owner"));
+    assert!(prompt.contains("## As the PM"));
     assert_eq!(owner["labels"], json!({"lila.project": "shop", "lila.member": "owner"}));
     assert_eq!(owner["env"]["LILA_MEMBER"], "owner");
     assert_eq!(owner["env"]["LILA_ROOT"], w.repo.to_string_lossy().as_ref());
@@ -234,7 +234,7 @@ fn assignment_rules_and_ownership_are_enforced() {
     assert!(w.call(Some("tester"), "task.cancel", json!({"id": "T1"})).is_err());
     w.ok(Some("owner"), "task.cancel", json!({"id": "T1", "reason": "changed plans"}));
     assert!(w.sends_to("engineer").iter().any(|s| s.contains("T1 was cancelled by owner")));
-    assert!(w.call(Some("engineer"), "ask", json!({"question": "?"})).unwrap_err().to_string().contains("only the owner"));
+    assert!(w.call(Some("engineer"), "ask", json!({"question": "?"})).unwrap_err().to_string().contains("only the PM"));
     assert!(w.call(Some("owner"), "answer", json!({"id": "Q1", "text": "x"})).is_err());
 }
 

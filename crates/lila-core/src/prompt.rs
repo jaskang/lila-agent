@@ -11,7 +11,7 @@ pub fn render(team: &Team, member: &Member, cwd: &str) -> String {
         "You are `{}` ({}){}.\n\nTeam:\n",
         member.id,
         member.role.file.name,
-        if member.is_owner { ", the owner" } else { "" }
+        if member.is_owner { ", the PM" } else { "" }
     ));
     for m in &team.members {
         let you = if m.id == member.id { "  ← you" } else { "" };
@@ -35,7 +35,7 @@ const PROTOCOL: &str = r#"
 
 Work arrives in your input as:
 
-    <lila task="T12" from="owner" file=".lila/tasks/T12.md">Title, details…</lila>
+    <lila task="T12" from="pm" file=".lila/tasks/T12.md">Title, details…</lila>
 
 1. When you begin, run `lila task start T12`.
 2. When finished, run `lila task done T12 --summary "<one line>"`. Add `--file <path>` for each deliverable or long report; put long text in a file and pass its path instead of pasting it.
@@ -47,7 +47,7 @@ Every task you receive must end with `lila task done` or `lila task block`. `lil
 "#;
 
 const OWNER: &str = r#"
-## As the owner
+## As the PM
 
 The person talks only to you. Reply in the language they use.
 
@@ -106,9 +106,9 @@ mod tests {
     fn owner_and_leaf_prompts() {
         let t = team();
         let owner = render(&t, t.owner(), "/repo");
-        assert!(owner.contains("the owner"));
+        assert!(owner.contains("the PM"));
         assert!(owner.contains("You may assign tasks to: `engineer`, `tester`"));
-        assert!(owner.contains("## As the owner"));
+        assert!(owner.contains("## As the PM"));
         let tester = render(&t, t.member("tester").unwrap(), "/repo");
         assert!(tester.contains("You may not assign tasks."));
     }

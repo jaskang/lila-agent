@@ -42,11 +42,11 @@ pub fn slug(s: &str) -> String {
 pub fn default_project(name: &str) -> String {
     format!(
         r#"name = "{name}"
-owner = "owner"
+owner = "pm"
 
 [[members]]
-id = "owner"
-role = "owner"
+id = "pm"
+role = "pm"
 
 [[members]]
 id = "architect"
@@ -60,17 +60,17 @@ role = "engineer"
 id = "tester"
 role = "tester"
 
-# Who may hand work to whom (the owner may assign to anyone).
+# Who may hand work to whom (the PM may assign to anyone).
 # Without an entry, a member follows its role's `can_assign`.
 # [assign]
 # engineer = ["tester"]
 
 [settings]
-# Non-owner members working at once. Raise it if your subscription allows.
+# Members other than the PM working at once. Raise it if your subscription allows.
 max_working = 1
 # Minutes a member may sit idle on an open task before a reminder.
 stall_minutes = 5
-# Fix cycles two members may bounce one chain between them before the owner decides.
+# Fix cycles two members may bounce one chain between them before the PM decides.
 max_rounds = 3
 "#
     )

@@ -8,7 +8,7 @@ use lila::{client, daemon, roles};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
-#[command(name = "lila", version, about = "Run a team of coding agents: you talk to the owner, the owner runs the team.")]
+#[command(name = "lila", version, about = "Run a team of coding agents: you talk to the PM, the PM runs the team.")]
 struct Cli {
     /// Print raw JSON instead of text.
     #[arg(long, global = true)]
@@ -35,7 +35,7 @@ enum Cmd {
     },
     /// Start this project's team (and lilad if needed).
     Up {
-        /// A first request for the owner, as task T-from-you.
+        /// A first request for the PM, as a task from you.
         #[arg(long)]
         brief: Option<String>,
     },
@@ -48,7 +48,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
-    /// (owner) Ask the person a question; the answer comes back as <lila answer>.
+    /// (PM) Ask the person a question; the answer comes back as <lila answer>.
     Ask {
         question: String,
         #[arg(long = "option")]
@@ -333,12 +333,12 @@ fn fmt_up(v: &Value) -> String {
         s.push_str(&format!("  running {:<10} in {}\n", m["member"].as_str().unwrap_or(""), m["terminal"].as_str().unwrap_or("")));
     }
     if let Some(t) = v["brief_task"].as_str() {
-        s.push_str(&format!("brief sent to the owner as {t}\n"));
+        s.push_str(&format!("brief sent to the PM as {t}\n"));
     }
     if !v["started"].as_array().is_none_or(|a| a.is_empty()) {
         s.push_str("First start in a folder: Claude Code asks whether you trust it. `lila inbox` tells you if a member is waiting.\n");
     }
-    s.push_str("Talk to the owner in its terminal (herdr-app, or `hc attach lila-<project>-owner`).");
+    s.push_str("Talk to the PM in its terminal (lila-app, herdr-app, or `hc attach lila-<project>-pm`).");
     s
 }
 

@@ -62,10 +62,6 @@ impl Role {
     }
 }
 
-fn default_owner() -> String {
-    "owner".into()
-}
-
 fn default_count() -> u32 {
     1
 }
@@ -106,8 +102,9 @@ impl Default for Settings {
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub name: String,
-    #[serde(default = "default_owner")]
-    pub owner: String,
+    /// The member who plans and talks to the person (the PM). Without it: `pm`, else `owner`.
+    #[serde(default)]
+    pub owner: Option<String>,
     pub members: Vec<MemberSpec>,
     /// Who may hand work to whom, by member id (overrides the role's `can_assign`).
     #[serde(default)]
@@ -174,11 +171,19 @@ impl Team {
                 if members.iter().any(|m: &Member| m.id == id) {
                     return Err(format!("member {id:?} is listed twice"));
                 }
-                members.push(Member { is_owner: id == config.owner, id, role: role.clone() });
+                members.push(Member { is_owner: false, id, role: role.clone() });
             }
         }
+        let owner = match &config.owner {
+            Some(o) => o.clone(),
+            None if members.iter().any(|m| m.id == "pm") => "pm".into(),
+            None => "owner".into(),
+        };
+        for m in &mut members {
+            m.is_owner = m.id == owner;
+        }
         if !members.iter().any(|m| m.is_owner) {
-            return Err(format!("owner {:?} is not one of the members", config.owner));
+            return Err(format!("the PM {owner:?} is not one of the members; set `owner = \"<member id>\"` in project.toml"));
         }
 
         // Resolve assignment: explicit per-member rules win, else the role's
@@ -207,7 +212,7 @@ impl Team {
                 return Err(format!("assign.{key}: unknown member"));
             }
         }
-        Ok(Team { project: config.name.clone(), owner: config.owner.clone(), members, assign, settings: config.settings.clone() })
+        Ok(Team { project: config.name.clone(), owner, members, assign, settings: config.settings.clone() })
     }
 
     pub fn member(&self, id: &str) -> Option<&Member> {
@@ -340,6 +345,17 @@ role = "architect"
         let reserved = PROJECT.replace("id = \"architect\"", "id = \"human\"");
         assert!(Team::build(&ProjectConfig::parse(&reserved).unwrap(), &roles()).unwrap_err().contains("reserved"));
         assert!(ProjectConfig::parse("name = \"x\"\nmembers = []\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn the_pm_is_found_without_an_owner_key() {
+        let pm = PROJECT.replace("id = \"owner\"\nrole = \"owner\"", "id = \"pm\"\nrole = \"owner\"");
+        let team = Team::build(&ProjectConfig::parse(&pm).unwrap(), &roles()).unwrap();
+        assert_eq!(team.owner, "pm");
+        let old = Team::build(&ProjectConfig::parse(PROJECT).unwrap(), &roles()).unwrap();
+        assert_eq!(old.owner, "owner", "projects from before the rename keep working");
+        let named = format!("owner = \"tester\"\n{PROJECT}");
+        assert_eq!(Team::build(&ProjectConfig::parse(&named).unwrap(), &roles()).unwrap().owner, "tester");
     }
 
     #[test]

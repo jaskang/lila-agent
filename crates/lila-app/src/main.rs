@@ -1,4 +1,4 @@
-//! lila-app: watch and steer a Lila team. Talk to the owner in its terminal,
+//! lila-app: watch and steer a Lila team. Talk to the PM in its terminal,
 //! answer what needs you, follow the task board.
 
 mod app;

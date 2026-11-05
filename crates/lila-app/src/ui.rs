@@ -379,7 +379,7 @@ impl LilaApp {
         for i in &self.snap.inbox {
             if i["kind"] == "question" {
                 let id = s(i, "id");
-                self.answers.entry(id).or_insert_with(|| cx.new(|cx| gpui::component::input::InputState::new(window, cx).placeholder("回答 Owner…")));
+                self.answers.entry(id).or_insert_with(|| cx.new(|cx| gpui::component::input::InputState::new(window, cx).placeholder("回答 PM…")));
             }
         }
         let inbox = self.snap.inbox.len();
@@ -441,7 +441,7 @@ impl LilaApp {
             .px_2()
             .pb_3()
             .gap_3()
-            .when(empty, |d| d.child(div().pt_16().text_center().text_sm().text_color(theme.muted_foreground).child("还没有任务。点上方「新建任务」，或者在 Owner 的终端里提需求。")))
+            .when(empty, |d| d.child(div().pt_16().text_center().text_sm().text_color(theme.muted_foreground).child("还没有任务。点上方「新建任务」，或者在 PM 的终端里提需求。")))
             .children(groups.into_iter().filter(|(_, rows)| !rows.is_empty()).map(|(title, rows)| {
                 v_flex()
                     .gap_0p5()
@@ -504,7 +504,7 @@ impl LilaApp {
         let kind = s(&item, "kind");
         let member = item["member"].as_str().map(String::from);
         let (icon, accent, label_text) = match kind.as_str() {
-            "question" => (IconName::CircleAlert, theme.yellow, "Owner 在问你"),
+            "question" => (IconName::CircleAlert, theme.yellow, "PM 在问你"),
             "terminal" => (IconName::SquareTerminal, theme.red, "终端在等你"),
             "startup" => (IconName::TriangleAlert, theme.red, "启动卡住"),
             "stalled" => (IconName::TriangleAlert, theme.yellow, "没有回应"),

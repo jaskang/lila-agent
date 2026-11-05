@@ -8,7 +8,7 @@ need them. Your identity comes from `LILA_PROJECT` and `LILA_MEMBER`.
 
 A task arrives in your input:
 
-    <lila task="T12" from="owner" parent="T7" file=".lila/tasks/T12.md">
+    <lila task="T12" from="pm" parent="T7" file=".lila/tasks/T12.md">
     Title
 
     Details…
@@ -40,7 +40,7 @@ When it finishes or blocks you get a note.
 
 - `<lila note about="T12">…</lila>`: information (a teammate finished, is blocked,
   went quiet, a member ended). Act on it if it concerns your work.
-- `<lila answer q="Q3">…</lila>`: the person's answer to the owner's question.
+- `<lila answer q="Q3">…</lila>`: the person's answer to the PM's question.
 
 ## Looking around
 
@@ -49,7 +49,7 @@ When it finishes or blocks you get a note.
     lila task ls [--mine]  open tasks
     lila log               recent activity
 
-## The owner only
+## The PM only
 
     lila ask "<question>" [--option "<A>" --option "<B>"] [--task T12]
 
@@ -60,7 +60,7 @@ blockers to whoever assigned them with `lila task block`.
 
 Two members may send one piece of work back and forth a few times (default 3
 rounds, `max_rounds`). After that `lila task new` refuses: block your task and
-let the owner decide.
+let the PM decide.
 
 ## Sandboxes
 

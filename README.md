@@ -1,6 +1,6 @@
 # Lila
 
-用 [herdr-core](https://github.com/herdrdev/herdr-core) 运行一支由不同模型组成的编码 agent 团队。你只和 Owner 对话；Owner 规划任务并分派给团队；Lila 负责投递任务、传递结果，把需要你的事情放进收件箱。
+用 [herdr-core](https://github.com/herdrdev/herdr-core) 运行一支由不同模型组成的编码 agent 团队。你只和 PM（产品经理 & 设计师）对话；PM 规划任务并分派给团队；Lila 负责投递任务、传递结果，把需要你的事情放进收件箱。
 
 每个成员都是官方 CLI（`claude` / `codex`）的交互会话，用你的订阅登录，不需要 API key。
 
@@ -28,23 +28,23 @@ lila-app
 
 没有项目时，点窗口里的「新建项目…」选一个代码仓库：Lila 会创建 `.lila/project.toml` 并启动默认团队，不需要用命令行。
 
-窗口左边是团队和每个成员正在做什么，中间是选中成员的终端（默认 Owner，可以直接在里面对话），右边是需要你的事、任务看板和动态。
+窗口左边是团队和每个成员正在做什么，中间是选中成员的终端（默认 PM，可以直接在里面对话），右边是需要你的事、任务看板和动态。
 
 ## 使用
 
 ```sh
 cd ~/codes/shop
-lila init                     # 生成 .lila/project.toml（默认团队：owner、architect、engineer、tester）
+lila init                     # 生成 .lila/project.toml（默认团队：pm、architect、engineer、tester）
 lila up --brief "做一个登录页：邮箱 + 密码"
 ```
 
 `lila up` 会启动 lilad（运行在 herdr-core 终端里，名为 `lilad`），并为每个成员各开一个终端。第一次在某个目录启动时，Claude Code 和 Codex 会询问是否信任该目录；`lila inbox` 会提醒你去对应终端确认。
 
-在 herdr-app 里，或用 `hc attach lila-<项目>-owner`，和 Owner 对话。其余时间：
+在 lila-app、herdr-app 里，或用 `hc attach lila-<项目>-pm`，和 PM 对话。其余时间：
 
 ```sh
 lila status                   # 谁在做什么
-lila inbox                    # 需要你的事：Owner 的提问、终端里的权限确认、完成报告
+lila inbox                    # 需要你的事：PM 的提问、终端里的权限确认、完成报告
 lila answer Q3 "用 Stripe"     # 回答问题（不带文字则表示忽略这条）
 lila log                      # 最近的动态
 lila task edit T5 --append "…" # 给已派出的任务补充要求
@@ -71,6 +71,8 @@ lila down                     # 停止成员（任务会保留）
 
 - **项目**：仓库内的 `.lila/project.toml`，包括成员列表、可选的 `[assign]` 指派规则和 `[settings]`（`max_working`、`stall_minutes`、`startup_timeout_secs`、`max_chain_depth`、`max_rounds`）。`.lila/tasks/` 存放任务正文，`.lila/spool/` 是给沙箱用的文件通道，两者都已加入 `.lila/.gitignore`。
 
+- **PM**：项目里负责统筹、和你对话的成员由 `owner = "<成员 id>"` 指定（`lila init` 写的是 `pm`）。不写时先找 `pm`，再找 `owner`，所以改名之前建的项目照常能用。
+
 - `LILA_HOME=<目录>` 会把配置、数据库和 socket 全部放进这个目录，适合用来做实验。
 
 ## agent 侧
@@ -83,7 +85,7 @@ lila task done T12 --summary "…" [--file path]
 lila task block T12 --reason "…"
 lila task new --to tester --title "…" --body "…" --parent T12
 lila task edit T13 --append "…"          # 修正或补充已派出的任务
-lila ask "…" --option A --option B      # 仅 Owner 可用
+lila ask "…" --option A --option B      # 仅 PM 可用
 ```
 
 ## 开发
