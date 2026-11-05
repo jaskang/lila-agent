@@ -47,12 +47,18 @@ fn main() {
                         .detach();
                 }
                 // Open the shown project's settings once it has loaded.
-                if std::env::var_os("LILA_APP_SETTINGS").is_some() {
+                if let Ok(page) = std::env::var("LILA_APP_SETTINGS") {
                     let view = view.clone();
+                    let page = crate::settings::Page::parse(&page);
                     window
                         .spawn(cx, async move |cx| {
                             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.open_settings(window, cx)));
+                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| {
+                                v.open_settings_at(page, window, cx);
+                                if let Ok(role) = std::env::var("LILA_APP_SETTINGS_ADD") {
+                                    v.add_member(&role, window, cx);
+                                }
+                            }));
                         })
                         .detach();
                 }

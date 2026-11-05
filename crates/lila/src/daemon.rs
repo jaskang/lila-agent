@@ -133,7 +133,7 @@ impl<T: Terminals> Daemon<T> {
         let mut d = Daemon { store, term, paths, projects: BTreeMap::new(), path_env, lila_bin, log: Vec::new(), failed_sends: BTreeMap::new(), live_version: 0 };
         let rows = d.store.projects().unwrap_or_default();
         for p in rows {
-            if let Err(e) = d.load_project(&p.id, Path::new(&p.cwd)) {
+            if let Err(e) = d.load_project(&p.id, Path::new(&p.cwd), now_ms()) {
                 d.say(format!("project {}: not loaded: {e:#}", p.id));
             }
         }
@@ -153,7 +153,9 @@ impl<T: Terminals> Daemon<T> {
         }
     }
 
-    fn load_project(&mut self, id: &str, cwd: &Path) -> Result<()> {
+    /// Reads a project's team. Members it no longer lists are stopped and their
+    /// open tasks cancelled (also when they left while lilad was not running).
+    fn load_project(&mut self, id: &str, cwd: &Path, now: i64) -> Result<Vec<String>> {
         let team = load_team(cwd, &self.paths.roles())?;
         if team.project != id {
             bail!("project.toml now names it {:?}; it was registered as {id:?}", team.project);
@@ -169,12 +171,32 @@ impl<T: Terminals> Daemon<T> {
                 }
             }
         }
-        live.retain(|mid, _| team.member(mid).is_some());
+        let in_team = |m: &str| team.member(m).is_some();
+        let mut terminals: BTreeMap<String, Option<String>> = live.iter().filter(|(m, _)| !in_team(m)).map(|(k, v)| (k.clone(), v.terminal.clone())).collect();
+        live.retain(|mid, _| in_team(mid));
         for m in &team.members {
             live.entry(m.id.clone()).or_default();
         }
+        for row in self.store.members(id)? {
+            if !in_team(&row.id) {
+                let t = terminals.remove(&row.id).flatten().or(row.terminal);
+                terminals.insert(row.id, t);
+            }
+        }
+        for (t, _) in self.store.tasks(id)? {
+            if t.state.is_open() && !in_team(&t.to) {
+                terminals.entry(t.to).or_default();
+            }
+        }
         self.projects.insert(id.to_owned(), Proj { cwd: cwd.to_path_buf(), team, live });
-        Ok(())
+        let removed: Vec<String> = terminals.keys().cloned().collect();
+        for (mid, terminal) in terminals {
+            self.member_removed(id, &mid, terminal, now);
+        }
+        if !removed.is_empty() {
+            self.pump(id, now);
+        }
+        Ok(removed)
     }
 
     // ---------------- requests ----------------
@@ -186,7 +208,7 @@ impl<T: Terminals> Daemon<T> {
             "ping" => Ok(json!({"pong": true, "pid": std::process::id()})),
             "project.up" => self.project_up(&caller, params, now),
             "project.down" => self.project_down(&caller, now),
-            "project.reload" => self.project_reload(&caller),
+            "project.reload" => self.project_reload(&caller, now),
             "member.restart" => self.member_restart(&caller, params, now),
             "projects" => Ok(json!(self.projects.iter().map(|(id, p)| json!({"id": id, "cwd": p.cwd})).collect::<Vec<_>>())),
             "status" => self.status(&caller),
@@ -249,7 +271,7 @@ impl<T: Terminals> Daemon<T> {
         let pid = team.project.clone();
         let root_s = root.to_string_lossy().to_string();
         self.store.upsert_project(&pid, &root_s, now)?;
-        self.load_project(&pid, &root)?;
+        self.load_project(&pid, &root, now)?;
         std::fs::create_dir_all(root.join(".lila").join("tasks"))?;
         std::fs::create_dir_all(spool_dir(&root))?;
         ensure_gitignore(&root)?;
@@ -350,16 +372,55 @@ impl<T: Terminals> Daemon<T> {
 
     /// Reads project.toml and the roles again (after the settings changed).
     /// Running members keep running; `status` marks those on old settings `stale`.
-    fn project_reload(&mut self, caller: &Value) -> Result<Value> {
+    fn project_reload(&mut self, caller: &Value, now: i64) -> Result<Value> {
         let (pid, actor) = self.who(caller)?;
         if actor != Actor::Human {
             bail!("only the person reloads a project");
         }
         let cwd = self.projects[&pid].cwd.clone();
-        self.load_project(&pid, &cwd)?;
+        let removed = self.load_project(&pid, &cwd, now)?;
         self.live_version += 1;
         let stale: Vec<String> = self.stale_members(&pid);
-        Ok(json!({"project": pid, "stale": stale}))
+        Ok(json!({"project": pid, "stale": stale, "removed": removed}))
+    }
+
+    /// A member left the team (the settings removed it): its CLI stops, and its
+    /// open tasks are cancelled, which whoever assigned them hears about.
+    fn member_removed(&mut self, pid: &str, mid: &str, terminal: Option<String>, now: i64) {
+        if let Some(t) = &terminal
+            && let Err(e) = self.term.kill(t)
+        {
+            self.say(format!("{pid}: kill removed {mid} ({t}): {e:#}"));
+        }
+        let _ = self.store.remove_member(pid, mid);
+        let owner = self.projects[pid].team.owner.clone();
+        let mut cancelled = Vec::new();
+        for (t, _) in self.store.tasks(pid).unwrap_or_default() {
+            if t.to != mid || !t.state.is_open() {
+                continue;
+            }
+            let why = format!("{mid} was removed from the team");
+            if self.store.transition(pid, &t.id, Transition::Cancel, &Actor::Human, &why, now).is_err() {
+                continue;
+            }
+            if let Actor::Member(from) = &t.from
+                && *from != owner
+                && self.projects[pid].team.member(from).is_some()
+            {
+                let _ = self.store.push_outbox(pid, from, &message::note(&t.id, &format!("{} \"{}\" was cancelled: {why}. Hand it to someone else if it is still needed.", t.id, t.title)), now);
+            }
+            cancelled.push(format!("{} \"{}\" (from {})", t.id, t.title, t.from));
+        }
+        for kind in ["terminal", "startup", "lost", "stalled"] {
+            self.resolve_open(pid, kind, mid, now);
+        }
+        let detail = if cancelled.is_empty() { String::new() } else { format!("; cancelled {}", cancelled.join(", ")) };
+        let _ = self.store.event(pid, None, "lilad", "member_removed", &format!("{mid}{detail}"), now);
+        self.say(format!("{pid}: {mid} removed{detail}"));
+        if !cancelled.is_empty() {
+            let text = format!("{mid} was removed from the team. Its open tasks were cancelled: {}. Re-assign what is still needed.", cancelled.join("; "));
+            let _ = self.store.push_outbox(pid, &owner, &message::note(mid, &text), now);
+        }
     }
 
     /// Running members started with other settings than the project has now.

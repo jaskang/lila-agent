@@ -9,5 +9,5 @@ pub mod prompt;
 pub mod runtime;
 pub mod task;
 
-pub use config::{Member, ProjectConfig, Role, RoleFile, Runtime, Settings, Team};
+pub use config::{Member, ProjectConfig, Role, RoleFile, Runtime, Settings, Team, validate_id};
 pub use task::{Actor, Task, TaskState, Transition};

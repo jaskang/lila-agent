@@ -653,3 +653,42 @@ fn a_waiting_note_is_read_before_a_new_session() {
     w.status("engineer", "idle");
     assert_eq!(w.d.term.kills.len(), 1);
 }
+
+#[test]
+fn a_removed_member_stops_and_its_tasks_are_cancelled() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build"}));
+    w.ok(Some("engineer"), "task.new", json!({"to": "tester", "title": "Check build", "parent": "T1"}));
+    let tester = w.terminal("tester");
+    std::fs::write(w.repo.join(".lila/project.toml"), PROJECT.replace("[[members]]\nid = \"tester\"\nrole = \"tester\"\n", "")).unwrap();
+    let r = w.ok(None, "project.reload", json!({}));
+    assert_eq!(r["removed"], json!(["tester"]));
+    assert!(w.d.term.kills.contains(&tester));
+    assert_eq!(w.state("T2"), TaskState::Cancelled);
+    assert!(w.sends_to("engineer").iter().any(|s| s.contains("T2 \"Check build\" was cancelled: tester was removed")));
+    assert!(w.sends_to("owner").iter().any(|s| s.contains("tester was removed from the team. Its open tasks were cancelled: T2")));
+    assert!(!w.d.projects["shop"].live.contains_key("tester"));
+    let status = w.ok(None, "status", json!({}));
+    assert!(!status["members"].as_array().unwrap().iter().any(|m| m["id"] == "tester"));
+}
+
+#[test]
+fn a_member_removed_while_lilad_was_down_is_cleaned_up() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    let tester = w.terminal("tester");
+    w.ok(None, "task.new", json!({"to": "tester", "title": "Check"}));
+    std::fs::write(w.repo.join(".lila/project.toml"), PROJECT.replace("[[members]]\nid = \"tester\"\nrole = \"tester\"\n", "")).unwrap();
+    // A new lilad on the same database.
+    let paths = w.d.paths.clone();
+    let mut d = Daemon::new(Store::open(&paths.db()).unwrap(), Fake::default(), paths, String::new(), PathBuf::from("/opt/lila/bin/lila"));
+    assert!(d.term.kills.contains(&tester));
+    assert_eq!(d.store.task("shop", "T1").unwrap().unwrap().state, TaskState::Cancelled);
+    assert!(!d.store.members("shop").unwrap().iter().any(|m| m.id == "tester"));
+    let again = Daemon::new(Store::open(&d.paths.db()).unwrap(), Fake::default(), d.paths.clone(), String::new(), PathBuf::from("/x"));
+    assert!(again.term.kills.is_empty(), "only once");
+    d.tick(w.now);
+}

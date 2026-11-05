@@ -79,7 +79,7 @@ cargo run -p lila-app
 
 - `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG。画面不包含系统的红绿灯；红绿灯的尺寸会打在 stderr 里（`close button WxH at (x, y)`）。
 - `LILA_APP_SWITCH=a,b,...`：每 3 秒切换到下一个项目。
-- `LILA_APP_SETTINGS=1`：启动 1.5 秒后打开项目设置。
+- `LILA_APP_SETTINGS=members|assign|rules`：启动 1.5 秒后打开项目设置的那一页。再加 `LILA_APP_SETTINGS_ADD=<角色>` 会顺便加一个新成员。
 - `LILA_APP_OPEN_TASK=T3`：打开任务详情。
 - `LILA_APP_COMPOSE=<成员>`：打开新建任务表单。
 - `LILA_APP_DEBUG=1`：每次刷新打一行日志。
@@ -94,7 +94,7 @@ macOS 上没有 `timeout` 命令。要让程序在后台跑一会儿再停，可
 
 所有分支都还没推送。分支依次叠加：
 
-- `main` → `docs/design-and-m0` → `m1-orchestration` → `m1-followups` → `m2-gui`（当前分支）。
+- `main` → `docs/design-and-m0` → `m1-orchestration` → `m1-followups` → `m2-gui` → `m3`（当前分支）。M3 的顺序和进度见 `docs/m3.md`。
 - `m2-gui` 最新的提交是 `61302f9`，加了项目设置、左侧项目列表和顶部打开的标签。
 - 提交信息用英文，末尾加 `Co-Authored-By` 署名行。只在用户要求时提交；推送前要先问。
 
@@ -114,9 +114,7 @@ macOS 上没有 `timeout` 命令。要让程序在后台跑一会儿再停，可
 
 ## 待办（用户还没要求做的）
 
-- 上下文膨胀：长时间运行的成员上下文越来越大（M3）。
 - 订阅额度用完时成员会怎样：还没观察到过（见 `docs/m1.md`）。
 - 终端：Option 当 Alt 用（herdr 是靠它打过补丁的 gpui_macos 实现的）、kitty 图片。
 - 角色库编辑器（编辑全局角色），新建项目向导（设计 §10.2，M3）。
 - 项目编号本身的改名：现在只能改显示名，改编号会牵涉数据库和终端名。
-- 项目设置里还不能增删成员、改指派规则和 `[settings]`。
