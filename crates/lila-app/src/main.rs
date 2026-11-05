@@ -40,7 +40,7 @@ fn main() {
                             for id in list.split(',').map(str::to_owned) {
                                 cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
                                 eprintln!("[lila-app] {} switch to {id}", data::clock_ms());
-                                let _ = view.update(cx, |v, cx| v.select_project(id, cx));
+                                view.update(cx, |v, cx| v.select_project(id, cx));
                             }
                         })
                         .detach();
