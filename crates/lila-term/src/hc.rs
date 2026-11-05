@@ -233,6 +233,16 @@ fn read_frame(r: &mut impl Read) -> Option<(u32, u8, Vec<u8>)> {
 }
 
 impl Core {
+    /// In-memory outbound frames for view tests; no herdr daemon or model CLI.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
+        let (writer, frames) = mpsc::channel();
+        let (_, lost) = async_channel::bounded(1);
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        (Arc::new(Self { hello: Value::Null, writer, routes: Arc::new(Mutex::new(Routes::default())), next_id: AtomicU64::new(1), child: Mutex::new(child), lost }), frames)
+    }
+
     /// Connects to the user's core (starting it if needed) and switches to framed mode.
     pub fn connect() -> Result<Arc<Core>> {
         let mut child = std::process::Command::new(hc_bin())

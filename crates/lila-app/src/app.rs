@@ -380,7 +380,14 @@ impl LilaApp {
         let alive = self.members().iter().any(|m| m["terminal"] == address && m["status"] != "gone");
         let stale = self.terminals.get(address).is_some_and(|v| v.read(cx).ended().is_some() && alive);
         if stale || !self.terminals.contains_key(address) {
-            let view = cx.new(|cx| TerminalView::new(core, address.to_owned(), false, window, cx));
+            let cwd = self.project().map(|p| std::path::PathBuf::from(p.cwd));
+            let view = cx.new(|cx| {
+                let mut view = TerminalView::new(core, address.to_owned(), false, window, cx);
+                if let Some(cwd) = cwd {
+                    view.set_working_directory(cwd);
+                }
+                view
+            });
             self.terminals.insert(address.to_owned(), view);
         }
         self.terminals.get(address).cloned()
@@ -416,7 +423,7 @@ impl Render for LilaApp {
 }
 
 impl LilaApp {
-    /// Window-wide keys. A focused terminal keeps everything but ⌘ chords (other than ⌘C/⌘V).
+    /// Window-wide keys. The terminal handles copy, paste and find; other ⌘ chords bubble here.
     fn shortcut(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         if k.key == "escape" && (self.task.is_some() || self.draft.is_some() || self.settings.is_some()) {

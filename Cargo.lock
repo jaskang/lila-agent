@@ -3849,6 +3849,7 @@ dependencies = [
  "gpui-pre",
  "png 0.17.16",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 

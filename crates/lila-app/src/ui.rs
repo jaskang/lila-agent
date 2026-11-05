@@ -289,10 +289,14 @@ impl LilaApp {
         let member = self.shown_member();
         let cwd = self.project().map(|p| data::tilde(&p.cwd)).unwrap_or_default();
         let address = member.as_ref().map(|m| s(m, "terminal")).filter(|a| !a.is_empty());
+        let mut terminal_view = None;
         let body: AnyElement = match (address, &self.core_error) {
             (_, Some(e)) => placeholder(e.clone(), cx).into_any_element(),
             (Some(addr), None) => match self.terminal(&addr, window, cx) {
-                Some(view) => div().flex_1().min_h_0().child(view).into_any_element(),
+                Some(view) => {
+                    terminal_view = Some(view.clone());
+                    div().flex_1().min_h_0().child(view).into_any_element()
+                }
                 None => placeholder("正在连接 herdr-core…".into(), cx).into_any_element(),
             },
             (None, None) if self.project().is_none() && !self.snap.projects.is_empty() => v_flex()
@@ -355,6 +359,11 @@ impl LilaApp {
                 })
                 .child(div().text_xs().text_color(status_color(&status, cx)).child(status_label(&status)))
                 .child(status_mark(&status, cx))
+                .when_some(terminal_view, |d, view| {
+                    d.child(Button::new("terminal-find").ghost().xsmall().icon(IconName::Search).tooltip("搜索终端历史 (⌘F)").on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| view.open_search(window, cx));
+                    }))
+                })
         });
         let working = member.as_ref().is_some_and(|m| m["status"] == "working" || m["status"] == "blocked");
         let border = match member.as_ref().map(|m| s(m, "status")).as_deref() {

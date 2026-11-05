@@ -158,3 +158,30 @@ fn open_system(arg: &std::ffi::OsStr) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{Target, find, resolve};
+
+    #[test]
+    fn urls_exclude_sentence_punctuation() {
+        let text = "See https://example.com/docs, then continue.";
+        let at = text.find("example").unwrap();
+        assert_eq!(&text[find(text, at).unwrap()], "https://example.com/docs");
+        assert_eq!(resolve("https://example.com/docs", None), Some(Target::Url("https://example.com/docs".into())));
+        assert!(find(text, 0).is_none());
+    }
+
+    #[test]
+    fn file_links_use_the_project_directory_and_strip_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("src/main.rs");
+        std::fs::create_dir(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        for text in ["src/main.rs", "src/main.rs:42", "src/main.rs:42:7."] {
+            assert_eq!(resolve(text, Some(dir.path())), Some(Target::File(file.clone())));
+        }
+        assert!(resolve("src/main.rs", None).is_none());
+        assert!(resolve("src/missing.rs", Some(dir.path())).is_none());
+    }
+}
+

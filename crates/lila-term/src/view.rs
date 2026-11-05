@@ -2,14 +2,20 @@
 //! Key encoding, IME handling and row painting follow herdr-app's terminal.rs.
 
 use crate::hc::{Core, Stream};
+use crate::links;
 use crate::vt::{self, CursorShape, Rgb, Select, Vt};
 use ghostty_sys::*;
+use gpui::component::button::{Button, ButtonVariants};
+use gpui::component::input::{Input, InputEvent, InputState};
+use gpui::component::{ActiveTheme, Disableable, IconName, Sizable, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::*;
 use serde_json::json;
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn hsla(c: Rgb) -> Hsla {
     Rgba { r: c.0 as f32 / 255.0, g: c.1 as f32 / 255.0, b: c.2 as f32 / 255.0, a: 1.0 }.into()
@@ -32,12 +38,12 @@ struct Grid {
 }
 
 impl Grid {
-    fn fit(&mut self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
+    fn fit(&mut self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) -> bool {
         self.cell = cell;
         self.scale = scale;
         let dev = device_cell(cell, scale);
         if (cols, rows) == (self.vt.cols, self.vt.rows) && dev == self.vt_cell {
-            return;
+            return false;
         }
         self.vt.resize(cols, rows, dev.0, dev.1);
         self.vt_cell = dev;
@@ -48,6 +54,7 @@ impl Grid {
             let replies = self.vt.take_replies();
             self.core.automatic_input(ch, &replies);
         }
+        true
     }
 
     fn send(&self, bytes: &[u8]) {
@@ -88,15 +95,26 @@ fn grid_size(bounds: Size<Pixels>, cell: Size<Pixels>) -> (u16, u16) {
 /// The key context terminals render in.
 pub const KEY_CONTEXT: &str = "Terminal";
 
+actions!(lila_terminal, [Find, FindNext, FindPrevious, CloseFind]);
+
 /// Keys the window binds that a terminal must get as typing instead. gpui-kit's
 /// Root binds Tab / Shift-Tab to focus moves and ⌘C to copying its own text
 /// selection; inside a terminal they go to the program (and ⌘C copies the
-/// terminal's selection, see `key_down`). Call once, after `gpui_kit::init`.
+/// terminal's selection, see `key_down`). Find bindings cover both the grid
+/// and its input, so the input's own editor search cannot take them over.
+/// Call once, after `gpui_kit::init`.
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("tab", NoAction, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-tab", NoAction, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-c", NoAction, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-f", Find, Some("LilaTerminal")),
+        KeyBinding::new("cmd-f", Find, Some("LilaTerminal > Input")),
+        KeyBinding::new("cmd-g", FindNext, Some("LilaTerminal")),
+        KeyBinding::new("cmd-g", FindNext, Some("LilaTerminal > Input")),
+        KeyBinding::new("cmd-shift-g", FindPrevious, Some("LilaTerminal")),
+        KeyBinding::new("cmd-shift-g", FindPrevious, Some("LilaTerminal > Input")),
+        KeyBinding::new("escape", CloseFind, Some("TerminalSearch > Input")),
     ]);
 }
 
@@ -110,6 +128,16 @@ pub struct TerminalView {
     /// Touchpad movement not yet a whole line (per axis, reset at each gesture).
     scrolled: Point<f32>,
     selecting: bool,
+    /// Relative file links start at the project's shared working directory.
+    cwd: Option<PathBuf>,
+    search_open: bool,
+    search_input: Option<Entity<InputState>>,
+    _search_subscription: Option<Subscription>,
+    _search_work: Option<Task<()>>,
+    pointer: Option<Point<Pixels>>,
+    hover_cell: Option<(u16, u16)>,
+    hovered: Option<(vt::LinkHit, links::Target)>,
+    pressed_link: Option<(links::Target, Point<Pixels>)>,
     _reader: Option<Task<()>>,
 }
 
@@ -130,7 +158,12 @@ impl TerminalView {
             observe,
             scale: window.scale_factor(),
         }));
-        let mut view = TerminalView { address, grid, focus: cx.focus_handle(), ended: None, title: None, scrolled: point(0.0, 0.0), selecting: false, _reader: None };
+        let mut view = TerminalView {
+            address, grid, focus: cx.focus_handle(), ended: None, title: None,
+            scrolled: point(0.0, 0.0), selecting: false, cwd: None,
+            search_open: false, search_input: None, _search_subscription: None, _search_work: None,
+            pointer: None, hover_cell: None, hovered: None, pressed_link: None, _reader: None,
+        };
         view.attach(window, cx);
         view
     }
@@ -222,6 +255,10 @@ impl TerminalView {
                 self.title = Some(t);
             }
         }
+        self.clear_hover();
+        if self.search_open {
+            self.drive_search(cx);
+        }
         cx.notify();
         open
     }
@@ -234,8 +271,157 @@ impl TerminalView {
         self.ended.as_deref()
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+    /// Initial directory for relative file links (members currently share it).
+    pub fn set_working_directory(&mut self, cwd: PathBuf) {
+        self.cwd = Some(cwd);
+    }
+
+    pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.grid.borrow().observe {
+            return;
+        }
+        if self.search_input.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索终端历史…"));
+            self._search_subscription = Some(cx.subscribe_in(&input, window, |this, input, event, _, cx| match event {
+                InputEvent::Change if this.search_open => {
+                    this.grid.borrow_mut().vt.start_search(&input.read(cx).value());
+                    this.drive_search(cx);
+                    cx.notify();
+                }
+                InputEvent::PressEnter { shift, .. } => this.navigate_search(*shift, cx),
+                _ => {}
+            }));
+            self.search_input = Some(input);
+        }
+        self.search_open = true;
+        self.clear_hover();
+        let input = self.search_input.as_ref().unwrap();
+        self.grid.borrow_mut().vt.start_search(&input.read(cx).value());
+        input.update(cx, |s, cx| {
+            s.focus(window, cx);
+            s.select_all(window, cx);
+        });
+        self.drive_search(cx);
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = false;
+        self._search_work = None;
+        self.grid.borrow_mut().vt.clear_search();
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn navigate_search(&mut self, previous: bool, cx: &mut Context<Self>) {
+        if self.search_open {
+            self.grid.borrow_mut().vt.search_navigate(previous);
+            self.clear_hover();
+            cx.notify();
+        }
+    }
+
+    /// Search incrementally; stop scheduling frames as soon as indexing ends.
+    fn drive_search(&mut self, cx: &mut Context<Self>) {
+        self._search_work = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let more = this.update(cx, |this, cx| {
+                    let mut g = this.grid.borrow_mut();
+                    if g.vt.progress_search() {
+                        cx.notify();
+                    }
+                    this.search_open && !g.vt.search_progress().complete
+                });
+                if !matches!(more, Ok(true)) {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_millis(16)).await;
+            }
+        }));
+    }
+
+    fn search_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.search_open {
+            return None;
+        }
+        let input = self.search_input.as_ref()?;
+        let progress = self.grid.borrow().vt.search_progress();
+        let count = if input.read(cx).value().is_empty() {
+            "输入关键词".to_owned()
+        } else if !progress.complete {
+            format!("搜索中 · {}", progress.total)
+        } else if let Some(index) = progress.selected {
+            format!("{} / {}", index + 1, progress.total)
+        } else {
+            format!("{} 处匹配", progress.total)
+        };
+        let disabled = progress.total == 0 || !progress.complete;
+        Some(h_flex()
+            .key_context("TerminalSearch")
+            .h(px(38.)).flex_none().px_2().gap_1()
+            .bg(cx.theme().background).border_b_1().border_color(cx.theme().border)
+            .child(div().flex_1().min_w_0().child(Input::new(input).small()))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(count))
+            .child(Button::new("find-previous").ghost().xsmall().icon(IconName::ChevronUp).tooltip("上一处 (⇧Enter / ⇧⌘G)").disabled(disabled).on_click(cx.listener(|this, _, _, cx| this.navigate_search(true, cx))))
+            .child(Button::new("find-next").ghost().xsmall().icon(IconName::ChevronDown).tooltip("下一处 (Enter / ⌘G)").disabled(disabled).on_click(cx.listener(|this, _, _, cx| this.navigate_search(false, cx))))
+            .child(Button::new("find-close").ghost().xsmall().icon(IconName::Close).tooltip("关闭搜索 (Esc)").on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx))))
+            .into_any_element())
+    }
+
+    fn clear_hover(&mut self) {
+        self.hovered = None;
+        self.hover_cell = None;
+    }
+
+    fn link_at(&self, pos: Point<Pixels>) -> Option<(vt::LinkHit, links::Target)> {
+        let g = self.grid.borrow();
+        let x = f32::from(pos.x - g.origin.x);
+        let y = f32::from(pos.y - g.origin.y);
+        if x < 0.0 || y < 0.0 || x >= f32::from(g.cell.width) * g.vt.cols as f32 || y >= f32::from(g.cell.height) * g.vt.rows as f32 {
+            return None;
+        }
+        let hit = g.vt.link_at((x / f32::from(g.cell.width)) as u16, (y / f32::from(g.cell.height)) as u16, |text, at, _| {
+            let range = links::find(text, at)?;
+            links::resolve(&text[range.clone()], self.cwd.as_deref()).map(|_| range)
+        })?;
+        let target = links::resolve(&hit.target, self.cwd.as_deref())?;
+        Some((hit, target))
+    }
+
+    fn hover_link(&mut self, pos: Point<Pixels>, modifiers: Modifiers, cx: &mut Context<Self>) {
+        self.pointer = Some(pos);
+        if !link_modifier(modifiers) || self.selecting {
+            if self.hovered.is_some() {
+                self.clear_hover();
+                cx.notify();
+            }
+            return;
+        }
+        let (col, row, x, y) = self.cell_at(pos);
+        let g = self.grid.borrow();
+        let inside = pos.x >= g.origin.x && pos.y >= g.origin.y
+            && x < f32::from(g.cell.width) * g.vt.cols as f32 && y < f32::from(g.cell.height) * g.vt.rows as f32;
+        drop(g);
+        if !inside {
+            self.clear_hover();
+            cx.notify();
+            return;
+        }
+        if self.hover_cell == Some((col, row)) {
+            return;
+        }
+        self.hovered = self.link_at(pos);
+        self.hover_cell = Some((col, row));
+        cx.notify();
+    }
+
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
+        if k.key == "escape" && self.search_open {
+            self.close_search(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if k.modifiers.platform {
             match k.key.as_str() {
                 "v" => {
@@ -273,6 +459,7 @@ impl TerminalView {
     /// shell's screen scrolls its history.
     fn scroll(&mut self, ev: &ScrollEvent, _w: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        self.clear_hover();
         let mut g = self.grid.borrow_mut();
         let (cell, cols, rows) = (g.cell, g.vt.cols, g.vt.rows);
         let steps = scroll_delta_steps(&mut self.scrolled, ev.delta, ev.touch_phase, cell, cols, rows);
@@ -295,6 +482,10 @@ impl TerminalView {
             g.send(&out);
         } else {
             g.vt.scroll_viewport(-(n as isize));
+        }
+        drop(g);
+        if self.search_open {
+            self.drive_search(cx);
         }
         cx.notify();
     }
@@ -548,13 +739,18 @@ impl Render for TerminalView {
         let grid_paint = self.grid.clone();
         let input_view = cx.entity();
         let input_focus = self.focus.clone();
+        let resize_view = cx.entity().downgrade();
         let observe = self.grid.borrow().observe;
         let ended = self.ended.clone();
-        div()
+        let search = self.search_bar(cx);
+        let hovered = self.hovered.clone();
+        let link_spans = hovered.as_ref().map(|(hit, _)| hit.spans.clone()).unwrap_or_default();
+        let terminal = div()
             .id(SharedString::from(format!("term-{}", self.address)))
-            .size_full()
+            .flex_1().min_h_0().w_full()
             .relative()
             .bg(hsla(vt::theme().bg))
+            .cursor(if hovered.is_some() { CursorStyle::PointingHand } else { CursorStyle::IBeam })
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .when(!observe, |d| {
@@ -563,6 +759,15 @@ impl Render for TerminalView {
                         MouseButton::Left,
                         cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                             window.focus(&this.focus, cx);
+                            if link_modifier(ev.modifiers)
+                                && let Some((_, target)) = this.link_at(ev.position)
+                            {
+                                this.selecting = false;
+                                this.pressed_link = Some((target, ev.position));
+                                cx.stop_propagation();
+                                return;
+                            }
+                            this.pressed_link = None;
                             this.selecting = true;
                             this.select(Select::Press, ev.position, cx);
                         }),
@@ -570,11 +775,35 @@ impl Render for TerminalView {
                     .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                         if this.selecting && ev.pressed_button == Some(MouseButton::Left) {
                             this.select(Select::Drag, ev.position, cx);
+                        } else {
+                            this.hover_link(ev.position, ev.modifiers, cx);
+                        }
+                    }))
+                    .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, _, cx| {
+                        if let Some(pos) = this.pointer {
+                            this.hover_cell = None;
+                            this.hover_link(pos, ev.modifiers, cx);
+                        }
+                    }))
+                    .on_hover(cx.listener(|this, hovered, _, cx| {
+                        if !hovered {
+                            this.pointer = None;
+                            this.clear_hover();
+                            cx.notify();
                         }
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                            if let Some((target, start)) = this.pressed_link.take() {
+                                if link_modifier(ev.modifiers) && short_click(start, ev.position)
+                                    && this.link_at(ev.position).is_some_and(|(_, at)| at == target)
+                                {
+                                    links::open(&target);
+                                }
+                                cx.stop_propagation();
+                                return;
+                            }
                             if this.selecting {
                                 this.selecting = false;
                                 this.select(Select::Release, ev.position, cx);
@@ -585,12 +814,23 @@ impl Render for TerminalView {
             .on_scroll(cx.listener(Self::scroll))
             .child(
                 canvas(
-                    move |bounds, window, _cx| {
+                    move |bounds, window, cx| {
                         let (cols, rows) = grid_size(bounds.size, cell);
-                        grid.borrow_mut().fit(cols, rows, cell, window.scale_factor());
+                        if grid.borrow_mut().fit(cols, rows, cell, window.scale_factor()) {
+                            let view = resize_view.clone();
+                            cx.defer(move |cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.clear_hover();
+                                    if this.search_open {
+                                        this.drive_search(cx);
+                                    }
+                                    cx.notify();
+                                });
+                            });
+                        }
                     },
                     move |bounds, _, window, cx| {
-                        paint_grid(bounds, &grid_paint, focused, window, cx);
+                        paint_grid(bounds, &grid_paint, focused, &link_spans, window, cx);
                         if focused {
                             window.handle_input(&input_focus, ElementInputHandler::new(bounds, input_view), cx);
                         }
@@ -613,10 +853,31 @@ impl Render for TerminalView {
                         .child(format!("[{why}]")),
                 )
             })
+            .when_some(hovered, |d, (hit, _)| {
+                d.child(div().absolute().bottom_0().left_0().max_w_full().px_2().py_1().text_xs().truncate()
+                    .bg(hsla(Rgb(0x32, 0x38, 0x44))).text_color(hsla(vt::theme().fg)).child(hit.target))
+            });
+        v_flex()
+            .size_full().min_h_0()
+            .key_context("LilaTerminal")
+            .on_action(cx.listener(|this, _: &Find, window, cx| this.open_search(window, cx)))
+            .on_action(cx.listener(|this, _: &FindNext, _, cx| this.navigate_search(false, cx)))
+            .on_action(cx.listener(|this, _: &FindPrevious, _, cx| this.navigate_search(true, cx)))
+            .on_action(cx.listener(|this, _: &CloseFind, window, cx| this.close_search(window, cx)))
+            .children(search)
+            .child(terminal)
     }
 }
 
-fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, window: &mut Window, cx: &mut App) {
+fn link_modifier(m: Modifiers) -> bool {
+    m.platform && !m.control && !m.alt && !m.shift
+}
+
+fn short_click(start: Point<Pixels>, end: Point<Pixels>) -> bool {
+    (f32::from(start.x - end.x)).abs() <= 4.0 && (f32::from(start.y - end.y)).abs() <= 4.0
+}
+
+fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, link_spans: &vt::Spans, window: &mut Window, cx: &mut App) {
     let mut g = grid.borrow_mut();
     let cell = g.cell;
     let scale = window.scale_factor();
@@ -651,6 +912,10 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
             }
             window.paint_quad(fill(snap_box(Bounds::new(at(start, y), size(cell.width * (x - start) as f32, cell.height))), hsla(bg)));
         }
+    }
+    for span in &frame.search_spans {
+        let color = if span.selected { Rgb(0x85, 0x5c, 0x22) } else { Rgb(0x54, 0x48, 0x22) };
+        window.paint_quad(fill(snap_box(Bounds::new(at(span.start as usize, span.row as usize), size(cell.width * (span.end - span.start + 1) as f32, cell.height))), hsla(color)));
     }
     // Text in runs of one style; box drawing as sprites; wide characters alone.
     for (y, row) in frame.rows.iter().enumerate() {
@@ -699,6 +964,11 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         }
     }
 
+    for &(row, start, end) in link_spans {
+        let p = at(start as usize, row as usize) + point(px(0.), cell.height - px(1.));
+        window.paint_quad(fill(snap_box(Bounds::new(p, size(cell.width * (end - start + 1) as f32, px(1.)))), hsla(vt::theme().fg)));
+    }
+
     if let Some(cur) = frame.cursor {
         let (x, y) = (cur.x as usize, cur.y as usize);
         let wide = frame.rows.get(y).and_then(|r| r.get(x)).is_some_and(|c| c.wide);
@@ -728,6 +998,129 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         let _ = line.paint(p, cell.height, TextAlign::Left, None, window, cx);
     }
     grid.borrow_mut().cursor_at = frame.cursor_cell.map(|(x, y)| Bounds::new(at(x as usize, y as usize), cell));
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::{Core, Stream, TerminalView, links};
+    use gpui::{AnyWindowHandle, AppContext, Entity, Modifiers, MouseButton, TestAppContext, VisualTestContext, point, px, size};
+    use std::sync::mpsc::Receiver;
+    use std::time::Duration;
+
+    fn terminal(cx: &mut TestAppContext, text: &[u8]) -> (Entity<TerminalView>, AnyWindowHandle, Receiver<Vec<u8>>) {
+        cx.update(|cx| {
+            gpui::init(cx);
+            super::init(cx);
+        });
+        let (core, frames) = Core::for_test();
+        let mut view = None;
+        let window = cx.add_window(|window, cx| {
+            let terminal = cx.new(|cx| {
+                let mut view = TerminalView::new(core, "test".into(), false, window, cx);
+                // Cancel attach before its future runs; keep the real view,
+                // VT and input dispatch, with only the transport replaced.
+                view._reader = None;
+                view.grid.borrow_mut().channel = Some(7);
+                view.grid.borrow_mut().vt.write(text);
+                view
+            });
+            let focus = terminal.read(cx).focus.clone();
+            window.focus(&focus, cx);
+            view = Some(terminal.clone());
+            gpui::base::Root::new(terminal, window, cx)
+        });
+        (view.unwrap(), window.into(), frames)
+    }
+
+    #[gpui::test]
+    fn search_keys_and_text_stay_out_of_the_terminal(cx: &mut TestAppContext) {
+        let (view, window, frames) = terminal(cx, b"needle one\r\nneedle two\r\nother");
+        let mut cx = VisualTestContext::from_window(window, cx);
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert!(view.search_open);
+            assert_eq!(view.grid.borrow().vt.search_progress().total, 2);
+        });
+        for (keys, selected) in [("enter", 0), ("cmd-g", 1), ("cmd-shift-g", 0), ("shift-enter", 1)] {
+            cx.simulate_keystrokes(keys);
+            cx.update(|_, cx| assert_eq!(view.read(cx).grid.borrow().vt.search_progress().selected, Some(selected)));
+        }
+        cx.update(|_, cx| view.update(cx, |view, cx| {
+            view.ingest(vec![Stream::Data(b"\r\nneedle three".to_vec())], cx);
+        }));
+        cx.simulate_resize(size(px(600.), px(400.)));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            let progress = view.grid.borrow().vt.search_progress();
+            assert!(progress.complete);
+            assert_eq!(progress.total, 3);
+        });
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("other");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).grid.borrow().vt.search_progress().total, 1));
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert!(!view.search_open);
+            assert!(view.focus.is_focused(window));
+            assert_eq!(view.grid.borrow().vt.search_progress().total, 0);
+        });
+        assert!(frames.try_iter().all(|frame| frame[4] != crate::hc::DATA), "search must never type into the CLI");
+        cx.simulate_keystrokes("x tab escape");
+        let typed: Vec<u8> = frames.try_iter().filter(|frame| frame[4] == crate::hc::DATA).flat_map(|frame| frame[9..].to_vec()).collect();
+        assert_eq!(typed, b"x\t\x1b");
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.search_input.as_ref().unwrap().read(cx).value().as_ref(), "other");
+        });
+    }
+
+    #[gpui::test]
+    fn command_hover_resolves_links_and_leaves_plain_clicks_for_selection(cx: &mut TestAppContext) {
+        let (view, window, _) = terminal(cx, b"https://example.com\r\n\x1b]8;;https://example.org/target\x1b\\named link\x1b]8;;\x1b\\");
+        let mut cx = VisualTestContext::from_window(window, cx);
+        cx.run_until_parked();
+        let at = cx.update(|_, cx| {
+            let view = view.read(cx);
+            let g = view.grid.borrow();
+            g.origin + point(g.cell.width * 2.0, g.cell.height * 0.5)
+        });
+        let cmd = Modifiers { platform: true, ..Default::default() };
+        cx.simulate_mouse_move(at, None, cmd);
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).hovered.as_ref().map(|(_, target)| target.clone()), Some(links::Target::Url("https://example.com".into())));
+        });
+        cx.simulate_modifiers_change(Modifiers::default());
+        cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::default());
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert!(view.hovered.is_none());
+            assert!(view.selecting);
+            assert!(view.pressed_link.is_none());
+        });
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::default());
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            let g = view.grid.borrow();
+            let second_row = at + point(px(0.), g.cell.height);
+            assert_eq!(view.link_at(second_row).unwrap().1, links::Target::Url("https://example.org/target".into()));
+            assert!(view.link_at(g.origin - point(px(1.), px(1.))).is_none());
+        });
+        // A command drag cancels opening, so verification launches no browser.
+        cx.simulate_mouse_down(at, MouseButton::Left, cmd);
+        cx.update(|_, cx| assert!(view.read(cx).pressed_link.is_some()));
+        cx.simulate_mouse_up(at + point(px(20.), px(0.)), MouseButton::Left, cmd);
+        cx.update(|_, cx| assert!(view.read(cx).pressed_link.is_none()));
+    }
 }
 
 #[cfg(test)]
