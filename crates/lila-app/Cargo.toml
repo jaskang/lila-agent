@@ -24,5 +24,11 @@ shots-gpui = { package = "gpui-pre", version = "=0.3.11", optional = true, featu
 shots-gpui-macos = { package = "gpui-pre-macos", version = "=0.3.11", optional = true, features = ["test-support"] }
 png = { version = "0.17", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# `shots`: logs the window buttons' size (they are not in the PNG).
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSWindow", "NSButton", "NSControl", "NSView", "NSResponder"] }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSGeometry"] }
+
 [features]
-shots = ["dep:shots-gpui", "dep:shots-gpui-macos", "dep:png"]
+shots = ["dep:shots-gpui", "dep:shots-gpui-macos", "dep:png", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]

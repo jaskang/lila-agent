@@ -14,24 +14,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// What the side panel shows.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RightTab {
-    Inbox = 0,
-    Tasks = 1,
-    Activity = 2,
-}
-
-impl From<usize> for RightTab {
-    fn from(ix: usize) -> Self {
-        match ix {
-            0 => RightTab::Inbox,
-            1 => RightTab::Tasks,
-            _ => RightTab::Activity,
-        }
-    }
-}
-
 pub struct LilaApp {
     paths: Paths,
     pub snap: Snapshot,
@@ -45,9 +27,8 @@ pub struct LilaApp {
     pub answers: HashMap<String, Entity<InputState>>,
     /// The last action's error, shown until the next one.
     pub notice: Option<String>,
-    /// The side panel (inbox, tasks, activity): shown, and which tab.
+    /// The side panel (inbox, tasks, activity) is shown.
     pub right_open: bool,
-    pub right_tab: RightTab,
     /// A press on a top bar that becomes a window drag once the mouse moves.
     pub drag_armed: bool,
     /// The task open in the detail panel.
@@ -129,7 +110,7 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, right_tab: RightTab::Tasks, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
@@ -149,7 +130,6 @@ impl LilaApp {
         // Something new needs the person: bring the inbox forward.
         if snap.project == self.snap.project && snap.inbox.iter().any(|i| !self.snap.inbox.iter().any(|o| o["id"] == i["id"])) && snap.status.is_some() {
             self.right_open = true;
-            self.right_tab = RightTab::Inbox;
         }
         // A detail fetched for another task (the panel moved on meanwhile) is dropped.
         let mut snap = snap;
@@ -179,6 +159,23 @@ impl LilaApp {
         self.selected = Some(id);
         self.refresh_now();
         cx.notify();
+    }
+
+    /// A project's state for its tab, from the last time it was fetched: the
+    /// most pressing member status (none while all are idle) and open inbox items.
+    pub fn project_summary(&self, id: &str) -> (Option<&'static str>, usize) {
+        let snap = if self.snap.project.as_deref() == Some(id) { Some(&self.snap) } else { self.cache.get(id) };
+        let Some(snap) = snap else { return (None, 0) };
+        let members = snap.status.as_ref().and_then(|s| s["members"].as_array());
+        let has = |st: &str| members.is_some_and(|m| m.iter().any(|m| m["status"] == st));
+        let status = if has("blocked") || has("error") {
+            Some("blocked")
+        } else if has("working") {
+            Some("working")
+        } else {
+            None
+        };
+        (status, snap.inbox.len())
     }
 
     pub fn project(&self) -> Option<Project> {
@@ -372,9 +369,8 @@ impl LilaApp {
             }
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
                 let n = (d.as_bytes()[0] - b'1') as usize;
-                if let Some(m) = self.members().get(n) {
-                    self.member = Some(s(m, "id"));
-                    cx.notify();
+                if let Some(p) = self.snap.projects.get(n) {
+                    self.select_project(p.id.clone(), cx);
                 }
             }
             _ => return,

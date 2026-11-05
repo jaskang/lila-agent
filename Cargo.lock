@@ -3808,6 +3808,9 @@ dependencies = [
  "lila",
  "lila-store",
  "lila-term",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "png 0.17.16",
  "serde_json",
 ]

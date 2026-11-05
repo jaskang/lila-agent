@@ -20,7 +20,7 @@ fn main() {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             // No separate title bar: the traffic lights sit in the sidebar's top row
             // and the top row of every column drags the window (see ui::drag_bar).
-            titlebar: Some(TitlebarOptions { title: Some("Lila".into()), appears_transparent: true, traffic_light_position: Some(point(px(14.), px(15.))) }),
+            titlebar: Some(TitlebarOptions { title: Some("Lila".into()), appears_transparent: true, traffic_light_position: Some(point(px(12.), px(14.))) }),
             ..Default::default()
         };
         let (_window, _view) = gpui::open_window(options, cx, |window, cx| {
@@ -77,7 +77,23 @@ mod shots {
             .detach();
     }
 
+    /// The close button's frame, as AppKit lays it out (the PNG has no window buttons).
+    #[cfg(target_os = "macos")]
+    fn log_buttons() {
+        use objc2_app_kit::{NSApplication, NSWindowButton};
+        let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+        for w in NSApplication::sharedApplication(mtm).windows().iter() {
+            if let Some(b) = w.standardWindowButton(NSWindowButton::CloseButton) {
+                let f = b.frame();
+                let m = w.standardWindowButton(NSWindowButton::MiniaturizeButton).map(|m| m.frame().origin.x).unwrap_or_default();
+                eprintln!("[lila-app] close button {}x{} at ({}, {}), minimize at x {m}", f.size.width, f.size.height, f.origin.x, f.origin.y);
+            }
+        }
+    }
+
     fn save(window: &Window, path: &str) {
+        #[cfg(target_os = "macos")]
+        log_buttons();
         let Ok(image) = window.render_to_image() else { return };
         let Ok(file) = std::fs::File::create(path) else { return };
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), image.width(), image.height());
