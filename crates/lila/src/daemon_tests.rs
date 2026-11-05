@@ -692,3 +692,22 @@ fn a_member_removed_while_lilad_was_down_is_cleaned_up() {
     assert!(again.term.kills.is_empty(), "only once");
     d.tick(w.now);
 }
+
+#[test]
+fn reload_loads_a_project_whose_config_came_back() {
+    let mut w = world();
+    w.up();
+    // Its config disappears and lilad starts again: the project is not loaded.
+    let toml = w.repo.join(".lila/project.toml");
+    std::fs::remove_file(&toml).unwrap();
+    let paths = w.d.paths.clone();
+    w.d = Daemon::new(Store::open(&paths.db()).unwrap(), Fake::default(), paths, String::new(), PathBuf::from("/opt/lila/bin/lila"));
+    assert!(!w.d.projects.contains_key("shop"));
+    // The window writes it again and asks lilad to read it; no member starts.
+    std::fs::write(&toml, PROJECT).unwrap();
+    let r = w.ok(None, "project.reload", json!({}));
+    assert_eq!(r["loaded"], true);
+    assert!(w.d.projects.contains_key("shop"));
+    assert!(w.d.term.runs.is_empty());
+    assert!(w.call(Some("owner"), "project.reload", json!({})).is_err(), "only the person");
+}

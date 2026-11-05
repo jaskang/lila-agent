@@ -261,6 +261,13 @@ impl<T: Terminals> Daemon<T> {
         Ok((pid, actor))
     }
 
+    /// The registered project the caller's folder belongs to, loaded or not.
+    fn registered(&self, caller: &Value) -> Option<(String, PathBuf)> {
+        let root = crate::paths::find_project_root(Path::new(s(caller, "cwd")?))?;
+        let p = self.store.project_by_cwd(&root.to_string_lossy()).ok()??;
+        Some((p.id, root))
+    }
+
     fn project_up(&mut self, caller: &Value, params: &Value, now: i64) -> Result<Value> {
         if s(caller, "member").is_some() {
             bail!("only the person starts a project");
@@ -373,7 +380,21 @@ impl<T: Terminals> Daemon<T> {
     /// Reads project.toml and the roles again (after the settings changed).
     /// Running members keep running; `status` marks those on old settings `stale`.
     fn project_reload(&mut self, caller: &Value, now: i64) -> Result<Value> {
-        let (pid, actor) = self.who(caller)?;
+        let (pid, actor) = match self.who(caller) {
+            Ok(w) => w,
+            // Registered but not loaded (its project.toml was missing when lilad
+            // started, and the window has just written it again): load it now.
+            Err(e) => {
+                let Some((pid, root)) = self.registered(caller) else { return Err(e) };
+                if s(caller, "member").is_some() {
+                    return Err(e);
+                }
+                self.load_project(&pid, &root, now)?;
+                self.live_version += 1;
+                self.say(format!("{pid}: loaded"));
+                return Ok(json!({"project": pid, "stale": [], "removed": [], "loaded": true}));
+            }
+        };
         if actor != Actor::Human {
             bail!("only the person reloads a project");
         }

@@ -124,6 +124,23 @@ pub fn create_and_start(paths: &Paths, dir: &std::path::Path) -> anyhow::Result<
     Ok(v["project"].as_str().unwrap_or_default().to_owned())
 }
 
+/// Writes a missing `.lila/project.toml` again with the default team, under the
+/// id the project is registered with, and has a running lilad load it (no
+/// member starts). Returns what the window should say, if anything.
+pub fn restore_config(paths: &Paths, p: &Project, daemon: bool) -> anyhow::Result<()> {
+    let dir = std::path::Path::new(&p.cwd);
+    if !dir.is_dir() {
+        anyhow::bail!("项目文件夹 {} 不在了", tilde(&p.cwd));
+    }
+    if !dir.join(".lila/project.toml").exists() {
+        lila::init::init_project(paths, dir, Some(p.id.clone()))?;
+    }
+    if daemon {
+        act(paths, p, "project.reload", json!({}), false)?;
+    }
+    Ok(())
+}
+
 /// The project tabs open in the window, kept across launches.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Tabs {

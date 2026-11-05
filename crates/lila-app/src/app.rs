@@ -23,6 +23,8 @@ pub struct LilaApp {
     pub tabs: Vec<String>,
     /// The saved tabs were restored (after the first snapshot).
     restored: bool,
+    /// Projects whose missing config the window has written again (once each).
+    restoring: std::collections::HashSet<String>,
     /// The project settings form, while open.
     pub settings: Option<crate::settings::Form>,
     /// The global settings (role library), while open.
@@ -122,7 +124,7 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, settings: None, prefs: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
@@ -168,6 +170,9 @@ impl LilaApp {
             snap.detail = self.snap.detail.take().filter(|d| d["id"].as_str() == self.task.as_deref());
         }
         self.snap = snap;
+        if let Some(id) = self.selected.clone() {
+            self.restore_config(&id, cx);
+        }
         cx.notify();
     }
 
@@ -207,6 +212,32 @@ impl LilaApp {
         }
         self.save_tabs();
         cx.notify();
+    }
+
+    /// A project opened without its `.lila/project.toml` gets the default one
+    /// back (see `data::restore_config`), then everything is fetched again.
+    fn restore_config(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(p) = self.snap.projects.iter().find(|p| p.id == id && p.missing).cloned() else { return };
+        if !self.restoring.insert(id.to_owned()) {
+            return;
+        }
+        let (paths, daemon, id) = (self.paths.clone(), self.snap.daemon, id.to_owned());
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { data::restore_config(&paths, &p, daemon) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match r {
+                    Ok(()) => {
+                        for p in this.snap.projects.iter_mut().filter(|p| p.id == id) {
+                            p.missing = false;
+                        }
+                    }
+                    Err(e) => this.notice = Some(format!("没能给 {id} 创建配置：{e:#}")),
+                }
+                this.refresh_now();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Shows another project: its last snapshot at once, then fresh data.
