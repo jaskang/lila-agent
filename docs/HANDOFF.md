@@ -34,14 +34,13 @@ Lila 是一个管理编程 agent 团队的桌面工具。
   - 项目配置放在仓库里的 `.lila/project.toml`。
 - **工作方式**：
   - 提交信息用英文，末尾加 `Co-Authored-By` 署名行。
-  - 只在用户要求时提交；推送前先问。
+  - 只在用户要求时提交。默认在 `main` 上开发，用户已同意直接推送到 `main`。
   - 用户给界面意见时，改完要截图自查，再说明哪些点不了、需要用户亲手试。
 
 ## 新电脑上的准备
 
 ```sh
 git clone git@github.com:jaskang/lila-agent.git && cd lila-agent
-git checkout m3                                   # 当前分支
 git submodule update --init --depth 1 vendor/ghostty
 brew install zig@0.16                             # keg-only，不在 PATH 上
 export ZIG=$(brew --prefix zig@0.16)/bin/zig      # libghostty 要 Zig 0.16
@@ -153,7 +152,7 @@ macOS 没有 `timeout` 命令，可以这样让程序跑一会儿再停：`prog 
 
 ## 分支
 
-分支依次叠加：`main` → `docs/design-and-m0` → `m1-orchestration` → `m1-followups` → `m2-gui` → `m3`（当前分支）。所有分支都已推送到 `origin`（`git@github.com:jaskang/lila-agent.git`），2026-11-05 晚。还没开 PR。
+**默认在 `main` 上开发并直接推送**（用户 2026-11-05 晚定的）。M0 到 M3 的分支 `docs/design-and-m0`、`m1-orchestration`、`m1-followups`、`m2-gui`、`m3` 都已经合进 `main`，只是作为历史留在远端。
 
 ## 等用户亲手验证的
 
