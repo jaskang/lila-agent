@@ -6,7 +6,7 @@ use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::input::{Input, InputState};
 use gpui::component::tag::Tag;
 use gpui::component::scroll::ScrollableElement;
-use gpui::component::{ActiveTheme, Sizable, StyledExt, h_flex, h_resizable, resizable_panel, v_flex, v_resizable};
+use gpui::component::{ActiveTheme, Sizable, StyledExt, h_flex, h_resizable, resizable_panel, v_flex};
 use gpui::prelude::*;
 use gpui::*;
 use lila::paths::Paths;
@@ -25,8 +25,6 @@ pub struct LilaApp {
     pub member: Option<String>,
     core: Option<Arc<Core>>,
     core_error: Option<String>,
-    /// The last screen text of each member's terminal, by address (for the thumbnails).
-    previews: HashMap<String, String>,
     terminals: HashMap<String, Entity<TerminalView>>,
     answers: HashMap<String, Entity<InputState>>,
     /// The last action's error, shown until the next one.
@@ -41,7 +39,6 @@ pub struct LilaApp {
     /// A queued task being rewritten in the detail panel.
     pub rewrite: Option<crate::compose::Rewrite>,
     _poll: Task<()>,
-    _previews: Task<()>,
 }
 
 pub fn s(v: &Value, key: &str) -> String {
@@ -89,37 +86,6 @@ impl LilaApp {
                 while wake.try_recv().is_ok() {}
             }
         });
-        // Thumbnails: every member's screen as text, read every 1.5 s.
-        let previews = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(1500)).await;
-                let Ok((core, terminals)) = this.update(cx, |this, _| {
-                    let shown = this.shown_member().map(|m| s(&m, "terminal"));
-                    let terminals: Vec<String> = this.members().iter().map(|m| s(m, "terminal")).filter(|t| !t.is_empty() && Some(t) != shown.as_ref()).collect();
-                    (this.core.clone(), terminals)
-                }) else {
-                    return;
-                };
-                let Some(core) = core else { continue };
-                let read = cx
-                    .background_executor()
-                    .spawn(async move {
-                        terminals
-                            .into_iter()
-                            .filter_map(|t| core.call("terminal.read", json!({"terminal": t, "lines": 0})).ok().map(|r| (t, r["text"].as_str().unwrap_or_default().to_owned())))
-                            .collect::<Vec<_>>()
-                    })
-                    .await;
-                if this.update(cx, |this, cx| {
-                    this.previews.extend(read);
-                    cx.notify();
-                })
-                .is_err()
-                {
-                    return;
-                }
-            }
-        });
         cx.spawn(async move |this, cx| {
             let core = cx.background_executor().spawn(async { Core::connect() }).await;
             let _ = this.update(cx, |this, cx| {
@@ -131,7 +97,7 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, previews: HashMap::new(), _poll: poll, _previews: previews }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
@@ -488,77 +454,7 @@ impl LilaApp {
                 placeholder(why.into(), cx).into_any_element()
             }
         };
-        let main = v_flex().size_full().children(header).child(body);
-        let thumbs = self.thumbnails(cx);
-        match thumbs {
-            Some(strip) => v_resizable("center")
-                .child(resizable_panel().child(main))
-                .child(resizable_panel().size(px(170.)).size_range(px(90.)..px(420.)).fixed().child(strip))
-                .into_any_element(),
-            None => main.into_any_element(),
-        }
-    }
-
-    /// The other members' screens, small: a glance at what each is doing. Click one to open it.
-    fn thumbnails(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let theme = cx.theme().clone();
-        let shown = self.shown_member().map(|m| s(&m, "id"));
-        let others: Vec<Value> = self.members().into_iter().filter(|m| Some(s(m, "id")) != shown).collect();
-        if others.is_empty() {
-            return None;
-        }
-        let cards = others.into_iter().map(|m| {
-            let (id, status, terminal) = (s(&m, "id"), s(&m, "status"), s(&m, "terminal"));
-            let text = self.previews.get(&terminal).map(|t| last_lines(t, 14)).unwrap_or_default();
-            let open = id.clone();
-            v_flex()
-                .id(SharedString::from(format!("thumb-{id}")))
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
-                .bg(gpui::Rgba { r: 0x21 as f32 / 255., g: 0x25 as f32 / 255., b: 0x2b as f32 / 255., a: 1.0 })
-                .overflow_hidden()
-                .cursor_pointer()
-                .hover(|d| d.border_color(theme.ring))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.member = Some(open.clone());
-                    cx.notify();
-                }))
-                .child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .gap_2()
-                        .flex_none()
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(dot(status_color(&status, cx)))
-                        .child(div().text_xs().font_semibold().child(id.clone()))
-                        .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(s(&m, "msg")))
-                        .child(div().flex_1())
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(status_label(&status))),
-                )
-                .child(
-                    // Newest line at the bottom; when the card is short, the oldest lines go.
-                    div()
-                        .flex()
-                        .flex_col_reverse()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .px_2()
-                        .pb_1()
-                        .font_family(lila_term::theme::FONT)
-                        .text_size(px(9.))
-                        .line_height(px(11.))
-                        .text_color(theme.muted_foreground)
-                        .children(text.into_iter().rev().map(|l| div().flex_none().whitespace_nowrap().overflow_hidden().child(l))),
-                )
-        });
-        Some(h_flex().size_full().p_2().gap_2().bg(theme.background).border_t_1().border_color(theme.border).children(cards).into_any_element())
+        v_flex().size_full().children(header).child(body)
     }
 
     fn right(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -780,22 +676,5 @@ impl Render for LilaApp {
                         .child("正在读取任务…"),
                 )
             })
-    }
-}
-
-/// The last `n` lines with text on a screen, without trailing blanks.
-fn last_lines(text: &str, n: usize) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
-    let end = lines.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1);
-    lines[..end].iter().rev().take(n).rev().map(|l| l.chars().take(160).collect()).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn last_lines_skips_the_blank_bottom() {
-        assert_eq!(super::last_lines("a\nb  \n\nc\n\n   \n", 2), ["", "c"]);
-        assert_eq!(super::last_lines("a\nb\nc", 5), ["a", "b", "c"]);
-        assert!(super::last_lines("\n\n", 3).is_empty());
     }
 }
