@@ -398,7 +398,7 @@ lila-agent/
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | **M0 技术验证** ✅ 已完成，见 `spikes.md` | ① 装 Zig 0.16，从源码编译 herdr-app；② 确认 codex 是否上报 7501、`developer_instructions` 能否生效；③ 向正在工作的 Claude Code 执行 `hc send` 的实际行为；④ 最小 GPUI 窗口 + 一个 libghostty 终端 attach 到 hc | 四项都有结论，写进 `docs/spikes.md` |
-| **M1 编排核心，无 GUI** | lila-core / store / hc-client / lila CLI + lilad；默认角色；`lila project up` | 用 **herdr-app 本身**观察：你在 Owner 终端提需求 → Owner 拆任务 → engineer 实现 → tester 验证/退回 → 阻塞时 `lila inbox` 能看到 Owner 的提问 |
+| **M1 编排核心，无 GUI** ✅ 已完成，见 `m1.md` | lila-core / store / hc-client / lila CLI + lilad；默认角色；`lila project up` | 用 **herdr-app 本身**观察：你在 Owner 终端提需求 → Owner 拆任务 → engineer 实现 → tester 验证/退回 → 阻塞时 `lila inbox` 能看到 Owner 的提问 |
 | **M2 GUI** | lila-app：侧栏、Owner 主终端、成员缩略图、看板、Inbox、动态流 | M1 的流程全程在 Lila 窗口里完成 |
 | **M3 增强** | 角色/项目编辑器 GUI、每成员独立 git worktree、每任务新会话选项、用量统计、远程机器（hc machine） | 按需排序 |
 

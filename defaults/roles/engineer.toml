@@ -1,0 +1,5 @@
+name = "工程师"
+runtime = "claude"
+model = "claude-sonnet-5-5"
+effort = "high"
+can_assign = ["tester"]

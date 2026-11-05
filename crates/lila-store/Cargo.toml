@@ -1,0 +1,15 @@
+[package]
+name = "lila-store"
+description = "SQLite persistence for Lila."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+lila-core = { path = "../lila-core" }
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

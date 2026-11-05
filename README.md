@@ -1,1 +1,83 @@
-# lila-agent
+# Lila
+
+用 [herdr-core](https://github.com/herdrdev/herdr-core) 运行一支由不同模型组成的编码 agent 团队。你只和 Owner 对话；Owner 规划任务并分派给团队；Lila 负责投递任务、传递结果，把需要你的事情放进收件箱。
+
+每个成员都是官方 CLI（`claude` / `codex`）的交互会话，用你的订阅登录，不需要 API key。
+
+设计见 [docs/design.md](docs/design.md)，技术验证见 [docs/spikes.md](docs/spikes.md)，第一阶段的实测记录见 [docs/m1.md](docs/m1.md)。
+
+## 安装
+
+需要 Rust（版本见 `rust-toolchain.toml`）、[herdr-core](https://github.com/herdrdev/herdr-core)（`hc`），以及 `claude` 和/或 `codex`。
+
+```sh
+cargo install --path crates/lila
+```
+
+## 使用
+
+```sh
+cd ~/codes/shop
+lila init                     # 生成 .lila/project.toml（默认团队：owner、architect、engineer、tester）
+lila up --brief "做一个登录页：邮箱 + 密码"
+```
+
+`lila up` 会启动 lilad（运行在 herdr-core 终端里，名为 `lilad`），并为每个成员各开一个终端。第一次在某个目录启动时，Claude Code 和 Codex 会询问是否信任该目录；`lila inbox` 会提醒你去对应终端确认。
+
+在 herdr-app 里，或用 `hc attach lila-<项目>-owner`，和 Owner 对话。其余时间：
+
+```sh
+lila status                   # 谁在做什么
+lila inbox                    # 需要你的事：Owner 的提问、终端里的权限确认、完成报告
+lila answer Q3 "用 Stripe"     # 回答问题（不带文字则表示忽略这条）
+lila log                      # 最近的动态
+lila task ls --all            # 所有任务
+lila pause / lila resume      # 暂停 / 恢复派发
+lila down                     # 停止成员（任务会保留）
+```
+
+## 配置
+
+- **角色**：`~/.config/lila/roles/<id>.toml` + `<id>.md`（提示词）。`lila roles` 列出全部，`lila roles init` 补齐缺少的默认角色（不会覆盖已有文件）。
+
+  ```toml
+  name = "工程师"
+  runtime = "claude"          # claude | codex
+  model = "claude-sonnet-5-5"
+  effort = "high"
+  can_assign = ["tester"]     # 可以把任务交给哪些角色
+  extra_args = []             # 原样传给 CLI
+  env = { PATH = "/opt/node/bin" }
+  ```
+
+  默认的 tester（Codex）带着 `-c sandbox_workspace_write.network_access=true`：Codex 的沙箱会拦截 `lila` 用来连接 lilad 的 Unix socket，开启这项后才能连上，但 agent 也因此能访问网络。不想开的话，删掉这一行，之后每次 `lila` 命令都需要你手动批准。
+
+- **项目**：仓库内的 `.lila/project.toml`，包括成员列表、可选的 `[assign]` 指派规则和 `[settings]`（`max_working`、`stall_minutes`、`startup_timeout_secs`、`max_chain_depth`）。`.lila/tasks/` 存放任务正文，已加入 `.lila/.gitignore`。
+
+- `LILA_HOME=<目录>` 会把配置、数据库和 socket 全部放进这个目录，适合用来做实验。
+
+## agent 侧
+
+成员的系统提示词里已经写好了协议；`lila --skill` 可以打印完整说明。
+
+```sh
+lila task start T12
+lila task done T12 --summary "…" [--file path]
+lila task block T12 --reason "…"
+lila task new --to tester --title "…" --body "…" --parent T12
+lila ask "…" --option A --option B      # 仅 Owner 可用
+```
+
+## 开发
+
+```sh
+cargo test
+cargo clippy --all-targets
+```
+
+| crate | 内容 |
+|---|---|
+| `lila-core` | 角色、项目、团队、任务状态机、指派规则、提示词、启动命令、派发决策。不做任何 IO。 |
+| `lila-store` | SQLite 存储 |
+| `hc-client` | herdr-core JSON-RPC 客户端（`hc connect`，plain 模式） |
+| `lila` | CLI 和 lilad。lilad 通过 `Terminals` trait 调用 hc，测试时替换成假实现 |
