@@ -1,0 +1,26 @@
+[package]
+name = "lila-app"
+description = "Lila's desktop app: the team, the owner's terminal, the inbox and the task board."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "lila-app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui = { package = "gpui-kit", version = "=0.9.0" }
+lila = { path = "../lila" }
+lila-store = { path = "../lila-store" }
+lila-term = { path = "../lila-term" }
+serde_json.workspace = true
+# `shots`: the window saves a PNG of itself every 2 s to $LILA_APP_SHOT (checks without screen-recording rights).
+shots-gpui = { package = "gpui-pre", version = "=0.3.11", optional = true, features = ["test-support"] }
+shots-gpui-macos = { package = "gpui-pre-macos", version = "=0.3.11", optional = true, features = ["test-support"] }
+png = { version = "0.17", optional = true }
+
+[features]
+shots = ["dep:shots-gpui", "dep:shots-gpui-macos", "dep:png"]

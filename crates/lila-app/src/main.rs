@@ -1,0 +1,61 @@
+//! lila-app: watch and steer a Lila team. Talk to the owner in its terminal,
+//! answer what needs you, follow the task board.
+
+mod app;
+mod data;
+
+use gpui::*;
+
+fn main() {
+    gpui::application().run(|cx: &mut App| {
+        gpui::init(cx);
+        gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
+        let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions { title: Some("Lila".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        let (_window, _view) = gpui::open_window(options, cx, |window, cx| {
+            let view = cx.new(|cx| app::LilaApp::new(window, cx));
+            #[cfg(feature = "shots")]
+            shots::start(window, cx);
+            view
+        })
+        .expect("open the Lila window");
+        cx.activate(true);
+    });
+}
+
+/// `--features shots`: the window saves itself as a PNG every 2 s to `$LILA_APP_SHOT`,
+/// so a change can be checked without screen-recording permission.
+#[cfg(feature = "shots")]
+mod shots {
+    use gpui::*;
+
+    pub fn start(window: &mut Window, cx: &mut App) {
+        let Ok(path) = std::env::var("LILA_APP_SHOT") else { return };
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+                    let path = path.clone();
+                    if cx.update(|window, _| save(window, &path)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
+
+    fn save(window: &Window, path: &str) {
+        let Ok(image) = window.render_to_image() else { return };
+        let Ok(file) = std::fs::File::create(path) else { return };
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), image.width(), image.height());
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        if let Ok(mut w) = encoder.write_header() {
+            let _ = w.write_image_data(image.as_raw());
+        }
+    }
+}

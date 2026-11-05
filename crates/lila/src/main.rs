@@ -1,14 +1,10 @@
 //! `lila`: run an agent team on herdr-core. The person uses it to start projects
 //! and answer the inbox; members use it to start, finish, block and hand on tasks.
 
-mod client;
-mod daemon;
-mod paths;
-mod roles;
-
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use paths::Paths;
+use lila::paths::Paths;
+use lila::{client, daemon, roles};
 use serde_json::{Value, json};
 
 #[derive(Parser)]

@@ -4,7 +4,9 @@
 
 每个成员都是官方 CLI（`claude` / `codex`）的交互会话，用你的订阅登录，不需要 API key。
 
-设计见 [docs/design.md](docs/design.md)，技术验证见 [docs/spikes.md](docs/spikes.md)，第一阶段的实测记录见 [docs/m1.md](docs/m1.md)。
+设计见 [docs/design.md](docs/design.md)，技术验证见 [docs/spikes.md](docs/spikes.md)，各阶段记录见 [docs/m1.md](docs/m1.md)（编排）和 [docs/m2.md](docs/m2.md)（桌面应用）。
+
+![lila-app](docs/images/m2-working.png)
 
 ## 安装
 
@@ -13,6 +15,17 @@
 ```sh
 cargo install --path crates/lila
 ```
+
+桌面应用（需要 Zig 0.16 来编译 libghostty）：
+
+```sh
+git submodule update --init --depth 1
+brew install zig@0.16
+ZIG=$(brew --prefix zig@0.16)/bin/zig cargo install --path crates/lila-app
+lila-app
+```
+
+窗口左边是团队和每个成员正在做什么，中间是选中成员的终端（默认 Owner，可以直接在里面对话），右边是需要你的事、任务看板和动态。
 
 ## 使用
 
@@ -82,4 +95,9 @@ cargo clippy --all-targets
 | `lila-core` | 角色、项目、团队、任务状态机、指派规则、提示词、启动命令、派发决策。不做任何 IO。 |
 | `lila-store` | SQLite 存储 |
 | `hc-client` | herdr-core JSON-RPC 客户端（`hc connect`，plain 模式） |
-| `lila` | CLI 和 lilad。lilad 通过 `Terminals` trait 调用 hc，测试时替换成假实现 |
+| `lila` | CLI 和 lilad（同时提供库）。lilad 通过 `Terminals` trait 调用 hc，测试时替换成假实现 |
+| `ghostty-sys` | libghostty-vt 绑定（来自 herdr-app） |
+| `lila-term` | GPUI 里的 herdr-core 终端视图 |
+| `lila-app` | 桌面应用（GPUI + gpui-kit） |
+
+完整 `cargo test` 会编译 libghostty，需要先设置 `ZIG`（见上）。第三方代码见 [THIRD-PARTY.md](THIRD-PARTY.md)。

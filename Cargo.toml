@@ -1,6 +1,7 @@
 [workspace]
-members = ["crates/lila-core", "crates/lila-store", "crates/hc-client", "crates/lila"]
+members = ["crates/lila-core", "crates/lila-store", "crates/hc-client", "crates/lila", "crates/ghostty-sys", "crates/lila-term", "crates/lila-app"]
 resolver = "3"
+exclude = ["vendor/ghostty"]
 
 [workspace.package]
 edition = "2024"
@@ -16,3 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 tempfile = "3"
+
+# GPUI and the terminal parse megabytes per frame: optimize dependencies in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
