@@ -66,11 +66,12 @@ fn run(paths: &lila::paths::Paths, plan: Plan) -> anyhow::Result<String> {
             anyhow::bail!("git init: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
     }
+    // A config already there is an earlier try that got this far: start that one.
     match &plan.new {
-        Some(p) => {
+        Some(p) if !plan.dir.join(".lila").join("project.toml").exists() => {
             lila::init::create_project(paths, &plan.dir, p)?;
         }
-        None => {
+        _ => {
             lila::roles::install_defaults(&paths.roles())?;
         }
     }
@@ -265,7 +266,9 @@ impl LilaApp {
     pub fn wizard_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let w = self.wizard.as_ref()?;
         let theme = cx.theme().clone();
-        let (busy, error, has_folder) = (w.busy, w.error.clone(), w.folder.is_some());
+        let (busy, error) = (w.busy, w.error.clone());
+        // A folder whose config doesn't load can't go on; any other failure can be tried again.
+        let ready = w.folder.as_ref().is_some_and(|f| f.existing.as_ref().is_none_or(|e| e.error.is_none()));
         let existing = w.folder.as_ref().is_some_and(|f| f.existing.is_some());
         let body = self.wizard_page(cx);
         let note = error.clone().map(|e| h_flex().gap_2().text_color(theme.red).child(Icon::new(IconName::CircleAlert).small()).child(div().truncate().child(e)).into_any_element());
@@ -283,7 +286,7 @@ impl LilaApp {
                 note,
                 saving: busy,
                 save_label,
-                can_save: has_folder && error.is_none(),
+                can_save: ready,
                 on_save: Box::new(|this, cx| this.wizard_finish(cx)),
                 on_close: Box::new(|this, _| {
                     if !this.wizard.as_ref().is_some_and(|w| w.busy) {
