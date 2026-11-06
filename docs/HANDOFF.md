@@ -1,6 +1,6 @@
 # 交接说明（给接手的模型）
 
-更新于 2026-11-05 晚。用户用中文交流，回复也用中文。用户会换一台电脑继续，新电脑上没有上一台的 Claude 记忆，所以该知道的都写在这里。
+更新于 2026-11-06。用户用中文交流，回复也用中文。用户会换一台电脑继续，新电脑上没有上一台的 Claude 记忆，所以该知道的都写在这里。
 
 先读这份。需要细节时再读：
 - `docs/design.md`：总体设计
@@ -55,7 +55,7 @@ cargo run -p lila-app
   - 角色目录 `~/.config/lila/roles/`：新电脑第一次 `lila init` 或 `lila up` 时会装上默认的五个角色。
   - 数据库 `~/.local/share/lila/lila.db`：任务、收件箱、动态都在里面，所以新电脑上是空的。
   - 窗口标签 `~/.local/state/lila/app-tabs.json`。
-- 上一台电脑上用来看效果的项目是 `~/temp`，以及 `creator-studio`（它的 `.lila/` 被删了，打开时会自动重建）。新电脑上要用 `lila init` 或窗口里的「新建项目」另建。
+- 上一台电脑上用来看效果的项目是 `~/temp`，以及 `creator-studio`（它的 `.lila/` 被删了，打开时会自动重建）。新电脑上用窗口里的新建项目向导（侧栏 `+`）或 `lila init` 另建。
 
 ## 技术栈
 
@@ -77,12 +77,12 @@ cargo run -p lila-app
 | ↳ `daemon.rs` | `Daemon::handle` 处理所有请求；测试在 `daemon_tests.rs`，用 Fake 终端 |
 | ↳ `settings.rs` | 项目设置读写：成员、count、指派规则、`[settings]`，用 toml_edit 保留注释 |
 | ↳ `roles.rs` | 角色读写删、默认角色、旧版默认文件升级 |
-| ↳ 其他 | `init.rs`（默认项目模板）、`client.rs`、`paths.rs`、`skill.md`（agent 协议说明） |
+| ↳ 其他 | `init.rs`（默认项目模板；`create_project` 按向导选的团队建项目）、`client.rs`、`paths.rs`、`skill.md`（agent 协议说明） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app）。`view.rs` 处理按键、IME、选择、复制粘贴、滚动、搜索、链接 |
 | `lila-app` | 窗口，详见下一行 |
 | ↳ 主体 | `app.rs`：状态、刷新循环、快捷键、对话框位置、缺配置自动重建。`ui.rs`：侧栏、项目右键菜单、标签栏、终端卡片、右侧概览、状态栏。`data.rs`：拉数据、标签持久化、`restore_config` |
 | ↳ 设置 | `dialog.rs`：设置对话框外壳（导航、分组行、分段控件、步进器、拖动）。`settings.rs`：项目设置四页，以及分组的模型 Select。`prefs.rs`：全局设置，即角色库和关于 |
-| ↳ 其他 | `detail.rs`（任务详情）、`compose.rs`（新建/改写任务）、`build.rs`（链接成 15.5 SDK） |
+| ↳ 其他 | `wizard.rs`（新建项目向导：文件夹 → 团队 → 简介）、`detail.rs`（任务详情）、`compose.rs`（新建/改写任务）、`build.rs`（链接成 15.5 SDK） |
 
 ### 关键机制
 
@@ -113,7 +113,7 @@ cargo run -p lila-app
 ## 界面现状（用户的意见都已落实）
 
 - **侧栏**：
-  - 「项目」小标题右边的 `+` 用来新建项目；红绿灯那一行没有按钮。
+  - 「项目」小标题右边的 `+` 打开新建项目向导（三步：文件夹 → 团队 → 简介，见 `docs/m3.md`）；红绿灯那一行没有按钮。
   - 项目行右键菜单：新建任务…、项目设置…、在访达中显示、关闭标签。顶部标签也有同样的右键菜单。
   - 侧栏底部是「启动团队」「暂停/恢复派发」和「设置」，其中「设置」打开全局设置。
   - 缺少配置的项目标「缺少配置」，打开时自动重建。
@@ -140,6 +140,7 @@ cargo run -p lila-app
 - `LILA_APP_SWITCH=a,b,...`：每 3 秒切换到下一个项目。
 - `LILA_APP_SETTINGS=general|members|assign|rules`：打开项目设置的那一页；再加 `LILA_APP_SETTINGS_ADD=<角色>` 会加一个新成员。
 - `LILA_APP_PREFS=roles|about`：打开全局设置的那一页。
+- `LILA_APP_NEW=<文件夹>`：打开新建项目向导并选好文件夹，空字符串表示还没选；再加 `LILA_APP_NEW_STEP=team|brief` 跳到那一步。
 - `LILA_APP_OPEN_TASK=T3`、`LILA_APP_COMPOSE=<成员>`、`LILA_APP_DEBUG=1`。
 
 截图时用临时的 `LILA_HOME`，不碰用户的真实数据：
@@ -166,6 +167,7 @@ macOS 没有 `timeout` 命令，可以这样让程序跑一会儿再停：`prog 
 - **设置对话框**：
   - 拖动对话框、模型 Select 的弹出列表、勾选表、− / +、添加或移出成员、保存；
   - 全局设置里新建和删除角色。
+- **新建项目向导**：选文件夹的系统对话框、勾选角色和 − / +、git 开关，最后点「创建并启动」（会真的启动 CLI）。
 - **lilad 相关**，前提是先重装 lila，再 `lila daemon stop` 换成新的 lilad：
   - 换任务时开新会话；
   - 移出成员时停终端、取消任务；
@@ -174,7 +176,6 @@ macOS 没有 `timeout` 命令，可以这样让程序跑一会儿再停：`prog 
 ## 待办
 
 - **M3 剩下的**（顺序见 `docs/m3.md`）：
-  - 第 3 项：新建项目向导，选目录 → 选角色 → 写简介 → 启动；
   - 第 5 项：用量统计；
   - 第 6 项：每成员独立 worktree，要先和用户确定合并方式；
   - 第 7 项：远程机器。

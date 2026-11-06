@@ -167,7 +167,7 @@ impl LilaApp {
                     .pb_0p5()
                     .child(label("项目", cx))
                     .child(div().flex_1())
-                    .child(Button::new("new-project").ghost().xsmall().icon(IconName::Plus).tooltip("新建项目…").on_click(cx.listener(|this, _, _, cx| this.new_project(cx)))),
+                    .child(Button::new("new-project").ghost().xsmall().icon(IconName::Plus).tooltip("新建项目…").on_click(cx.listener(|this, _, window, cx| this.new_project(window, cx)))),
             )
             .children(projects.into_iter().map(|p| {
                 let active = selected.as_deref() == Some(&p.id);
@@ -355,8 +355,8 @@ impl LilaApp {
                 .gap_3()
                 .text_color(theme.muted_foreground)
                 .child(Icon::new(IconName::FolderOpen).large().text_color(theme.muted_foreground))
-                .child("还没有项目。选一个代码仓库，Lila 会创建 .lila/project.toml 并启动默认团队。")
-                .child(Button::new("new-project-big").primary().label("新建项目…").on_click(cx.listener(|this, _, _, cx| this.new_project(cx))))
+                .child("还没有项目。选一个文件夹、挑好团队、写一段简介，PM 就会开始规划。")
+                .child(Button::new("new-project-big").primary().label("新建项目…").on_click(cx.listener(|this, _, window, cx| this.new_project(window, cx))))
                 .into_any_element(),
             (None, None) => {
                 let why = if !self.snap.daemon { "lilad 没有运行" } else { "这个成员没有在运行" };

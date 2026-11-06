@@ -36,6 +36,12 @@ pub struct Shell {
     /// Left of the buttons: what saving will do, or an error.
     pub note: Option<AnyElement>,
     pub saving: bool,
+    /// The main button: "保存" in settings, "下一步" or "创建并启动" in the wizard.
+    pub save_label: &'static str,
+    /// Off: the main button can't be pressed yet.
+    pub can_save: bool,
+    /// A "上一步" button left of cancel.
+    pub back: Option<Act>,
     pub on_save: Act,
     pub on_close: Act,
 }
@@ -147,7 +153,7 @@ impl LilaApp {
 
     pub fn dialog(&mut self, shell: Shell, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
-        let Shell { id, heading, nav, title, description, body, note, saving, on_save, on_close } = shell;
+        let Shell { id, heading, nav, title, description, body, note, saving, save_label, can_save, back, on_save, on_close } = shell;
         let on_close: std::rc::Rc<Act> = std::rc::Rc::new(on_close);
         let (close_x, close_cancel) = (on_close.clone(), on_close);
         let offset = self.dialog_offset;
@@ -260,11 +266,17 @@ impl LilaApp {
                                     .border_t_1()
                                     .border_color(t.border)
                                     .child(div().flex_1().min_w_0().text_xs().children(note))
+                                    .when_some(back, |d, back| {
+                                        d.child(Button::new(SharedString::from(format!("{id}-back"))).outline().label("上一步").disabled(saving).on_click(cx.listener(move |this, _, _, cx| {
+                                            back(this, cx);
+                                            cx.notify();
+                                        })))
+                                    })
                                     .child(Button::new(SharedString::from(format!("{id}-cancel"))).ghost().label("取消").on_click(cx.listener(move |this, _, _, cx| {
                                         close_cancel(this, cx);
                                         cx.notify();
                                     })))
-                                    .child(Button::new(SharedString::from(format!("{id}-save"))).primary().label(if saving { "保存中…" } else { "保存" }).disabled(saving).on_click(cx.listener(move |this, _, _, cx| on_save(this, cx)))),
+                                    .child(Button::new(SharedString::from(format!("{id}-save"))).primary().label(save_label).disabled(saving || !can_save).on_click(cx.listener(move |this, _, _, cx| on_save(this, cx)))),
                             ),
                     )
                     .child(div().absolute().top_3().right_3().child(Button::new(SharedString::from(format!("{id}-x"))).ghost().small().icon(IconName::Close).tooltip("关闭 (Esc)").on_click(cx.listener(move |this, _, _, cx| {

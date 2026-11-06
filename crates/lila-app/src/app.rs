@@ -29,6 +29,8 @@ pub struct LilaApp {
     pub settings: Option<crate::settings::Form>,
     /// The global settings (role library), while open.
     pub prefs: Option<crate::prefs::Prefs>,
+    /// The new-project wizard, while open.
+    pub wizard: Option<crate::wizard::Wizard>,
     /// Where the open dialog was dragged to, from the window's center.
     pub dialog_offset: Point<Pixels>,
     /// While dragging a dialog: where the press was and the offset then.
@@ -124,7 +126,7 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
+        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
@@ -379,27 +381,6 @@ impl LilaApp {
         self.append.get_or_insert_with(|| cx.new(|cx| InputState::new(window, cx).placeholder("补充要求或修正…"))).clone()
     }
 
-    /// Pick a folder, make it a project if needed, start its team.
-    pub fn new_project(&mut self, cx: &mut Context<Self>) {
-        let paths = self.paths.clone();
-        let picked = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("用这个文件夹".into()) });
-        self.notice = None;
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(dirs))) = picked.await else { return };
-            let Some(dir) = dirs.into_iter().next() else { return };
-            let r = cx.background_executor().spawn(async move { data::create_and_start(&paths, &dir) }).await;
-            let _ = this.update(cx, |this, cx| {
-                match r {
-                    Ok(id) if !id.is_empty() => this.select_project(id, cx),
-                    Ok(_) => {}
-                    Err(e) => this.notice = Some(format!("{e:#}")),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     pub fn answer(&mut self, id: String, text: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(input) = self.answers.get(&id) {
             input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -435,7 +416,7 @@ impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let compose = self.compose_panel(cx);
-        let dialog = self.settings_dialog(cx).or_else(|| self.prefs_dialog(cx));
+        let dialog = self.settings_dialog(cx).or_else(|| self.prefs_dialog(cx)).or_else(|| self.wizard_dialog(cx));
         let detail = if compose.is_some() { None } else { self.task.as_ref().and(self.snap.detail.clone()) };
         let loading = compose.is_none() && self.task.is_some() && detail.is_none();
         let overlay = |d: Div| d.absolute().top_0().right_0().bottom(px(26.)).w(px(600.)).bg(theme.popover).border_l_1().border_color(theme.border).shadow_lg().occlude();
@@ -465,9 +446,12 @@ impl LilaApp {
     /// Window-wide keys. The terminal handles copy, paste and find; other ⌘ chords bubble here.
     fn shortcut(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
-        if k.key == "escape" && (self.settings.is_some() || self.prefs.is_some()) {
+        if k.key == "escape" && (self.settings.is_some() || self.prefs.is_some() || self.wizard.is_some()) {
             self.settings = None;
             self.prefs = None;
+            if !self.wizard.as_ref().is_some_and(|w| w.busy) {
+                self.wizard = None;
+            }
             cx.notify();
             cx.stop_propagation();
             return;

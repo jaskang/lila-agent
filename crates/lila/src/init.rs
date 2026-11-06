@@ -29,12 +29,69 @@ pub fn init_project(paths: &Paths, dir: &Path, name: Option<String>) -> Result<C
     Ok(Created { file, name, roles_installed })
 }
 
+/// What the new-project wizard chose: the id, the name the window shows, and
+/// the team as `(role, count)`, one entry per role (the PM's role among them).
+#[derive(Debug, Clone)]
+pub struct NewProject {
+    pub name: String,
+    pub title: String,
+    pub team: Vec<(String, u32)>,
+}
+
+/// Like [`init_project`], with the wizard's team and title instead of the
+/// default team. Members are named after their roles. Nothing is left behind
+/// when the team doesn't build.
+pub fn create_project(paths: &Paths, dir: &Path, p: &NewProject) -> Result<Created> {
+    if !p.team.iter().any(|(r, _)| r == roles::PM_ROLE) {
+        bail!("the team needs its PM");
+    }
+    let had_dir = dir.join(".lila").is_dir();
+    let created = init_project(paths, dir, Some(p.name.clone()))?;
+    let undo = || {
+        let _ = std::fs::remove_file(&created.file);
+        if !had_dir {
+            let _ = std::fs::remove_dir(dir.join(".lila"));
+        }
+    };
+    let r = (|| {
+        let mut s = crate::settings::load(dir, &paths.roles())?;
+        let wanted = |role: &str| p.team.iter().find(|(r, _)| r == role).map(|(_, n)| *n);
+        let gone: Vec<String> = s.members.iter().filter(|m| m.role != roles::PM_ROLE && wanted(&m.role).is_none()).map(|m| m.id.clone()).collect();
+        for id in gone {
+            s.remove_member(&id)?;
+        }
+        for (role, _) in &p.team {
+            if !s.members.iter().any(|m| &m.role == role) {
+                s.add_member(role)?;
+            }
+        }
+        // The wizard's order, PM first.
+        s.members.sort_by_key(|m| p.team.iter().position(|(r, _)| *r == m.role));
+        for ix in 0..s.members.len() {
+            let n = wanted(&s.members[ix].role).unwrap_or(1);
+            s.set_count(ix, n);
+        }
+        s.title = p.title.trim().to_owned();
+        crate::settings::save(dir, &paths.roles(), &s)
+    })();
+    match r {
+        Ok(()) => Ok(created),
+        Err(e) => {
+            undo();
+            Err(e)
+        }
+    }
+}
+
 pub fn slug(s: &str) -> String {
     let mut out: String = s.to_ascii_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     while out.contains("--") {
         out = out.replace("--", "-");
     }
     let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        return "project".into();
+    }
     let out = if out.starts_with(|c: char| c.is_ascii_lowercase()) { out } else { format!("p-{out}") };
     out.chars().take(24).collect::<String>().trim_end_matches('-').to_string()
 }
@@ -94,6 +151,7 @@ mod tests {
         assert_eq!(slug("My Shop!"), "my-shop");
         assert_eq!(slug("lila-agent"), "lila-agent");
         assert_eq!(slug("2048"), "p-2048");
+        assert_eq!(slug("记账本"), "project");
     }
 
     #[test]
@@ -108,6 +166,52 @@ mod tests {
         assert_eq!(team.settings.max_working, 0, "no cap: each member's count decides");
         assert_eq!(team.assign["engineer"], ["tester"]);
         assert_eq!(team.assign["tester"], ["engineer"]);
+    }
+
+    fn home() -> (tempfile::TempDir, Paths, std::path::PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths { config: home.path().join("c"), data: home.path().join("d"), state: home.path().join("s"), isolated: true };
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        (home, paths, repo)
+    }
+
+    #[test]
+    fn wizard_team_and_title() {
+        let (_h, paths, repo) = home();
+        let team = vec![("pm".into(), 1), ("engineer".into(), 2), ("tester".into(), 1)];
+        let p = NewProject { name: "shop".into(), title: "我的小店".into(), team };
+        create_project(&paths, &repo, &p).unwrap();
+        let s = crate::settings::load(&repo, &paths.roles()).unwrap();
+        assert_eq!(s.title, "我的小店");
+        assert_eq!(s.member_ids(), ["pm", "engineer", "engineer-2", "tester"]);
+        let text = std::fs::read_to_string(repo.join(".lila/project.toml")).unwrap();
+        assert!(text.contains("# Who may hand work to whom"), "comments kept: {text}");
+        assert!(!text.contains("designer"), "{text}");
+    }
+
+    #[test]
+    fn wizard_adds_a_role_outside_the_default_team() {
+        let (_h, paths, repo) = home();
+        roles::install_defaults(&paths.roles()).unwrap();
+        let dir = paths.roles();
+        std::fs::write(dir.join("writer.toml"), "name = \"Writer\"\nruntime = \"claude\"\nmodel = \"claude-haiku-5-5\"\n").unwrap();
+        std::fs::write(dir.join("writer.md"), "Write docs.").unwrap();
+        let p = NewProject { name: "docs".into(), title: String::new(), team: vec![("pm".into(), 1), ("writer".into(), 1)] };
+        create_project(&paths, &repo, &p).unwrap();
+        let s = crate::settings::load(&repo, &paths.roles()).unwrap();
+        assert_eq!(s.member_ids(), ["pm", "writer"]);
+        assert_eq!(s.title, "");
+    }
+
+    #[test]
+    fn wizard_leaves_nothing_when_it_fails() {
+        let (_h, paths, repo) = home();
+        let p = NewProject { name: "x".into(), title: String::new(), team: vec![("pm".into(), 1), ("nobody".into(), 1)] };
+        assert!(create_project(&paths, &repo, &p).is_err());
+        assert!(!repo.join(".lila").exists());
+        let p = NewProject { name: "x".into(), title: String::new(), team: vec![("engineer".into(), 1)] };
+        assert!(create_project(&paths, &repo, &p).unwrap_err().to_string().contains("PM"));
     }
 
     #[test]
