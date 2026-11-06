@@ -16,10 +16,13 @@ pub const GAP: f32 = 8.;
 pub const R_BLOCK: f32 = 12.;
 /// Buttons, inputs, rows.
 pub const R_CTL: f32 = 8.;
-/// A one-line row in the sidebar.
-pub const ROW: f32 = 30.;
-/// A member's two-line row.
+/// A one-line row in the sidebar, and the room under it (a chosen or hovered
+/// row never touches the next).
+pub const ROW: f32 = 32.;
+pub const ROW_GAP: f32 = 2.;
+/// A member's two-line row, and the room under it (the tree's lines run through it).
 pub const MEMBER_ROW: f32 = 46.;
+pub const MEMBER_GAP: f32 = 4.;
 /// The status bar card.
 pub const STATUS: f32 = 34.;
 
@@ -53,6 +56,9 @@ pub fn red() -> Hsla {
 pub fn yellow() -> Hsla {
     c(0xffd60aff)
 }
+pub fn orange() -> Hsla {
+    c(0xff9f0aff)
+}
 /// Claude Code's own orange, for its tile.
 pub fn claude() -> Hsla {
     c(0xf0905fff)
@@ -83,9 +89,9 @@ pub fn hairline() -> Hsla {
 }
 
 // ---- materials: heavier = more structural ----
-/// The window: neutral graphite glass; the wallpaper only tints it.
+/// The window: neutral graphite glass, see-through enough that the blurred wallpaper shows a little.
 pub fn glass() -> Hsla {
-    c(0x18191cdb)
+    c(0x18191cbd)
 }
 /// Cards: a lighter step of the window's own glass.
 pub fn block() -> Hsla {

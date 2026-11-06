@@ -40,7 +40,7 @@ Lila 是一个管理编程 agent 团队的桌面工具。
   - 交接由 lilad 按流程模板推进；
   - 有验收关口，积压上限 3；
   - PM 上下文到约 12 万 token 时换新会话（接受滚动历史被清空）；
-  - worktree 按链分，验收时用 squash 合并（阶段 E，还没做）。
+  - worktree 按链分，验收时用 squash 合并：后来决定第一版不做 worktree，阶段 E 改成同一时间一条链、验收时提交（§14）。
 
 ## 家里电脑上的准备
 
@@ -64,7 +64,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
   - 角色 `~/.config/lila/roles/`：第一次 `lila init` / `lila up` 时装上默认的五个角色。
   - 账号 `~/.config/lila/accounts.toml` 和 `~/.config/lila/accounts/`：没有时每个 CLI 只有用它自己目录的「默认」账号。
   - 数据库 `~/.local/share/lila/lila.db`：任务、收件箱、动态、流程运行、会话账本。
-  - 窗口标签 `~/.local/state/lila/app-tabs.json`。
+  - 窗口上次打开的项目 `~/.local/state/lila/app-tabs.json`。
 - 这一台用来看效果的项目是 `~/temp` 和 `creator-studio`；家里电脑上用窗口里的新建项目向导（侧栏「项目」右边的 `+`）或 `lila init` 另建。
 
 ## 技术栈
@@ -93,7 +93,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | ↳ `usage.rs` | 按成员统计 token（读两个 CLI 的会话记录）、时间解析 |
 | ↳ 其他 | `settings.rs`（项目设置读写，用 toml_edit 保留注释）、`roles.rs`（角色和默认角色升级）、`init.rs`、`client.rs`、`paths.rs`、`skill.md`（给 agent 的协议说明） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app） |
-| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、窗口自己的焦点。`ui.rs`：侧栏卡片、标签栏、终端卡片、概览（需要你 / 任务 / 动态）、收件箱卡片（含验收、预算）、状态栏。`style.rs`：配色和小部件。`tree.rs`：成员树动画。`data.rs`：拉数据、本地时间。`dialog.rs`：对话框外壳（`footer: false` 不显示保存栏）。`settings.rs`：项目设置。`prefs.rs`：全局设置（角色 / 用量 / 关于）。`usage.rs`：用量页（账号、浏览器登录、magpie）。`wizard.rs`、`detail.rs`、`compose.rs`、`build.rs`。 |
+| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、窗口自己的焦点。`ui.rs`：侧栏卡片、中间卡片（项目标题行、终端、状态行）、概览（需要你 / 任务 / 动态）、收件箱卡片（含验收、预算）、状态栏。`style.rs`：配色和小部件。`tree.rs`：成员树动画。`data.rs`：拉数据、本地时间。`dialog.rs`：对话框外壳（`footer: false` 不显示保存栏）。`settings.rs`：项目设置。`prefs.rs`：全局设置（角色 / 用量 / 关于）。`usage.rs`：用量页（账号、浏览器登录、magpie）。`wizard.rs`、`detail.rs`、`compose.rs`、`build.rs`。 |
 
 ## 关键机制（v2 之后）
 
@@ -115,6 +115,9 @@ cargo run -p lila-app                             # 或者：cargo install --pat
   - 成员工作超过 `runaway_minutes`（30）没调用 `lila`：先提醒，再进收件箱。
   - `--budget 300k`：流程超预算时在步骤之间暂停，等用户选「继续」（预算翻倍）或「取消」。
   - Codex 额度用完时，给 Codex 成员的任务排队到重置时间；装了 magpie 时用 magpie 读到的当前账号额度。
+- **一条链占目录、验收时提交**（§14）：
+  - `max_chains`（1）：一条链从成员拿到第一个任务到你验收为止占着项目目录，别的链排队。
+  - `commit_on_accept`（开）：点「通过」时 lilad `git add -A` 并提交一次，失败进收件箱。
 - **账号和用量**（全局设置 → 用量）：
   - 账号写在 `~/.config/lila/accounts.toml`，每个账号一个 CLI 配置目录；成员用当前账号启动（`CLAUDE_CONFIG_DIR` / `CODEX_HOME`）。
   - 额度：Claude 读 `.claude.json` 的 `cachedUsageUtilization`，Codex 读会话记录里的 `rate_limits`。命令行是 `lila accounts`。
@@ -126,7 +129,8 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 - **完成通知只给在等的人**（`lila_core::route`）：一条链只叫醒 PM 一次；已经在排队的通知合成一条发。
 - **成员覆盖角色设置**：`[[members]]` 里可以写 `runtime`、`model`、`effort`、`prompt_file`、`count`；`project.reload` 重新读配置；`member.restart` 用新设置重启。
 - **默认角色升级**：`defaults/roles/previous/` 存着旧版默认文件，用户没改过的会自动换成新版。
-- **macOS 红绿灯**：`build.rs` 用 `-platform_version macos 11.0 15.5` 链接，红绿灯在 `(20, 18)`，旁边是「Lila」。
+- **macOS 红绿灯**：`build.rs` 用 `-platform_version macos 11.0 15.5` 链接，红绿灯在 `(24, 22)`，在侧栏卡片的第一行里，旁边是「Lila」。
+- **Claude Code 的全屏模式**：Claude Code（2.1.x）默认是行内渲染，输入框跟在输出后面，滚轮滚的是整个终端，和终端类型无关（试过 `TERM_PROGRAM` 和 XTVERSION 的各种回答）。`CLAUDE_CODE_NO_FLICKER=1` 让它用备用屏幕并接收鼠标事件：输入框固定在底部，滚轮交给它只滚输出区。lilad 给 Claude 成员默认设上，角色的 `env` 里写 `CLAUDE_CODE_NO_FLICKER = "0"` 可以关掉。Codex 本来就是全屏。
 - **gpui-kit 的 Root 会抢 Tab、Shift-Tab 和 ⌘C**：终端用 `Terminal` 按键上下文把它们绑定成 `NoAction`。
 - **窗口自己有焦点**：没有别的元素有焦点时，焦点落在窗口上，这样团队没启动时 ⌘, 也能用。
 
@@ -134,17 +138,18 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 - **风格**（`style.rs` 是唯一来源，数值照抄原型的 `:root`）：
   - 石墨色毛玻璃窗口，内边距 8，卡片之间的缝是 8，也是拖动改宽度的把手。
-  - 12px 圆角卡片，靠填充色区分层次。侧栏也是一张卡片，它上方的顶行（红绿灯和「Lila」）在玻璃上。
+  - 12px 圆角卡片，靠填充色区分层次。左、中、右三栏都是卡片，侧栏卡片的第一行是红绿灯和「Lila」。
   - 字号：正文 13、次要 12、说明 11。
 - **布局**：
   - 侧栏是项目列表，加上两层的成员树（PM 在根上），底部是启动团队、暂停派发和设置。
-  - 右边是标签行、终端卡片和概览（需要你 / 任务 / 动态），最底下是状态栏。
+  - 中间一张卡片：项目标题行（项目名、目录、分支、团队状态、项目设置、概览开关）、成员的卡片头和终端、状态行。没有标签页，项目在侧栏里切换。
+  - 右边是概览（需要你 / 任务 / 动态）。
 - **收件箱卡片**：PM 在问你、终端在等你、等你验收（通过 / 写意见打回）、超出预算（继续 / 取消）、额度用完、可能在打转等。
 - **设置**：
   - 全局设置（⌘,）：角色、用量、关于。
   - 项目设置（⇧⌘,）：通用、成员、指派规则、运行规则。
   - 两个都是居中对话框，用户确认过保持两个。
-- **快捷键**：⌘N 新建任务、⌘1–9 切换标签、⌘W 关闭标签、⌘, 全局设置、⇧⌘, 项目设置、⌘I 右侧面板、Esc 关闭。
+- **快捷键**：⌘N 新建任务、⌘1–9 按侧栏顺序切换项目、⌘, 全局设置、⇧⌘, 项目设置、⌘I 右侧面板、Esc 关闭。
 
 ## 无法点鼠标时怎么验证
 
@@ -181,27 +186,23 @@ macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; ki
 - **窗口**：
   - 团队没启动时按 ⌘,；
   - 验收卡片的通过和打回、预算卡片；
-  - 拖动面板、标签和右键菜单；
+  - 拖动面板和右键菜单；红绿灯的位置（截图里没有红绿灯）；
   - 设置对话框里的各种控件；
   - 新建项目向导的「创建并启动」。
 - **终端**：Tab 和 Shift-Tab、平滑滚动、中文输入法、复制粘贴、⌘点击链接。
 
 ## 待办
 
-- **阶段 E**（`docs/architecture-v2.md` §4.8、§8）：每条链一个 git worktree，`check` 在链的 worktree 里跑，用户点「通过」时 squash 合并回主分支，冲突时阻塞给 PM。
-- **窗口里还缺的**（先做进 HTML 原型）：
-  - 流程进度（现在只有 `lila status` 能看）；
-  - 任务详情里的原话、验收标准、决定和没验到的；
-  - 每个成员的上下文大小；
-  - 「整理 PM 上下文」按钮。
+- **阶段 E 的 worktree**（`docs/architecture-v2.md` §4.8）：第一版没做，改成一条链占目录、验收时提交（§14）。以后要真正并行时再做每条链一个 worktree。
+- PM 自己开的链（终端里提的需求）没有验收卡片，也就不会提交（§14 已知限制）。
+- **窗口里已经补上的**（2026-11-06）：任务详情里的流程进度、原话、验收标准、不做、决定和没验到的；任务列表里的当前步骤；终端卡片头的上下文大小；PM 的「整理上下文」（就是 `member.restart`，新会话收到摘要）；角色页的「预览最终提示词」（`lila::roles::preview`）；项目右键「从列表移除」（`project.remove`：停团队、删数据库记录，目录不动）。布局改成三栏卡片，去掉了标签页。
 - **已知限制**：
   - Claude 额度用完时 lilad 还发现不了，它的会话记录里没有额度信息；可以考虑在 lilad 里读 `.claude.json` 或 magpie。
   - 积压上限只挡 PM 新开的链，挂到旧链下面的新工作挡不住。
   - 预算只在步骤之间检查。
   - 成员池在建任务时就选定成员，不会改派给后来空出来的那个。
 - **更早的**：
-  - 角色库的「预览最终提示词」；
-  - Option 当 Alt 用、kitty 图片；
-  - 项目编号改名；
-  - 从列表里移除项目（用户还没表态）；
+  - Option 当 Alt 用（下一个要做）；
+  - kitty 图片（用户决定先不做）；
+  - 项目编号改名：不做，用户认为现有的显示名（`title`）就够了；
   - 远程机器（M3 第 7 项）。

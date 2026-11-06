@@ -58,6 +58,10 @@ pub struct LilaApp {
     append: Option<Entity<InputState>>,
     /// The task whose "cancel" was pressed once (press again to confirm).
     pub confirm_cancel: Option<String>,
+    /// "Tidy the PM's context" was pressed once (press again to confirm).
+    pub confirm_refresh: bool,
+    /// The project "remove from the list" asks about.
+    pub removing: Option<data::Project>,
     /// The new-task form, while open.
     pub draft: Option<crate::compose::Draft>,
     /// A queued task being rewritten in the detail panel.
@@ -132,7 +136,7 @@ impl LilaApp {
             });
         })
         .detach();
-        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
+        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
         app.start_usage(window, cx);
         app
     }
@@ -149,6 +153,16 @@ impl LilaApp {
                     {
                         m["status"] = json!(st);
                         m["msg"] = json!(match st { "working" => "画结算页的三种状态", "blocked" => "终端在等确认：运行 pnpm test", _ => "" });
+                    }
+                }
+            }
+            // `LILA_APP_FAKE_CONTEXT=pm:104000,engineer:47000`: context sizes as if read from sessions.
+            if let (Ok(spec), Some(members)) = (std::env::var("LILA_APP_FAKE_CONTEXT"), snap.status.as_mut().and_then(|s| s["members"].as_array_mut())) {
+                for pair in spec.split(',') {
+                    if let Some((id, n)) = pair.split_once(':')
+                        && let Some(m) = members.iter_mut().find(|m| m["id"] == id)
+                    {
+                        m["context"] = json!(n.parse::<u64>().unwrap_or(0));
                     }
                 }
             }
@@ -343,6 +357,26 @@ impl LilaApp {
         .detach();
     }
 
+    /// Removes `p` from Lila (after the person confirmed): its tab closes, its folder stays.
+    pub fn remove_project(&mut self, p: data::Project, cx: &mut Context<Self>) {
+        let paths = self.paths.clone();
+        self.removing = None;
+        self.notice = None;
+        let id = p.id.clone();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { data::remove_project(&paths, &p) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match r {
+                    Ok(()) => this.close_tab(&id, cx),
+                    Err(e) => this.notice = Some(format!("移除失败：{e:#}")),
+                }
+                this.refresh_now();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Like `act`, then `done` with the result. Errors go to the open form, else the notice.
     pub fn request(&mut self, method: &'static str, params: Value, cx: &mut Context<Self>, done: impl FnOnce(&mut Self, Value, &mut Context<Self>) + 'static) {
         let Some(project) = self.project() else { return };
@@ -440,7 +474,7 @@ impl LilaApp {
 impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let compose = self.compose_panel(cx);
-        let dialog = self.settings_dialog(cx).or_else(|| self.prefs_dialog(cx)).or_else(|| self.wizard_dialog(cx));
+        let dialog = self.settings_dialog(cx).or_else(|| self.prefs_dialog(cx)).or_else(|| self.wizard_dialog(cx)).or_else(|| self.remove_dialog(cx));
         let detail = if compose.is_some() { None } else { self.task.as_ref().and(self.snap.detail.clone()) };
         let loading = compose.is_none() && self.task.is_some() && detail.is_none();
         let overlay = |d: Div| crate::ui::drawer_frame(d, 600.);
@@ -462,14 +496,13 @@ impl Render for LilaApp {
                 div().flex_1().min_h_0().child(
                     // The gutters between the sidebar, the terminal and the overview are the resize handles.
                     gpui::base::h_resizable("main")
-                        .with_handle_appearance(gutter(crate::ui::TAB_BAR))
+                        .with_handle_appearance(gutter(0.))
                         .child(resizable_panel().size(px(250.)).size_range(px(200.)..px(420.)).fixed().child(div().size_full().pr(px(3.)).child(self.sidebar(cx)).into_any_element()))
                         .child(
                             resizable_panel().child(
                                 v_flex()
                                     .size_full()
                                     .pl(px(4.))
-                                    .child(self.tab_bar(cx))
                                     .child(
                                         div().flex_1().min_h_0().child(
                                             gpui::base::h_resizable("work")
@@ -478,7 +511,6 @@ impl Render for LilaApp {
                                                 .child(resizable_panel().visible(self.right_open).size(px(360.)).size_range(px(300.)..px(640.)).fixed().child(self.right(window, cx).into_any_element())),
                                         ),
                                     )
-                                    .child(self.status_bar(cx))
                                     .into_any_element(),
                             ),
                         ),
@@ -510,6 +542,12 @@ impl LilaApp {
     /// Window-wide keys. The terminal handles copy, paste and find; other ⌘ chords bubble here.
     fn shortcut(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
+        if k.key == "escape" && self.removing.is_some() {
+            self.removing = None;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if k.key == "escape" && (self.settings.is_some() || self.prefs.is_some() || self.wizard.is_some()) {
             self.settings = None;
             self.prefs = None;
@@ -539,10 +577,6 @@ impl LilaApp {
         }
         match k.key.as_str() {
             "n" if self.project().is_some() => self.compose(None, None, window, cx),
-            "w" => match self.selected.clone() {
-                Some(id) => self.close_tab(&id, cx),
-                None => return,
-            },
             "," => self.open_prefs(crate::prefs::PrefPage::Roles, window, cx),
             "i" => {
                 self.right_open = !self.right_open;
@@ -550,8 +584,8 @@ impl LilaApp {
             }
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
                 let n = (d.as_bytes()[0] - b'1') as usize;
-                if let Some(id) = self.tabs.get(n).cloned() {
-                    self.select_project(id, cx);
+                if let Some(id) = self.snap.projects.get(n).map(|p| p.id.clone()) {
+                    self.open_project(id, cx);
                 }
             }
             _ => return,

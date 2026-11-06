@@ -111,6 +111,17 @@ pub fn act(paths: &Paths, p: &Project, method: &str, mut params: Value, autostar
     lila::client::request(paths, method, params, autostart)
 }
 
+/// Removes a project from Lila: lilad stops its team and forgets it; with
+/// lilad down, its rows go from the database directly. Its folder stays.
+pub fn remove_project(paths: &Paths, p: &Project) -> anyhow::Result<()> {
+    if lila::client::is_running(paths) {
+        act(paths, p, "project.remove", json!({}), false)?;
+    } else {
+        lila_store::Store::open(&paths.db())?.remove_project(&p.id)?;
+    }
+    Ok(())
+}
+
 /// Writes a missing `.lila/project.toml` again with the default team, under the
 /// id the project is registered with, and has a running lilad load it (no
 /// member starts). Returns what the window should say, if anything.

@@ -72,6 +72,66 @@ fn block(title: &str, _cx: &App) -> Div {
     v_flex().gap_2().child(div().text_xs().font_semibold().text_color(muted()).child(title.to_owned()))
 }
 
+/// A flow step as the window names it (`code`: implement → check → verify).
+pub fn step_label(action: &str) -> String {
+    match action {
+        "implement" => "实现".into(),
+        "check" => "检查".into(),
+        "verify" => "验证".into(),
+        "review" => "审阅".into(),
+        other => other.to_owned(),
+    }
+}
+
+/// Lines with a muted bullet each.
+fn bullets(items: &[String], color: Hsla) -> Div {
+    v_flex().gap_1().text_size(px(13.)).children(items.iter().map(|i| {
+        h_flex().gap_2().items_start().child(div().flex_none().text_color(muted2()).child("•")).child(div().flex_1().min_w_0().text_color(color).child(i.clone()))
+    }))
+}
+
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect()
+}
+
+/// The flow a task is a step of: its steps (done ticked, the current one blue),
+/// the round, and what the last check said.
+fn flow_block(f: &Value) -> Div {
+    let steps = strings(&f["steps"]);
+    let at = f["step"].as_u64().unwrap_or(0) as usize;
+    let finished = f["state"] == "done";
+    let round = f["round"].as_u64().unwrap_or(0);
+    let mut chips = h_flex().gap_1().flex_wrap();
+    for (i, st) in steps.iter().enumerate() {
+        if i > 0 {
+            chips = chips.child(div().text_xs().text_color(muted2()).child("›"));
+        }
+        let label = step_label(st);
+        chips = chips.child(if finished || i < at {
+            style::tag(style::green(), format!("✓ {label}"))
+        } else if i == at {
+            style::tag(style::blue(), format!("● {label}"))
+        } else {
+            style::tag_neutral(label)
+        });
+    }
+    let head = h_flex()
+        .gap(px(6.))
+        .child(div().text_xs().font_semibold().text_color(muted()).child("流程"))
+        .child(div().text_xs().text_color(muted2()).child(if round > 0 {
+            format!("{} · 已返工 {round} 次，最多 {} 次", s(f, "flow"), f["max_rounds"].as_u64().unwrap_or(0))
+        } else {
+            s(f, "flow")
+        }));
+    let check = f["last_check"].as_object().map(|c| {
+        let detail = c.get("detail").and_then(Value::as_str).unwrap_or_default();
+        let at = data::clock(c.get("at_ms").and_then(Value::as_i64).unwrap_or(0));
+        let cmd = f["check"].as_str().unwrap_or_default();
+        if detail == "passed" { format!("上一次检查 `{cmd}` 通过了（{at}）") } else { format!("上一次检查 `{cmd}` 没通过（{at}）：{detail}") }
+    });
+    v_flex().gap_2().child(head).child(chips).when_some(check, |d, c| d.child(div().text_xs().text_color(muted()).child(c)))
+}
+
 impl LilaApp {
     pub fn detail_panel(&mut self, t: Value, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -148,6 +208,13 @@ impl LilaApp {
             _ => None,
         };
 
+        let decisions = strings(&t["decisions"]);
+        let unverified = strings(&t["unverified"]);
+        let brief = t["brief"].clone();
+        let quote = brief["quote"].as_str().map(String::from);
+        let quote_from = brief["quote_from"].as_str().filter(|f| *f != id).map(String::from);
+        let accept = strings(&brief["accept"]);
+        let out_of_scope = strings(&brief["out_of_scope"]);
         let body = s(&t, "body");
         let artifacts: Vec<String> = t["artifacts"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(String::from)).collect();
         let children: Vec<Value> = t["children"].as_array().cloned().unwrap_or_default();
@@ -187,6 +254,19 @@ impl LilaApp {
                     .when_some(outcome, |d, (accent, text)| {
                         d.child(div().px_3().py(px(10.)).rounded(px(8.)).bg(accent.opacity(0.12)).text_color(style::tint(accent, 0.4)).text_size(px(13.)).child(text))
                     })
+                    .when(!decisions.is_empty(), |d| d.child(block("替你做的决定", cx).child(bullets(&decisions, style::fg()))))
+                    .when(!unverified.is_empty(), |d| {
+                        d.child(v_flex().gap_2().child(div().text_xs().font_semibold().text_color(style::yellow()).child("没有验到的")).child(bullets(&unverified, style::fg())))
+                    })
+                    .when(t["flow"].is_object(), |d| d.child(flow_block(&t["flow"])))
+                    .when_some(quote, |d, q| {
+                        let head = h_flex().gap(px(6.)).text_xs().child(div().font_semibold().text_color(muted()).child("你的原话")).when_some(quote_from, |h, from| {
+                            h.child(div().text_color(muted2()).child("来自")).child(task_link(&from, "quote", cx))
+                        });
+                        d.child(v_flex().gap_2().child(head).child(div().border_l_2().border_color(style::blue()).pl_3().py(px(2.)).text_size(px(13.)).line_height(relative(1.6)).child(q)))
+                    })
+                    .when(!accept.is_empty(), |d| d.child(block("怎样算完成", cx).child(bullets(&accept, style::fg()))))
+                    .when(!out_of_scope.is_empty(), |d| d.child(block("不做", cx).child(bullets(&out_of_scope, muted()))))
                     .child(block("说明", cx).child(if let Some(form) = rewrite {
                         form
                     } else if body.trim().is_empty() {

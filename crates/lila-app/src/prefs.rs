@@ -52,6 +52,17 @@ pub struct Prefs {
     pub users: BTreeMap<String, Vec<String>>,
     pub error: Option<String>,
     pub saving: bool,
+    /// The final prompt shown in place of the editor, while on.
+    pub preview: Option<Preview>,
+}
+
+/// What a member using a role is started with, in one project (`lila::roles::preview`).
+pub struct Preview {
+    /// The role's index in `Prefs::roles`.
+    pub role: usize,
+    pub project: String,
+    /// The member it was made for and its prompt, or why it can't be made.
+    pub text: Result<(String, String), String>,
 }
 
 fn role_form(r: &RoleEdit, new: bool, window: &mut Window, cx: &mut Context<LilaApp>) -> RoleForm {
@@ -107,8 +118,35 @@ impl LilaApp {
         self.settings = None;
         self.draft = None;
         self.dialog_offset = Point::default();
-        self.prefs = Some(Prefs { page, roles: forms, deleted: Vec::new(), selected: 0, users, error: None, saving: false });
+        self.prefs = Some(Prefs { page, roles: forms, deleted: Vec::new(), selected: 0, users, error: None, saving: false, preview: None });
         cx.notify();
+    }
+
+    /// Shows role `ix`'s final prompt in `project` (with its unsaved edits), or the editor again (`None`).
+    fn preview_role(&mut self, ix: usize, project: Option<String>, cx: &mut Context<Self>) {
+        let roles_dir = self.paths().roles();
+        let cwd = project.as_ref().and_then(|id| self.snap.projects.iter().find(|p| p.id == *id)).map(|p| p.cwd.clone());
+        let Some(p) = self.prefs.as_mut() else { return };
+        p.preview = match (project, cwd, p.roles.get(ix)) {
+            (Some(project), Some(cwd), Some(r)) => {
+                let v = r.value(cx);
+                let text = lila::roles::preview(&roles_dir, std::path::Path::new(&cwd), &v.id, &v.prompt).map_err(|e| format!("{e:#}"));
+                Some(Preview { role: ix, project, text })
+            }
+            _ => None,
+        };
+        cx.notify();
+    }
+
+    /// Screenshots: the role library on `role`, its final prompt in the first project using it.
+    #[cfg(feature = "shots")]
+    pub fn dev_preview(&mut self, role: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_prefs(PrefPage::Roles, window, cx);
+        let Some(p) = self.prefs.as_mut() else { return };
+        let Some(ix) = p.roles.iter().position(|r| r.id == role) else { return };
+        p.selected = ix;
+        let first = p.users.get(role).and_then(|u| u.first().cloned());
+        self.preview_role(ix, first, cx);
     }
 
     fn pref_role(&mut self, ix: usize) -> Option<&mut RoleForm> {
@@ -335,7 +373,62 @@ impl LilaApp {
         } else {
             body.push(group(Some("协作"), vec![assign_row], cx));
         }
-        body.extend([group(Some("提示词"), vec![block("预设提示词", Some("每个用这个角色、又没有自己提示词的成员都会用它。Lila 会在后面接上协作协议。".into()), Textarea::new(&prompt).area(), None, cx)], cx)]);
+        // Edit, or see what a member is started with: this prompt plus Lila's part.
+        let shown = p.preview.as_ref().filter(|pv| pv.role == ix).map(|pv| (pv.project.clone(), pv.text.clone()));
+        let first = used.first().cloned();
+        let toggle = (!used.is_empty()).then(|| {
+            dialog::segmented(&format!("prompt-view-{ix}"), &["编辑", "预览最终提示词"], shown.is_some() as usize, move |this, i, _, cx| this.preview_role(ix, if i == 1 { first.clone() } else { None }, cx), cx)
+        });
+        let prompt_block = match shown {
+            None => block("预设提示词", Some("每个用这个角色、又没有自己提示词的成员都会用它。Lila 会在后面接上协作协议。".into()), Textarea::new(&prompt).area(), toggle, cx),
+            Some((project, text)) => {
+                let weak = cx.entity().downgrade();
+                let picker = Button::new(SharedString::from(format!("prompt-project-{ix}"))).outline().small().small_button().label(project.clone()).dropdown_caret(true).dropdown_menu({
+                    let used = used.clone();
+                    move |mut menu, _, _| {
+                        for id in &used {
+                            let (weak, id) = (weak.clone(), id.clone());
+                            menu = menu.item(PopupMenuItem::new(id.clone()).on_click(move |_, _, cx| {
+                                let _ = weak.update(cx, |this, cx| this.preview_role(ix, Some(id.clone()), cx));
+                            }));
+                        }
+                        menu
+                    }
+                });
+                let content = match text {
+                    Ok((member, text)) => {
+                        let tokens = text.chars().count() as u64 / 3;
+                        let copy = text.clone();
+                        v_flex()
+                            .gap_2()
+                            .child(h_flex().gap_2().text_xs().text_color(theme.muted_foreground).child("按这个项目里的").child(picker).child(format!("成员 {member} 生成")))
+                            .child(div().text_xs().text_color(crate::style::muted2()).child("角色提示词（含没保存的改动），加上 Lila 接的项目信息和协作协议。只读。"))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("prompt-preview-{ix}")))
+                                    .max_h(px(320.))
+                                    .overflow_y_scrollbar()
+                                    .p_3()
+                                    .rounded(px(8.))
+                                    .bg(crate::style::well())
+                                    .font_family(lila_term::theme::FONT)
+                                    .text_size(px(11.5))
+                                    .line_height(relative(1.6))
+                                    .child(text),
+                            )
+                            .child(
+                                h_flex()
+                                    .child(div().flex_1().text_xs().text_color(crate::style::muted2()).child(format!("约 {:.1}k token", tokens as f64 / 1000.)))
+                                    .child(Button::new(SharedString::from(format!("prompt-copy-{ix}"))).ghost().small().small_button().icon(IconName::Copy).label("复制").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone())))),
+                            )
+                            .into_any_element()
+                    }
+                    Err(e) => div().text_xs().text_color(theme.red).child(format!("生成不了：{e}")).into_any_element(),
+                };
+                block("最终提示词", None, content, toggle, cx)
+            }
+        };
+        body.extend([group(Some("提示词"), vec![prompt_block], cx)]);
         if is_default {
             body.push(notice(IconName::Info, theme.muted_foreground, "这是 Lila 自带的角色。改动保存在你的角色目录里，Lila 升级不会覆盖。", cx));
         }

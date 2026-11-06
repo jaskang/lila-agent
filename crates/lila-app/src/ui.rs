@@ -102,6 +102,7 @@ fn row(id: impl Into<ElementId>, active: bool) -> Stateful<Div> {
         .mx_2()
         .px_2()
         .h(px(style::ROW))
+        .mb(px(style::ROW_GAP))
         .gap_2()
         .rounded(px(style::R_CTL))
         .cursor_pointer()
@@ -109,25 +110,25 @@ fn row(id: impl Into<ElementId>, active: bool) -> Stateful<Div> {
         .when(!active, |d| d.hover(|d| d.bg(style::hover())))
 }
 
-/// The window's bars: the tab row (as tall as the sidebar's top row, where
-/// the traffic lights sit; its last 8 px are the gutter to the cards).
-pub const TAB_BAR: f32 = 44.;
+/// The first row of the sidebar card (the traffic lights and the app's name)
+/// and the center card's project row: as tall as each other, so they line up.
+pub const BAR: f32 = 44.;
 
-/// The room the macOS traffic lights take at the start of the sidebar's top row:
-/// they end at 72 px from the window's edge (see main.rs).
-pub const TRAFFIC_LIGHTS: f32 = 84.;
+/// The room the macOS traffic lights take at the start of the sidebar card's
+/// first row: they end 76 px from the window's edge (see main.rs).
+pub const TRAFFIC_LIGHTS: f32 = 86.;
 
 /// Where the drawers (new task, task detail) sit, inside the window's padding:
-/// from under the tab row to above the status bar, right-aligned.
+/// as tall as the cards, right-aligned.
 pub fn drawer_frame(d: Div, width: f32) -> Div {
     let shadow = vec![
         BoxShadow { color: gpui::black().opacity(0.45), offset: point(px(-18.), px(0.)), blur_radius: px(50.), spread_radius: px(0.), inset: false },
         BoxShadow { color: gpui::black().opacity(0.4), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: false },
     ];
     d.absolute()
-        .top(px(style::GAP + TAB_BAR))
+        .top(px(style::GAP))
         .right(px(style::GAP))
-        .bottom(px(style::GAP + style::STATUS + style::GAP))
+        .bottom(px(style::GAP))
         .w(px(width))
         .max_w(relative(0.9))
         .rounded(px(style::R_BLOCK))
@@ -188,6 +189,7 @@ impl LilaApp {
             .when(!in_tree, |d| d.mx_2())
             .px_2()
             .h(px(style::MEMBER_ROW))
+            .mb(px(style::MEMBER_GAP))
             .gap(px(10.))
             .rounded(px(style::R_CTL))
             .cursor_pointer()
@@ -237,7 +239,8 @@ impl LilaApp {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .pt(px(6.))
+            // The first row: the traffic lights, then the app's name. It drags the window.
+            .child(drag_bar(h_flex().id("sidebar-top"), cx).h(px(BAR)).flex_none().pl(px(TRAFFIC_LIGHTS)).child(div().text_size(px(13.)).font_semibold().child("Lila")))
             .child(
                 h_flex()
                     .pl_4()
@@ -248,7 +251,7 @@ impl LilaApp {
                     .child(div().flex_1())
                     .child(Button::new("new-project").ghost().xsmall().icon(IconName::Plus).tooltip("新建项目…").on_click(cx.listener(|this, _, window, cx| this.new_project(window, cx)))),
             )
-            .children(projects.into_iter().map(|p| {
+            .children(projects.into_iter().enumerate().map(|(n, p)| {
                 let active = selected.as_deref() == Some(&p.id);
                 let (status, inbox) = self.project_summary(&p.id);
                 let id = p.id.clone();
@@ -262,7 +265,7 @@ impl LilaApp {
                         let path = data::tilde(&format!("{}/.lila/project.toml", p.cwd));
                         move |window, cx| gpui::component::tooltip::Tooltip::new(format!("找不到 {path}。打开这个项目时会用默认团队重新创建。")).build(window, cx)
                     }))
-                    .when_some(p.branch.clone().filter(|_| !p.missing && inbox == 0 && status.is_none()), |d, b| d.child(div().text_xs().text_color(muted2()).truncate().max_w(px(110.)).child(b)))
+                    .when(!p.missing && inbox == 0 && status.is_none() && n < 9, |d| d.child(div().text_xs().text_color(muted2()).child(format!("⌘{}", n + 1))))
                     .on_click(cx.listener(move |this, _, _, cx| this.open_project(id.clone(), cx)))
                     .context_menu(self.project_menu(&p, cx))
             }))
@@ -305,24 +308,13 @@ impl LilaApp {
                     ),
             );
 
-        v_flex()
-            .size_full()
-            .text_color(style::fg())
-            .child(
-                drag_bar(h_flex().id("sidebar-top"), cx)
-                    .h(px(TAB_BAR - style::GAP))
-                    .mb(px(style::GAP))
-                    .flex_none()
-                    .pl(px(TRAFFIC_LIGHTS))
-                    .child(div().text_size(px(13.)).font_semibold().child("Lila")),
-            )
-            .child(body)
+        v_flex().size_full().text_color(style::fg()).child(body)
     }
 
     /// The right-click menu of a project (sidebar row or tab).
     fn project_menu(&self, p: &data::Project, cx: &mut Context<Self>) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let weak = cx.entity().downgrade();
-        let (id, cwd, open) = (p.id.clone(), p.cwd.clone(), self.tabs.contains(&p.id));
+        let (id, cwd) = (p.id.clone(), p.cwd.clone());
         move |menu, _, _| {
             let on = |f: fn(&mut LilaApp, &mut Window, &mut Context<LilaApp>)| {
                 let (weak, id) = (weak.clone(), id.clone());
@@ -334,72 +326,132 @@ impl LilaApp {
                 }
             };
             let cwd = cwd.clone();
-            let close = {
-                let (weak, id) = (weak.clone(), id.clone());
-                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    let _ = weak.update(cx, |this, cx| this.close_tab(&id, cx));
-                }
-            };
             menu.item(PopupMenuItem::new("新建任务…").icon(IconName::Plus).on_click(on(|this, window, cx| this.compose(None, None, window, cx))))
                 .item(PopupMenuItem::new("项目设置…").icon(IconName::Settings2).on_click(on(|this, window, cx| this.open_settings(window, cx))))
                 .separator()
                 .item(PopupMenuItem::new("在访达中显示").icon(IconName::FolderOpen).on_click(move |_, _, _| {
                     let _ = std::process::Command::new("open").arg(&cwd).spawn();
                 }))
-                .when(open, |m| m.item(PopupMenuItem::new("关闭标签").icon(IconName::Close).on_click(close)))
+                .separator()
+                .item(PopupMenuItem::new("从列表移除…").icon(style::icon("lila/trash.svg")).on_click({
+                    let (weak, id) = (weak.clone(), id.clone());
+                    move |_, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.removing = this.snap.projects.iter().find(|p| p.id == id).cloned();
+                            cx.notify();
+                        });
+                    }
+                }))
         }
     }
 
-    /// The row over the cards: one tab per open project, new project, then the overview switch.
-    pub fn tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.project().map(|p| p.id);
-        let projects: Vec<data::Project> = self.tabs.iter().filter_map(|id| self.snap.projects.iter().find(|p| &p.id == id).cloned()).collect();
+    /// Asks before removing a project from the list: what goes, what stays.
+    pub fn remove_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let p = self.removing.clone()?;
+        let running = self.snap.daemon && self.snap.project.as_deref() == Some(p.id.as_str()) && self.members().iter().any(|m| m["terminal"].is_string());
+        let shadows = vec![
+            BoxShadow { color: gpui::black().opacity(0.55), offset: point(px(0.), px(24.)), blur_radius: px(64.), spread_radius: px(0.), inset: false },
+            BoxShadow { color: gpui::black().opacity(0.35), offset: point(px(0.), px(2.)), blur_radius: px(8.), spread_radius: px(0.), inset: false },
+        ];
+        let text = format!(
+            "{}Lila 会删掉它的任务、动态和收件箱。项目目录和里面的 .lila/ 不动，以后在这个文件夹新建项目可以重新加回来，只是历史没了。",
+            if running { "团队会先停止。" } else { "" }
+        );
+        Some(
+            div()
+                .id("remove-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::black().opacity(0.42))
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.removing = None;
+                    cx.notify();
+                }))
+                .child(
+                    v_flex()
+                        .id("remove-dialog")
+                        .w(px(440.))
+                        .px(px(22.))
+                        .pt(px(20.))
+                        .pb(px(16.))
+                        .gap(px(10.))
+                        .rounded(px(14.))
+                        .bg(style::popover())
+                        .border_1()
+                        .border_color(style::hairline())
+                        .shadow(shadows)
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(div().text_size(px(15.)).font_semibold().child(format!("从列表移除「{}」？", p.label())))
+                        .child(div().text_size(px(13.)).text_color(muted()).line_height(relative(1.6)).child(text))
+                        .child(div().text_xs().text_color(muted2()).child(data::tilde(&p.cwd)))
+                        .child(
+                            h_flex()
+                                .mt(px(6.))
+                                .gap_2()
+                                .justify_end()
+                                .child(Button::new("remove-no").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| {
+                                    this.removing = None;
+                                    cx.notify();
+                                })))
+                                .child(Button::new("remove-yes").outline().text_color(style::red()).label("移除").on_click(cx.listener(move |this, _, _, cx| this.remove_project(p.clone(), cx)))),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The center card's first row: the shown project (name, folder, branch, how
+    /// its team is doing), its settings and the overview switch. Drags the window.
+    pub fn project_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let (open, inbox) = (self.right_open, self.snap.inbox.len());
-        drag_bar(h_flex().id("tab-bar"), cx)
-            .h(px(TAB_BAR))
+        let project = self.project();
+        let members = self.members();
+        let working = members.iter().filter(|m| m["status"] == "working").count();
+        let waiting = members.iter().filter(|m| m["status"] == "blocked").count();
+        let paused = self.snap.status.as_ref().is_some_and(|s| s["paused"] == true);
+        let daemon = self.snap.daemon;
+        let small_icon = |i: Icon| i.size(px(12.)).text_color(muted2());
+        let sep = || div().w(px(1.)).h(px(14.)).flex_none().bg(gpui::Hsla::from(rgba(0xffffff1a)));
+        drag_bar(h_flex().id("project-bar"), cx)
+            .h(px(BAR))
             .flex_none()
-            .pr_1()
-            .pb(px(style::GAP))
-            .gap(px(2.))
-            .children(projects.into_iter().enumerate().map(|(n, p)| {
-                let active = selected.as_deref() == Some(&p.id);
-                let (status, inbox) = self.project_summary(&p.id);
-                let click = p.id.clone();
-                let group = SharedString::from(format!("tab-{}", p.id));
-                h_flex()
-                    .id(group.clone())
-                    .group(group.clone())
-                    .h(px(28.))
-                    .pl_2()
-                    .pr(px(6.))
-                    .gap(px(7.))
-                    .rounded(px(style::R_CTL))
-                    .border_1()
-                    .cursor_pointer()
-                    .when(active, |d| d.bg(gpui::Hsla::from(rgba(0xffffff17))).border_color(style::hairline()).text_color(style::fg()).shadow_xs())
-                    .when(!active, |d| d.border_color(gpui::transparent_black()).text_color(muted()).hover(|d| d.bg(style::hover()).text_color(style::fg())))
-                    .child(avatar(&p.id, 16., cx))
-                    .child(div().text_size(px(13.)).truncate().max_w(px(180.)).child(p.label()))
-                    .map(|d| match (inbox, status) {
-                        (n, _) if n > 0 => d.child(style::pill(style::red(), n.to_string())),
-                        (_, Some(st)) => d.child(status_mark(st, cx)),
-                        _ if n < 9 => d.child(div().text_size(px(11.)).text_color(muted2()).child(format!("⌘{}", n + 1))),
-                        _ => d,
-                    })
-                    .child({
-                        let close = p.id.clone();
-                        div().when(!active, |d| d.opacity(0.).group_hover(group.clone(), |d| d.opacity(1.))).child(
-                            Button::new(SharedString::from(format!("tab-close-{}", p.id))).ghost().xsmall().icon(IconName::Close).tooltip("关闭标签 (⌘W)，团队继续运行").on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(&close, cx);
-                            })),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_project(click.clone(), cx)))
-                    .context_menu(self.project_menu(&p, cx))
-            }))
-            .child(Button::new("tab-new-project").ghost().xsmall().icon(IconName::Plus).tooltip("新建项目…").on_click(cx.listener(|this, _, window, cx| this.new_project(window, cx))))
+            .pl(px(14.))
+            .pr_2()
+            .gap(px(10.))
+            .border_b_1()
+            .border_color(style::divider())
+            .text_xs()
+            .text_color(muted())
+            .whitespace_nowrap()
+            .when_some(project, |d, p| {
+                let team = if !daemon {
+                    div().text_color(muted2()).child("lilad 未运行").into_any_element()
+                } else if members.iter().all(|m| !m["terminal"].is_string()) {
+                    div().text_color(muted2()).child("团队未启动").into_any_element()
+                } else {
+                    h_flex()
+                        .child(format!("{} 个成员", members.len()))
+                        .when(working > 0, |d| d.child(" · ").child(div().text_color(style::blue()).child(format!("{working} 个工作中"))))
+                        .when(waiting > 0, |d| d.child(" · ").child(div().text_color(style::red()).child(format!("{waiting} 个在等你"))))
+                        .into_any_element()
+                };
+                d.child(avatar(&p.id, 20., cx))
+                    .child(div().flex_none().max_w(px(260.)).truncate().text_size(px(15.)).font_semibold().text_color(style::fg()).child(p.label()))
+                    .when(paused, |d| d.child(style::tag(style::yellow(), "已暂停派发")))
+                    .child(sep())
+                    .child(h_flex().min_w_0().gap(px(5.)).child(small_icon(Icon::new(IconName::Folder))).child(div().truncate().max_w(px(220.)).child(data::tilde(&p.cwd))))
+                    .when_some(p.branch.clone(), |d, b| d.child(h_flex().flex_none().gap(px(5.)).child(small_icon(style::icon("lila/branch.svg"))).child(b)))
+                    .child(sep())
+                    .child(div().flex_none().child(team))
+            })
             .child(div().flex_1())
+            .when(self.project().is_some(), |d| {
+                d.child(Button::new("bar-settings").ghost().xsmall().icon(IconName::Settings2).tooltip("项目设置 (⇧⌘,)").on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))))
+            })
             .child(
                 div().relative().child(
                     Button::new("bar-panel")
@@ -467,7 +519,27 @@ impl LilaApp {
                 .child(div().text_xs().text_color(muted()).flex_none().child(s(m, "role")))
                 .child(div().text_xs().text_color(muted2()).truncate().min_w_0().child(spec))
                 .child(div().flex_1())
-                .child(div().text_xs().text_color(muted()).truncate().max_w(px(360.)).child(s(m, "msg")))
+                .child(div().text_xs().text_color(muted()).truncate().max_w(px(300.)).child(s(m, "msg")))
+                .when_some(m["context"].as_u64().zip(m["context_limit"].as_u64()), |d, (n, limit)| d.child(context_chip(n, limit, m["owner"] == true)))
+                .when(m["owner"] == true && m["context"].is_u64(), |d| {
+                    let id = s(m, "id");
+                    if self.confirm_refresh {
+                        d.child(div().text_xs().text_color(muted()).flex_none().child("换新会话，终端历史会清空"))
+                            .child(Button::new("refresh-pm-yes").small().small_button().outline().label("确认整理").on_click(cx.listener(move |this, _, _, cx| {
+                                this.confirm_refresh = false;
+                                this.act("member.restart", json!({"member": id}), false, cx)
+                            })))
+                            .child(Button::new("refresh-pm-no").small().small_button().ghost().label("算了").on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_refresh = false;
+                                cx.notify();
+                            })))
+                    } else {
+                        d.child(Button::new("refresh-pm").small().small_button().ghost().icon(IconName::RefreshCw).label("整理上下文").tooltip("PM 换一个新会话，第一条消息是 Lila 从数据库生成的项目摘要。终端的滚动历史会清空。").on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_refresh = true;
+                            cx.notify();
+                        })))
+                    }
+                })
                 .when(m["stale"] == true, |d| {
                     let id = s(m, "id");
                     d.child(style::tag(style::yellow(), "设置已改")).child(
@@ -483,45 +555,40 @@ impl LilaApp {
                     }))
                 })
         });
-        // The state shows as a soft ring, not a loud border: the pill in the header carries the word.
-        let status = member.as_ref().map(|m| s(m, "status")).unwrap_or_default();
-        let (ring, halo) = match status.as_str() {
-            "blocked" => (style::red().opacity(0.4), Some(style::red().opacity(0.08))),
-            "working" => (style::blue().opacity(0.32), None),
-            _ => (style::block_line(), None),
-        };
-        v_flex()
-            .size_full()
-            .pr(px(4.))
-            .when_some(self.notice.clone(), |d, n| {
-                d.child(
-                    h_flex()
-                        .mb_2()
-                        .px_3()
-                        .py_2()
-                        .gap_2()
-                        .rounded(px(10.))
-                        .bg(style::red().opacity(0.12))
-                        .text_size(px(13.))
-                        .child(Icon::new(IconName::CircleAlert).small().text_color(style::red()))
-                        .child(div().flex_1().child(n))
-                        .child(Button::new("notice-close").ghost().xsmall().icon(IconName::Close).on_click(cx.listener(|this, _, _, cx| {
-                            this.notice = None;
-                            cx.notify();
-                        }))),
-                )
-            })
-            .child(
-                card()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .border_color(ring)
-                    .when_some(halo, |d, h| d.shadow(vec![BoxShadow { color: h, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(3.), inset: false }]))
-                    .children(card_header)
-                    .child(body),
-            )
+        // One card: the project's row, the shown member's header and terminal, the
+        // status row. The member's state shows in its header's pill.
+        let project_bar = self.project_bar(cx).into_any_element();
+        let status_bar = self.status_bar(cx).into_any_element();
+        v_flex().size_full().pr(px(4.)).child(
+            card()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .child(project_bar)
+                .when_some(self.notice.clone(), |d, n| {
+                    d.child(
+                        h_flex()
+                            .mx_2()
+                            .mt_2()
+                            .px_3()
+                            .py_2()
+                            .gap_2()
+                            .rounded(px(10.))
+                            .bg(style::red().opacity(0.12))
+                            .text_size(px(13.))
+                            .child(Icon::new(IconName::CircleAlert).small().text_color(style::red()))
+                            .child(div().flex_1().child(n))
+                            .child(Button::new("notice-close").ghost().xsmall().icon(IconName::Close).on_click(cx.listener(|this, _, _, cx| {
+                                this.notice = None;
+                                cx.notify();
+                            }))),
+                    )
+                })
+                .children(card_header)
+                .child(body)
+                .child(status_bar),
+        )
     }
 
     pub fn right(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -571,6 +638,14 @@ impl LilaApp {
 
     fn task_board(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let tasks = self.snap.tasks.clone();
+        // Open flow runs by their first task: where each is now.
+        let runs: Vec<Value> = self.snap.status.as_ref().and_then(|v| v["runs"].as_array().cloned()).unwrap_or_default();
+        let flow_now = |t: &Value| -> Option<String> {
+            let anchor = t["run"].as_str()?;
+            let r = runs.iter().find(|r| r["anchor"] == anchor)?;
+            let round = r["round"].as_u64().unwrap_or(0);
+            Some(format!("{}{}", crate::detail::step_label(r["step"].as_str()?), if round > 0 { format!(" · 返工 {round} 次") } else { String::new() }))
+        };
         let group = |title: &'static str, states: &[&str], limit: usize| {
             let rows: Vec<Value> = tasks.iter().rev().filter(|t| states.contains(&t["state"].as_str().unwrap_or(""))).take(limit).cloned().collect();
             (title, rows)
@@ -596,6 +671,7 @@ impl LilaApp {
                         let id = s(&t, "id");
                         let open = id.clone();
                         let active = self.task.as_deref() == Some(id.as_str());
+                        let step = if state == "done" { None } else { flow_now(&t) };
                         h_flex()
                             .id(SharedString::from(format!("board-{id}")))
                             .items_start()
@@ -608,7 +684,11 @@ impl LilaApp {
                             .when(!active, |d| d.hover(|d| d.bg(style::hover())))
                             .on_click(cx.listener(move |this, _, window, cx| this.open_task(open.clone(), window, cx)))
                             .child(crate::detail::state_tag(&state, id.clone()))
-                            .child(v_flex().flex_1().min_w_0().gap(px(1.)).child(div().text_size(px(13.)).truncate().child(s(&t, "title"))).child(div().pl(px(2.)).text_xs().text_color(muted2()).child(format!("{} → {}", s(&t, "from"), s(&t, "to")))))
+                            .child(v_flex().flex_1().min_w_0().gap(px(1.)).child(div().text_size(px(13.)).truncate().child(s(&t, "title"))).child(
+                                h_flex().pl(px(2.)).gap(px(4.)).text_xs().text_color(muted2()).child(format!("{} → {}", s(&t, "from"), s(&t, "to"))).when_some(step, |d, st| {
+                                    d.child("·").child(div().truncate().text_color(style::tint(style::blue(), 0.35)).child(st))
+                                }),
+                            ))
                             .child(div().pt(px(2.)).text_xs().text_color(muted2()).child(data::clock(t["updated_ms"].as_i64().unwrap_or(0))))
                     }))
             }))
@@ -742,18 +822,14 @@ impl LilaApp {
 
     /// The bottom of the main column: where the daemon and the project stand, at a glance.
     pub fn status_bar(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let project = self.project();
-        let members = self.members();
-        let working = members.iter().filter(|m| m["status"] == "working").count();
-        let waiting = members.iter().filter(|m| m["status"] == "blocked").count();
         let paused = self.snap.status.as_ref().is_some_and(|s| s["paused"] == true);
         let daemon = self.snap.daemon;
         let item = || h_flex().flex_none().gap(px(6.));
-        let small_icon = |i: Icon| i.size(px(12.)).text_color(muted2());
-        card()
+        div()
             .h(px(style::STATUS))
             .flex_none()
-            .mt(px(style::GAP))
+            .border_t_1()
+            .border_color(style::divider())
             .flex()
             .items_center()
             .pl(px(14.))
@@ -763,23 +839,40 @@ impl LilaApp {
             .text_color(muted())
             .whitespace_nowrap()
             .child(item().child(dot(if daemon { style::green() } else { muted2() })).child(if daemon { "lilad 运行中" } else { "lilad 未运行" }))
-            .when_some(project.as_ref().map(|p| data::tilde(&p.cwd)), |d, p| d.child(item().child(small_icon(Icon::new(IconName::Folder))).child(div().truncate().max_w(px(280.)).child(p))))
-            .when_some(project.as_ref().and_then(|p| p.branch.clone()), |d, b| d.child(item().child(small_icon(style::icon("lila/branch.svg"))).child(b)))
-            .when(project.is_some() && !members.is_empty(), |d| {
-                d.child(
-                    item()
-                        .gap_0()
-                        .child(format!("{} 个成员", members.len()))
-                        .when(daemon, |d| d.child(" · ").child(div().text_color(style::blue()).child(format!("{working} 个工作中"))))
-                        .when(waiting > 0, |d| d.child(" · ").child(div().text_color(style::red()).child(format!("{waiting} 个在等你")))),
-                )
-            })
             .when(paused, |d| d.child(div().text_color(style::yellow()).child("已暂停派发")))
             .child(div().flex_1())
-            .child(h_flex().gap_3().min_w_0().overflow_hidden().text_color(muted2()).children([("⌘N", "新建任务"), ("⌘I", "概览"), ("⇧⌘,", "项目设置"), ("⌘,", "设置")].into_iter().map(|(k, l)| h_flex().flex_none().gap_1().child(style::kbd(k)).child(l))))
+            .child(h_flex().gap_3().min_w_0().overflow_hidden().text_color(muted2()).children([("⌘1–9", "切换项目"), ("⌘N", "新建任务"), ("⌘I", "概览"), ("⇧⌘,", "项目设置"), ("⌘,", "设置")].into_iter().map(|(k, l)| h_flex().flex_none().gap_1().child(style::kbd(k)).child(l))))
     }
 }
 
 pub fn placeholder(text: String, _cx: &App) -> impl IntoElement {
     div().flex_1().flex().items_center().justify_center().p_8().text_color(muted()).child(text)
+}
+
+/// How full a member's context is: a short bar and the size, against where Lila
+/// starts it afresh (the bar's end). Yellow from 80%, orange past it.
+fn context_chip(n: u64, limit: u64, pm: bool) -> impl IntoElement {
+    let k = |t: u64| if t >= 1_000_000 { format!("{:.1}M", t as f64 / 1e6) } else { format!("{}k", (t + 500) / 1000) };
+    let frac = if limit == 0 { 0.0 } else { (n as f32 / limit as f32).min(1.0) };
+    let color = if limit > 0 && n >= limit {
+        style::orange()
+    } else if limit > 0 && n * 5 >= limit * 4 {
+        style::yellow()
+    } else {
+        muted()
+    };
+    let tip = match (pm, limit) {
+        (_, 0) => format!("上下文 {}", k(n)),
+        (true, _) => format!("上下文 {}。到 {} 并且空闲一会儿后，Lila 会给 PM 换新会话", k(n), k(limit)),
+        (false, _) => format!("上下文 {}。超过 {} 后，换到别的链时开新会话", k(n), k(limit)),
+    };
+    h_flex()
+        .id("context-chip")
+        .flex_none()
+        .gap(px(5.))
+        .text_xs()
+        .text_color(color)
+        .child(div().w(px(34.)).h(px(4.)).rounded(px(2.)).bg(gpui::Hsla::from(rgba(0xffffff1a))).child(div().h_full().w(relative(frac)).rounded(px(2.)).bg(color)))
+        .child(k(n))
+        .tooltip(move |window, cx| gpui::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
 }

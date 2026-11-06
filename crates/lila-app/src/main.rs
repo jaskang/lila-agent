@@ -31,10 +31,10 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            // No separate title bar: the traffic lights sit in the sidebar's top row,
-            // centered on the tab row beside it (window padding 8 + 18), and the top
-            // row of every column drags the window (see ui::drag_bar).
-            titlebar: Some(TitlebarOptions { title: Some("Lila".into()), appears_transparent: true, traffic_light_position: Some(point(px(20.), px(18.))) }),
+            // No separate title bar: the traffic lights sit in the sidebar card's first
+            // row, centered on it (window padding 8 + 14 down, 8 + 16 in), and the
+            // first row of the sidebar and center cards drags the window (see ui::drag_bar).
+            titlebar: Some(TitlebarOptions { title: Some("Lila".into()), appears_transparent: true, traffic_light_position: Some(point(px(24.), px(22.))) }),
             // Graphite frosted glass: the root paints a translucent graphite over the blur.
             window_background: WindowBackgroundAppearance::Blurred,
             ..Default::default()
@@ -106,6 +106,26 @@ fn main() {
                         .spawn(cx, async move |cx| {
                             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
                             let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.dev_signin(&spec, window, cx)));
+                        })
+                        .detach();
+                }
+                // Ask about removing this project from the list.
+                if let Ok(id) = std::env::var("LILA_APP_REMOVE") {
+                    let view = view.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                            let _ = cx.update(|_, cx| view.update(cx, |v, _| v.removing = v.snap.projects.iter().find(|p| p.id == id).cloned()));
+                        })
+                        .detach();
+                }
+                // The role library on this role, its final prompt shown.
+                if let Ok(role) = std::env::var("LILA_APP_PROMPT") {
+                    let view = view.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.dev_preview(&role, window, cx)));
                         })
                         .detach();
                 }

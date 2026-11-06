@@ -45,7 +45,7 @@
   --sheen: inset 0 1px 0 rgb(255 255 255 / .06);   /* light catching the top edge of a raised surface */
 
   /* ---- materials: heavier = more structural ---- */
-  --glass: rgb(24 25 28 / .86);          /* window: neutral graphite glass; the wallpaper only tints it */
+  --glass: rgb(24 25 28 / .74);          /* window: neutral graphite glass; the blurred wallpaper shows a little */
   --glass-blur: blur(48px) saturate(1.15);
   --block: rgb(255 255 255 / .055);      /* overview cards: a lighter step of the window's own glass */
   --block-line: rgb(255 255 255 / .06);
@@ -71,6 +71,7 @@
 
   /* layout constants (ui.rs) */
   --tab-bar: 44px;
+  --bar: 44px;                           /* the first row of the sidebar card and the project card: same height, so they line up */
   --traffic: 84px;
   --row: 30px;
 
@@ -128,10 +129,13 @@ body {
 /* ---------- sidebar: sits straight on the glass, no card of its own ---------- */
 .side { flex: none; display: flex; flex-direction: column; min-height: 0; }
 /* the sidebar's content is a card like the others; the app's name sits above it, beside the traffic lights */
-.side-card { flex: 1; min-height: 0; display: flex; flex-direction: column; padding-top: 6px;
+.side-card { flex: 1; min-height: 0; display: flex; flex-direction: column; padding-top: 0;
   background: var(--block); box-shadow: inset 0 0 0 1px var(--block-line), var(--sheen); border-radius: var(--r-block); overflow: hidden; }
 .side-sec { padding: 6px 10px 6px 16px; gap: 5px; }
 .row.tall { height: 46px; gap: 10px; }
+/* the sidebar's rows keep a little air between them, so a chosen or hovered row never touches the next */
+.side-card .row { height: 32px; margin-bottom: 2px; }
+.side-card .row.tall { height: 46px; margin-bottom: 4px; }
 /* member tree: the trunk drops from the PM's tile, an elbow curves into each member */
 .tree { margin-left: 27px; padding-left: 14px; }
 .tree > .row { position: relative; margin: 0 8px 0 0; }
@@ -147,9 +151,9 @@ body {
 /* waiting for you: the tile breathes a red ring, slow enough to notice without nagging */
 .row.waiting .cli { animation: ask-ring 1.8s ease-out infinite; }
 @keyframes ask-ring { 0% { box-shadow: 0 0 0 0 rgb(255 69 58 / .55); } 70%, 100% { box-shadow: 0 0 0 5px rgb(255 69 58 / 0); } }
-.side-top { height: var(--tab-bar); flex: none; padding-left: var(--traffic); padding-right: 12px; padding-bottom: var(--gap); gap: 8px; }
-/* centered on the tab row: (44 − 8) / 2 − 6 = 12 below the window padding */
-.traffic { position: absolute; left: calc(var(--gap) + 12px); top: calc(var(--gap) + 12px); display: flex; gap: 8px; z-index: 30; }
+.side-top { height: var(--bar); flex: none; padding-left: calc(var(--traffic) + 2px); padding-right: 12px; gap: 8px; }
+/* inside the sidebar card's first row, centered on it: (44 − 12) / 2 = 16 from the card's top and left */
+.traffic { position: absolute; left: calc(var(--gap) + 16px); top: calc(var(--gap) + 16px); display: flex; gap: 8px; z-index: 30; }
 .traffic i { width: 12px; height: 12px; border-radius: 50%; background: #ff5f57; box-shadow: inset 0 0 0 .5px rgb(0 0 0 / .25); }
 .traffic i:nth-child(2) { background: #febc2e; }
 .traffic i:nth-child(3) { background: #28c840; }
@@ -224,16 +228,15 @@ body {
 
 /* ---------- main column ---------- */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
-/* title row and status row: the window's own padding counts as one side of the gap, so the row adds the same
-   amount on its inner side. Window edge → tab = tab → card = 12px; card → status text = status text → window edge = 12px */
-.tabbar { height: var(--tab-bar); flex: none; padding: 0 4px var(--gap) 0; gap: 2px; }
-.tab { height: 28px; padding: 0 6px 0 8px; gap: 7px; border-radius: var(--r-ctl); color: var(--muted); cursor: default; transition: background-color 80ms ease, color 80ms ease; }
-.tab:hover { background: var(--hover); color: var(--fg); }
-/* the current tab is raised a step out of the glass */
-.tab.on { background: rgb(255 255 255 / .09); color: var(--fg); box-shadow: var(--hairline), var(--sheen), 0 1px 3px rgb(0 0 0 / .25); }
-.tab .btn.xs { width: 18px; height: 18px; border-radius: 5px; opacity: 0; transition: opacity 100ms ease; }
-.tab:hover .btn.xs, .tab.on .btn.xs { opacity: 1; }
-.tab .kbd { font-size: var(--t-caption); color: var(--muted-2); }
+/* the center card's first row: the project, its settings and the overview switch; it drags the window */
+.projbar { height: var(--bar); flex: none; padding: 0 8px 0 14px; gap: 10px; border-bottom: 1px solid rgb(255 255 255 / .06); }
+.center .card-head { background: none; }
+/* the center card's last row */
+.center .status { margin-top: 0; background: none; box-shadow: none; border-radius: 0; border-top: 1px solid rgb(255 255 255 / .06); }
+.projbar .pname { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.projbar .pmeta { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: var(--t-caption); min-width: 0; }
+.projbar .pmeta svg.i.sm { width: 12px; height: 12px; color: var(--muted-2); }
+.projbar .sep { width: 1px; height: 14px; background: rgb(255 255 255 / .1); flex: none; }
 .work { flex: 1; min-height: 0; display: flex; position: relative; }
 .center { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
@@ -312,6 +315,23 @@ kbd { font: 500 10px/1 var(--sans); padding: 2px 4px; border-radius: 4px; color:
 .md li::marker { color: var(--muted-2); }
 .md code { font: 11.5px var(--mono); background: var(--secondary); padding: 1px 5px; border-radius: 4px; }
 .callout { padding: 10px 12px; border-radius: 8px; line-height: 1.5; }
+.quote { border-left: 2px solid var(--blue); padding: 2px 0 2px 12px; line-height: 1.6; color: var(--fg); white-space: pre-wrap; }
+.blist { margin: 0; padding-left: 18px; line-height: 1.7; }
+.blist li::marker { color: var(--muted-2); }
+.flow { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.fstep { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 11px; font-size: var(--t-caption); color: var(--muted); background: var(--secondary); }
+.fstep.done { color: #7ee2a0; background: rgb(48 209 88 / .12); }
+.fstep.now { color: #9cc8ff; background: rgb(10 132 255 / .16); }
+.fstep.now .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--blue); }
+.fstep svg.i.sm { width: 11px; height: 11px; }
+.farrow { color: var(--muted-2); font-size: 12px; }
+.ctx { display: inline-flex; align-items: center; gap: 5px; flex: none; }
+.ctx .bar { width: 34px; height: 4px; border-radius: 2px; background: rgb(255 255 255 / .1); overflow: hidden; }
+.ctx .bar i { display: block; height: 100%; border-radius: 2px; }
+.prompt-pre { font: 11.5px/1.6 var(--mono); white-space: pre-wrap; margin: 0; padding: 12px 14px; border-radius: 8px; background: rgb(0 0 0 / .25); color: var(--fg); max-height: 300px; overflow-y: auto; }
+.prompt-pre .lila { color: var(--muted); }
+.confirm { width: min(440px, calc(100% - 80px)); background: var(--popover); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur); border-radius: 14px; box-shadow: inset 0 0 0 1px rgb(255 255 255 / .1), var(--sheen), 0 0 0 1px rgb(0 0 0 / .5), 0 32px 90px rgb(0 0 0 / .55); padding: 20px 22px 16px; display: flex; flex-direction: column; gap: 10px; }
+.confirm h2 { margin: 0; font-size: 15px; font-weight: 600; }
 .timeline { border-left: 1px solid rgb(255 255 255 / .1); margin-left: 4px; padding-left: 16px; gap: 10px; }
 .timeline .ev { position: relative; }
 .timeline .ev::before { content: ""; position: absolute; left: -20px; top: 5px; width: 7px; height: 7px; border-radius: 50%; background: #48484e; box-shadow: 0 0 0 2px rgb(32 32 37); }
@@ -459,21 +479,28 @@ const clock = ms => { const d = new Date(ms); return `${String(d.getHours()).pad
 const ago = m => now - m * 60000;
 
 const TEAM = [
-  { id: 'pm', status: 'blocked', msg: '等你回答 Q3：游客下单', task: 'T4' },
-  { id: 'designer', status: 'working', msg: '画结算页的三种状态', task: 'T6' },
-  { id: 'architect', status: 'done', msg: 'T5 数据模型已交付', task: null },
-  { id: 'engineer', status: 'working', msg: '实现购物车接口', task: 'T7', queued: 1 },
-  { id: 'engineer-2', status: 'blocked', msg: '终端在等确认：运行 pnpm test', task: 'T8' },
+  { id: 'pm', status: 'blocked', msg: '等你回答 Q3：游客下单', task: 'T4', ctx: 104e3 },
+  { id: 'designer', status: 'working', msg: '画结算页的三种状态', task: 'T6', ctx: 22e3 },
+  { id: 'architect', status: 'done', msg: 'T5 数据模型已交付', task: null, ctx: 64e3 },
+  { id: 'engineer', status: 'working', msg: '实现购物车接口', task: 'T7', queued: 1, ctx: 47e3 },
+  { id: 'engineer-2', status: 'blocked', msg: '终端在等确认：运行 pnpm test', task: 'T8', ctx: 31e3 },
   { id: 'tester', status: 'idle', msg: '', task: null, stale: true },
 ];
 const TASKS = [
-  { id: 'T1', title: '做一个网上小店', state: 'in_progress', from: 'human', to: 'pm', upd: ago(50), cre: ago(180) },
+  { id: 'T1', title: '做一个网上小店', state: 'in_progress', from: 'human', to: 'pm', upd: ago(50), cre: ago(180),
+    quote: '做一个网上小店：能浏览商品、加购物车、下单。先不做支付，订单记下来就行。',
+    accept: ['能从商品页一路下单成功', '购物车刷新后不丢'], out: ['在线支付', '后台管理'] },
   { id: 'T3', title: '技术选型：前端框架和数据库', state: 'done', from: 'pm', to: 'architect', upd: ago(120), cre: ago(170), parent: 'T1' },
   { id: 'T4', title: '结算流程', state: 'blocked', from: 'pm', to: 'pm', upd: ago(4), cre: ago(90), parent: 'T1' },
-  { id: 'T5', title: '数据模型：商品、购物车、订单', state: 'done', from: 'pm', to: 'architect', upd: ago(35), cre: ago(110), parent: 'T1' },
+  { id: 'T5', title: '数据模型：商品、购物车、订单', state: 'done', from: 'pm', to: 'architect', upd: ago(35), cre: ago(110), parent: 'T1',
+    summary: '数据模型写在 docs/model.md，迁移脚本在 db/migrations/0002_cart.sql。',
+    decisions: ['购物车按用户存，游客先存在浏览器里', '价格用整数分，不用浮点'], unverified: ['大于 1 万件商品时的查询速度'] },
   { id: 'T6', title: '结算页交互和三种状态', state: 'in_progress', from: 'pm', to: 'designer', upd: ago(12), cre: ago(40), parent: 'T4' },
-  { id: 'T7', title: '购物车接口：加、减、清空', state: 'in_progress', from: 'pm', to: 'engineer', upd: ago(6), cre: ago(30), parent: 'T1' },
-  { id: 'T8', title: '订单列表页', state: 'in_progress', from: 'pm', to: 'engineer-2', upd: ago(2), cre: ago(28), parent: 'T1' },
+  { id: 'T7', title: '购物车接口：加、减、清空', state: 'in_progress', from: 'pm', to: 'engineer', upd: ago(6), cre: ago(30), parent: 'T1',
+    accept: ['加、减、清空三个接口都有测试', '库存不足时返回 409'],
+    run: { flow: 'code', step: 0, round: 2, maxRounds: 3, checks: [['check', 'failed', ago(14)]] } },
+  { id: 'T8', title: '订单列表页', state: 'in_progress', from: 'pm', to: 'engineer-2', upd: ago(2), cre: ago(28), parent: 'T1',
+    run: { flow: 'code', step: 0, round: 1, maxRounds: 3 } },
   { id: 'T9', title: '测试购物车接口', state: 'queued', from: 'engineer', to: 'tester', upd: ago(5), cre: ago(5), parent: 'T7' },
   { id: 'T10', title: '商品详情页图片懒加载', state: 'queued', from: 'pm', to: 'engineer', upd: ago(3), cre: ago(3), parent: 'T1' },
 ];
@@ -492,6 +519,24 @@ const LOG = [
   { at: ago(12), actor: 'designer', task: 'T6', kind: '开始', detail: '' },
   { at: ago(35), actor: 'architect', task: 'T5', kind: '完成', detail: '数据模型写在 docs/model.md，含迁移脚本' },
 ];
+// flow steps as lilad runs them (`code`: implement → check → verify); the window names them in Chinese
+const FLOWS = { code: [['implement', '实现'], ['check', '检查'], ['verify', '验证']] };
+// context sizes against the threshold where Lila starts that member afresh (members: fresh_after_tokens; the PM: pm_refresh_tokens)
+const CTX_LIMIT = { member: 60e3, pm: 120e3 };
+const kTok = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : Math.round(n / 1e3) + 'k';
+const ctxColor = (n, lim) => n >= lim ? 'var(--orange)' : n >= lim * .8 ? 'var(--yellow)' : 'var(--muted)';
+// the chain's brief: each part from the task itself or the nearest ancestor that has it (Lila carries them down the chain)
+function briefOf(t) {
+  const b = {};
+  for (let x = t; x; x = TASKS.find(p => p.id === x.parent))
+    for (const k of ['quote', 'accept', 'out']) if (x[k] && !b[k]) { b[k] = x[k]; if (k === 'quote' && x.id !== t.id) b.from = x.id; }
+  return b.quote || b.accept || b.out ? b : null;
+}
+function flowLine(r) {
+  const steps = FLOWS[r.flow];
+  return `<span class="flow">${steps.map(([, name], i) => `<span class="fstep ${i < r.step ? 'done' : i === r.step ? 'now' : ''}">${i < r.step ? I('check', 'sm') : i === r.step ? '<span class="dot"></span>' : ''}${name}</span>`).join('<span class="farrow">›</span>')}</span>`;
+}
+
 // usage is per subscription account, read from each CLI's own rate-limit records; members don't matter here
 const hrs = h => now + h * 3600e3;
 // Each CLI can have several logged-in accounts (each in its own config dir: CLAUDE_CONFIG_DIR / CODEX_HOME).
@@ -555,7 +600,7 @@ function view() {
     return { daemon: true, projects, tabs: S.tabs, project: p, members: TEAM, inbox: INBOX.filter(i => !S.answered.has(i.id)), tasks: TASKS, log: LOG };
   }
   if (sc === 'stopped') {
-    return { daemon: false, projects, tabs: S.tabs, project: p, members: TEAM.map(m => ({ ...m, status: 'gone', msg: '', stale: false })), inbox: [], tasks: p?.id === 'shop' ? TASKS : [], log: p?.id === 'shop' ? LOG : [] };
+    return { daemon: false, projects, tabs: S.tabs, project: p, members: TEAM.map(m => ({ ...m, status: 'gone', msg: '', stale: false, ctx: undefined })), inbox: [], tasks: p?.id === 'shop' ? TASKS : [], log: p?.id === 'shop' ? LOG : [] };
   }
   // a quiet project: everyone idle, nothing yet
   const quiet = ['pm', 'designer', 'architect', 'engineer', 'tester'].map(id => ({ id, status: id === 'pm' ? 'working' : 'idle', msg: id === 'pm' ? '读项目简介，准备拆任务' : '' }));
@@ -603,10 +648,11 @@ function memberRow(m, branchSvg = '') {
 //   and its tile pulses. Where the trunk is shared, both run on the one line: blue dashes down, red dots up.
 // Dashes are anchored to the tree's own y, so they line up across rows, and their phase follows the clock, so a
 // re-render never makes them jump.
-const ROW_H = 46, FLOW_P = 11.5, FLOW_MS = 600, ASK_P = 6.5, ASK_MS = 1100;
+// a member row is ROW_H tall with ROW_GAP under it; the lines run through the gaps, so each SVG covers both
+const ROW_H = 46, ROW_GAP = 4, PITCH = ROW_H + ROW_GAP, FLOW_P = 11.5, FLOW_MS = 600, ASK_P = 6.5, ASK_MS = 1100;
 function branch(i, crew) {
   const first = i === 0, last = i === crew.length - 1;
-  const T = first ? 12 : 0, H = ROW_H + T, mid = T + ROW_H / 2, y0 = i * ROW_H - T;
+  const T = first ? 12 + ROW_GAP : 0, H = PITCH + T, mid = T + ROW_H / 2, y0 = i * PITCH - T;
   const lastWorking = crew.map(m => m.status).lastIndexOf('working'), lastWaiting = crew.map(m => m.status).lastIndexOf('blocked');
   const phase = (y, P = FLOW_P, ms = FLOW_MS) => `--o:${(((y % P) + P) % P).toFixed(2)}px;animation-delay:-${Math.round(performance.now() % ms)}ms`;
   const elbow = `M1 0V${mid - 8}Q1 ${mid} 9 ${mid}H17`, down = `M1 ${mid - 8}V${H}`, trunk = `M1 0V${H}`;
@@ -623,8 +669,8 @@ function sidebar(v) {
   // two levels: the PM at the root, everyone it hands work to hanging off it
   const pm = v.members.find(m => m.id === 'pm'), crew = v.members.filter(m => m !== pm);
   return `<aside class="side" style="width:${S.sideW}px" data-anno="侧栏 ${S.sideW}px（200–420）">
-    <div class="side-top flex" data-anno="顶行 44 · 拖动窗口"><span class="sm b">Lila</span></div>
     <div class="side-card" data-anno="侧栏卡片">
+    <div class="side-top flex" data-anno="卡片首行 44 · 红绿灯 · 拖动窗口"><span class="sm b">Lila</span></div>
     <div class="side-sec flex"><span class="label">项目</span><span class="grow"></span>
       <button class="btn ghost xs" data-act="wizard" title="新建项目…">${I('plus', 'sm')}</button></div>
     ${v.projects.map(p => {
@@ -634,7 +680,7 @@ function sidebar(v) {
         ${sm.status ? mark(sm.status) : ''}
         ${sm.inbox ? `<span class="tag danger pill">${sm.inbox}</span>` : ''}
         ${p.missing ? `<span class="tag warn" title="找不到 ${p.cwd}/.lila/project.toml。打开这个项目时会用默认团队重新创建。">缺少配置</span>` : ''}
-        ${!p.missing && !sm.inbox && !sm.status ? `<span class="xs mut2 trunc" style="max-width:110px">${p.branch}</span>` : ''}
+        ${!p.missing && !sm.inbox && !sm.status ? `<span class="xs mut2">⌘${v.projects.indexOf(p) + 1}</span>` : ''}
       </div>`;
     }).join('')}
     ${v.members.length ? `<div class="side-sec flex" style="margin-top:14px"><span class="label">成员</span><span class="xs mut2">${v.members.length}</span></div>` : ''}
@@ -651,25 +697,28 @@ function sidebar(v) {
   </aside>`;
 }
 
-function tabbar(v) {
-  const inbox = v.inbox.length;
-  return `<div class="tabbar flex" data-anno="标签栏 44 · 空白处拖动窗口">
-    ${v.tabs.map((id, n) => {
-      const p = PROJECTS.find(p => p.id === id); if (!p) return '';
-      const sm = summary(id, v);
-      return `<div class="tab flex ${v.project?.id === id ? 'on' : ''}" data-act="select" data-id="${id}" data-project="${id}">
-        ${avatar(id, 's16')}<span class="sm trunc" style="max-width:180px">${esc(p.label)}</span>
-        ${sm.inbox ? `<span class="tag danger pill">${sm.inbox}</span>` : sm.status ? mark(sm.status) : `<span class="kbd">⌘${n + 1}</span>`}
-        <button class="btn ghost xs" data-act="close-tab" data-id="${id}" title="关闭标签 (⌘W)，团队继续运行">${I('x', 'sm')}</button>
-      </div>`;
-    }).join('')}
-    <button class="btn ghost xs" data-act="wizard" title="新建项目…">${I('plus', 'sm')}</button>
+function projbar(v) {
+  const inbox = v.inbox.length, p = v.project;
+  const working = v.members.filter(m => m.status === 'working').length, waiting = v.members.filter(m => m.status === 'blocked').length;
+  const toggle = `<button class="btn ghost xs icon-btn ${S.right ? 'on' : ''}" data-act="toggle-right" title="${S.right ? '收起概览 (⌘I)' : '显示收件箱、任务和动态 (⌘I)'}">
+      ${I('panelRight')}${!S.right && inbox ? `<span class="tag danger pill" style="position:absolute;top:-3px;right:-5px;height:15px;min-width:15px;font-size:10px">${inbox}</span>` : ''}</button>`;
+  if (!p) return `<div class="projbar flex" data-anno="项目行 44 · 空白处拖动窗口"><span class="grow"></span>${toggle}</div>`;
+  const team = !v.daemon ? '<span class="mut2">lilad 未运行</span>'
+    : v.members.every(m => m.status === 'gone') ? '<span class="mut2">团队未启动</span>'
+    : `${v.members.length} 个成员${working ? ` · <span style="color:var(--blue)">${working} 个工作中</span>` : ''}${waiting ? ` · <span style="color:var(--red)">${waiting} 个在等你</span>` : ''}`;
+  return `<div class="projbar flex" data-anno="项目行 44 · 空白处拖动窗口">
+    ${avatar(p.id)}<span class="pname trunc" style="flex:none;max-width:260px">${esc(p.label)}</span>
+    ${S.paused ? '<span class="tag warn">已暂停派发</span>' : ''}
+    <span class="sep"></span>
+    <span class="pmeta" title="${p.cwd}">${I('folder', 'sm')}<span class="trunc" style="max-width:220px">${p.cwd}</span></span>
+    <span class="pmeta" style="flex:none">${I('branch', 'sm')}${p.branch}</span>
+    <span class="sep"></span>
+    <span class="pmeta" style="flex:none">${team}</span>
     <span class="grow" style="align-self:stretch"></span>
-    <button class="btn ghost xs icon-btn ${S.right ? 'on' : ''}" data-act="toggle-right" title="${S.right ? '收起概览 (⌘I)' : '显示收件箱、任务和动态 (⌘I)'}">
-      ${I('panelRight')}${!S.right && inbox ? `<span class="tag danger pill" style="position:absolute;top:-3px;right:-5px;height:15px;min-width:15px;font-size:10px">${inbox}</span>` : ''}</button>
+    <button class="btn ghost xs" data-act="settings" title="项目设置 (⇧⌘,)">${I('settings', 'sm')}</button>
+    ${toggle}
   </div>`;
 }
-
 
 function terminalText(m, v) {
   const r = role(m.id);
@@ -726,12 +775,17 @@ function statusbar(v) {
   const item = (body, title = '') => `<span class="st-item flex"${title ? ` title="${title}"` : ''}>${body}</span>`;
   return `<footer class="status flex" data-anno="状态栏 34">
     ${item(`<span class="dot" style="background:${v.daemon ? 'var(--green)' : 'var(--muted-2)'}"></span>${v.daemon ? 'lilad 运行中' : 'lilad 未运行'}`, '唯一写状态的后台进程')}
-    ${v.project ? `${item(`${I('folder', 'sm')}<span class="trunc" style="max-width:280px">${v.project.cwd}</span>`)}${item(`${I('branch', 'sm')}${v.project.branch}`)}` : ''}
-    ${v.project && v.members.length ? item(`${v.members.length} 个成员${v.daemon ? ` · <span style="color:var(--blue)">${working} 个工作中</span>` : ''}${waiting ? ` · <span style="color:var(--red)">${waiting} 个在等你</span>` : ''}`) : ''}
     ${S.paused ? item('<span style="color:var(--yellow)">已暂停派发</span>') : ''}
     <span class="grow"></span>
-    <span class="st-keys trunc">${[['⌘N', '新建任务'], ['⌘I', '概览'], ['⇧⌘,', '项目设置'], ['⌘,', '设置']].map(([k, l]) => `<span><kbd>${k}</kbd>${l}</span>`).join('')}</span>
+    <span class="st-keys trunc">${[['⌘1–9', '切换项目'], ['⌘N', '新建任务'], ['⌘I', '概览'], ['⇧⌘,', '项目设置'], ['⌘,', '设置']].map(([k, l]) => `<span><kbd>${k}</kbd>${l}</span>`).join('')}</span>
   </footer>`;
+}
+
+// how full a member's context is, against the size where Lila starts it afresh
+function ctxChip(m) {
+  const lim = m.id === 'pm' ? CTX_LIMIT.pm : CTX_LIMIT.member, c = ctxColor(m.ctx, lim);
+  const tip = m.id === 'pm' ? `上下文 ${kTok(m.ctx)}。到 ${kTok(lim)} 并且空闲 10 分钟后，Lila 会给 PM 换新会话` : `上下文 ${kTok(m.ctx)}。超过 ${kTok(lim)} 后，换到别的链时开新会话`;
+  return `<span class="ctx xs" title="${tip}" style="color:${c}"><span class="bar"><i style="width:${Math.min(100, m.ctx / lim * 100)}%;background:${c}"></i></span>${kTok(m.ctx)}</span>`;
 }
 
 function center(v) {
@@ -749,14 +803,18 @@ function center(v) {
       <span class="xs mut" style="flex:none">${r.name}</span>
       <span class="xs mut2 trunc" style="flex:0 1 auto">${r.model} · ${r.effort}</span>
       <span class="grow"></span>
-      <span class="xs mut trunc" style="max-width:360px">${esc(m.msg || '')}</span>
+      <span class="xs mut trunc" style="max-width:300px">${esc(m.msg || '')}</span>
+      ${m.ctx ? ctxChip(m) : ''}
+      ${m.id === 'pm' && m.ctx ? (S.confirmRefresh
+        ? `<span class="xs mut">换新会话，终端历史会清空</span><button class="btn outline small" data-act="refresh-yes">确认整理</button><button class="btn ghost small" data-act="refresh-no">算了</button>`
+        : `<button class="btn ghost small" data-act="refresh" title="PM 换一个新会话，第一条消息是 Lila 从数据库生成的项目摘要。终端的滚动历史会清空。">${I('refresh', 'sm')}整理上下文</button>`) : ''}
       ${m.stale ? `<span class="tag warn">设置已改</span><button class="btn pill small" title="用新设置重启它：当前对话会丢失，手上的任务会重新派给它">${I('refresh', 'sm')}重启</button>` : ''}
       ${stPill(m.status)}
       ${m.status !== 'gone' ? `<button class="btn ghost xs" title="搜索终端历史 (⌘F)">${I('search', 'sm')}</button>` : ''}
     </div>` : '';
-  const cls = m?.status === 'blocked' ? 'blocked' : m?.status === 'working' ? 'working' : '';
-  return `<section class="center" data-anno="终端区">
-    <div class="card ${cls}">${head}${body}</div>
+  // one card holds the project's row, the member's terminal and the status row; the state shows in the member's pill
+  return `<section class="center" data-anno="中间卡片：项目 · 终端 · 状态">
+    <div class="card">${projbar(v)}${head}${body}${statusbar(v)}</div>
   </section>`;
 }
 
@@ -805,7 +863,7 @@ function right(v) {
           <div class="flex" style="padding:2px 8px 4px;gap:5px"><span class="sublabel">${title}</span><span class="sublabel">${rows.length}</span></div>
           ${rows.map(t => `<div class="task-row flex ${S.drawer?.kind === 'task' && S.drawer.id === t.id ? 'on' : ''}" data-act="task" data-id="${t.id}">
             <span class="tag ${stateTag(t.state)}">${t.id}</span>
-            <div class="col grow" style="align-items:stretch;gap:1px"><span class="sm trunc">${esc(t.title)}</span><span class="xs meta">${t.from} → ${t.to}</span></div>
+            <div class="col grow" style="align-items:stretch;gap:1px"><span class="sm trunc">${esc(t.title)}</span><span class="xs meta trunc">${t.from} → ${t.to}${t.run && t.state !== 'done' ? ` · <span style="color:#9cc8ff">${FLOWS[t.run.flow][t.run.step][1]}</span>${t.run.round > 1 ? ` · 返工 ${t.run.round - 1} 次` : ''}` : ''}</span></div>
             <span class="xs mut2" style="align-self:flex-start;padding-top:2px">${clock(t.upd)}</span></div>`).join('')}
         </div>`).join('') : '<div class="sm mut" style="padding:0 8px;line-height:1.6">还没有任务。按 ⌘N 或在左侧项目上右键「新建任务」，也可以在 PM 的终端里提需求。</div>'}
       </div>
@@ -848,8 +906,18 @@ function taskDrawer(v) {
         ${open ? (S.confirmCancel ? `<span class="xs mut">取消后通知 ${t.to} 和 PM</span><button class="btn outline small danger" data-act="cancel-yes">确认取消</button><button class="btn ghost small" data-act="cancel-no">算了</button>`
           : '<button class="btn ghost small danger" data-act="cancel">取消任务</button>') : ''}
       </div>
-      ${t.state === 'done' ? `<div class="sm callout" style="background:rgb(48 209 88 / .12);color:#7ee2a0">完成：数据模型写在 docs/model.md，迁移脚本在 db/migrations/0002_cart.sql。</div>` : ''}
+      ${t.state === 'done' ? `<div class="sm callout" style="background:rgb(48 209 88 / .12);color:#7ee2a0">完成：${esc(t.summary || '数据模型写在 docs/model.md，迁移脚本在 db/migrations/0002_cart.sql。')}</div>` : ''}
       ${t.state === 'blocked' ? `<div class="sm callout" style="background:rgb(255 69 58 / .12);color:#ff9f97">阻塞：等你回答 Q3（游客下单）。</div>` : ''}
+      ${t.decisions?.length || t.unverified?.length ? `<div class="col" style="align-items:stretch;gap:12px">
+        ${t.decisions?.length ? `<div><div class="label" style="margin-bottom:6px">替你做的决定</div><ul class="blist sm">${t.decisions.map(d => `<li>${esc(d)}</li>`).join('')}</ul></div>` : ''}
+        ${t.unverified?.length ? `<div><div class="label" style="margin-bottom:6px;color:var(--yellow)">没有验到的</div><ul class="blist sm">${t.unverified.map(d => `<li>${esc(d)}</li>`).join('')}</ul></div>` : ''}</div>` : ''}
+      ${t.run ? `<div><div class="flex" style="margin-bottom:8px;gap:6px"><span class="label">流程</span><span class="xs mut2">${t.run.flow}${t.run.round > 1 ? ` · 已返工 ${t.run.round - 1} 次，最多 ${t.run.maxRounds} 次` : ''}</span></div>
+        ${flowLine(t.run)}
+        ${t.run.checks?.length ? `<div class="xs mut" style="margin-top:8px">上一轮检查 <code style="font:11px var(--mono)">pnpm test</code> 没通过（${clock(t.run.checks[0][2])}），已退回给 ${t.to}</div>` : ''}</div>` : ''}
+      ${briefOf(t) ? (b => `<div class="col" style="align-items:stretch;gap:14px">
+        ${b.quote ? `<div><div class="flex" style="margin-bottom:8px;gap:6px"><span class="label">你的原话</span>${b.from ? `<span class="xs mut2">来自</span><button class="link xs" data-act="task" data-id="${b.from}">${b.from}</button>` : ''}</div><div class="quote sm">${esc(b.quote)}</div></div>` : ''}
+        ${b.accept ? `<div><div class="label" style="margin-bottom:6px">怎样算完成</div><ul class="blist sm">${b.accept.map(a => `<li>${esc(a)}</li>`).join('')}</ul></div>` : ''}
+        ${b.out ? `<div><div class="label" style="margin-bottom:6px">不做</div><ul class="blist sm mut">${b.out.map(a => `<li>${esc(a)}</li>`).join('')}</ul></div>` : ''}</div>`)(briefOf(t)) : ''}
       <div><div class="label" style="margin-bottom:8px">说明</div>
         <div class="md sm"><p>从商品页加入购物车，到下单成功的整条路径。</p>
           <h3>要做到</h3><ul><li>接口 <code>POST /cart/items</code>、<code>DELETE /cart/items/:id</code>、<code>DELETE /cart</code></li><li>库存不足时返回 409，前端提示「库存不够」</li><li>接口测试覆盖加、减、清空和库存不足</li></ul>
@@ -1040,9 +1108,26 @@ function prefsDialog() {
       <div class="group-title">协作</div><div class="group" style="padding:12px 16px">
         <div class="sm m">默认可以派给</div><div class="xs mut" style="margin-bottom:10px">${r.id === 'pm' ? 'PM 总是可以派给所有人。' : '项目里没单独设置时用这个。'}</div>
         <div class="flex" style="gap:16px;flex-wrap:wrap">${ROLES.filter(x => x.id !== r.id).map(x => { const on = r.id === 'pm' || r.to.includes(x.id); return `<span class="flex" style="gap:6px"><span class="check ${on ? 'on' : ''} ${r.id === 'pm' ? 'fixed' : ''}" data-act="toggle-check">${on ? I('check') : ''}</span><span class="sm">${x.name}</span></span>`; }).join('')}</div></div>
-      <div class="group-title">提示词</div><div class="group" style="padding:12px 16px">
-        <div class="xs mut" style="margin-bottom:8px">Lila 会在后面接上协作协议。</div>
-        <textarea class="area" rows="6">You are the ${r.id} on this team.</textarea></div>
+      <div class="group-title flex" style="gap:8px"><span>提示词</span><span class="grow"></span>
+        <span class="seg">${[['edit', '编辑'], ['preview', '预览最终提示词']].map(([k, n]) => `<button class="${(S.promptView || 'edit') === k ? 'on' : ''}" style="height:24px;padding:0 10px;font-size:12px" data-act="prompt-view" data-id="${k}">${n}</button>`).join('')}</span></div>
+      <div class="group" style="padding:12px 16px">
+        ${(S.promptView || 'edit') === 'edit' ? `<div class="xs mut" style="margin-bottom:8px">Lila 会在后面接上协作协议。</div>
+        <textarea class="area" rows="6">You are the ${r.id} on this team.</textarea>`
+        : `<div class="flex" style="margin-bottom:6px;gap:8px"><span class="xs mut">按这个成员生成</span><select class="select" style="height:26px;font-size:12px;width:220px"><option>网上小店 · ${r.id}</option><option>temp · ${r.id}</option></select></div>
+        <div class="xs mut2" style="margin-bottom:8px">成员启动时实际拿到的系统提示词：上面的角色提示词，加上 Lila 接的项目信息和协作协议。只读。</div>
+        <pre class="prompt-pre">You are the ${r.id} on this team.
+
+<span class="lila"># Lila
+You are ${r.id} in project "shop" (网上小店), folder ~/code/shop.
+Teammates: pm (PM), designer, architect, engineer, engineer-2, tester.
+You may hand work to: ${r.id === 'pm' ? 'everyone' : r.to.join(', ') || 'nobody'}.
+
+## Protocol
+1. When a &lt;lila task&gt; arrives, run \`lila task start T&lt;n&gt;\` first.
+2. When it is finished: \`lila task done T&lt;n&gt; --summary "…" [--decision "…"] [--unverified "…"]\`.
+3. Stuck: \`lila task block T&lt;n&gt; --reason "…"\`.
+…（共 62 行）</span></pre>
+        <div class="flex" style="margin-top:8px;gap:8px"><span class="xs mut2">约 1.4k token</span><span class="grow"></span><button class="btn ghost small">${I('file', 'sm')}复制</button></div>`}</div>
       <div style="margin-top:18px">${r.id === 'pm' ? '<span class="xs mut">每个项目都有且只有一个 PM，这个角色不能删除</span>' : '<button class="btn outline small danger">删除角色</button>'}</div>
     </div></div>`, '<button class="btn ghost" data-act="close-dialog">取消</button><button class="btn primary" data-act="close-dialog">保存</button>');
 }
@@ -1083,7 +1168,20 @@ function menu() {
     <button data-act="menu-compose" data-id="${m.id}">${I('plus', 'sm')}新建任务…</button>
     <button data-act="menu-settings" data-id="${m.id}">${I('settings', 'sm')}项目设置…</button><hr>
     <button data-act="menu-close">${I('folder', 'sm')}在访达中显示</button>
-    ${open ? `<button data-act="close-tab" data-id="${m.id}">${I('x', 'sm')}关闭标签</button>` : ''}</div>`;
+<hr>
+    <button data-act="menu-remove" data-id="${m.id}" style="color:var(--red)">${I('trash', 'sm')}从列表移除…</button></div>`;
+}
+
+// removing a project: it leaves Lila's list and database; its folder and .lila/ stay
+function removeDialog() {
+  const p = PROJECTS.find(p => p.id === S.dialog.id);
+  const running = p.id === 'shop' && S.scene === 'running';
+  return `<div class="backdrop" data-act="backdrop"><div class="confirm" data-anno="确认对话框 440">
+    <h2>从列表移除「${esc(p.label)}」？</h2>
+    <div class="sm mut" style="line-height:1.6">${running ? '团队会先停止。' : ''}Lila 会删掉它的任务、动态和收件箱。项目目录和里面的 <code style="font:11.5px var(--mono)">.lila/</code> 不动，以后在这个文件夹新建项目可以重新加回来，只是历史没了。</div>
+    <div class="xs mut2">${esc(p.cwd)}</div>
+    <div class="flex" style="gap:8px;justify-content:flex-end;margin-top:6px"><button class="btn ghost" data-act="close-dialog">取消</button><button class="btn outline danger" data-act="remove-yes" data-id="${p.id}">移除</button></div>
+  </div></div>`;
 }
 
 function protoBar() {
@@ -1113,13 +1211,12 @@ function render() {
   if (S.dialog?.kind === 'settings' && v.project) dialog = settingsDialog(v);
   if (S.dialog?.kind === 'prefs') dialog = prefsDialog();
   if (S.dialog?.kind === 'wizard') dialog = wizardDialog();
+  if (S.dialog?.kind === 'remove') dialog = removeDialog();
   document.getElementById('app').innerHTML = `${menubar()}<div class="desk"><div class="win">
     <div class="traffic"><i></i><i></i><i></i></div>
     ${sidebar(v)}<div class="split" data-drag="side"></div>
     <div class="main">
-      ${tabbar(v)}
       <div class="work">${center(v)}${S.right ? `<div class="split" data-drag="right"></div>${right(v)}` : ''}${drawer}</div>
-      ${statusbar(v)}
     </div>
     ${dialog}${S.menu ? menu() : ''}
   </div></div>${protoBar()}`;
@@ -1236,6 +1333,11 @@ const A = {
   'menu-compose': id => { A.open(id); S.menu = null; A.compose(); },
   'menu-settings': id => { A.open(id); S.menu = null; A.settings(); },
   'menu-close': () => { S.menu = null; },
+  'menu-remove': id => { S.menu = null; S.dialog = { kind: 'remove', id }; },
+  'remove-yes': id => { const i = PROJECTS.findIndex(p => p.id === id); if (i >= 0) PROJECTS.splice(i, 1); S.tabs = S.tabs.filter(t => t !== id); if (S.project === id) S.project = S.tabs[0] || null; S.dialog = null; },
+  refresh: () => { S.confirmRefresh = true; }, 'refresh-no': () => { S.confirmRefresh = false; },
+  'refresh-yes': () => { const pm = TEAM.find(m => m.id === 'pm'); pm.ctx = 3e3; S.confirmRefresh = false; },
+  'prompt-view': id => { S.promptView = id; },
   scene: (_, el) => { cycle(+el.dataset.d); },
   anno: () => { S.anno = !S.anno; },
   'hide-bar': () => { S.bar = false; },
@@ -1302,6 +1404,8 @@ if (o === 'task') A.task(arg || 'T7');
 if (o === 'compose') A.compose();
 if (o === 'settings') { A.settings(); if (arg && S.dialog) S.dialog.page = arg; }
 if (o === 'prefs') { A.prefs(); if (arg) S.dialog.page = arg; }
+if (o === 'remove') S.dialog = { kind: 'remove', id: arg || 'shop' };
+if (o === 'prompt') { A.prefs(); S.prefsRole = arg || 'engineer'; S.promptView = 'preview'; }
 if (o === 'wizard') { A.wizard(); if (arg > 1) { S.wizard.folder = '~/code/ledger'; S.wizard.step = +arg; } }
 // Figma capture (generate_figma_design): hide the prototype bar, name the frame, load Figma's capture script.
 const shot = new URLSearchParams(location.search).get('name');
@@ -1313,6 +1417,7 @@ if (location.hash.includes('figmacapture')) {
   document.head.appendChild(s);
 }
 render();
+if (o === 'prompt') document.querySelector('.prompt-pre')?.scrollIntoView({ block: 'center' });
 </script>
 </body>
 </html>

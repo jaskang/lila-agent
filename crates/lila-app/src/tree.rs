@@ -14,6 +14,8 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 pub const ROW_H: f32 = style::MEMBER_ROW;
+/// From one member row's top to the next: the row and the gap under it, which its canvas covers too.
+pub const PITCH: f32 = style::MEMBER_ROW + style::MEMBER_GAP;
 /// The canvas sits this far left of its row (the trunk's x).
 pub const LEFT: f32 = -15.;
 pub const WIDTH: f32 = 18.;
@@ -38,12 +40,13 @@ pub struct Branch {
 }
 
 impl Branch {
-    /// Extra height over the row for the first branch: the trunk starts under the PM's tile.
+    /// Extra height over the row for the first branch: the trunk starts under the
+    /// PM's tile, across the gap under the PM's row.
     fn top(&self) -> f32 {
-        if self.index == 0 { 12. } else { 0. }
+        if self.index == 0 { 12. + style::MEMBER_GAP } else { 0. }
     }
     pub fn height(&self) -> f32 {
-        ROW_H + self.top()
+        PITCH + self.top()
     }
     pub fn moving(&self) -> bool {
         self.trunk_flow || self.trunk_ask || self.working || self.waiting
@@ -173,7 +176,7 @@ fn ask(line: &Line, y0: f32, origin: Point<Pixels>, window: &mut Window) {
 pub fn canvas_for(b: Branch) -> impl IntoElement {
     let top = b.top();
     let h = b.height();
-    let y0 = b.index as f32 * ROW_H - top;
+    let y0 = b.index as f32 * PITCH - top;
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
