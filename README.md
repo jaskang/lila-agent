@@ -111,3 +111,11 @@ cargo clippy --all-targets
 | `lila-app` | 桌面应用（GPUI + gpui-kit） |
 
 完整 `cargo test` 会编译 libghostty，需要先设置 `ZIG`（见上）。第三方代码见 [THIRD-PARTY.md](THIRD-PARTY.md)。
+
+
+## 参考资料
+
+https://code.claude.com/docs/en/sub-agents
+https://x.com/trq212/status/2061907337154367865
+https://x.com/DeepSeekHarness/status/2116857257245987236
+https://x.com/addyosmani/status/2117512471930167377?a=4SjBIVw8bU7wkcBb2GA&s=46
