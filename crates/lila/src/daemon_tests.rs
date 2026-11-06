@@ -204,9 +204,8 @@ fn full_handoff_flow_respects_the_working_limit() {
     let t3 = w.ok(Some("engineer"), "task.new", json!({"to": "tester", "title": "Verify login", "parent": "T1"}));
     assert_eq!(t3["state"], "queued");
     w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "login works", "files": ["src/login.rs"]}));
-    let owner_notes = w.sends_to("owner");
-    assert!(owner_notes.iter().any(|n| n.contains("engineer finished T1 \"Implement login\": login works\nFiles: src/login.rs")), "{owner_notes:?}");
-    assert!(owner_notes.iter().any(|n| n.contains("Already handed on: T3 → tester [queued] Verify login")), "{owner_notes:?}");
+    // The tester still has to verify it: nothing the owner could act on yet, so no note (no turn).
+    assert!(w.sends_to("owner").iter().all(|n| !n.contains("<lila note")), "{:?}", w.sends_to("owner"));
 
     // The slot freed up: the oldest queued task (architect's T2) goes first.
     assert_eq!(w.state("T2"), TaskState::Delivered);
@@ -214,10 +213,39 @@ fn full_handoff_flow_respects_the_working_limit() {
     w.ok(Some("architect"), "task.done", json!({"id": "T2", "summary": "docs/sessions.md"}));
     assert_eq!(w.state("T3"), TaskState::Delivered);
     assert!(w.sends_to("tester").iter().any(|s| s.contains("<lila task=\"T3\" from=\"engineer\" parent=\"T1\"")));
-    // The tester reports to the engineer, and the owner is copied so it can close its own task.
+    // The chain is finished: the owner hears once, with the engineer's step. The engineer's
+    // part was over, so it is not woken for the PASS.
     w.ok(Some("tester"), "task.done", json!({"id": "T3", "summary": "PASS"}));
-    assert!(w.sends_to("engineer").iter().any(|s| s.contains("tester finished T3")));
-    assert!(w.sends_to("owner").iter().any(|s| s.contains("tester finished T3")));
+    assert!(w.sends_to("engineer").iter().all(|s| !s.contains("tester finished T3")));
+    let notes: Vec<String> = w.sends_to("owner").into_iter().filter(|n| n.contains("<lila note about=\"T1\"") || n.contains("<lila note about=\"T3\"")).collect();
+    assert_eq!(notes.len(), 1, "one note for the T1 → T3 chain: {notes:?}");
+    assert!(notes[0].contains("tester finished T3 \"Verify login\": PASS"), "{}", notes[0]);
+    assert!(notes[0].contains("Before it, engineer finished T1 \"Implement login\": login works (files: src/login.rs)"), "{}", notes[0]);
+    assert!(notes[0].contains("Nothing else is open in this chain."), "{}", notes[0]);
+}
+
+#[test]
+fn the_pm_hears_when_a_chain_under_its_task_ends_and_is_not_nudged_meanwhile() {
+    let mut w = world();
+    w.ok(None, "project.up", json!({"brief": "Ship login"}));
+    w.all_idle();
+    w.ok(Some("owner"), "task.start", json!({"id": "T1"}));
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1"}));
+    w.ok(Some("owner"), "task.new", json!({"to": "architect", "title": "Review sessions", "parent": "T1"}));
+    w.ok(Some("engineer"), "task.new", json!({"to": "tester", "title": "Verify login", "parent": "T2"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "built"}));
+    // The owner waits on its team for a long time: that is not going quiet.
+    w.status("owner", "idle");
+    w.now += 30 * 60_000;
+    w.d.tick(w.now);
+    assert!(w.sends_to("owner").iter().all(|n| !n.contains("went quiet")), "{:?}", w.sends_to("owner"));
+    w.ok(Some("tester"), "task.done", json!({"id": "T4", "summary": "PASS"}));
+    let note = w.sends_to("owner").into_iter().rfind(|n| n.contains("tester finished T4")).expect("owner told");
+    assert!(note.contains("Before it, engineer finished T2 \"Build login\": built"), "{note}");
+    assert!(note.contains("Still open under your T1: T3 → architect"), "{note}");
+    w.ok(Some("architect"), "task.done", json!({"id": "T3", "summary": "fine"}));
+    let note = w.sends_to("owner").into_iter().rfind(|n| n.contains("architect finished T3")).expect("owner told");
+    assert!(note.contains("Nothing else is open under your T1 \"Ship login\". Finish it with `lila task done T1`"), "{note}");
 }
 
 #[test]

@@ -29,15 +29,29 @@ pub fn note(about: &str, text: &str) -> String {
     format!("<lila note about=\"{about}\">{}</lila>", text.trim())
 }
 
-/// `follow_ups`: tasks created under this one, so the reader doesn't assign the same work again.
-pub fn done_note(task: &Task, files: &[String], follow_ups: &[Task]) -> String {
+/// A finished task, for the member whose work waited on it.
+/// `path`: tasks finished on the way to `waiting` that nobody was told about yet, with their files.
+/// `still_open`: what is open under `waiting` (or the chain, when nobody waits).
+pub fn done_note(task: &Task, files: &[String], path: &[(&Task, Vec<String>)], waiting: Option<&Task>, still_open: &[&Task]) -> String {
     let mut text = format!("{} finished {} \"{}\": {}", task.to, task.id, task.title, task.summary.as_deref().unwrap_or("(no summary)"));
     if !files.is_empty() {
         text.push_str(&format!("\nFiles: {}", files.join(", ")));
     }
-    if !follow_ups.is_empty() {
-        let list: Vec<String> = follow_ups.iter().map(|t| format!("{} → {} [{}] {}", t.id, t.to, t.state, t.title)).collect();
-        text.push_str(&format!("\nAlready handed on: {}", list.join("; ")));
+    for (t, files) in path {
+        text.push_str(&format!("\nBefore it, {} finished {} \"{}\": {}", t.to, t.id, t.title, t.summary.as_deref().unwrap_or("(no summary)")));
+        if !files.is_empty() {
+            text.push_str(&format!(" (files: {})", files.join(", ")));
+        }
+    }
+    let open = || still_open.iter().map(|t| format!("{} → {} [{}] {}", t.id, t.to, t.state, t.title)).collect::<Vec<_>>().join("; ");
+    match (waiting, still_open.is_empty()) {
+        (Some(w), true) => text.push_str(&format!(
+            "\nNothing else is open under your {} \"{}\". Finish it with `lila task done {}` once your part is done.",
+            w.id, w.title, w.id
+        )),
+        (Some(w), false) => text.push_str(&format!("\nStill open under your {}: {}", w.id, open())),
+        (None, true) => text.push_str("\nNothing else is open in this chain."),
+        (None, false) => text.push_str(&format!("\nStill open in this chain: {}", open())),
     }
     note(&task.id, &text)
 }
@@ -100,12 +114,25 @@ mod tests {
 
     #[test]
     fn notes() {
-        assert_eq!(done_note(&task(""), &["a.md".into()], &[]), "<lila note about=\"T3\">engineer finished T3 \"Add login\": done it\nFiles: a.md</lila>");
-        let mut child = task("");
-        child.id = "T4".into();
-        child.to = "tester".into();
-        child.title = "Verify login".into();
-        assert!(done_note(&task(""), &[], &[child]).contains("Already handed on: T4 → tester [queued] Verify login"));
+        assert_eq!(
+            done_note(&task(""), &["a.md".into()], &[], None, &[]),
+            "<lila note about=\"T3\">engineer finished T3 \"Add login\": done it\nFiles: a.md\nNothing else is open in this chain.</lila>"
+        );
+        let mut parent = task("");
+        parent.id = "T1".into();
+        parent.to = "owner".into();
+        parent.title = "Ship login".into();
+        let mut step = task("");
+        step.id = "T2".into();
+        step.summary = Some("built it".into());
+        let s = done_note(&task(""), &[], &[(&step, vec!["src/a.rs".into()])], Some(&parent), &[]);
+        assert!(s.contains("\nBefore it, engineer finished T2 \"Add login\": built it (files: src/a.rs)"), "{s}");
+        assert!(s.contains("Nothing else is open under your T1 \"Ship login\". Finish it with `lila task done T1`"), "{s}");
+        let mut other = task("");
+        other.id = "T4".into();
+        other.to = "designer".into();
+        other.title = "Polish".into();
+        assert!(done_note(&task(""), &[], &[], Some(&parent), &[&other]).contains("Still open under your T1: T4 → designer [queued] Polish"));
         assert!(answer("Q1", "Which DB?", "Postgres").contains("A: Postgres"));
     }
 }

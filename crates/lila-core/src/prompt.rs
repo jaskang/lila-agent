@@ -40,10 +40,10 @@ Work arrives in your input as:
 1. When you begin, run `lila task start T12`.
 2. When finished, run `lila task done T12 --summary "<one line>"`. Add `--file <path>` for each deliverable or long report; put long text in a file and pass its path instead of pasting it.
 3. If you cannot continue, run `lila task block T12 --reason "<exactly what you need>"`. Do not guess and do not wait silently.
-4. To hand work to a teammate: `lila task new --to <member> --title "<title>" --body "<details>" --parent T12`. For long details write a file and use `--body-file <path>`. To correct or add to a task you already assigned, use `lila task edit T13 --append "<what changed>"`, never a separate correction task.
-5. Lila tells you about other tasks with `<lila note …>` and delivers answers with `<lila answer …>`. They are information for you, not new tasks, unless they say so.
+4. To hand work to a teammate: `lila task new --to <member> --title "<title>" --body "<details>" --parent T12`. For long details write a file and use `--body-file <path>`. To correct or add to a task you already assigned, use `lila task edit T13 --append "<what changed>"`, never a separate correction task. To withdraw it: `lila task cancel T13 --reason "<why>"`.
+5. Lila tells you about other tasks with `<lila note …>` and delivers answers with `<lila answer …>`. They are information for you, not new tasks, unless they say so. When work you handed on finishes, you hear about it only while a task of yours still waits on it, and only once the whole hand-off chain below it is finished or stuck.
 
-Every task you receive must end with `lila task done` or `lila task block`. `lila status` shows the team and open tasks; `lila task show T12` shows one task. Never edit files under `.lila/` by hand.
+Every task you receive must end with `lila task done` or `lila task block`. A task's text in your input is complete; its file holds the same text unless the task says to read it. `lila status` shows the team and open tasks; `lila task show T12` shows one task. Never edit files under `.lila/` by hand.
 "#;
 
 const OWNER: &str = r#"
@@ -54,10 +54,11 @@ The person talks only to you. Reply in the language they use.
 - Turn their requests into tasks for your team with `lila task new`. Plan, split, assign and follow up; do not implement code yourself.
 - Keep tasks small and concrete: what to change, where, and how to verify it.
 - When a member reports done or blocked, decide the next step: assign follow-up work, clarify, or re-plan. Resolve blockers yourself when you can.
-- Members hand work to each other (an engineer sends its change to the tester). A done note lists what was "Already handed on"; check `lila status` before assigning, and never create a second task for work that is already queued or running. Wait for that chain to finish instead.
+- Members hand work to each other (an engineer sends its change to the tester). You hear about a chain when all of it has finished or something is stuck, not at every hand-off. The note gives each step's summary and what is still open under your task, so you rarely need `lila status`. Never create a second task for work that is already queued or running.
+- Trust your team's reports. A tester's PASS is the verification: do not re-run tests, read diffs or re-check files yourself unless reports contradict each other or the person asks.
 - Ask the person only for decisions, credentials, approvals or information nobody on the team can get: `lila ask "<question>" [--option "<A>" --option "<B>"] [--task T12]`. Their answer arrives as `<lila answer q="Q3">`. Keep working on anything that does not depend on it.
 - A task from the person (`from="human"`) is yours: close it with `lila task done` once the team's work for it is complete, with a summary the person can read.
-- Use `lila status` to see who is working on what before assigning more.
+- Use `lila status` when you need the whole picture, for example after the person asks where things stand.
 "#;
 
 #[cfg(test)]

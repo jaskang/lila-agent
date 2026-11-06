@@ -6,6 +6,7 @@ use crate::paths::{Paths, which};
 use crate::roles;
 use anyhow::{Context, Result, anyhow, bail};
 use lila_core::dispatch::{self, AgentStatus, MemberView, QueuedTask, StallAction};
+use lila_core::route::{self, DoneRoute};
 use lila_core::{Actor, ProjectConfig, Task, TaskState, Team, Transition, message, prompt, runtime};
 use lila_store::{NewTask, Store};
 use serde_json::{Value, json};
@@ -589,10 +590,7 @@ impl<T: Terminals> Daemon<T> {
             self.store.add_artifacts(&pid, &task.id, &files)?;
         }
         match t {
-            Transition::Done => {
-                let follow_ups: Vec<Task> = self.store.tasks(&pid)?.into_iter().map(|(t, _)| t).filter(|t| t.parent.as_deref() == Some(&task.id)).collect();
-                self.report(&pid, &task, message::done_note(&task, &files, &follow_ups), now)?
-            }
+            Transition::Done => self.report_done(&pid, &task, &files, now)?,
             Transition::Block => self.report(&pid, &task, message::blocked_note(&task), now)?,
             Transition::Cancel if was_active && actor != Actor::Member(task.to.clone()) => {
                 let text = message::note(&task.id, &format!("{} was cancelled by {actor}. Stop working on it. {detail}", task.id));
@@ -605,13 +603,35 @@ impl<T: Terminals> Daemon<T> {
         Ok(task_json(&self.store.task(&pid, &task.id)?.expect("exists")))
     }
 
-    /// Tells whoever assigned the task (and the owner, when a blocker skips it).
+    /// Tells the member whose work waits on a finished task, once nothing it set
+    /// off is still open (`lila_core::route`). Each note costs that member a turn.
+    fn report_done(&mut self, pid: &str, task: &Task, files: &[String], now: i64) -> Result<()> {
+        let owner = self.projects[pid].team.owner.clone();
+        let tasks: Vec<Task> = self.store.tasks(pid)?.into_iter().map(|(t, _)| t).collect();
+        match route::route_done(&tasks, &task.id, &owner) {
+            DoneRoute::Inbox => {
+                let body = format!("{} done: {}", task.id, task.summary.clone().unwrap_or_default());
+                self.store.add_inbox(pid, "report", Some(&task.to), Some(&task.id), &body, &[], now)?;
+            }
+            DoneRoute::Hold | DoneRoute::Nobody => {}
+            DoneRoute::Tell { member, waiting, path } => {
+                let path: Vec<(&Task, Vec<String>)> =
+                    path.iter().filter_map(|id| route::find(&tasks, id)).map(|t| (t, self.store.artifacts(pid, &t.id).unwrap_or_default())).collect();
+                let waiting = waiting.as_deref().and_then(|id| route::find(&tasks, id));
+                let root = route::ancestors(&tasks, &task.id).last().map(|t| t.id.clone()).unwrap_or_else(|| task.id.clone());
+                let open = route::open_under(&tasks, waiting.map_or(root.as_str(), |w| w.id.as_str()));
+                self.store.push_outbox(pid, &member, &message::done_note(task, files, &path, waiting, &open), now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Tells whoever assigned a blocked task (and the owner, when a blocker skips it).
     fn report(&mut self, pid: &str, task: &Task, text: String, now: i64) -> Result<()> {
         let owner = self.projects[pid].team.owner.clone();
         match &task.from {
             Actor::Human => {
-                let what = if task.state == TaskState::Done { "done" } else { "blocked" };
-                let body = format!("{} {what}: {}", task.id, task.summary.clone().or(task.block_reason.clone()).unwrap_or_default());
+                let body = format!("{} blocked: {}", task.id, task.block_reason.clone().unwrap_or_default());
                 self.store.add_inbox(pid, "report", Some(&task.to), Some(&task.id), &body, &[], now)?;
             }
             Actor::Member(m) => {
@@ -1023,12 +1043,18 @@ impl<T: Terminals> Daemon<T> {
                 }
             }
             let stall_ms = settings.stall_minutes as i64 * 60_000;
-            for (t, meta) in self.store.tasks(&pid).unwrap_or_default() {
+            let tasks = self.store.tasks(&pid).unwrap_or_default();
+            let all: Vec<Task> = tasks.iter().map(|(t, _)| t.clone()).collect();
+            for (t, meta) in tasks {
                 if !matches!(t.state, TaskState::Delivered | TaskState::InProgress) {
                     continue;
                 }
                 let Some((_, live)) = lives.iter().find(|(m, _)| *m == t.to) else { continue };
                 if !live.status.is_free() {
+                    continue;
+                }
+                // It handed work on and waits for it: quiet is expected, and it hears when that finishes.
+                if !route::open_under(&all, &t.id).is_empty() {
                     continue;
                 }
                 match dispatch::stall_check(now, live.free_since, meta.nudged_ms, meta.stall_reported, stall_ms) {

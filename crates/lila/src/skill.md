@@ -14,7 +14,8 @@ A task arrives in your input:
     Details…
     </lila>
 
-The full text is always in the `file`. Every task must end with `done` or `block`:
+Short tasks arrive in full; long ones say to read the `file`, which always holds the
+full text. Every task must end with `done` or `block`:
 
     lila task start T12
     lila task done  T12 --summary "<one line>" [--file <path>]...
@@ -34,12 +35,15 @@ To correct or extend a task you assigned, edit it instead of sending a second ta
 
 Who you may assign to is in your system prompt; `lila status` shows the team.
 A task you create is delivered when its member is free: you don't need to wait for it.
-When it finishes or blocks you get a note.
+If it blocks you get a note. When it finishes you get a note only while a task of
+yours still waits on it, and only once everything it handed on has finished too;
+the note sums up each step and says what is still open under your task.
+To withdraw a task you assigned: `lila task cancel T13 --reason "<why>"`.
 
 ## Messages from Lila
 
-- `<lila note about="T12">…</lila>`: information (a teammate finished, is blocked,
-  went quiet, a member ended). Act on it if it concerns your work.
+- `<lila note about="T12">…</lila>`: information (work you wait on finished, a
+  teammate is blocked or went quiet, a member ended). Act on it if it concerns your work.
 - `<lila answer q="Q3">…</lila>`: the person's answer to the PM's question.
 
 ## Looking around
