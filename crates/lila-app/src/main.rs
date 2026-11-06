@@ -17,6 +17,10 @@ mod wizard;
 use gpui::*;
 
 fn main() {
+    // lilad and the members it starts inherit this PATH: give them the shell's,
+    // before any thread runs.
+    // SAFETY: nothing else runs yet.
+    unsafe { std::env::set_var("PATH", usage::login_path()) };
     // The component icons (Lucide) come from gpui-kit's bundled assets, Lila's own from assets/lila.
     gpui::application().with_assets(style::Assets).run(|cx: &mut App| {
         gpui::init(cx);

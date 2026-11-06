@@ -57,7 +57,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 - Rust 版本由 `rust-toolchain.toml` 固定为 1.99.1，rustup 会自动装。
 - 还需要：
   - herdr-core 的 `hc` 0.1.18（这一台装在 `~/.local/bin/hc`；也可以用 `LILA_HC` 指定路径）；
-  - 已经登录的 `claude` 和 `codex`；
+  - 已经登录的 `claude` 和 `codex`； 
   - 可选：magpie（`/Applications/magpie.app`），装了的话用量页会读它的账号。
 - 已经在跑旧版 lilad 的话，装新版后要 `lila daemon stop`，让窗口或 `lila up` 再启动新的。数据库打开时会自动加上新的列和表。
 - **不随仓库走的东西**（家里电脑上要重新生成，或者是空的）：

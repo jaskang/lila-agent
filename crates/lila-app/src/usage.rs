@@ -100,14 +100,18 @@ fn meter_color(used: f64, cli: Hsla) -> Hsla {
     }
 }
 
-/// The PATH a login shell has: an app opened from the Finder gets a bare one,
-/// and the CLIs live where the person's shell puts them.
-fn login_path() -> String {
+/// The PATH the person's shell has: an app opened from the Finder gets a bare one,
+/// and the CLIs live where the shell puts them. Interactive as well as login, since
+/// installers (pnpm, nvm, …) often add their folder in `.zshrc`; the markers keep
+/// whatever the rc files print out of it.
+pub(crate) fn login_path() -> String {
     use std::sync::OnceLock;
     static PATH: OnceLock<String> = OnceLock::new();
     PATH.get_or_init(|| {
-        let shell = std::process::Command::new("/bin/zsh").args(["-lc", "printf %s \"$PATH\""]).stdin(std::process::Stdio::null()).output();
-        let found = shell.ok().and_then(|o| String::from_utf8(o.stdout).ok()).filter(|p| !p.trim().is_empty());
+        const MARK: &str = "__LILA_PATH__";
+        let sh = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
+        let shell = std::process::Command::new(sh).args(["-ilc", &format!("printf '{MARK}%s{MARK}' \"$PATH\"")]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output();
+        let found = shell.ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|out| out.split(MARK).nth(1).map(str::to_owned)).filter(|p| !p.trim().is_empty());
         let mut p = found.unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
         let home = std::env::var("HOME").unwrap_or_default();
         for extra in [format!("{home}/.local/bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into()] {
