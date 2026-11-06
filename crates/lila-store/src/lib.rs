@@ -1,7 +1,7 @@
 //! SQLite persistence. Only the daemon writes; everything is scoped by project id.
 
 use anyhow::{Context, Result, bail};
-use lila_core::{Actor, Task, TaskState, Transition, task};
+use lila_core::{Actor, Brief, Outcome, Task, TaskState, Transition, task};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::Path;
 
@@ -75,6 +75,17 @@ CREATE TABLE IF NOT EXISTS outbox (
     text TEXT NOT NULL,
     created_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS runs (
+    project TEXT NOT NULL,
+    anchor TEXT NOT NULL,
+    flow TEXT NOT NULL,
+    step INTEGER NOT NULL DEFAULT 0,
+    round INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (project, anchor)
+);
 "#;
 
 pub struct Store {
@@ -104,6 +115,94 @@ pub struct NewTask {
     pub to: String,
     pub parent: Option<String>,
     pub priority: i64,
+    pub brief: Brief,
+    /// A step of a flow run: its anchor and step index.
+    pub run: Option<(String, usize)>,
+}
+
+/// A flow run: the steps one piece of work goes through (`lila_core::flow`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Run {
+    /// The task that started it.
+    pub anchor: String,
+    pub flow: String,
+    /// The step now under way.
+    pub step: usize,
+    /// Times work was sent back.
+    pub round: u32,
+    pub state: RunState,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    /// A member is on the current step.
+    Running,
+    /// lilad runs the check command.
+    Checking,
+    Done,
+    /// Failed more than `max_rounds` times; the PM decides.
+    Failed,
+    Cancelled,
+}
+
+impl RunState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunState::Running => "running",
+            RunState::Checking => "checking",
+            RunState::Done => "done",
+            RunState::Failed => "failed",
+            RunState::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(s: &str) -> RunState {
+        match s {
+            "checking" => RunState::Checking,
+            "done" => RunState::Done,
+            "failed" => RunState::Failed,
+            "cancelled" => RunState::Cancelled,
+            _ => RunState::Running,
+        }
+    }
+
+    pub fn is_open(self) -> bool {
+        matches!(self, RunState::Running | RunState::Checking)
+    }
+}
+
+/// Columns added after the first release: `(table, column, declaration)`.
+/// Missing ones are added when a database opens, so old databases keep working.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("tasks", "quote", "TEXT"),
+    ("tasks", "accept", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "out_of_scope", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "decisions", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "unverified", "TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "run", "TEXT"),
+    ("tasks", "run_step", "INTEGER"),
+    ("tasks", "verdict", "TEXT"),
+];
+
+fn migrate(db: &Connection) -> Result<()> {
+    db.execute_batch(SCHEMA)?;
+    for (table, col, decl) in ADDED_COLUMNS {
+        let has: bool = db.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), [col], |r| r.get::<_, i64>(0))? > 0;
+        if !has {
+            db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Lists live in one column, separated by the unit separator (like inbox options).
+fn join_list(items: &[String]) -> String {
+    items.iter().map(|i| i.trim()).filter(|i| !i.is_empty()).collect::<Vec<_>>().join("\u{1f}")
+}
+
+fn split_list(s: &str) -> Vec<String> {
+    s.split('\u{1f}').filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,8 +243,7 @@ pub struct OutMessage {
     pub text: String,
 }
 
-const TASK_COLS: &str =
-    "project, id, title, body, state, from_actor, to_member, parent, priority, summary, block_reason, created_ms, updated_ms, seq, nudged_ms, stall_reported";
+const TASK_COLS: &str = "project, id, title, body, state, from_actor, to_member, parent, priority, summary, block_reason, created_ms, updated_ms, seq, nudged_ms, stall_reported, quote, accept, out_of_scope, decisions, unverified, run, run_step, verdict";
 
 fn task_row(r: &Row) -> rusqlite::Result<(Task, TaskMeta)> {
     let state: String = r.get(4)?;
@@ -165,6 +263,16 @@ fn task_row(r: &Row) -> rusqlite::Result<(Task, TaskMeta)> {
             block_reason: r.get(10)?,
             created_ms: r.get(11)?,
             updated_ms: r.get(12)?,
+            brief: Brief { quote: r.get(16)?, accept: split_list(&r.get::<_, String>(17)?), out_of_scope: split_list(&r.get::<_, String>(18)?) },
+            outcome: Outcome {
+                decisions: split_list(&r.get::<_, String>(19)?),
+                unverified: split_list(&r.get::<_, String>(20)?),
+                passed: r.get::<_, Option<String>>(23)?.map(|v| v == "pass"),
+            },
+            run: match (r.get::<_, Option<String>>(21)?, r.get::<_, Option<i64>>(22)?) {
+                (Some(a), Some(s)) => Some((a, s as usize)),
+                _ => None,
+            },
         },
         TaskMeta { seq: r.get(13)?, nudged_ms: r.get(14)?, stall_reported: r.get::<_, i64>(15)? != 0 },
     ))
@@ -190,13 +298,13 @@ impl Store {
         let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "busy_timeout", 5000)?;
-        db.execute_batch(SCHEMA)?;
+        migrate(&db)?;
         Ok(Store { db })
     }
 
     pub fn in_memory() -> Result<Store> {
         let db = Connection::open_in_memory()?;
-        db.execute_batch(SCHEMA)?;
+        migrate(&db)?;
         Ok(Store { db })
     }
 
@@ -280,9 +388,26 @@ impl Store {
         tx.execute("UPDATE projects SET next_task = next_task + 1 WHERE id = ?1", [project])?;
         let id = format!("T{n}");
         tx.execute(
-            "INSERT INTO tasks (project, id, seq, title, body, state, from_actor, to_member, parent, priority, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
-            params![project, id, n, new.title, new.body, TaskState::Queued.as_str(), new.from.as_str(), new.to, new.parent, new.priority, now],
+            "INSERT INTO tasks (project, id, seq, title, body, state, from_actor, to_member, parent, priority, created_ms, updated_ms, quote, accept, out_of_scope, run, run_step)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                project,
+                id,
+                n,
+                new.title,
+                new.body,
+                TaskState::Queued.as_str(),
+                new.from.as_str(),
+                new.to,
+                new.parent,
+                new.priority,
+                now,
+                new.brief.quote.as_deref().map(str::trim).filter(|q| !q.is_empty()),
+                join_list(&new.brief.accept),
+                join_list(&new.brief.out_of_scope),
+                new.run.as_ref().map(|(a, _)| a.as_str()),
+                new.run.as_ref().map(|(_, s)| *s as i64)
+            ],
         )?;
         tx.execute(
             "INSERT INTO task_events (project, task, at_ms, actor, kind, detail) VALUES (?1, ?2, ?3, ?4, 'created', ?5)",
@@ -327,6 +452,63 @@ impl Store {
         )?;
         self.event(project, Some(&task.id), actor.as_str(), t.as_str(), detail, now)?;
         Ok(self.task(project, &task.id)?.expect("exists"))
+    }
+
+    /// What a member reported with `done` besides its summary.
+    pub fn set_outcome(&self, project: &str, id: &str, o: &Outcome) -> Result<()> {
+        self.db.execute(
+            "UPDATE tasks SET decisions = ?3, unverified = ?4, verdict = ?5 WHERE project = ?1 AND id = ?2",
+            params![project, id.to_ascii_uppercase(), join_list(&o.decisions), join_list(&o.unverified), o.passed.map(|p| if p { "pass" } else { "fail" })],
+        )?;
+        Ok(())
+    }
+
+    // ---------- flow runs ----------
+
+    /// Starts a run at `anchor`, which becomes its step 0.
+    pub fn start_run(&self, project: &str, anchor: &str, flow: &str, now: i64) -> Result<Run> {
+        self.db.execute(
+            "INSERT INTO runs (project, anchor, flow, state, created_ms, updated_ms) VALUES (?1, ?2, ?3, 'running', ?4, ?4)",
+            params![project, anchor, flow, now],
+        )?;
+        self.db.execute("UPDATE tasks SET run = ?2, run_step = 0 WHERE project = ?1 AND id = ?2", params![project, anchor])?;
+        Ok(self.run(project, anchor)?.expect("just inserted"))
+    }
+
+    fn run_from(r: &Row) -> rusqlite::Result<Run> {
+        Ok(Run {
+            anchor: r.get(0)?,
+            flow: r.get(1)?,
+            step: r.get::<_, i64>(2)? as usize,
+            round: r.get::<_, i64>(3)? as u32,
+            state: RunState::parse(&r.get::<_, String>(4)?),
+            updated_ms: r.get(5)?,
+        })
+    }
+
+    pub fn run(&self, project: &str, anchor: &str) -> Result<Option<Run>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT anchor, flow, step, round, state, updated_ms FROM runs WHERE project = ?1 AND anchor = ?2",
+                params![project, anchor],
+                Self::run_from,
+            )
+            .optional()?)
+    }
+
+    /// Every run of a project, oldest first.
+    pub fn runs(&self, project: &str) -> Result<Vec<Run>> {
+        let mut st = self.db.prepare("SELECT anchor, flow, step, round, state, updated_ms FROM runs WHERE project = ?1 ORDER BY created_ms, rowid")?;
+        Ok(st.query_map([project], Self::run_from)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_run(&self, project: &str, anchor: &str, step: usize, round: u32, state: RunState, now: i64) -> Result<()> {
+        self.db.execute(
+            "UPDATE runs SET step = ?3, round = ?4, state = ?5, updated_ms = ?6 WHERE project = ?1 AND anchor = ?2",
+            params![project, anchor, step as i64, round as i64, state.as_str(), now],
+        )?;
+        Ok(())
     }
 
     /// Replaces a task's title and body (only while it is queued: what was typed cannot change).
@@ -502,7 +684,72 @@ mod tests {
     }
 
     fn new(to: &str, parent: Option<&str>) -> NewTask {
-        NewTask { title: "t".into(), body: "b".into(), from: Actor::Member("owner".into()), to: to.into(), parent: parent.map(Into::into), priority: 0 }
+        NewTask {
+            title: "t".into(),
+            body: "b".into(),
+            from: Actor::Member("owner".into()),
+            to: to.into(),
+            parent: parent.map(Into::into),
+            priority: 0,
+            brief: Brief::default(),
+            run: None,
+        }
+    }
+
+    #[test]
+    fn a_brief_and_an_outcome_round_trip() {
+        let mut s = store();
+        let mut n = new("engineer", None);
+        n.brief = Brief { quote: Some("  加登录 ".into()), accept: vec!["401 on a wrong password".into(), " ".into()], out_of_scope: vec!["sign-up".into()] };
+        let t = s.create_task("shop", n, 1).unwrap();
+        assert_eq!(t.brief, Brief { quote: Some("加登录".into()), accept: vec!["401 on a wrong password".into()], out_of_scope: vec!["sign-up".into()] });
+        assert!(t.outcome.is_empty());
+        let o = Outcome { decisions: vec!["24h tokens".into()], unverified: vec!["load".into(), "real DB".into()], passed: Some(false) };
+        s.set_outcome("shop", "t1", &o).unwrap();
+        assert_eq!(s.task("shop", "T1").unwrap().unwrap().outcome, o);
+        assert!(s.create_task("shop", new("engineer", None), 2).unwrap().brief.is_empty());
+    }
+
+    #[test]
+    fn runs_track_their_step_round_and_state() {
+        let mut s = store();
+        s.create_task("shop", new("engineer", None), 1).unwrap();
+        let run = s.start_run("shop", "T1", "code", 2).unwrap();
+        assert_eq!((run.step, run.round, run.state), (0, 0, RunState::Running));
+        assert_eq!(s.task("shop", "T1").unwrap().unwrap().run, Some(("T1".into(), 0)));
+        let mut step = new("tester", Some("T1"));
+        step.run = Some(("T1".into(), 2));
+        assert_eq!(s.create_task("shop", step, 3).unwrap().run, Some(("T1".into(), 2)));
+        s.set_run("shop", "T1", 2, 1, RunState::Checking, 4).unwrap();
+        let run = s.run("shop", "T1").unwrap().unwrap();
+        assert_eq!((run.step, run.round, run.state, run.updated_ms), (2, 1, RunState::Checking, 4));
+        assert!(run.state.is_open() && !RunState::Failed.is_open());
+        assert_eq!(s.runs("shop").unwrap().len(), 1);
+        assert!(s.run("shop", "T2").unwrap().is_none());
+    }
+
+    #[test]
+    fn old_databases_get_the_new_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lila.db");
+        {
+            // SCHEMA is still the first release's; the newer columns come from ADDED_COLUMNS.
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(SCHEMA).unwrap();
+            db.execute("INSERT INTO projects (id, cwd, created_ms) VALUES ('shop', '/r', 0)", []).unwrap();
+            db.execute(
+                "INSERT INTO tasks (project, id, seq, title, body, state, from_actor, to_member, created_ms, updated_ms)
+                 VALUES ('shop', 'T1', 1, 'old', '', 'queued', 'human', 'pm', 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let t = s.task("shop", "T1").unwrap().unwrap();
+        assert_eq!(t.title, "old");
+        assert!(t.brief.is_empty() && t.outcome.is_empty());
+        drop(s);
+        Store::open(&path).unwrap();
     }
 
     #[test]

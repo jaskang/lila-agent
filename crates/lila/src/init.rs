@@ -137,6 +137,12 @@ max_rounds = 3
 # Start a member's CLI again before work from an unrelated chain, so its
 # context stays small. Rework in the same chain keeps the session. Never the PM.
 fresh_session = true
+# Work the PM gives the engineer runs through this flow: `code` (implement →
+# check → verify by the tester), `quick` (no tester), or `none`.
+flow = "code"
+# The command Lila runs for the flow's check step, in this folder. A failure goes
+# back to the engineer without waking the tester. Empty: no check step.
+# check = "cargo test"
 "#
     )
 }

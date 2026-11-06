@@ -116,10 +116,41 @@ pub fn stall_check(now_ms: i64, free_since_ms: i64, nudged_ms: Option<i64>, repo
     }
 }
 
+/// Which member of a pool (`Team::pool`) a new task goes to. `affinity`: the
+/// member that last worked in this chain, whose session may still hold the work
+/// (a fix the tester sends back goes to whoever wrote the code). Otherwise the
+/// one with the fewest open tasks, a free one first, in pool order.
+/// `load(member)` gives (open tasks, free right now).
+pub fn pick_slot<'a>(slots: &'a [String], affinity: Option<&str>, load: impl Fn(&str) -> (usize, bool)) -> &'a str {
+    if let Some(a) = affinity.and_then(|a| slots.iter().find(|s| *s == a)) {
+        return a;
+    }
+    slots.iter().min_by_key(|s| {
+        let (open, free) = load(s);
+        (open, !free)
+    })
+    .map(String::as_str)
+    .expect("a pool has members")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use AgentStatus::*;
+
+    #[test]
+    fn a_pool_task_goes_back_to_the_chain_or_to_the_least_loaded() {
+        let slots = vec!["engineer".to_string(), "engineer-2".into(), "engineer-3".into()];
+        let load = |m: &str| match m {
+            "engineer" => (1, false),
+            "engineer-2" => (0, false),
+            _ => (0, true),
+        };
+        assert_eq!(pick_slot(&slots, Some("engineer"), load), "engineer", "the chain's member, though busy");
+        assert_eq!(pick_slot(&slots, None, load), "engineer-3", "nothing open and free");
+        assert_eq!(pick_slot(&slots, Some("tester"), load), "engineer-3", "affinity outside the pool is ignored");
+        assert_eq!(pick_slot(&slots, None, |_| (0, false)), "engineer", "ties go in pool order");
+    }
 
     fn m(id: &str, owner: bool, status: AgentStatus, holds: bool, busy: bool) -> MemberView {
         MemberView { id: id.into(), is_owner: owner, status, holds_task: holds, busy }

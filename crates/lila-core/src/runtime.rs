@@ -19,12 +19,26 @@ pub fn launch(role: &Role, prompt_path: &str, prompt_text: &str) -> Launch {
             if let Some(e) = &f.effort {
                 argv.extend(["--effort".into(), e.clone()]);
             }
+            // Lists take several values; the next flag ends each one.
+            let t = &f.tools;
+            if !t.only.is_empty() {
+                argv.extend(["--tools".into(), t.only.join(",")]);
+            }
+            for (flag, rules) in [("--allowedTools", &t.allow), ("--disallowedTools", &t.deny)] {
+                if !rules.is_empty() {
+                    argv.push(flag.into());
+                    argv.extend(rules.iter().cloned());
+                }
+            }
             argv.extend(["--append-system-prompt-file".into(), prompt_path.into()]);
         }
         Runtime::Codex => {
             argv.extend(["codex".into(), "--no-daemon".into(), "-m".into(), f.model.clone()]);
             if let Some(e) = &f.effort {
                 argv.extend(["-c".into(), format!("model_reasoning_effort={}", toml_string(e))]);
+            }
+            if let Some(mode) = &f.tools.sandbox {
+                argv.extend(["--sandbox".into(), mode.clone()]);
             }
             argv.extend(["-c".into(), format!("developer_instructions={}", toml_string(prompt_text))]);
         }
@@ -56,6 +70,7 @@ mod tests {
                 env: BTreeMap::new(),
                 can_assign: vec![],
                 prompt_file: None,
+                tools: Default::default(),
             },
             prompt: String::new(),
         }
@@ -76,6 +91,28 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&format!("v = {value}")).unwrap();
         assert_eq!(parsed["v"].as_str().unwrap(), "Say \"hi\"\nline2 \\ end");
         assert_eq!(l.argv.last().unwrap(), "--foo");
+    }
+
+    #[test]
+    fn tools_become_flags_the_cli_enforces() {
+        let mut r = role(Runtime::Claude, None);
+        r.file.tools.only = vec!["Read".into(), "Bash".into()];
+        r.file.tools.allow = vec!["Bash(lila:*)".into(), "Bash(git log:*)".into()];
+        r.file.tools.deny = vec!["Edit".into()];
+        r.file.tools.sandbox = Some("read-only".into());
+        let l = launch(&r, "/p.md", "");
+        assert_eq!(
+            l.argv,
+            [
+                "claude", "--model", "the-model", "--tools", "Read,Bash", "--allowedTools", "Bash(lila:*)", "Bash(git log:*)",
+                "--disallowedTools", "Edit", "--append-system-prompt-file", "/p.md", "--foo"
+            ],
+            "the sandbox is codex's"
+        );
+        r.file.runtime = Runtime::Codex;
+        let l = launch(&r, "/p.md", "");
+        assert_eq!(l.argv[4..6], ["--sandbox", "read-only"]);
+        assert!(!l.argv.iter().any(|a| a == "--tools"), "claude's lists are not codex flags");
     }
 
     #[test]

@@ -22,6 +22,10 @@ const PREVIOUS: &[(&str, &str)] = &[
     ("engineer.toml", include_str!("../../../defaults/roles/previous/engineer.1.toml")),
     ("pm.toml", include_str!("../../../defaults/roles/previous/pm.2.toml")),
     ("pm.md", include_str!("../../../defaults/roles/previous/pm.2.md")),
+    ("pm.toml", include_str!("../../../defaults/roles/previous/pm.3.toml")),
+    ("tester.md", include_str!("../../../defaults/roles/previous/tester.1.md")),
+    ("engineer.md", include_str!("../../../defaults/roles/previous/engineer.1.md")),
+    ("tester.md", include_str!("../../../defaults/roles/previous/tester.2.md")),
 ];
 
 /// The role every project's PM has: it can't be deleted.
@@ -210,6 +214,25 @@ mod tests {
         assert_eq!(roles["engineer"].prompt, "mine");
         assert!(roles.contains_key("designer"));
         assert!(delete(dir.path(), "pm", &BTreeMap::new()).is_err());
+        // The Opus PM with no tool limits, and the tester before it checked the person's words.
+        let last = |f: &str| PREVIOUS.iter().rev().find(|(n, _)| *n == f).unwrap().1;
+        std::fs::write(dir.path().join("pm.toml"), last("pm.toml")).unwrap();
+        std::fs::write(dir.path().join("tester.md"), last("tester.md")).unwrap();
+        install_defaults(dir.path()).unwrap();
+        let roles = load(dir.path()).unwrap();
+        assert_eq!(roles["pm"].file.model, "claude-sonnet-5-5");
+        assert!(roles["pm"].file.tools.allow.contains(&"Bash(lila:*)".to_string()));
+        assert!(!roles["pm"].file.tools.only.contains(&"Edit".to_string()));
+        assert!(roles["tester"].prompt.contains("Done when") && roles["tester"].prompt.contains("--verdict"));
+        // Every earlier engineer and tester prompt is brought up to the flow-aware one.
+        for f in ["engineer.md", "tester.md"] {
+            for (_, old) in PREVIOUS.iter().filter(|(n, _)| *n == f) {
+                std::fs::write(dir.path().join(f), old).unwrap();
+                install_defaults(dir.path()).unwrap();
+                assert!(std::fs::read_to_string(dir.path().join(f)).unwrap().contains("Lila"), "{f}");
+            }
+        }
+        assert!(load(dir.path()).unwrap()["engineer"].prompt.contains("If your task says Lila sends it on"));
     }
 
     #[test]

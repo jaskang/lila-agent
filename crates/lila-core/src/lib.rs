@@ -4,11 +4,12 @@
 
 pub mod config;
 pub mod dispatch;
+pub mod flow;
 pub mod message;
 pub mod prompt;
 pub mod route;
 pub mod runtime;
 pub mod task;
 
-pub use config::{Member, ProjectConfig, Role, RoleFile, Runtime, Settings, Team, expand_ids, validate_id};
-pub use task::{Actor, Task, TaskState, Transition};
+pub use config::{Member, ProjectConfig, Role, RoleFile, Runtime, Settings, Team, Tools, expand_ids, validate_id};
+pub use task::{Actor, Brief, Outcome, Task, TaskState, Transition};

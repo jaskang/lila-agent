@@ -111,6 +111,19 @@ enum TaskCmd {
         /// Lower runs first (default 0).
         #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
         priority: i64,
+        /// The person's own words, unchanged; every step of the chain sees them.
+        #[arg(long)]
+        quote: Option<String>,
+        /// A checkable outcome that counts as done (repeatable).
+        #[arg(long)]
+        accept: Vec<String>,
+        /// Something not to do (repeatable).
+        #[arg(long)]
+        out_of_scope: Vec<String>,
+        /// The flow it runs through (`code`, `quick`, the project's own), or `none`.
+        /// Default: the project's flow, for work from the PM or the person.
+        #[arg(long)]
+        flow: Option<String>,
     },
     /// Change a task you assigned: rewrite it while queued, or --append an update once delivered.
     Edit {
@@ -135,6 +148,15 @@ enum TaskCmd {
         /// A deliverable or report (repeatable).
         #[arg(long = "file")]
         files: Vec<String>,
+        /// A choice you made that the task did not settle (repeatable).
+        #[arg(long = "decision")]
+        decisions: Vec<String>,
+        /// Something you did not check (repeatable).
+        #[arg(long)]
+        unverified: Vec<String>,
+        /// For a verification step: pass or fail.
+        #[arg(long, value_parser = ["pass", "fail"])]
+        verdict: Option<String>,
     },
     Block {
         id: String,
@@ -260,12 +282,15 @@ type Out<'a> = dyn Fn(Value, &dyn Fn(&Value) -> String) + 'a;
 
 fn task(cmd: TaskCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out) -> Result<()> {
     match cmd {
-        TaskCmd::New { to, title, body, body_file, parent, priority } => {
+        TaskCmd::New { to, title, body, body_file, parent, priority, quote, accept, out_of_scope, flow } => {
             let body = match body_file {
                 Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?,
                 None => body.unwrap_or_default(),
             };
-            let v = call("task.new", json!({"to": to, "title": title, "body": body, "parent": parent, "priority": priority}))?;
+            let v = call(
+                "task.new",
+                json!({"to": to, "title": title, "body": body, "parent": parent, "priority": priority, "quote": quote, "accept": accept, "out_of_scope": out_of_scope, "flow": flow}),
+            )?;
             out(v, &|v| {
                 let when = if v["state"] == "delivered" { "delivered now" } else { "queued until they are free" };
                 format!("{} → {}: {} ({when})", v["id"].as_str().unwrap_or("?"), v["to"].as_str().unwrap_or("?"), v["title"].as_str().unwrap_or(""))
@@ -283,10 +308,13 @@ fn task(cmd: TaskCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out) ->
             });
         }
         TaskCmd::Start { id } => out(call("task.start", json!({"id": id}))?, &|v| format!("{} in progress", v["id"].as_str().unwrap_or("?"))),
-        TaskCmd::Done { id, summary, files } => out(call("task.done", json!({"id": id, "summary": summary, "files": files}))?, &|v| {
+        TaskCmd::Done { id, summary, files, decisions, unverified, verdict } => out(
+            call("task.done", json!({"id": id, "summary": summary, "files": files, "decisions": decisions, "unverified": unverified, "verdict": verdict}))?,
+            &|v| {
             let to = if v["from"] == "human" { "the person".to_string() } else { v["from"].as_str().unwrap_or("?").to_string() };
             format!("{} done; {to} was told", v["id"].as_str().unwrap_or("?"))
-        }),
+            },
+        ),
         TaskCmd::Block { id, reason } => out(call("task.block", json!({"id": id, "reason": reason}))?, &|v| {
             format!("{} blocked; {} was told. Stop here until you hear back.", v["id"].as_str().unwrap_or("?"), v["from"].as_str().unwrap_or("?"))
         }),
@@ -404,6 +432,17 @@ fn fmt_status(v: &Value) -> String {
             m["model"].as_str().unwrap_or(""),
         ));
     }
+    for r in v["runs"].as_array().into_iter().flatten() {
+        let round = r["round"].as_u64().filter(|n| *n > 0).map(|n| format!(", fix round {n}")).unwrap_or_default();
+        s.push_str(&format!(
+            "  flow {} {} \"{}\": {} ({}{round})\n",
+            r["flow"].as_str().unwrap_or(""),
+            r["anchor"].as_str().unwrap_or(""),
+            r["title"].as_str().unwrap_or(""),
+            r["step"].as_str().unwrap_or(""),
+            r["state"].as_str().unwrap_or(""),
+        ));
+    }
     let open = v["open_tasks"].as_array().map(|a| a.len()).unwrap_or(0);
     s.push_str(&format!("{open} open task(s)"));
     let inbox = v["inbox"].as_u64().unwrap_or(0);
@@ -463,9 +502,25 @@ fn fmt_task_show(v: &Value) -> String {
     if files != "none" {
         s.push_str(&format!("files: {files}\n"));
     }
+    for (key, head) in [("decisions", "decided"), ("unverified", "not checked")] {
+        for item in v[key].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            s.push_str(&format!("{head}: {item}\n"));
+        }
+    }
     let body = v["body"].as_str().unwrap_or("").trim();
     if !body.is_empty() {
         s.push_str(&format!("\n{body}\n"));
+    }
+    if let Some(q) = v["quote"].as_str() {
+        s.push_str("\nthe person's words:\n");
+        s.extend(q.lines().map(|l| format!("> {l}\n")));
+    }
+    for (key, head) in [("accept", "done when"), ("out_of_scope", "out of scope")] {
+        let items: Vec<&str> = v[key].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        if !items.is_empty() {
+            s.push_str(&format!("\n{head}:\n"));
+            s.extend(items.iter().map(|i| format!("- {i}\n")));
+        }
     }
     for c in v["children"].as_array().into_iter().flatten() {
         s.push_str(&format!("\n  sub {}", task_line(c)));

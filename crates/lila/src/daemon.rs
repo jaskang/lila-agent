@@ -2,19 +2,24 @@
 //! Unix socket, terminal facts from herdr-core's event stream; both are
 //! handled one at a time on one thread, so there is no locking.
 
+use crate::check::{CheckJob, CheckResult};
 use crate::paths::{Paths, which};
 use crate::roles;
 use anyhow::{Context, Result, anyhow, bail};
 use lila_core::dispatch::{self, AgentStatus, MemberView, QueuedTask, StallAction};
+use lila_core::flow::{self, Flow, Next};
+use lila_core::message::StepHint;
 use lila_core::route::{self, DoneRoute};
-use lila_core::{Actor, ProjectConfig, Task, TaskState, Team, Transition, message, prompt, runtime};
-use lila_store::{NewTask, Store};
+use lila_core::{Actor, Brief, Outcome, ProjectConfig, Task, TaskState, Team, Transition, message, prompt, runtime};
+use lila_store::{NewTask, Run, RunState, Store};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// What the daemon needs from herdr-core. A fake stands in for it in tests.
 pub trait Terminals {
+    /// Live terminals carrying this project's label.
+    fn list(&mut self, project: &str) -> Result<Vec<Value>>;
     /// Starts a program; returns its terminal address.
     fn run(&mut self, req: Value) -> Result<String>;
     /// Types text and presses Enter. `only_if`: only when the status word is exactly this.
@@ -25,6 +30,11 @@ pub trait Terminals {
 pub struct HcTerminals(pub hc_client::Hc);
 
 impl Terminals for HcTerminals {
+    fn list(&mut self, project: &str) -> Result<Vec<Value>> {
+        let r = self.0.call("terminal.list", json!({"labels": {"lila.project": project}}))?;
+        r["terminals"].as_array().cloned().ok_or_else(|| anyhow!("terminal.list returned no terminals"))
+    }
+
     fn run(&mut self, req: Value) -> Result<String> {
         let r = self.0.call("terminal.run", req)?;
         r["address"].as_str().map(String::from).ok_or_else(|| anyhow!("terminal.run returned no address: {r}"))
@@ -89,6 +99,17 @@ pub struct Daemon<T: Terminals> {
     failed_sends: BTreeMap<String, String>,
     /// Goes up when what members are doing changes (status, words, terminals): not in the database.
     live_version: u64,
+    /// Checks to start (`take_checks`), and the runs whose check is under way.
+    checks: Vec<CheckJob>,
+    checking: BTreeSet<(String, String)>,
+}
+
+/// The actor lilad writes as: it creates a flow's later steps.
+const LILAD: &str = "lilad";
+
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 fn now_ms() -> i64 {
@@ -131,11 +152,32 @@ fn terminal_name(project: &str, member: &str) -> String {
 
 impl<T: Terminals> Daemon<T> {
     pub fn new(store: Store, term: T, paths: Paths, path_env: String, lila_bin: PathBuf) -> Daemon<T> {
-        let mut d = Daemon { store, term, paths, projects: BTreeMap::new(), path_env, lila_bin, log: Vec::new(), failed_sends: BTreeMap::new(), live_version: 0 };
+        let mut d = Daemon {
+            store,
+            term,
+            paths,
+            projects: BTreeMap::new(),
+            path_env,
+            lila_bin,
+            log: Vec::new(),
+            failed_sends: BTreeMap::new(),
+            live_version: 0,
+            checks: Vec::new(),
+            checking: BTreeSet::new(),
+        };
         let rows = d.store.projects().unwrap_or_default();
         for p in rows {
             if let Err(e) = d.load_project(&p.id, Path::new(&p.cwd), now_ms()) {
                 d.say(format!("project {}: not loaded: {e:#}", p.id));
+            }
+        }
+        // A check that was running when lilad stopped runs again.
+        let pids: Vec<String> = d.projects.keys().cloned().collect();
+        for pid in pids {
+            for run in d.store.runs(&pid).unwrap_or_default() {
+                if run.state == RunState::Checking {
+                    d.queue_check(&pid, &run.anchor);
+                }
             }
         }
         d
@@ -284,6 +326,19 @@ impl<T: Terminals> Daemon<T> {
         std::fs::create_dir_all(spool_dir(&root))?;
         ensure_gitignore(&root)?;
 
+        // A project may have been absent from the database when the event
+        // snapshot arrived. Recover its existing team before starting anyone.
+        for rec in self.term.list(&pid)? {
+            if rec["state"] != "live" || rec["labels"]["lila.project"] != pid || rec["cwd"] != root_s {
+                continue;
+            }
+            let (Some(mid), Some(addr)) = (s(&rec["labels"], "lila.member"), s(&rec, "address")) else { continue };
+            let Some(member) = self.projects[&pid].team.member(mid) else { continue };
+            let started_ms = self.projects[&pid].live[mid].started_ms.unwrap_or(now);
+            self.store.set_member(&pid, mid, &member.role.id, Some(addr), Some(started_ms))?;
+            self.on_terminal(&rec, now);
+        }
+
         let mut started = Vec::new();
         let mut running = Vec::new();
         let members: Vec<_> = self.projects[&pid].team.members.clone();
@@ -312,7 +367,7 @@ impl<T: Terminals> Daemon<T> {
         if let Some(brief) = s(params, "brief") {
             let owner = self.projects[&pid].team.owner.clone();
             let (title, body) = split_brief(brief);
-            let t = self.create_task(&pid, NewTask { title, body, from: Actor::Human, to: owner, parent: None, priority: 0 }, now)?;
+            let t = self.create_task(&pid, NewTask { title, body, from: Actor::Human, to: owner, parent: None, priority: 0, brief: Brief::default(), run: None }, now)?;
             brief_task = Some(t.id);
         }
         self.pump(&pid, now);
@@ -515,7 +570,18 @@ impl<T: Terminals> Daemon<T> {
         let open: Vec<Value> = tasks.iter().filter(|(t, _)| t.state.is_open()).map(|(t, _)| task_json(t)).collect();
         let inbox = self.store.inbox(&pid, false)?.len();
         let paused = self.store.project(&pid)?.map(|p| p.paused).unwrap_or(false);
-        Ok(json!({"project": pid, "cwd": proj.cwd, "paused": paused, "members": members, "open_tasks": open, "inbox": inbox}))
+        let runs: Vec<Value> = self
+            .store
+            .runs(&pid)?
+            .into_iter()
+            .filter(|r| r.state.is_open())
+            .map(|r| {
+                let title = tasks.iter().find(|(t, _)| t.id == r.anchor).map(|(t, _)| t.title.clone()).unwrap_or_default();
+                let step = proj.team.flows.get(&r.flow).and_then(|f| f.steps.get(r.step)).map(|s| s.action.clone()).unwrap_or_default();
+                json!({"anchor": r.anchor, "title": title, "flow": r.flow, "step": step, "round": r.round, "state": r.state.as_str()})
+            })
+            .collect();
+        Ok(json!({"project": pid, "cwd": proj.cwd, "paused": paused, "members": members, "open_tasks": open, "inbox": inbox, "runs": runs}))
     }
 
     fn create_task(&mut self, pid: &str, new: NewTask, now: i64) -> Result<Task> {
@@ -528,16 +594,33 @@ impl<T: Terminals> Daemon<T> {
 
     fn task_new(&mut self, caller: &Value, params: &Value, now: i64) -> Result<Value> {
         let (pid, actor) = self.who(caller)?;
-        let to = req(params, "to")?.to_owned();
-        let team = &self.projects[&pid].team;
-        team.check_assign(&actor, &to).map_err(anyhow::Error::msg)?;
-        let max_depth = team.settings.max_chain_depth;
         let parent = s(params, "parent").map(|p| p.to_ascii_uppercase());
         if let Some(p) = &parent {
             self.store.task(&pid, p)?.ok_or_else(|| anyhow!("no task {p} to use as parent"))?;
-            if self.store.depth(&pid, p)? + 1 >= max_depth {
-                bail!("task chain under {p} is already {max_depth} deep; report to the PM with `lila task block` instead of creating more subtasks");
-            }
+        }
+        let to = self.resolve_to(&pid, &actor, req(params, "to")?, parent.as_deref())?;
+        let team = &self.projects[&pid].team;
+        team.check_assign(&actor, &to).map_err(anyhow::Error::msg)?;
+        // Inside a flow, lilad hands the work on: a member doing it too would double it.
+        if let (Some(p), Actor::Member(m)) = (&parent, &actor)
+            && *m != team.owner
+            && let Some(pt) = self.store.task(&pid, p)?
+            && let Some((run, f, step)) = self.current_step(&pid, &pt)
+            && f.steps.iter().any(|st| st.by.as_deref().is_some_and(|by| team.covers(by, &to)))
+        {
+            let how = if f.steps[step].wants_verdict() {
+                format!("finish {p} with `lila task done {p} --verdict fail --summary \"<what fails>\"`: Lila sends the fix back")
+            } else {
+                format!("finish {p} with `lila task done {p}`: Lila {}", flow::later(&f, step, self.check_cmd(&pid).as_deref()).join(", then "))
+            };
+            bail!("{p} is a step of the {} flow; {how}", run.flow);
+        }
+        let flow_name = team.flow_for(s(params, "flow"), &to, &actor).map_err(anyhow::Error::msg)?;
+        let max_depth = team.settings.max_chain_depth;
+        if let Some(p) = &parent
+            && self.store.depth(&pid, p)? + 1 >= max_depth
+        {
+            bail!("task chain under {p} is already {max_depth} deep; report to the PM with `lila task block` instead of creating more subtasks");
         }
         if let (Some(p), Actor::Member(from)) = (&parent, &actor) {
             let chain: Vec<(String, String)> = self.store.ancestors(&pid, p)?.into_iter().map(|t| (t.from.to_string(), t.to)).collect();
@@ -559,11 +642,36 @@ impl<T: Terminals> Daemon<T> {
             to,
             parent,
             priority: params.get("priority").and_then(Value::as_i64).unwrap_or(0),
+            brief: Brief { quote: s(params, "quote").map(String::from), accept: strings(params, "accept"), out_of_scope: strings(params, "out_of_scope") },
+            run: None,
         };
         let task = self.create_task(&pid, new, now)?;
+        if let Some(f) = &flow_name {
+            self.store.start_run(&pid, &task.id, f, now)?;
+            self.store.event(&pid, Some(&task.id), LILAD, "flow", &format!("{f} flow starts"), now)?;
+        }
         self.pump(&pid, now);
         let task = self.store.task(&pid, &task.id)?.expect("exists");
         Ok(task_json(&task))
+    }
+
+    /// A pool id (`engineer` with `count = 2`) becomes one of its members: the one
+    /// that last worked in the parent's chain, else the least loaded (`dispatch::pick_slot`).
+    fn resolve_to(&self, pid: &str, actor: &Actor, to: &str, parent: Option<&str>) -> Result<String> {
+        let proj = &self.projects[pid];
+        let Some(slots) = proj.team.pool(to) else { return Ok(to.to_owned()) };
+        let slots: Vec<String> = slots.iter().filter(|m| actor.as_str() != m.as_str()).cloned().collect();
+        if slots.is_empty() {
+            return Ok(to.to_owned());
+        }
+        let tasks: Vec<Task> = self.store.tasks(pid)?.into_iter().map(|(t, _)| t).collect();
+        let affinity = parent.and_then(|p| {
+            let root = route::ancestors(&tasks, p).last().map(|t| t.id.clone()).unwrap_or_else(|| p.to_owned());
+            let in_chain = |t: &Task| t.id == root || route::ancestors(&tasks, &t.id).iter().any(|a| a.id == root);
+            tasks.iter().rev().find(|t| slots.contains(&t.to) && in_chain(t)).map(|t| t.to.clone())
+        });
+        let load = |m: &str| (tasks.iter().filter(|t| t.to == m && t.state.is_open()).count(), proj.live.get(m).is_some_and(|l| l.status.is_free()));
+        Ok(dispatch::pick_slot(&slots, affinity.as_deref(), load).to_owned())
     }
 
     fn task_move(&mut self, caller: &Value, params: &Value, t: Transition, now: i64) -> Result<Value> {
@@ -583,14 +691,44 @@ impl<T: Terminals> Daemon<T> {
             Transition::Block => req(params, "reason").context("say what you need with --reason")?.to_owned(),
             _ => s(params, "reason").unwrap_or_default().to_owned(),
         };
+        // The current step of a flow run: lilad starts the next one.
+        let step = if t == Transition::Done { self.current_step(&pid, &task) } else { None };
+        let passed = match (&step, s(params, "verdict")) {
+            (Some((_, f, i)), v) if f.steps[*i].wants_verdict() => match v {
+                Some("pass") => Some(true),
+                Some("fail") => Some(false),
+                _ => bail!("{} is a verification: finish with `lila task done {} --verdict pass|fail --summary \"…\"`", task.id, task.id),
+            },
+            (_, Some(v)) => bail!("{} asks for no verdict; drop --verdict {v}", task.id),
+            _ => None,
+        };
         let was_active = task.state.is_active();
-        let task = self.store.transition(&pid, &task.id, t, &actor, &detail, now)?;
+        let mut task = self.store.transition(&pid, &task.id, t, &actor, &detail, now)?;
+        let outcome = Outcome { decisions: strings(params, "decisions"), unverified: strings(params, "unverified"), passed };
+        if t == Transition::Done && !outcome.is_empty() {
+            self.store.set_outcome(&pid, &task.id, &outcome)?;
+            task = self.store.task(&pid, &task.id)?.expect("exists");
+        }
         let files = strings(params, "files");
         if !files.is_empty() {
             self.store.add_artifacts(&pid, &task.id, &files)?;
         }
+        if t == Transition::Cancel
+            && let Some((anchor, _)) = &task.run
+            && let Some(run) = self.store.run(&pid, anchor)?
+            && run.state.is_open()
+        {
+            self.store.set_run(&pid, anchor, run.step, run.round, RunState::Cancelled, now)?;
+            self.store.event(&pid, Some(anchor), actor.as_str(), "flow_cancelled", &format!("with {}", task.id), now)?;
+        }
         match t {
-            Transition::Done => self.report_done(&pid, &task, &files, now)?,
+            Transition::Done => match &step {
+                Some((run, _, i)) => {
+                    let failure = message::fix_from_verdict(&task, &files);
+                    self.advance(&pid, &run.anchor, *i, passed != Some(false), &task, &failure, now)?;
+                }
+                None => self.report_done(&pid, &task, &files, now)?,
+            },
             Transition::Block => self.report(&pid, &task, message::blocked_note(&task), now)?,
             Transition::Cancel if was_active && actor != Actor::Member(task.to.clone()) => {
                 let text = message::note(&task.id, &format!("{} was cancelled by {actor}. Stop working on it. {detail}", task.id));
@@ -610,7 +748,7 @@ impl<T: Terminals> Daemon<T> {
         let tasks: Vec<Task> = self.store.tasks(pid)?.into_iter().map(|(t, _)| t).collect();
         match route::route_done(&tasks, &task.id, &owner) {
             DoneRoute::Inbox => {
-                let body = format!("{} done: {}", task.id, task.summary.clone().unwrap_or_default());
+                let body = format!("{} done: {}{}", task.id, task.summary.clone().unwrap_or_default(), message::outcome_text(&task.outcome));
                 self.store.add_inbox(pid, "report", Some(&task.to), Some(&task.id), &body, &[], now)?;
             }
             DoneRoute::Hold | DoneRoute::Nobody => {}
@@ -629,7 +767,7 @@ impl<T: Terminals> Daemon<T> {
     /// Tells whoever assigned a blocked task (and the owner, when a blocker skips it).
     fn report(&mut self, pid: &str, task: &Task, text: String, now: i64) -> Result<()> {
         let owner = self.projects[pid].team.owner.clone();
-        match &task.from {
+        match &self.assigner(pid, task) {
             Actor::Human => {
                 let body = format!("{} blocked: {}", task.id, task.block_reason.clone().unwrap_or_default());
                 self.store.add_inbox(pid, "report", Some(&task.to), Some(&task.id), &body, &[], now)?;
@@ -644,6 +782,200 @@ impl<T: Terminals> Daemon<T> {
             }
         }
         Ok(())
+    }
+
+    /// Who hears about a task: whoever assigned it, or for a step lilad created,
+    /// whoever started its flow run.
+    fn assigner(&self, pid: &str, task: &Task) -> Actor {
+        if task.from.as_str() == LILAD
+            && let Some((anchor, _)) = &task.run
+            && let Ok(Some(a)) = self.store.task(pid, anchor)
+        {
+            return a.from;
+        }
+        task.from.clone()
+    }
+
+    fn check_cmd(&self, pid: &str) -> Option<String> {
+        let c = self.projects[pid].team.settings.check.trim();
+        (!c.is_empty()).then(|| c.to_owned())
+    }
+
+    /// The open run `task` is the step under way of: the run, its flow and the step.
+    fn current_step(&self, pid: &str, task: &Task) -> Option<(Run, Flow, usize)> {
+        let (anchor, step) = task.run.clone()?;
+        let run = self.store.run(pid, &anchor).ok()??;
+        if run.state != RunState::Running || run.step != step {
+            return None;
+        }
+        let f = self.projects[pid].team.flows.get(&run.flow)?.clone();
+        (step < f.steps.len()).then_some((run, f, step))
+    }
+
+    /// What a member doing a step is told about the rest of its flow.
+    fn step_hint(&self, pid: &str, task: &Task) -> Option<StepHint> {
+        let (anchor, step) = task.run.as_ref()?;
+        let run = self.store.run(pid, anchor).ok()??;
+        let f = self.projects[pid].team.flows.get(&run.flow)?;
+        let st = f.steps.get(*step)?;
+        Some(if st.wants_verdict() { StepHint::Verdict } else { StepHint::HandOn(flow::later(f, *step, self.check_cmd(pid).as_deref())) })
+    }
+
+    /// Step `at` of `anchor`'s run ended (`passed`: its verdict or check). Starts what
+    /// comes next (`flow::after`). `last`: the newest step task, which the next hangs
+    /// under. `failure`: what goes back to the member on a fail.
+    #[allow(clippy::too_many_arguments)]
+    fn advance(&mut self, pid: &str, anchor: &str, at: usize, passed: bool, last: &Task, failure: &str, now: i64) -> Result<()> {
+        let Some(run) = self.store.run(pid, anchor)? else { return Ok(()) };
+        let anchor_task = self.store.task(pid, anchor)?.context("a flow run without its task")?;
+        let (f, max) = {
+            let team = &self.projects[pid].team;
+            (team.flows.get(&run.flow).filter(|f| at < f.steps.len()).cloned(), team.settings.max_rounds)
+        };
+        let Some(f) = f else {
+            self.store.set_run(pid, anchor, at, run.round, RunState::Done, now)?;
+            self.store.event(pid, Some(anchor), LILAD, "flow_done", &format!("the {} flow is gone from the project: stopped here", run.flow), now)?;
+            let files = self.store.artifacts(pid, &last.id)?;
+            return self.report_done(pid, last, &files, now);
+        };
+        let check = self.check_cmd(pid);
+        match flow::after(&f, at, passed, run.round, max, check.is_some()) {
+            Next::Finished => {
+                self.store.set_run(pid, anchor, at, run.round, RunState::Done, now)?;
+                self.store.event(pid, Some(anchor), LILAD, "flow_done", &format!("{} flow passed", run.flow), now)?;
+                self.finish_run(pid, &anchor_task, &run.flow, last, now)?;
+            }
+            Next::GiveUp => {
+                self.store.set_run(pid, anchor, at, run.round, RunState::Failed, now)?;
+                self.store.event(pid, Some(anchor), LILAD, "flow_failed", &format!("still failing after {} rounds", run.round), now)?;
+                let text = message::gave_up(&anchor_task, &run.flow, run.round, failure);
+                self.tell_lead(pid, &anchor_task, &text, now)?;
+            }
+            Next::Check { step } => {
+                self.store.set_run(pid, anchor, step, run.round, RunState::Checking, now)?;
+                self.store.event(pid, Some(anchor), LILAD, "check", &format!("running `{}`", check.as_deref().unwrap_or("")), now)?;
+                self.queue_check(pid, anchor);
+            }
+            Next::Member { step } => {
+                let st = f.steps[step].clone();
+                let to = self.resolve_to(pid, &Actor::Member(LILAD.into()), st.by.as_deref().unwrap_or_default(), Some(&last.id))?;
+                let files = self.store.artifacts(pid, &last.id)?;
+                let ran = if f.steps[at].is_check() { check.as_deref() } else { None };
+                let title = if st.wants_verdict() { format!("Verify: {}", anchor_task.title) } else { format!("{}: {}", capitalized(&st.action), anchor_task.title) };
+                let body = message::step_body(last, &files, ran, st.wants_verdict());
+                self.store.set_run(pid, anchor, step, run.round, RunState::Running, now)?;
+                self.create_step(pid, anchor, step, &to, &last.id, title, body, now)?;
+            }
+            Next::Back { step, round } => {
+                // To whoever did that step last: its session may still hold the work.
+                let to = self
+                    .store
+                    .tasks(pid)?
+                    .into_iter()
+                    .rev()
+                    .map(|(t, _)| t)
+                    .find(|t| t.run.as_ref().is_some_and(|(a, s)| a == anchor && *s == step))
+                    .map(|t| t.to)
+                    .context("nobody did the step to send the work back to")?;
+                self.store.set_run(pid, anchor, step, round, RunState::Running, now)?;
+                self.store.event(pid, Some(anchor), LILAD, "sent_back", &format!("round {round} of {max}, to {to}"), now)?;
+                self.create_step(pid, anchor, step, &to, &last.id, format!("Fix: {}", anchor_task.title), failure.to_owned(), now)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_step(&mut self, pid: &str, anchor: &str, step: usize, to: &str, parent: &str, title: String, body: String, now: i64) -> Result<Task> {
+        let new = NewTask {
+            title,
+            body,
+            from: Actor::Member(LILAD.into()),
+            to: to.to_owned(),
+            parent: Some(parent.to_owned()),
+            priority: 0,
+            brief: Brief::default(),
+            run: Some((anchor.to_owned(), step)),
+        };
+        self.create_task(pid, new, now)
+    }
+
+    /// Every step passed: whoever started the run hears once, like for any finished chain.
+    fn finish_run(&mut self, pid: &str, anchor: &Task, flow_name: &str, last: &Task, now: i64) -> Result<()> {
+        if anchor.from == Actor::Human {
+            let mut text = format!(
+                "{} done, {flow_name} flow passed: {}{}",
+                anchor.id,
+                anchor.summary.as_deref().unwrap_or_default(),
+                message::outcome_text(&anchor.outcome)
+            );
+            if last.id != anchor.id {
+                text.push_str(&format!("\n{} {}: {}{}", last.to, last.id, last.summary.as_deref().unwrap_or_default(), message::outcome_text(&last.outcome)));
+            }
+            self.store.add_inbox(pid, "report", Some(&anchor.to), Some(&anchor.id), &text, &[], now)?;
+            return Ok(());
+        }
+        let files = self.store.artifacts(pid, &last.id)?;
+        self.report_done(pid, last, &files, now)
+    }
+
+    /// News about a run for whoever started it, and the PM.
+    fn tell_lead(&mut self, pid: &str, anchor: &Task, text: &str, now: i64) -> Result<()> {
+        let owner = self.projects[pid].team.owner.clone();
+        if anchor.from == Actor::Human {
+            self.store.add_inbox(pid, "report", Some(&anchor.to), Some(&anchor.id), text, &[], now)?;
+        } else if anchor.from.as_str() != owner {
+            self.store.push_outbox(pid, anchor.from.as_str(), text, now)?;
+        }
+        self.store.push_outbox(pid, &owner, text, now)?;
+        Ok(())
+    }
+
+    fn queue_check(&mut self, pid: &str, anchor: &str) {
+        let Some(cmd) = self.check_cmd(pid) else { return };
+        if !self.checking.insert((pid.to_owned(), anchor.to_owned())) {
+            return;
+        }
+        let p = &self.projects[pid];
+        self.checks.push(CheckJob {
+            project: pid.to_owned(),
+            anchor: anchor.to_owned(),
+            cwd: p.cwd.clone(),
+            cmd,
+            timeout: std::time::Duration::from_secs(p.team.settings.check_timeout_secs.max(1)),
+            path_env: self.path_env.clone(),
+        });
+    }
+
+    /// Checks to start now; each result comes back through `on_check_done`.
+    pub fn take_checks(&mut self) -> Vec<CheckJob> {
+        std::mem::take(&mut self.checks)
+    }
+
+    /// A check finished: on to the next step, or the work goes back.
+    pub fn on_check_done(&mut self, pid: &str, anchor: &str, r: &CheckResult, now: i64) {
+        self.checking.remove(&(pid.to_owned(), anchor.to_owned()));
+        if !self.projects.contains_key(pid) {
+            return;
+        }
+        let Ok(Some(run)) = self.store.run(pid, anchor) else { return };
+        if run.state != RunState::Checking {
+            return;
+        }
+        let detail = match r.exit {
+            Some(0) => "passed".to_owned(),
+            Some(c) => format!("failed (exit {c})"),
+            None => "did not finish".to_owned(),
+        };
+        let _ = self.store.event(pid, Some(anchor), LILAD, "check", &detail, now);
+        self.say(format!("{pid}: check for {anchor} {detail}"));
+        let tasks = self.store.tasks(pid).unwrap_or_default();
+        let Some(last) = tasks.into_iter().rev().map(|(t, _)| t).find(|t| t.run.as_ref().is_some_and(|(a, _)| a == anchor)) else { return };
+        let failure = message::fix_from_check(&self.check_cmd(pid).unwrap_or_default(), r.exit, &r.tail);
+        if let Err(e) = self.advance(pid, anchor, run.step, r.passed(), &last, &failure, now) {
+            self.say(format!("{pid}: after the check for {anchor}: {e:#}"));
+        }
+        self.pump(pid, now);
     }
 
     /// Changes a task you assigned. Queued: rewritten in place. Already delivered:
@@ -980,7 +1312,8 @@ impl<T: Terminals> Daemon<T> {
             let Some(task) = tasks.iter().find(|(t, _)| t.id == tid).map(|(t, _)| t.clone()) else { continue };
             let live = self.projects[pid].live[&mid].clone();
             let Some(terminal) = live.terminal else { continue };
-            let chain = self.store.ancestors(pid, &tid).ok().and_then(|a| a.last().map(|t| t.id.clone())).unwrap_or_else(|| tid.clone());
+            let ancestors = self.store.ancestors(pid, &tid).unwrap_or_default();
+            let chain = ancestors.last().map(|t| t.id.clone()).unwrap_or_else(|| tid.clone());
             let proj = &self.projects[pid];
             let fresh = proj.team.settings.fresh_session && proj.team.member(&mid).is_some_and(|m| !m.is_owner);
             if fresh && live.chain.as_ref().is_some_and(|c| *c != chain) {
@@ -990,7 +1323,12 @@ impl<T: Terminals> Daemon<T> {
                 }
                 continue;
             }
-            let text = message::task_delivery(&task, &task_file_rel(&task.id));
+            // The request the chain serves: the person's words from nearest the root,
+            // and every "done when" and "out of scope" set on the way down.
+            let origin = chain_brief(&ancestors);
+            let origin = origin.as_ref().map(|(ids, file, brief)| message::ChainBrief { id: ids, file, brief });
+            let hint = self.step_hint(pid, &task);
+            let text = message::task_delivery(&task, &task_file_rel(&task.id), origin, hint.as_ref());
             // Type only if it is still idle. hc's `if` knows `idle` and `working`
             // only; `done` (finished while unseen) takes input like idle, unguarded.
             let guard = (live.status == AgentStatus::Idle).then_some("idle");
@@ -1054,6 +1392,7 @@ impl<T: Terminals> Daemon<T> {
             let stall_ms = settings.stall_minutes as i64 * 60_000;
             let tasks = self.store.tasks(&pid).unwrap_or_default();
             let all: Vec<Task> = tasks.iter().map(|(t, _)| t.clone()).collect();
+            let open_runs: Vec<String> = self.store.runs(&pid).unwrap_or_default().into_iter().filter(|r| r.state.is_open()).map(|r| r.anchor).collect();
             for (t, meta) in tasks {
                 if !matches!(t.state, TaskState::Delivered | TaskState::InProgress) {
                     continue;
@@ -1064,6 +1403,10 @@ impl<T: Terminals> Daemon<T> {
                 }
                 // It handed work on and waits for it: quiet is expected, and it hears when that finishes.
                 if !route::open_under(&all, &t.id).is_empty() {
+                    continue;
+                }
+                // Or a flow under it is between steps (lilad runs the check).
+                if open_runs.iter().any(|a| *a == t.id || route::ancestors(&all, a).iter().any(|x| x.id == t.id)) {
                     continue;
                 }
                 match dispatch::stall_check(now, live.free_since, meta.nudged_ms, meta.stall_reported, stall_ms) {
@@ -1161,6 +1504,29 @@ impl<T: Terminals> Daemon<T> {
     }
 }
 
+/// The brief a task's ancestors (nearest first) set: ids, the file of the words, the brief.
+fn chain_brief(ancestors: &[Task]) -> Option<(String, String, Brief)> {
+    let set: Vec<(String, Brief)> = ancestors.iter().rev().map(|a| (a.id.clone(), a.chain_brief())).filter(|(_, b)| !b.is_empty()).collect();
+    let (first, _) = set.first()?;
+    let mut merged = Brief::default();
+    let mut file = task_file_rel(first);
+    for (id, b) in &set {
+        if merged.quote.is_none() && b.quote.is_some() {
+            merged.quote = b.quote.clone();
+            file = task_file_rel(id);
+        }
+        for (into, from) in [(&mut merged.accept, &b.accept), (&mut merged.out_of_scope, &b.out_of_scope)] {
+            for item in from {
+                if !into.contains(item) {
+                    into.push(item.clone());
+                }
+            }
+        }
+    }
+    let ids = set.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", ");
+    Some((ids, file, merged))
+}
+
 pub fn task_file_rel(id: &str) -> String {
     format!(".lila/tasks/{id}.md")
 }
@@ -1169,7 +1535,18 @@ fn write_task_file(cwd: &Path, t: &Task) -> Result<()> {
     let dir = cwd.join(".lila").join("tasks");
     std::fs::create_dir_all(&dir)?;
     let parent = t.parent.as_deref().map(|p| format!(" · parent {p}")).unwrap_or_default();
-    let text = format!("# {} · {}\n\nfrom {} → {}{parent}\n\n{}\n", t.id, t.title, t.from, t.to, t.body.trim());
+    let mut text = format!("# {} · {}\n\nfrom {} → {}{parent}\n\n{}\n", t.id, t.title, t.from, t.to, t.body.trim());
+    let b = &t.brief;
+    if let Some(q) = b.quote.as_deref() {
+        text.push_str("\n## The person's words\n\n");
+        text.extend(q.lines().map(|l| format!("> {l}\n")));
+    }
+    for (head, items) in [("Done when", &b.accept), ("Out of scope", &b.out_of_scope)] {
+        if !items.is_empty() {
+            text.push_str(&format!("\n## {head}\n\n"));
+            text.extend(items.iter().map(|i| format!("- {i}\n")));
+        }
+    }
     std::fs::write(dir.join(format!("{}.md", t.id)), text)?;
     Ok(())
 }
@@ -1179,6 +1556,10 @@ pub fn task_json(t: &Task) -> Value {
         "id": t.id, "title": t.title, "body": t.body, "state": t.state.as_str(), "from": t.from.as_str(), "to": t.to,
         "parent": t.parent, "priority": t.priority, "summary": t.summary, "block_reason": t.block_reason,
         "created_ms": t.created_ms, "updated_ms": t.updated_ms,
+        "quote": t.brief.quote, "accept": t.brief.accept, "out_of_scope": t.brief.out_of_scope,
+        "decisions": t.outcome.decisions, "unverified": t.outcome.unverified,
+        "verdict": t.outcome.passed.map(|p| if p { "pass" } else { "fail" }),
+        "run": t.run.as_ref().map(|(a, _)| a), "run_step": t.run.as_ref().map(|(_, s)| s),
     })
 }
 
@@ -1199,6 +1580,8 @@ enum Input {
     Tick,
     /// Look for spool requests (fast: sandboxed members wait on them).
     Spool,
+    /// A flow's check finished: project, run anchor, result.
+    CheckDone(String, String, CheckResult),
     Stop,
 }
 
@@ -1316,6 +1699,7 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
         }
     });
 
+    spawn_checks(&mut daemon, &tx);
     let mut seen = daemon.fingerprint();
     let mut seq: u64 = 0;
     for input in rx {
@@ -1344,8 +1728,10 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
             Input::Hc(line) => daemon.on_event(&line, now),
             Input::Tick => daemon.tick(now),
             Input::Spool => daemon.process_spool(now),
+            Input::CheckDone(pid, anchor, r) => daemon.on_check_done(&pid, &anchor, &r, now),
             Input::Stop => break,
         }
+        spawn_checks(&mut daemon, &tx);
         let fp = daemon.fingerprint();
         if fp != seen {
             seen = fp;
@@ -1357,6 +1743,17 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
     let _ = std::fs::remove_file(&sock);
     eprintln!("[lilad] stopped");
     Ok(())
+}
+
+/// Runs each check lilad asked for on its own thread.
+fn spawn_checks<T: Terminals>(daemon: &mut Daemon<T>, tx: &std::sync::mpsc::Sender<Input>) {
+    for job in daemon.take_checks() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let r = crate::check::run(&job);
+            let _ = tx.send(Input::CheckDone(job.project, job.anchor, r));
+        });
+    }
 }
 
 impl<T: Terminals> Daemon<T> {

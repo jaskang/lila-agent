@@ -1,11 +1,31 @@
 //! Text typed into members' terminals. One shape, `<lila …>…</lila>`, like hc's own `<hc …>` tags.
 
-use crate::task::Task;
+use crate::task::{Brief, Outcome, Task};
 
 /// Bodies longer than this are not inlined: the member reads the task file.
 const INLINE_BODY: usize = 1200;
+/// The person's words are cut here in a delivery; the task file holds all of them.
+const INLINE_QUOTE: usize = 1200;
 
-pub fn task_delivery(task: &Task, file: &str) -> String {
+/// The brief of the task that started a chain: its id, its file, the brief.
+pub struct ChainBrief<'a> {
+    pub id: &'a str,
+    pub file: &'a str,
+    pub brief: &'a Brief,
+}
+
+/// What a member doing a flow step is told about the rest of the flow.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepHint {
+    /// What lilad does once it is done (`flow::later`): "runs `cargo test`", ...
+    HandOn(Vec<String>),
+    /// The step gives a verdict.
+    Verdict,
+}
+
+/// `chain`: the brief of the task this one's chain started from, when that is another task.
+/// `hint`: the task is a step of a flow.
+pub fn task_delivery(task: &Task, file: &str, chain: Option<ChainBrief>, hint: Option<&StepHint>) -> String {
     let parent = task.parent.as_deref().map(|p| format!(" parent=\"{p}\"")).unwrap_or_default();
     let mut s = format!("<lila task=\"{}\" from=\"{}\"{parent} file=\"{file}\">\n{}\n", task.id, task.from, task.title);
     let body = task.body.trim();
@@ -18,10 +38,122 @@ pub fn task_delivery(task: &Task, file: &str) -> String {
             s.push_str(&format!("\nDetails are in {file}. Read it first.\n"));
         }
     }
+    if !task.brief.is_empty() {
+        s.push('\n');
+        push_brief(&mut s, &task.brief, file);
+    }
+    if let Some(c) = chain.filter(|c| !c.brief.is_empty()) {
+        s.push_str(&format!("\nThe request this work serves ({}), the bar to meet:\n", c.id));
+        push_brief(&mut s, c.brief, c.file);
+    }
+    let id = &task.id;
+    match hint {
+        Some(StepHint::HandOn(next)) if !next.is_empty() => s.push_str(&format!(
+            "\nWhen you finish, Lila {} with your summary. Don't hand it on yourself.\n",
+            and_list(next)
+        )),
+        Some(StepHint::Verdict) => s.push_str(
+            "\nThis is a verification: test it against the bar above and give a verdict. For a fail, say what fails: expected vs actual and how to reproduce. Lila sends it back.\n",
+        ),
+        _ => {}
+    }
+    let verdict = if hint == Some(&StepHint::Verdict) { " --verdict pass|fail" } else { "" };
     s.push_str(&format!(
-        "\nStart: lila task start {id} · Finish: lila task done {id} --summary \"…\" · Stuck: lila task block {id} --reason \"…\"\n</lila>",
-        id = task.id
+        "\nStart: lila task start {id} · Finish: lila task done {id}{verdict} --summary \"…\" [--decision \"…\"] [--unverified \"…\"] · Stuck: lila task block {id} --reason \"…\"\n</lila>"
     ));
+    s
+}
+
+/// "a, b and c".
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The text of the next flow step lilad creates after `done` (and its files).
+/// `check`: the check command that passed before it. `verdict`: the step verifies.
+pub fn step_body(done: &Task, files: &[String], check: Option<&str>, verdict: bool) -> String {
+    let mut s = format!("{} finished {} \"{}\": {}", done.to, done.id, done.title, done.summary.as_deref().unwrap_or("(no summary)"));
+    s.push_str(&outcome_text(&done.outcome));
+    if !files.is_empty() {
+        s.push_str(&format!("\nFiles: {}", files.join(", ")));
+    }
+    if let Some(c) = check {
+        s.push_str(&format!("\nLila ran `{c}`: it passed."));
+    }
+    if verdict {
+        s.push_str("\n\nThat is their account. Verify the work against the person's words and what counts as done, below.");
+    }
+    s
+}
+
+/// A fix after a failed verdict: what `failed` (the verification) found.
+pub fn fix_from_verdict(failed: &Task, files: &[String]) -> String {
+    let mut s = format!("{} found a failure in {} \"{}\": {}", failed.to, failed.id, failed.title, failed.summary.as_deref().unwrap_or("(no summary)"));
+    s.push_str(&outcome_text(&failed.outcome));
+    if !files.is_empty() {
+        s.push_str(&format!("\nFiles: {}", files.join(", ")));
+    }
+    s.push_str("\n\nFix it and finish this task; Lila checks and verifies it again.");
+    s
+}
+
+/// A fix after the check command failed. `exit`: None when it did not finish (timeout, could not start).
+pub fn fix_from_check(cmd: &str, exit: Option<i32>, tail: &str) -> String {
+    let how = match exit {
+        Some(code) => format!("exited with {code}"),
+        None => "did not finish".into(),
+    };
+    format!("Lila ran `{cmd}` after your work and it {how}. The end of its output:\n\n```\n{}\n```\n\nFix it and finish this task; Lila runs the check again.", tail.trim_end())
+}
+
+/// A flow run that failed more than `max_rounds` times. `last`: the last failure.
+pub fn gave_up(anchor: &Task, flow: &str, rounds: u32, last: &str) -> String {
+    note(
+        &anchor.id,
+        &format!(
+            "{} \"{}\" ({flow} flow) still fails after {rounds} rounds of fixes. Last failure: {}\nNothing more is sent back. Decide: clarify the task, re-plan it, or ask the person.",
+            anchor.id,
+            anchor.title,
+            last.trim()
+        ),
+    )
+}
+
+fn push_brief(s: &mut String, b: &Brief, file: &str) {
+    if let Some(q) = b.quote.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        s.push_str("The person's words:\n");
+        let cut: String = q.chars().take(INLINE_QUOTE).collect();
+        for line in cut.lines() {
+            s.push_str(&format!("> {line}\n"));
+        }
+        if cut.len() < q.len() {
+            s.push_str(&format!("> … (the rest is in {file})\n"));
+        }
+    }
+    for (head, items) in [("Done when:", &b.accept), ("Out of scope:", &b.out_of_scope)] {
+        if !items.is_empty() {
+            s.push_str(head);
+            s.push('\n');
+            for i in items {
+                s.push_str(&format!("- {}\n", i.trim()));
+            }
+        }
+    }
+}
+
+/// A member's decisions and unchecked points after its summary, one line each kind.
+pub fn outcome_text(o: &Outcome) -> String {
+    let mut s = String::new();
+    if !o.decisions.is_empty() {
+        s.push_str(&format!("\n  Decided: {}", o.decisions.join("; ")));
+    }
+    if !o.unverified.is_empty() {
+        s.push_str(&format!("\n  Not checked: {}", o.unverified.join("; ")));
+    }
     s
 }
 
@@ -34,6 +166,7 @@ pub fn note(about: &str, text: &str) -> String {
 /// `still_open`: what is open under `waiting` (or the chain, when nobody waits).
 pub fn done_note(task: &Task, files: &[String], path: &[(&Task, Vec<String>)], waiting: Option<&Task>, still_open: &[&Task]) -> String {
     let mut text = format!("{} finished {} \"{}\": {}", task.to, task.id, task.title, task.summary.as_deref().unwrap_or("(no summary)"));
+    text.push_str(&outcome_text(&task.outcome));
     if !files.is_empty() {
         text.push_str(&format!("\nFiles: {}", files.join(", ")));
     }
@@ -42,6 +175,7 @@ pub fn done_note(task: &Task, files: &[String], path: &[(&Task, Vec<String>)], w
         if !files.is_empty() {
             text.push_str(&format!(" (files: {})", files.join(", ")));
         }
+        text.push_str(&outcome_text(&t.outcome));
     }
     let open = || still_open.iter().map(|t| format!("{} → {} [{}] {}", t.id, t.to, t.state, t.title)).collect::<Vec<_>>().join("; ");
     match (waiting, still_open.is_empty()) {
@@ -94,22 +228,62 @@ mod tests {
             block_reason: None,
             created_ms: 0,
             updated_ms: 0,
+            brief: Default::default(),
+            outcome: Default::default(),
+            run: None,
         }
     }
 
     #[test]
     fn delivery_inlines_short_bodies() {
-        let s = task_delivery(&task("Use bcrypt."), ".lila/tasks/T3.md");
+        let s = task_delivery(&task("Use bcrypt."), ".lila/tasks/T3.md", None, None);
         assert!(s.starts_with("<lila task=\"T3\" from=\"owner\" parent=\"T1\" file=\".lila/tasks/T3.md\">\nAdd login\n\nUse bcrypt.\n"));
         assert!(s.contains("lila task start T3"));
+        assert!(s.contains("--decision"));
+        assert!(!s.contains("The request"), "no brief, no section");
         assert!(s.ends_with("</lila>"));
     }
 
     #[test]
+    fn delivery_carries_its_own_brief_and_the_chains() {
+        let mut t = task("Use bcrypt.");
+        t.brief.accept = vec!["login returns a token".into()];
+        let root = Brief { quote: Some("加一个登录\n用邮箱".into()), accept: vec!["wrong password: 401".into()], out_of_scope: vec!["sign-up".into()] };
+        let s = task_delivery(&t, "f.md", Some(ChainBrief { id: "T1", file: ".lila/tasks/T1.md", brief: &root }), None);
+        assert!(s.contains("Use bcrypt.\n\nDone when:\n- login returns a token\n"), "{s}");
+        assert!(
+            s.contains("The request this work serves (T1), the bar to meet:\nThe person's words:\n> 加一个登录\n> 用邮箱\nDone when:\n- wrong password: 401\nOut of scope:\n- sign-up\n"),
+            "{s}"
+        );
+        let long = Brief { quote: Some("字".repeat(1500)), ..Default::default() };
+        let s = task_delivery(&task(""), "f.md", Some(ChainBrief { id: "T1", file: ".lila/tasks/T1.md", brief: &long }), None);
+        assert!(s.contains("> … (the rest is in .lila/tasks/T1.md)"), "{s}");
+        assert!(!s.contains(&"字".repeat(1201)));
+    }
+
+    #[test]
     fn delivery_points_to_file_for_long_bodies() {
-        let s = task_delivery(&task(&"x".repeat(2000)), "f.md");
+        let s = task_delivery(&task(&"x".repeat(2000)), "f.md", None, None);
         assert!(s.contains("Details are in f.md"));
         assert!(!s.contains("xxxx"));
+    }
+
+    #[test]
+    fn flow_steps_say_what_lila_does_next() {
+        let hand_on = StepHint::HandOn(vec!["runs `cargo test`".into(), "sends it to `tester` to verify".into()]);
+        let s = task_delivery(&task(""), "f.md", None, Some(&hand_on));
+        assert!(s.contains("When you finish, Lila runs `cargo test` and sends it to `tester` to verify with your summary. Don't hand it on yourself."), "{s}");
+        let s = task_delivery(&task(""), "f.md", None, Some(&StepHint::Verdict));
+        assert!(s.contains("This is a verification"), "{s}");
+        assert!(s.contains("lila task done T3 --verdict pass|fail --summary"), "{s}");
+        let mut done = task("");
+        done.outcome.decisions = vec!["bcrypt cost 12".into()];
+        let v = step_body(&done, &["src/login.rs".into()], Some("cargo test"), true);
+        assert!(v.contains("That is their account"));
+        assert!(!step_body(&done, &[], None, false).contains("That is their account"));
+        assert!(v.starts_with("engineer finished T3 \"Add login\": done it\n  Decided: bcrypt cost 12\nFiles: src/login.rs\nLila ran `cargo test`: it passed."), "{v}");
+        assert!(fix_from_check("cargo test", Some(101), "boom\n").contains("it exited with 101. The end of its output:\n\n```\nboom\n```"));
+        assert!(fix_from_check("x", None, "").contains("did not finish"));
     }
 
     #[test]
@@ -134,5 +308,9 @@ mod tests {
         other.title = "Polish".into();
         assert!(done_note(&task(""), &[], &[], Some(&parent), &[&other]).contains("Still open under your T1: T4 → designer [queued] Polish"));
         assert!(answer("Q1", "Which DB?", "Postgres").contains("A: Postgres"));
+        let mut decided = task("");
+        decided.outcome = Outcome { decisions: vec!["tokens last 24h".into()], unverified: vec!["concurrent logins".into()], passed: None };
+        let s = done_note(&decided, &[], &[], None, &[]);
+        assert!(s.contains(": done it\n  Decided: tokens last 24h\n  Not checked: concurrent logins\n"), "{s}");
     }
 }

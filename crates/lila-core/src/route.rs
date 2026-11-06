@@ -112,6 +112,9 @@ mod tests {
             block_reason: None,
             created_ms: n,
             updated_ms: n,
+            brief: Default::default(),
+            outcome: Default::default(),
+            run: None,
         }
     }
 

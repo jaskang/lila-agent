@@ -1,9 +1,15 @@
 //! Roles (global, `~/.config/lila/roles/<id>.toml` + prompt) and projects
 //! (`<repo>/.lila/project.toml`), and the team they expand into.
 
+use crate::flow::Flow;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+
+/// Flows `flow::builtin` may give a project; naming one the team can't run is not an error.
+fn builtin_names() -> [&'static str; 2] {
+    ["code", "quick"]
+}
 
 /// Which official CLI runs a role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +47,32 @@ pub struct RoleFile {
     /// Prompt file next to the role file. Defaults to `<id>.md`.
     #[serde(default)]
     pub prompt_file: Option<String>,
+    /// What its CLI lets it do, enforced by the CLI rather than asked for in the prompt.
+    #[serde(default, skip_serializing_if = "Tools::is_empty")]
+    pub tools: Tools,
+}
+
+/// A role's tool limits, rendered into CLI flags (`runtime::launch`). A rule in
+/// the prompt is a suggestion; these are not: the PM that can't edit files
+/// delegates instead of doing the work itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Tools {
+    /// claude `--tools`: the only built-in tools it has. Empty: the CLI's default set.
+    pub only: Vec<String>,
+    /// claude `--allowedTools`: rules that run without asking, such as `Bash(lila:*)`.
+    pub allow: Vec<String>,
+    /// claude `--disallowedTools`.
+    pub deny: Vec<String>,
+    /// codex `--sandbox`: `read-only`, `workspace-write` or `danger-full-access`.
+    /// `read-only` also stops `lila` from reaching lilad (the spool is a folder in the project).
+    pub sandbox: Option<String>,
+}
+
+impl Tools {
+    pub fn is_empty(&self) -> bool {
+        self == &Tools::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,11 +169,29 @@ pub struct Settings {
     /// Start a member's CLI afresh before it gets work from another chain
     /// than its last task (keeps long-lived contexts small). Never the PM.
     pub fresh_session: bool,
+    /// The flow work from the PM or the person runs through when its member does
+    /// the flow's first step (`code`: implement → check → verify). `none`: no flow.
+    pub flow: String,
+    /// The command lilad runs for a flow's `check` step, in the project folder.
+    /// Empty: the step is skipped.
+    pub check: String,
+    /// A check running longer than this fails.
+    pub check_timeout_secs: u64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { max_working: 0, stall_minutes: 5, startup_timeout_secs: 20, max_chain_depth: 8, max_rounds: 3, fresh_session: true }
+        Settings {
+            max_working: 0,
+            stall_minutes: 5,
+            startup_timeout_secs: 20,
+            max_chain_depth: 8,
+            max_rounds: 3,
+            fresh_session: true,
+            flow: "code".into(),
+            check: String::new(),
+            check_timeout_secs: 600,
+        }
     }
 }
 
@@ -162,6 +212,9 @@ pub struct ProjectConfig {
     pub assign: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub settings: Settings,
+    /// Flows besides (or replacing) the built-in `code` and `quick` (`flow::builtin`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub flows: BTreeMap<String, Flow>,
 }
 
 impl ProjectConfig {
@@ -201,6 +254,9 @@ impl Member {
         let f = &self.role.file;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (f.runtime.to_string(), &f.model, &f.effort, &f.extra_args, &f.env, &self.role.prompt).hash(&mut h);
+        if !f.tools.is_empty() {
+            f.tools.hash(&mut h);
+        }
         h.finish()
     }
 }
@@ -214,12 +270,18 @@ pub struct Team {
     /// Resolved assignment rules: member → members it may hand work to.
     pub assign: BTreeMap<String, Vec<String>>,
     pub settings: Settings,
+    /// `[[members]]` entries with `count > 1`: entry id → its members. A task
+    /// sent to the entry id goes to one of them (`dispatch::pick_slot`).
+    pub pools: BTreeMap<String, Vec<String>>,
+    /// The built-in flows that fit the team, and the project's own.
+    pub flows: BTreeMap<String, Flow>,
 }
 
 impl Team {
     pub fn build(config: &ProjectConfig, roles: &BTreeMap<String, Role>) -> Result<Team, String> {
         validate_id(&config.name).map_err(|e| format!("project name {:?}: {e}", config.name))?;
         let mut members = Vec::new();
+        let mut pools = BTreeMap::new();
         for spec in &config.members {
             let role = roles.get(&spec.role).ok_or_else(|| {
                 let known: Vec<&str> = roles.keys().map(String::as_str).collect();
@@ -234,6 +296,9 @@ impl Team {
                 return Err(format!("member {:?}: model is empty", spec.id));
             }
             let role = spec.apply(role);
+            if spec.count > 1 {
+                pools.insert(spec.id.clone(), spec.ids());
+            }
             for id in spec.ids() {
                 validate_id(&id).map_err(|e| format!("member {id:?}: {e}"))?;
                 if members.iter().any(|m: &Member| m.id == id) {
@@ -280,7 +345,19 @@ impl Team {
                 return Err(format!("assign.{key}: unknown member"));
             }
         }
-        Ok(Team { project: config.name.clone(), owner, members, assign, settings: config.settings.clone() })
+        let is_target = |id: &str| members.iter().any(|m| m.id == id) || pools.contains_key(id);
+        let mut flows = crate::flow::builtin(is_target);
+        for (name, f) in &config.flows {
+            validate_id(name).map_err(|e| format!("flows.{name}: {e}"))?;
+            crate::flow::validate(name, f, is_target)?;
+            flows.insert(name.clone(), f.clone());
+        }
+        let wanted = &config.settings.flow;
+        // A built-in the team can't run (no engineer) just means no default flow.
+        if !wanted.is_empty() && wanted != "none" && !flows.contains_key(wanted) && !builtin_names().contains(&wanted.as_str()) {
+            return Err(format!("settings.flow: no flow {wanted:?} (have: {})", flows.keys().cloned().collect::<Vec<_>>().join(", ")));
+        }
+        Ok(Team { project: config.name.clone(), owner, members, assign, settings: config.settings.clone(), pools, flows })
     }
 
     /// Gives the members of one `[[members]]` entry their own prompt.
@@ -293,6 +370,54 @@ impl Team {
 
     pub fn member(&self, id: &str) -> Option<&Member> {
         self.members.iter().find(|m| m.id == id)
+    }
+
+    /// `member` is `by` or one of the pool `by`.
+    pub fn covers(&self, by: &str, member: &str) -> bool {
+        by == member || self.pool(by).is_some_and(|p| p.iter().any(|m| m == member))
+    }
+
+    /// The flow a new task to `to` starts. `asked`: `--flow` (`none`: no flow).
+    /// Without it, work from the PM or the person runs the project's default
+    /// flow when `to` does that flow's first step; members' hand-offs run none.
+    pub fn flow_for(&self, asked: Option<&str>, to: &str, from: &crate::Actor) -> Result<Option<String>, String> {
+        let starts = |name: &str| self.flows.get(name).and_then(|f| f.steps[0].by.as_deref()).is_some_and(|by| self.covers(by, to));
+        match asked {
+            Some("none") => Ok(None),
+            Some(name) if !self.flows.contains_key(name) => {
+                Err(format!("no flow {name:?}; have: {}, or none", self.flows.keys().cloned().collect::<Vec<_>>().join(", ")))
+            }
+            Some(name) if !starts(name) => {
+                Err(format!("flow {name} starts with `{}`, not {to}", self.flows[name].steps[0].by.as_deref().unwrap_or("?")))
+            }
+            Some(name) => Ok(Some(name.to_owned())),
+            None => {
+                let lead = matches!(from, crate::Actor::Human) || from.as_str() == self.owner;
+                let name = self.settings.flow.as_str();
+                Ok((lead && starts(name)).then(|| name.to_owned()))
+            }
+        }
+    }
+
+    /// The members `to` stands for when it names a pool (an entry with `count > 1`).
+    pub fn pool(&self, to: &str) -> Option<&[String]> {
+        self.pools.get(to).map(Vec::as_slice)
+    }
+
+    /// `targets` with every pool whose members are all in it written once, by its id.
+    pub fn collapse_pools(&self, targets: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for t in targets {
+            match self.pools.iter().find(|(_, slots)| slots.contains(t)) {
+                Some((id, slots)) if slots.iter().all(|s| targets.contains(s)) => {
+                    if !out.contains(id) {
+                        out.push(id.clone());
+                    }
+                }
+                _ => out.push(t.clone()),
+            }
+        }
+        out
     }
 
     pub fn owner(&self) -> &Member {
@@ -348,6 +473,7 @@ mod tests {
                 env: BTreeMap::new(),
                 can_assign: can_assign.iter().map(|s| s.to_string()).collect(),
                 prompt_file: None,
+                tools: Tools::default(),
             },
             prompt: format!("You are {id}."),
         }
@@ -386,6 +512,10 @@ role = "architect"
         assert_eq!(team.assign["tester"], ["engineer", "engineer-2"]);
         assert!(team.assign["architect"].is_empty());
         assert!(team.owner().is_owner);
+        assert_eq!(team.pool("engineer").unwrap(), ["engineer", "engineer-2"]);
+        assert!(team.pool("tester").is_none(), "one member is not a pool");
+        assert_eq!(team.collapse_pools(&team.assign["tester"]), ["engineer"]);
+        assert_eq!(team.collapse_pools(&["engineer-2".into(), "tester".into()]), ["engineer-2", "tester"]);
     }
 
     #[test]
@@ -459,6 +589,34 @@ role = "architect"
     }
 
     #[test]
+    fn flows_start_from_the_pm_or_the_person() {
+        let team = Team::build(&ProjectConfig::parse(PROJECT).unwrap(), &roles()).unwrap();
+        assert_eq!(team.flows.keys().collect::<Vec<_>>(), ["code", "quick"]);
+        let pm = Actor::Member("owner".into());
+        assert_eq!(team.flow_for(None, "engineer-2", &pm).unwrap().as_deref(), Some("code"), "a pool member does the first step");
+        assert_eq!(team.flow_for(None, "engineer", &Actor::Human).unwrap().as_deref(), Some("code"));
+        assert_eq!(team.flow_for(None, "architect", &pm).unwrap(), None, "not the first step's member");
+        assert_eq!(team.flow_for(None, "engineer", &Actor::Member("tester".into())).unwrap(), None, "members' hand-offs");
+        assert_eq!(team.flow_for(Some("none"), "engineer", &pm).unwrap(), None);
+        assert_eq!(team.flow_for(Some("quick"), "engineer", &pm).unwrap().as_deref(), Some("quick"));
+        assert!(team.flow_for(Some("quick"), "architect", &pm).unwrap_err().contains("starts with `engineer`"));
+        assert!(team.flow_for(Some("nope"), "engineer", &pm).unwrap_err().contains("no flow"));
+
+        let own = format!(
+            "{PROJECT}\n[settings]\nflow = \"design\"\n[flows.design]\nsteps = [{{ do = \"design\", by = \"architect\" }}, {{ do = \"review\", by = \"tester\", on_fail = \"design\" }}]\n"
+        );
+        let team = Team::build(&ProjectConfig::parse(&own).unwrap(), &roles()).unwrap();
+        assert_eq!(team.flow_for(None, "architect", &pm).unwrap().as_deref(), Some("design"));
+        let bad = PROJECT.to_owned() + "\n[settings]\nflow = \"nope\"\n";
+        assert!(Team::build(&ProjectConfig::parse(&bad).unwrap(), &roles()).unwrap_err().contains("settings.flow"));
+        let broken = PROJECT.to_owned() + "\n[flows.x]\nsteps = [{ do = \"check\" }]\n";
+        assert!(Team::build(&ProjectConfig::parse(&broken).unwrap(), &roles()).unwrap_err().contains("first step"));
+        let no_engineer = PROJECT.replace("role = \"engineer\"\ncount = 2", "role = \"architect\"\ncount = 2").replace("id = \"engineer\"", "id = \"writer\"");
+        let team = Team::build(&ProjectConfig::parse(&no_engineer).unwrap(), &roles()).unwrap();
+        assert!(team.flows.is_empty(), "the default flow needs an engineer; without one there is none");
+    }
+
+    #[test]
     fn parses_role_file() {
         let r = Role::parse(
             "tester",
@@ -468,6 +626,16 @@ role = "architect"
         .unwrap();
         assert_eq!(r.file.runtime, Runtime::Codex);
         assert_eq!(r.file.env["PATH"], "/opt/node/bin");
+        assert!(r.file.tools.is_empty());
         assert!(Role::parse("Bad", "", String::new()).is_err());
+        let pm = Role::parse(
+            "pm",
+            "name = \"PM\"\nruntime = \"claude\"\nmodel = \"m\"\n[tools]\nonly = [\"Read\", \"Bash\"]\nallow = [\"Bash(lila:*)\"]\n",
+            String::new(),
+        )
+        .unwrap();
+        assert_eq!(pm.file.tools.only, ["Read", "Bash"]);
+        assert_eq!(pm.file.tools.allow, ["Bash(lila:*)"]);
+        assert!(Role::parse("pm", "name = \"PM\"\nruntime = \"claude\"\nmodel = \"m\"\n[tools]\nbogus = 1\n", String::new()).is_err());
     }
 }

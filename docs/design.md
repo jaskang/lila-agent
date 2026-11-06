@@ -113,7 +113,7 @@ prompt_file = "engineer.md"
 
 | id | 名称 | runtime | model | effort |
 |---|---|---|---|---|
-| `pm` | PM（项目经理） | claude | `claude-opus-5-5` | high |
+| `pm` | PM（项目经理） | claude | `claude-sonnet-5-5`（v2 起，工具受限，见 `architecture-v2.md`） | high |
 | `designer` | 设计师 | claude | `claude-opus-5-5` | high |
 | `architect` | 架构师 | claude | `claude-opus-5-5` | high |
 | `engineer` | 开发工程师 | claude | `claude-sonnet-5-5` | high |

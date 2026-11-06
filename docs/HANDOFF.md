@@ -3,6 +3,7 @@
 更新于 2026-11-06。用户用中文交流，回复也用中文。用户会换一台电脑继续，新电脑上没有上一台的 Claude 记忆，所以该知道的都写在这里。
 
 先读这份。需要细节时再读：
+- `docs/architecture-v2.md`：参考四篇文章重新评估后的架构，以及分阶段落地的进度（阶段 A 已完成）
 - `docs/design.md`：总体设计
 - `DESIGN.md`（仓库根目录）：界面的设计规范：颜色、字号、间距、组件、该做和不该做的，以及和 `style.rs` 的对照
 - `docs/m1.md`：编排层的发现和待办
@@ -14,7 +15,7 @@
 Lila 是一个管理编程 agent 团队的桌面工具。
 
 - **角色**：每个角色有 CLI、模型、努力程度和预设提示词，放在 `~/.config/lila/roles/`。默认五个：
-  - `pm`：PM（项目经理），Claude Opus 5.5 high。负责拆任务、分派、跟进、向用户汇报。每个项目有且只有一个，这个角色不能删。
+  - `pm`：PM（项目经理），Claude Sonnet 5.5 high（2026-11-06 从 Opus 改过来）。负责拆任务、分派、跟进、向用户汇报。它的工具由 CLI 限制：只能读代码、运行 `lila` 和只读的 git 命令，不能改文件（角色文件里的 `[tools]`）。每个项目有且只有一个，这个角色不能删。
   - `designer`：设计师，Opus 5.5 high。负责流程、界面状态、文案、交互，做完交给开发。
   - `architect`：架构师，Opus 5.5 high。
   - `engineer`：开发工程师，Sonnet 5.5 high。
@@ -112,6 +113,7 @@ cargo run -p lila-app
   - 做完后只告诉往上第一个还没做完的祖先任务的负责人；没有这样的人就告诉 PM。
   - note 里带上中间环节的摘要，以及还剩什么没做完。
   - 成员在等交接出去的工作时，不发沉默提醒。
+- **流程**（`lila_core::flow`，见 `docs/architecture-v2.md` §11）：PM 或用户派给 engineer 的活默认走 `code` 流程（实现 → `[settings] check` 检查命令 → tester 验证），由 lilad 推进。检查命令由 lilad 自己跑，失败直接退回给 engineer；tester 用 `--verdict pass|fail` 给结论，fail 由 lilad 退回给写代码的人，超过 `max_rounds` 交给 PM。进度存在 `runs` 表里。`--flow none` 不走流程。
 - **`max_working`**：默认改成 0，表示不限。同时工作多少由各成员的 `count` 决定。窗口保存项目设置时，会删掉旧配置里的 `max_working`。
 - **默认角色升级**：`defaults/roles/previous/` 存着旧版默认文件。用户角色目录里的文件如果和某个旧版一模一样，`install_defaults` 就把它换成新版；改过的不动。
 - **macOS 红绿灯**：`build.rs` 用 `-platform_version macos 11.0 15.5` 链接，红绿灯位置是 `(20, 18)`，和标签行对齐（窗口内边距 8 + 18）。侧栏顶行是空的，只用来拖动窗口。

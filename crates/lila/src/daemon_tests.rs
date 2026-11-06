@@ -7,10 +7,19 @@ struct Fake {
     sends: Vec<(String, String, Option<String>)>,
     kills: Vec<String>,
     refuse_sends: bool,
+    /// Live terminals left over from before this daemon loaded a project.
+    existing: Vec<Value>,
 }
 
 impl Terminals for Fake {
+    fn list(&mut self, project: &str) -> Result<Vec<Value>> {
+        Ok(self.existing.iter().filter(|t| t["labels"]["lila.project"] == project).cloned().collect())
+    }
+
     fn run(&mut self, req: Value) -> Result<String> {
+        if self.existing.iter().any(|t| t["state"] == "live" && t["name"] == req["name"]) {
+            bail!("a live terminal is already named {} (name_taken)", req["name"]);
+        }
         self.runs.push(req);
         Ok(format!("t{}", self.runs.len()))
     }
@@ -81,6 +90,11 @@ fn world() -> World {
     world_with(PROJECT)
 }
 
+/// Members hand work on themselves (no flow), with these `[settings]` lines.
+fn manual(settings: &str) -> String {
+    format!("{PROJECT}\n[settings]\nflow = \"none\"\n{settings}")
+}
+
 impl World {
     fn caller(&self, member: Option<&str>) -> Value {
         json!({"cwd": self.repo.join("src").to_string_lossy(), "project": member.map(|_| "shop"), "member": member})
@@ -141,9 +155,13 @@ fn up_starts_every_member_with_its_command() {
     let owner = &runs[0];
     let argv: Vec<&str> = owner["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert!(argv[0].ends_with("/bin/claude"), "resolved to an absolute path: {argv:?}");
-    assert_eq!(argv[1..5], ["--model", "claude-opus-5-5", "--effort", "high"]);
-    assert_eq!(argv[5], "--append-system-prompt-file");
-    let prompt = std::fs::read_to_string(argv[6]).unwrap();
+    assert_eq!(argv[1..5], ["--model", "claude-sonnet-5-5", "--effort", "high"]);
+    // The PM's limits are the CLI's, not a line in its prompt.
+    assert_eq!(argv[5..7], ["--tools", "Read,Grep,Glob,Bash"]);
+    let allow = argv.iter().position(|a| *a == "--allowedTools").expect("allowed rules");
+    assert_eq!(argv[allow + 1], "Bash(lila:*)");
+    let at = argv.iter().position(|a| *a == "--append-system-prompt-file").unwrap();
+    let prompt = std::fs::read_to_string(argv[at + 1]).unwrap();
     assert!(prompt.contains("## As the PM"));
     assert_eq!(owner["labels"], json!({"lila.project": "shop", "lila.member": "owner"}));
     assert_eq!(owner["env"]["LILA_MEMBER"], "owner");
@@ -160,6 +178,63 @@ fn up_starts_every_member_with_its_command() {
     assert!(r["started"].as_array().unwrap().is_empty());
     assert_eq!(r["running"].as_array().unwrap().len(), 4);
     assert!(w.repo.join(".lila/.gitignore").exists());
+}
+
+#[test]
+fn up_recovers_a_terminal_seen_before_the_project_was_loaded() {
+    let mut w = world_with(&PROJECT.replace("id = \"engineer\"\nrole = \"engineer\"", "id = \"designer\"\nrole = \"designer\""));
+    let terminal = json!({
+        "address": "t-existing", "name": "lila-shop-designer", "state": "live",
+        "cwd": w.repo, "labels": {"lila.project": "shop", "lila.member": "designer"},
+        "reported": true, "status": {"state": "idle"}
+    });
+    w.d.term.existing.push(terminal.clone());
+    w.d.on_terminal(&terminal, w.now);
+    let result = w.ok(None, "project.up", json!({}));
+    assert_eq!(w.terminal("designer"), "t-existing");
+    assert!(result["running"].as_array().unwrap().iter().any(|m| m["member"] == "designer"));
+    assert!(!w.d.term.runs.iter().any(|r| r["name"] == "lila-shop-designer"));
+    assert!(w.d.term.kills.is_empty());
+    assert_eq!(w.d.store.members("shop").unwrap().into_iter().find(|m| m.id == "designer").unwrap().terminal.as_deref(), Some("t-existing"));
+    assert_eq!(w.d.projects["shop"].live["designer"].status, AgentStatus::Idle);
+    let again = w.ok(None, "project.up", json!({}));
+    assert!(again["started"].as_array().unwrap().is_empty());
+    assert_eq!(again["running"].as_array().unwrap().len(), 4);
+    assert_eq!(w.d.term.runs.len(), 3);
+}
+
+#[test]
+fn up_does_not_adopt_a_name_collision_from_another_folder_or_member() {
+    for mismatch in ["folder", "member", "project", "labels"] {
+        let mut w = world();
+        let mut terminal = json!({
+            "address": "t-unrelated", "name": "lila-shop-owner", "state": "live",
+            "cwd": w.repo, "labels": {"lila.project": "shop", "lila.member": "owner"}
+        });
+        match mismatch {
+            "folder" => terminal["cwd"] = json!(w.repo.join("other")),
+            "member" => terminal["labels"]["lila.member"] = json!("someone-else"),
+            "project" => terminal["labels"]["lila.project"] = json!("another-project"),
+            _ => terminal["labels"] = json!({}),
+        }
+        w.d.term.existing.push(terminal);
+        let error = w.call(None, "project.up", json!({})).unwrap_err();
+        assert!(format!("{error:#}").contains("name_taken"), "{mismatch}: {error:#}");
+        assert!(w.d.term.kills.is_empty(), "{mismatch}");
+        assert!(w.d.projects["shop"].live["owner"].terminal.is_none(), "{mismatch}");
+    }
+}
+
+#[test]
+fn up_starts_a_new_member_when_the_old_terminal_finished() {
+    let mut w = world();
+    w.d.term.existing.push(json!({
+        "address": "t-finished", "name": "lila-shop-owner", "state": "finished",
+        "cwd": w.repo, "labels": {"lila.project": "shop", "lila.member": "owner"}
+    }));
+    let result = w.up();
+    assert_eq!(result["started"].as_array().unwrap().len(), 4);
+    assert_ne!(w.terminal("owner"), "t-finished");
 }
 
 #[test]
@@ -188,7 +263,7 @@ fn brief_goes_to_the_owner_once_it_reports_idle() {
 
 #[test]
 fn full_handoff_flow_respects_the_working_limit() {
-    let mut w = world_with(&format!("{PROJECT}\n[settings]\nmax_working = 1\n"));
+    let mut w = world_with(&manual("max_working = 1\n"));
     w.up();
     w.all_idle();
     // Owner plans two tasks; only one non-owner member may work at a time.
@@ -225,8 +300,75 @@ fn full_handoff_flow_respects_the_working_limit() {
 }
 
 #[test]
+fn the_persons_words_and_the_bar_reach_every_step() {
+    let mut w = world_with(&manual(""));
+    w.ok(None, "project.up", json!({"brief": "加一个登录页\n用邮箱和密码"}));
+    w.all_idle();
+    // Work under the person's task carries their words without the PM copying them.
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1"}));
+    w.ok(Some("engineer"), "task.new", json!({"to": "tester", "title": "Verify login", "parent": "T2", "body": "I changed src/login.rs"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "built"}));
+    let to_tester = w.sends_to("tester").into_iter().find(|s| s.contains("<lila task=\"T3\"")).unwrap();
+    assert!(to_tester.contains("The request this work serves (T1), the bar to meet:\nThe person's words:\n> 加一个登录页\n> 用邮箱和密码\n"), "{to_tester}");
+
+    // A chain the PM starts from what the person said in its terminal.
+    let t = w.ok(
+        Some("owner"),
+        "task.new",
+        json!({"to": "engineer", "title": "Search", "quote": "能按标题搜索", "accept": ["empty query lists all"], "out_of_scope": ["fuzzy matching"]}),
+    );
+    assert_eq!(t["accept"], json!(["empty query lists all"]));
+    let file = std::fs::read_to_string(w.repo.join(".lila/tasks/T4.md")).unwrap();
+    assert!(file.contains("## The person's words\n\n> 能按标题搜索\n") && file.contains("## Out of scope\n\n- fuzzy matching\n"), "{file}");
+    w.status("engineer", "idle");
+    w.ok(Some("engineer"), "task.new", json!({"to": "tester", "title": "Verify search", "parent": "T4"}));
+    w.ok(Some("tester"), "task.done", json!({"id": "T3", "summary": "PASS"}));
+    w.status("tester", "idle"); // T5 is from another chain: it waits for the tester's new session
+    let to_tester = w.sends_to("tester").into_iter().find(|s| s.contains("<lila task=\"T5\"")).unwrap();
+    assert!(to_tester.contains("(T4), the bar to meet:\nThe person's words:\n> 能按标题搜索\nDone when:\n- empty query lists all\nOut of scope:\n- fuzzy matching\n"), "{to_tester}");
+}
+
+#[test]
+fn decisions_and_unchecked_points_travel_with_done() {
+    let mut w = world_with(&manual(""));
+    w.ok(None, "project.up", json!({"brief": "Ship login"}));
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "built", "decisions": ["tokens last 24h"], "unverified": ["load"]}));
+    let note = w.sends_to("owner").into_iter().rfind(|n| n.contains("engineer finished T2")).expect("owner told");
+    assert!(note.contains("built\n  Decided: tokens last 24h\n  Not checked: load"), "{note}");
+    let shown = w.ok(Some("owner"), "task.show", json!({"id": "T2"}));
+    assert_eq!(shown["decisions"], json!(["tokens last 24h"]));
+    // The PM passes them on to the person, who signs off on them.
+    w.ok(Some("owner"), "task.done", json!({"id": "T1", "summary": "login is in", "decisions": ["tokens last 24h"], "unverified": ["load"]}));
+    let inbox = w.ok(None, "inbox", json!({}));
+    assert_eq!(inbox[0]["text"], "T1 done: login is in\n  Decided: tokens last 24h\n  Not checked: load");
+}
+
+#[test]
+fn a_pool_shares_work_and_rework_returns_to_its_author() {
+    let mut w = world_with(&manual("").replace("id = \"engineer\"\nrole = \"engineer\"", "id = \"engineer\"\nrole = \"engineer\"\ncount = 2"));
+    w.up();
+    w.all_idle();
+    w.status("engineer-2", "idle");
+    let a = w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Login"}));
+    let b = w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Search"}));
+    assert_eq!((a["to"].as_str(), b["to"].as_str()), (Some("engineer"), Some("engineer-2")), "the second goes to the free one");
+    // engineer-2 hands Search to the tester, who sends a fix back to "engineer":
+    // it reaches engineer-2, which wrote the code, though engineer has less open.
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "ok"}));
+    w.ok(Some("engineer-2"), "task.new", json!({"to": "tester", "title": "Verify search", "parent": "T2"}));
+    w.ok(Some("engineer-2"), "task.done", json!({"id": "T2", "summary": "ok"}));
+    let fix = w.ok(Some("tester"), "task.new", json!({"to": "engineer", "title": "Fix: empty query", "parent": "T3"}));
+    assert_eq!(fix["to"], "engineer-2");
+    // One named member is still one member.
+    let direct = w.ok(Some("owner"), "task.new", json!({"to": "engineer-2", "title": "Docs"}));
+    assert_eq!(direct["to"], "engineer-2");
+}
+
+#[test]
 fn the_pm_hears_when_a_chain_under_its_task_ends_and_is_not_nudged_meanwhile() {
-    let mut w = world();
+    let mut w = world_with(&manual(""));
     w.ok(None, "project.up", json!({"brief": "Ship login"}));
     w.all_idle();
     w.ok(Some("owner"), "task.start", json!({"id": "T1"}));
@@ -318,7 +460,7 @@ fn questions_go_to_the_inbox_and_answers_back_to_the_owner() {
 
 #[test]
 fn notes_wait_while_a_member_is_blocked_in_its_terminal() {
-    let mut w = world();
+    let mut w = world_with(&manual(""));
     w.up();
     w.all_idle();
     w.status("owner", "blocked");
@@ -333,7 +475,7 @@ fn notes_wait_while_a_member_is_blocked_in_its_terminal() {
 
 #[test]
 fn silent_members_are_flagged_and_quiet_ones_nudged() {
-    let mut w = world();
+    let mut w = world_with(&manual(""));
     w.up();
     w.now += 21_000;
     w.d.tick(w.now);
@@ -403,7 +545,7 @@ fn pause_stops_deliveries_but_not_notes() {
 
 #[test]
 fn chain_depth_is_limited() {
-    let mut w = world_with(&format!("{PROJECT}\n[settings]\nmax_chain_depth = 2\n"));
+    let mut w = world_with(&manual("max_chain_depth = 2\n"));
     w.up();
     w.all_idle();
     w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "a"}));
@@ -508,7 +650,7 @@ fn queued_tasks_are_rewritten_and_delivered_ones_get_updates() {
 
 #[test]
 fn back_and_forth_stops_after_max_rounds() {
-    let mut w = world_with(&format!("{PROJECT}\n[settings]\nmax_rounds = 1\nmax_working = 9\n"));
+    let mut w = world_with(&manual("max_rounds = 1\nmax_working = 9\n"));
     w.up();
     w.all_idle();
     w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build"}));
@@ -632,7 +774,7 @@ fn a_missing_member_prompt_file_is_an_error() {
 
 #[test]
 fn work_from_another_chain_starts_a_new_session() {
-    let mut w = world();
+    let mut w = world_with(&manual(""));
     w.up();
     w.all_idle();
     w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login"}));
@@ -699,7 +841,7 @@ fn a_waiting_note_is_read_before_a_new_session() {
 
 #[test]
 fn a_removed_member_stops_and_its_tasks_are_cancelled() {
-    let mut w = world();
+    let mut w = world_with(&manual(""));
     w.up();
     w.all_idle();
     w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build"}));
@@ -753,4 +895,172 @@ fn reload_loads_a_project_whose_config_came_back() {
     assert!(w.d.projects.contains_key("shop"));
     assert!(w.d.term.runs.is_empty());
     assert!(w.call(Some("owner"), "project.reload", json!({})).is_err(), "only the person");
+}
+
+// ---------------- flows ----------------
+
+fn with_check(cmd: &str, more: &str) -> String {
+    format!("{PROJECT}\n[settings]\ncheck = \"{cmd}\"\n{more}")
+}
+
+impl World {
+    /// The check lilad asked for finishes with `exit`.
+    fn finish_check(&mut self, anchor: &str, exit: Option<i32>, tail: &str) {
+        let jobs = self.d.take_checks();
+        assert_eq!(jobs.iter().map(|j| j.anchor.as_str()).collect::<Vec<_>>(), [anchor], "one check for {anchor}");
+        self.now += 1000;
+        self.d.on_check_done("shop", anchor, &crate::check::CheckResult { exit, tail: tail.into() }, self.now);
+    }
+
+    fn run(&self, anchor: &str) -> Run {
+        self.d.store.run("shop", anchor).unwrap().unwrap()
+    }
+
+    fn task(&self, id: &str) -> Task {
+        self.d.store.task("shop", id).unwrap().unwrap()
+    }
+}
+
+#[test]
+fn the_code_flow_checks_verifies_and_reports_once() {
+    let mut w = world_with(&with_check("cargo test", ""));
+    w.ok(None, "project.up", json!({"brief": "加一个登录页"}));
+    w.all_idle();
+    w.ok(Some("owner"), "task.start", json!({"id": "T1"}));
+    let t2 = w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1", "accept": ["401 on a bad password"]}));
+    assert_eq!(t2["run"], "T2", "work from the PM to the engineer runs the default flow");
+    let to_engineer = w.sends_to("engineer").into_iter().find(|s| s.contains("<lila task=\"T2\"")).unwrap();
+    assert!(to_engineer.contains("When you finish, Lila runs `cargo test` and sends it to `tester` to verify"), "{to_engineer}");
+
+    // Done: lilad runs the check itself. Nobody is woken meanwhile, nor nudged.
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "login added", "files": ["src/login.rs"], "decisions": ["bcrypt"]}));
+    assert_eq!(w.run("T2").state, RunState::Checking);
+    let job = w.d.take_checks().pop().unwrap();
+    assert_eq!((job.cmd.as_str(), job.cwd.as_path()), ("cargo test", w.repo.as_path()));
+    w.d.checks.push(job);
+    assert!(w.sends_to("owner").iter().all(|n| !n.contains("<lila note")), "{:?}", w.sends_to("owner"));
+    w.status("owner", "idle");
+    w.now += 30 * 60_000;
+    w.d.tick(w.now);
+    assert!(w.sends_to("owner").iter().all(|n| !n.contains("went quiet")), "the PM waits on the flow");
+
+    // Green: the tester gets a verification with the engineer's account and the bar.
+    w.finish_check("T2", Some(0), "ok");
+    let t3 = w.task("T3");
+    assert_eq!((t3.from.as_str(), t3.to.as_str(), t3.parent.as_deref(), t3.title.as_str()), ("lilad", "tester", Some("T2"), "Verify: Build login"));
+    assert!(t3.body.contains("engineer finished T2 \"Build login\": login added\n  Decided: bcrypt\nFiles: src/login.rs\nLila ran `cargo test`: it passed."), "{}", t3.body);
+    let to_tester = w.sends_to("tester").into_iter().find(|s| s.contains("<lila task=\"T3\"")).unwrap();
+    assert!(to_tester.contains("> 加一个登录页") && to_tester.contains("- 401 on a bad password"), "T1's words and T2's bar: {to_tester}");
+    assert!(to_tester.contains("--verdict pass|fail"), "{to_tester}");
+
+    let e = w.call(Some("tester"), "task.done", json!({"id": "T3", "summary": "PASS"})).unwrap_err();
+    assert!(e.to_string().contains("--verdict pass|fail"), "{e}");
+    w.ok(Some("tester"), "task.done", json!({"id": "T3", "summary": "PASS: 4 cases", "verdict": "pass", "unverified": ["rate limits"]}));
+    assert_eq!(w.run("T2").state, RunState::Done);
+    assert_eq!(w.task("T3").outcome.passed, Some(true));
+    let notes: Vec<String> = w.sends_to("owner").into_iter().filter(|n| n.contains("<lila note")).collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("tester finished T3 \"Verify: Build login\": PASS: 4 cases\n  Not checked: rate limits"), "{}", notes[0]);
+    assert!(notes[0].contains("Before it, engineer finished T2"), "{}", notes[0]);
+    assert!(notes[0].contains("Nothing else is open under your T1"), "{}", notes[0]);
+    assert!(w.ok(None, "status", json!({}))["runs"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn failures_go_back_to_their_author_until_the_rounds_run_out() {
+    let mut w = world_with(&with_check("make test", "max_rounds = 2\n"));
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Search"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "done"}));
+    // A red check goes straight back to the engineer: no tester turn spent.
+    w.finish_check("T1", Some(2), "error[E0308]: mismatched types");
+    let fix = w.task("T2");
+    assert_eq!((fix.to.as_str(), fix.parent.as_deref(), fix.title.as_str()), ("engineer", Some("T1"), "Fix: Search"));
+    assert!(fix.body.contains("Lila ran `make test` after your work and it exited with 2") && fix.body.contains("mismatched types"), "{}", fix.body);
+    assert_eq!(w.run("T1").round, 1);
+    assert!(w.sends_to("tester").iter().all(|s| !s.contains("<lila task")));
+    assert_eq!(w.ok(None, "status", json!({}))["runs"][0]["step"], "implement");
+
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "fixed the types"}));
+    w.finish_check("T1", Some(0), "");
+    assert_eq!(w.task("T3").to, "tester");
+    w.ok(Some("tester"), "task.done", json!({"id": "T3", "summary": "FAIL: empty query crashes", "verdict": "fail"}));
+    let fix = w.task("T4");
+    assert_eq!((fix.to.as_str(), fix.parent.as_deref()), ("engineer", Some("T3")));
+    assert!(fix.body.contains("tester found a failure in T3") && fix.body.contains("empty query crashes"), "{}", fix.body);
+    assert_eq!(w.run("T1").round, 2);
+
+    // A third failure is one round too many: the PM decides, nothing more goes back.
+    w.ok(Some("engineer"), "task.done", json!({"id": "T4", "summary": "handled empty"}));
+    w.finish_check("T1", Some(1), "still broken");
+    assert_eq!(w.run("T1").state, RunState::Failed);
+    assert!(w.d.store.task("shop", "T6").unwrap().is_none());
+    let note = w.sends_to("owner").into_iter().rfind(|n| n.contains("still fails after 2 rounds")).expect("the PM hears");
+    assert!(note.contains("T1 \"Search\" (code flow)") && note.contains("still broken"), "{note}");
+}
+
+#[test]
+fn members_do_not_hand_on_inside_a_flow() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Search"}));
+    let e = w.call(Some("engineer"), "task.new", json!({"to": "tester", "title": "Verify", "parent": "T1"})).unwrap_err();
+    assert!(e.to_string().contains("finish T1 with `lila task done T1`: Lila sends it to `tester` to verify"), "{e}");
+    // Help from outside the flow is still fine.
+    w.ok(Some("owner"), "task.new", json!({"to": "architect", "title": "Review the index", "parent": "T1", "flow": "none"}));
+    // Without a check command the verification comes next.
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "done"}));
+    assert!(w.d.take_checks().is_empty());
+    assert_eq!(w.task("T3").title, "Verify: Search");
+    let e = w.call(Some("tester"), "task.new", json!({"to": "engineer", "title": "Fix", "parent": "T3"})).unwrap_err();
+    assert!(e.to_string().contains("--verdict fail"), "{e}");
+    let e = w.call(Some("architect"), "task.done", json!({"id": "T2", "summary": "ok", "verdict": "pass"})).unwrap_err();
+    assert!(e.to_string().contains("asks for no verdict"), "{e}");
+}
+
+#[test]
+fn which_work_runs_a_flow() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    assert!(w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Docs", "flow": "none"}))["run"].is_null());
+    assert!(w.ok(Some("owner"), "task.new", json!({"to": "architect", "title": "Design"}))["run"].is_null(), "not the flow's first step");
+    let e = w.call(Some("owner"), "task.new", json!({"to": "architect", "title": "x", "flow": "code"})).unwrap_err();
+    assert!(e.to_string().contains("starts with `engineer`"), "{e}");
+    // quick: no tester; with no check command the work is simply done.
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Rename", "flow": "quick"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "docs"}));
+    w.status("engineer", "idle");
+    w.ok(Some("engineer"), "task.done", json!({"id": "T3", "summary": "renamed"}));
+    assert_eq!(w.run("T3").state, RunState::Done);
+    assert!(w.sends_to("owner").iter().any(|n| n.contains("engineer finished T3 \"Rename\": renamed")));
+    // Work the person gives the engineer: the inbox hears once the flow passed.
+    w.status("engineer", "idle");
+    w.ok(None, "task.new", json!({"to": "engineer", "title": "Fix the footer"}));
+    w.status("engineer", "idle");
+    w.ok(Some("engineer"), "task.done", json!({"id": "T4", "summary": "fixed"}));
+    assert!(w.inbox_kinds().is_empty(), "verification first");
+    w.ok(Some("tester"), "task.done", json!({"id": "T5", "summary": "PASS", "verdict": "pass"}));
+    let inbox = w.ok(None, "inbox", json!({}));
+    assert_eq!(inbox[0]["text"], "T4 done, code flow passed: fixed\ntester T5: PASS");
+}
+
+#[test]
+fn a_check_under_way_runs_again_after_a_restart() {
+    let mut w = world_with(&with_check("true", ""));
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Search"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "done"}));
+    let paths = w.d.paths.clone();
+    let mut d2 = Daemon::new(Store::open(&paths.db()).unwrap(), Fake::default(), paths, w.d.path_env.clone(), PathBuf::from("/x/lila"));
+    assert_eq!(d2.take_checks().len(), 1);
+    // And a real one, end to end through the runner.
+    let job = w.d.take_checks().pop().unwrap();
+    let r = crate::check::run(&job);
+    w.d.on_check_done("shop", "T1", &r, w.now + 1000);
+    assert_eq!(w.task("T2").title, "Verify: Search");
+    assert!(w.task("T2").body.contains("Lila ran `true`: it passed."));
 }
