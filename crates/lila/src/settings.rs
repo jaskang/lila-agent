@@ -388,6 +388,8 @@ pub fn save(root: &Path, roles_dir: &Path, s: &ProjectSettings) -> Result<()> {
         put(&mut doc, k, value(v), v != d);
     }
     put(&mut doc, "fresh_session", value(s.settings.fresh_session), s.settings.fresh_session != defaults.fresh_session);
+    let check = s.settings.check.trim();
+    put(&mut doc, "check", value(check), check != defaults.check);
 
     let new_text = doc.to_string();
     let cfg = ProjectConfig::parse(&new_text).map_err(anyhow::Error::msg)?;
@@ -430,7 +432,7 @@ mod tests {
         roles::install_defaults(&roles_dir).unwrap();
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(root.join(".lila")).unwrap();
-        std::fs::write(project_file(&root), crate::init::default_project("shop")).unwrap();
+        std::fs::write(project_file(&root), crate::init::default_project("shop", None)).unwrap();
         (tmp, root, roles_dir)
     }
 
@@ -468,7 +470,7 @@ mod tests {
         (eng.runtime, eng.model, eng.effort, eng.prompt) = (eng.role_runtime, eng.role_model.clone(), eng.role_effort.clone(), eng.role_prompt.clone());
         s.title = String::new();
         save(&root, &roles_dir, &s).unwrap();
-        assert_eq!(std::fs::read_to_string(project_file(&root)).unwrap(), crate::init::default_project("shop"));
+        assert_eq!(std::fs::read_to_string(project_file(&root)).unwrap(), crate::init::default_project("shop", None));
         assert!(!root.join(".lila/prompts/engineer.md").exists());
     }
 
@@ -495,7 +497,7 @@ mod team_tests {
         roles::install_defaults(&roles_dir).unwrap();
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(root.join(".lila")).unwrap();
-        std::fs::write(project_file(&root), crate::init::default_project("shop")).unwrap();
+        std::fs::write(project_file(&root), crate::init::default_project("shop", None)).unwrap();
         (tmp, root, roles_dir)
     }
 
@@ -563,6 +565,7 @@ mod team_tests {
         s.settings.stall_minutes = 9;
         s.settings.fresh_session = false;
         s.settings.max_chain_depth = 5;
+        s.settings.check = " cargo test ".into();
         save(&root, &roles_dir, &s).unwrap();
         let t = text(&root);
         assert!(t.contains("# Minutes a member may sit idle on an open task before a reminder.\nstall_minutes = 9\n"), "{t}");
@@ -570,7 +573,7 @@ mod team_tests {
         assert!(t.contains("max_chain_depth = 5"), "{t}");
         assert!(!t.contains("startup_timeout_secs"), "defaults not written: {t}");
         let cfg = ProjectConfig::parse(&t).unwrap();
-        assert_eq!((cfg.settings.stall_minutes, cfg.settings.fresh_session, cfg.settings.max_chain_depth), (9, false, 5));
+        assert_eq!((cfg.settings.stall_minutes, cfg.settings.fresh_session, cfg.settings.max_chain_depth, cfg.settings.check.as_str()), (9, false, 5, "cargo test"));
     }
 
     #[test]

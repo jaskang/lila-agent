@@ -48,20 +48,17 @@ impl Page {
 
 /// The numbers in `[settings]`, with the bounds the form keeps them in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The rest of `[settings]` (startup timeout, chain depth…) is edited in the file.
 enum Rule {
     StallMinutes,
-    StartupSecs,
     MaxRounds,
-    MaxDepth,
 }
 
 impl Rule {
     fn get(self, s: &Settings) -> i64 {
         match self {
             Rule::StallMinutes => s.stall_minutes as i64,
-            Rule::StartupSecs => s.startup_timeout_secs as i64,
             Rule::MaxRounds => s.max_rounds.into(),
-            Rule::MaxDepth => s.max_chain_depth.into(),
         }
     }
 
@@ -70,23 +67,15 @@ impl Rule {
         let v = v.clamp(lo, hi);
         match self {
             Rule::StallMinutes => s.stall_minutes = v as u64,
-            Rule::StartupSecs => s.startup_timeout_secs = v as u64,
             Rule::MaxRounds => s.max_rounds = v as u32,
-            Rule::MaxDepth => s.max_chain_depth = v as u32,
         }
     }
 
     fn range(self) -> (i64, i64) {
         match self {
             Rule::StallMinutes => (1, 120),
-            Rule::StartupSecs => (5, 600),
             Rule::MaxRounds => (1, 20),
-            Rule::MaxDepth => (1, 32),
         }
-    }
-
-    fn step(self) -> i64 {
-        if self == Rule::StartupSecs { 5 } else { 1 }
     }
 
     /// Title, unit.
@@ -94,8 +83,6 @@ impl Rule {
         match self {
             Rule::StallMinutes => ("无回应提醒", "分钟"),
             Rule::MaxRounds => ("返工上限", "轮"),
-            Rule::MaxDepth => ("子任务层数上限", "层"),
-            Rule::StartupSecs => ("启动超时", "秒"),
         }
     }
 }
@@ -117,6 +104,8 @@ pub struct Form {
     /// Members, rules and `[settings]` as the form has them now (the inputs hold the rest).
     pub value: ProjectSettings,
     pub title: Entity<InputState>,
+    /// `[settings] check`: what Lila runs after the work, before the tester.
+    pub check: Entity<InputState>,
     pub members: Vec<MemberForm>,
     pub page: Page,
     /// The member open on the members page.
@@ -202,8 +191,9 @@ impl LilaApp {
         self.dialog_offset = Point::default();
         self.close_task(cx);
         let title = cx.new(|cx| InputState::new(window, cx).placeholder(base.name.clone()).default_value(base.title.clone()));
+        let check = cx.new(|cx| InputState::new(window, cx).default_value(base.settings.check.clone()));
         let members = base.members.iter().map(|m| member_form(m, false, window, cx)).collect();
-        self.settings = Some(Form { project, value: base.clone(), base, title, members, page, selected: 0, error: None, saving: false });
+        self.settings = Some(Form { project, value: base.clone(), base, title, check, members, page, selected: 0, error: None, saving: false });
         cx.notify();
     }
 
@@ -265,6 +255,7 @@ impl LilaApp {
         let f = self.settings.as_ref()?;
         let mut out = f.value.clone();
         out.title = f.title.read(cx).value().trim().to_owned();
+        out.settings.check = f.check.read(cx).value().trim().to_owned();
         for (m, form) in out.members.iter_mut().zip(&f.members) {
             (m.runtime, m.model) = form.choice(cx);
             m.effort = form.effort.clone();
@@ -323,9 +314,9 @@ impl LilaApp {
 
     fn general_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(f) = self.settings.as_ref() else { return div().into_any_element() };
-        let (title, cwd) = (f.title.clone(), data::tilde(&f.project.cwd));
+        let (title, check, cwd) = (f.title.clone(), f.check.clone(), data::tilde(&f.project.cwd));
         let now = f.value.settings.clone();
-        let rules: Vec<AnyElement> = [Rule::StallMinutes, Rule::MaxRounds, Rule::MaxDepth, Rule::StartupSecs].into_iter().map(|r| self.rule_row(r, &now, cx)).collect();
+        let rules: Vec<AnyElement> = [Rule::StallMinutes, Rule::MaxRounds].into_iter().map(|r| self.rule_row(r, &now, cx)).collect();
         let fresh = now.fresh_session;
         let fresh_row = row(
             "换任务时开新会话",
@@ -336,7 +327,7 @@ impl LilaApp {
             })),
             cx,
         );
-        let mut team = vec![fresh_row];
+        let mut team = vec![row("检查命令", None, div().w(px(280.)).child(Input::new(&check).control()), cx), fresh_row];
         team.extend(rules);
         dialog::scroll(
             "settings-general",
@@ -494,9 +485,8 @@ impl LilaApp {
         let (title, unit) = rule.text();
         let v = rule.get(now);
         let (lo, hi) = rule.range();
-        let step = rule.step();
-        let down: Option<Act> = (v > lo).then(|| Box::new(move |this: &mut LilaApp, cx: &mut Context<LilaApp>| this.settings_edit(cx, |s| rule.set(&mut s.settings, v - step))) as Act);
-        let up: Option<Act> = (v < hi).then(|| Box::new(move |this: &mut LilaApp, cx: &mut Context<LilaApp>| this.settings_edit(cx, |s| rule.set(&mut s.settings, v + step))) as Act);
+        let down: Option<Act> = (v > lo).then(|| Box::new(move |this: &mut LilaApp, cx: &mut Context<LilaApp>| this.settings_edit(cx, |s| rule.set(&mut s.settings, v - 1))) as Act);
+        let up: Option<Act> = (v < hi).then(|| Box::new(move |this: &mut LilaApp, cx: &mut Context<LilaApp>| this.settings_edit(cx, |s| rule.set(&mut s.settings, v + 1))) as Act);
         row(title, None, stepper(&format!("{rule:?}"), format!("{v} {unit}"), down, up, cx), cx)
     }
 

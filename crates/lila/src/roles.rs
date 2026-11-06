@@ -293,7 +293,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("shop");
         std::fs::create_dir_all(repo.join(".lila")).unwrap();
-        std::fs::write(repo.join(".lila/project.toml"), crate::init::default_project("shop")).unwrap();
+        std::fs::write(repo.join(".lila/project.toml"), crate::init::default_project("shop", None)).unwrap();
         let u = users(&[("shop".into(), repo), ("gone".into(), dir.path().join("nope"))]);
         assert_eq!(u["tester"], ["shop"]);
         assert!(!u.contains_key("qa"));
@@ -306,7 +306,7 @@ mod tests {
         install_defaults(&roles).unwrap();
         let repo = dir.path().join("shop");
         std::fs::create_dir_all(repo.join(".lila")).unwrap();
-        std::fs::write(repo.join(".lila/project.toml"), crate::init::default_project("shop")).unwrap();
+        std::fs::write(repo.join(".lila/project.toml"), crate::init::default_project("shop", None)).unwrap();
         let (member, text) = preview(&roles, &repo, "tester", "You test things, carefully.").unwrap();
         assert_eq!(member, "tester");
         assert!(text.starts_with("You test things, carefully.\n\n---\n\n## Your team (Lila)"), "{text}");

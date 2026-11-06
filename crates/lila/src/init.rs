@@ -24,7 +24,7 @@ pub fn init_project(paths: &Paths, dir: &Path, name: Option<String>) -> Result<C
     };
     lila_core::config::validate_id(&name).map_err(|e| anyhow::anyhow!("project name {name:?}: {e}; pass --name"))?;
     std::fs::create_dir_all(file.parent().unwrap())?;
-    std::fs::write(&file, default_project(&name))?;
+    std::fs::write(&file, default_project(&name, detect_check(dir).as_deref()))?;
     let roles_installed = roles::install_defaults(&paths.roles())?;
     Ok(Created { file, name, roles_installed })
 }
@@ -96,7 +96,27 @@ pub fn slug(s: &str) -> String {
     out.chars().take(24).collect::<String>().trim_end_matches('-').to_string()
 }
 
-pub fn default_project(name: &str) -> String {
+/// The command that tests the code in `dir`, from what the folder holds: the
+/// flow's check step runs it after the engineer, before the tester.
+pub fn detect_check(dir: &Path) -> Option<String> {
+    if dir.join("Cargo.toml").is_file() {
+        return Some("cargo test".into());
+    }
+    if dir.join("go.mod").is_file() {
+        return Some("go test ./...".into());
+    }
+    let package: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).ok()?).ok()?;
+    // npm init's placeholder only fails.
+    package["scripts"]["test"].as_str().filter(|t| !t.contains("no test specified"))?;
+    let runner = [("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lock", "bun run"), ("bun.lockb", "bun run")].into_iter().find(|(lock, _)| dir.join(lock).is_file()).map_or("npm", |(_, r)| r);
+    Some(format!("{runner} test"))
+}
+
+pub fn default_project(name: &str, check: Option<&str>) -> String {
+    let check = match check {
+        Some(c) => format!("check = {}", serde_json::to_string(c).expect("a string")),
+        None => "# check = \"cargo test\"".to_owned(),
+    };
     format!(
         r#"name = "{name}"
 owner = "pm"
@@ -142,7 +162,7 @@ fresh_session = true
 flow = "code"
 # The command Lila runs for the flow's check step, in this folder. A failure goes
 # back to the engineer without waking the tester. Empty: no check step.
-# check = "cargo test"
+{check}
 "#
     )
 }
@@ -161,11 +181,28 @@ mod tests {
     }
 
     #[test]
+    fn the_check_command_comes_from_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        assert_eq!(detect_check(d), None);
+        std::fs::write(d.join("package.json"), r#"{"scripts": {"test": "echo \"Error: no test specified\" && exit 1"}}"#).unwrap();
+        assert_eq!(detect_check(d), None, "npm's placeholder is no test");
+        std::fs::write(d.join("package.json"), r#"{"scripts": {"test": "vitest run"}}"#).unwrap();
+        assert_eq!(detect_check(d).as_deref(), Some("npm test"));
+        std::fs::write(d.join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(detect_check(d).as_deref(), Some("pnpm test"));
+        std::fs::write(d.join("Cargo.toml"), "").unwrap();
+        assert_eq!(detect_check(d).as_deref(), Some("cargo test"));
+        let cfg = lila_core::ProjectConfig::parse(&default_project("shop", Some("cargo test"))).unwrap();
+        assert_eq!(cfg.settings.check, "cargo test");
+    }
+
+    #[test]
     fn default_project_builds_with_default_roles() {
         let dir = tempfile::tempdir().unwrap();
         roles::install_defaults(dir.path()).unwrap();
         let roles = roles::load(dir.path()).unwrap();
-        let cfg = lila_core::ProjectConfig::parse(&default_project("shop")).unwrap();
+        let cfg = lila_core::ProjectConfig::parse(&default_project("shop", None)).unwrap();
         let team = lila_core::Team::build(&cfg, &roles).unwrap();
         assert_eq!(team.members.len(), 5);
         assert_eq!(team.assign["designer"], ["engineer"]);
