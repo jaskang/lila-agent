@@ -5,13 +5,15 @@
 use crate::check::{CheckJob, CheckResult};
 use crate::paths::{Paths, which};
 use crate::roles;
+use crate::sessions::{self, Contexts};
+use crate::usage::Sources;
 use anyhow::{Context, Result, anyhow, bail};
 use lila_core::dispatch::{self, AgentStatus, MemberView, QueuedTask, StallAction};
 use lila_core::flow::{self, Flow, Next};
 use lila_core::message::StepHint;
 use lila_core::route::{self, DoneRoute};
 use lila_core::{Actor, Brief, Outcome, ProjectConfig, Task, TaskState, Team, Transition, message, prompt, runtime};
-use lila_store::{NewTask, Run, RunState, Store};
+use lila_store::{NewTask, Run, RunState, SessionRow, Store};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -71,11 +73,14 @@ struct Live {
     /// The chain (root task) of the last task this session was given; unknown
     /// for a session started before lilad was.
     chain: Option<String>,
+    /// The CLI session the terminal runs (the store's `sessions`), once known:
+    /// at start for Claude Code, when its rollout turns up for Codex.
+    session: Option<String>,
 }
 
 impl Default for Live {
     fn default() -> Self {
-        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None, chain: None }
+        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None, chain: None, session: None }
     }
 }
 
@@ -102,6 +107,20 @@ pub struct Daemon<T: Terminals> {
     /// Checks to start (`take_checks`), and the runs whose check is under way.
     checks: Vec<CheckJob>,
     checking: BTreeSet<(String, String)>,
+    /// Where the CLIs record their sessions, and the context sizes read from them.
+    sources: Sources,
+    contexts: Contexts,
+}
+
+/// How a member gets work from another chain than its session's.
+#[derive(Debug, Clone, PartialEq)]
+enum Switch {
+    /// Its context is still small: the same session takes it.
+    Keep,
+    /// An earlier session of it did this chain: back to that one.
+    Resume(String),
+    /// A new, empty session.
+    Fresh,
 }
 
 /// The actor lilad writes as: it creates a flow's later steps.
@@ -164,6 +183,8 @@ impl<T: Terminals> Daemon<T> {
             live_version: 0,
             checks: Vec::new(),
             checking: BTreeSet::new(),
+            sources: Sources::from_env(),
+            contexts: Contexts::default(),
         };
         let rows = d.store.projects().unwrap_or_default();
         for p in rows {
@@ -210,7 +231,8 @@ impl<T: Terminals> Daemon<T> {
                 if team.member(&m.id).is_some() {
                     // Until herdr-core's snapshot says otherwise, a recorded terminal is presumed alive.
                     let status = if m.terminal.is_some() { AgentStatus::Unknown } else { AgentStatus::Gone };
-                    live.insert(m.id.clone(), Live { terminal: m.terminal, started_ms: m.started_ms, status, ..Live::default() });
+                    let chain = m.session.as_deref().and_then(|s| self.store.last_chain(id, s).ok().flatten());
+                    live.insert(m.id.clone(), Live { terminal: m.terminal, started_ms: m.started_ms, status, session: m.session, chain, ..Live::default() });
                 }
             }
         }
@@ -375,6 +397,11 @@ impl<T: Terminals> Daemon<T> {
     }
 
     fn start_member(&mut self, pid: &str, mid: &str, now: i64) -> Result<String> {
+        self.start_session(pid, mid, runtime::Session::New(None), now)
+    }
+
+    /// Starts a member's CLI in a new session or an earlier one (`Session::Resume`).
+    fn start_session(&mut self, pid: &str, mid: &str, session: runtime::Session, now: i64) -> Result<String> {
         let proj = &self.projects[pid];
         let member = proj.team.member(mid).expect("member").clone();
         let cwd = proj.cwd.to_string_lossy().to_string();
@@ -384,7 +411,13 @@ impl<T: Terminals> Daemon<T> {
         let prompt_path = dir.join(format!("{mid}.md"));
         std::fs::write(&prompt_path, &text)?;
 
-        let mut launch = runtime::launch(&member.role, &prompt_path.to_string_lossy(), &text);
+        let rt = member.role.file.runtime;
+        // Claude Code takes the id Lila picks, so the session is known from the start.
+        let session = match session {
+            runtime::Session::New(None) if rt == lila_core::Runtime::Claude => runtime::Session::New(Some(sessions::new_uuid())),
+            other => other,
+        };
+        let mut launch = runtime::launch(&member.role, &prompt_path.to_string_lossy(), &text, &session);
         let (program, mut env) = self.member_env(&member.role)?;
         launch.argv[0] = program.to_string_lossy().to_string();
         env.insert("LILA_PROJECT".into(), pid.to_owned());
@@ -405,8 +438,27 @@ impl<T: Terminals> Daemon<T> {
             "no_notify": true,
         }))?;
         self.store.set_member(pid, mid, &member.role.id, Some(&addr), Some(now))?;
+        let known = match &session {
+            runtime::Session::New(Some(id)) | runtime::Session::Resume(id) => Some(id.clone()),
+            runtime::Session::New(None) => None,
+        };
+        let mut chain = None;
+        if let Some(id) = &known {
+            let file = (rt == lila_core::Runtime::Claude).then(|| sessions::claude_file(&self.sources, &cwd, id).to_string_lossy().to_string());
+            self.store.add_session(pid, &SessionRow { id: id.clone(), member: mid.to_owned(), runtime: rt.to_string(), file, started_ms: now })?;
+            chain = self.store.last_chain(pid, id)?;
+        }
         let live = self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap();
-        *live = Live { terminal: Some(addr.clone()), status: AgentStatus::Unknown, started_ms: Some(now), free_since: now, launched: Some(member.launch_key()), ..Live::default() };
+        *live = Live {
+            terminal: Some(addr.clone()),
+            status: AgentStatus::Unknown,
+            started_ms: Some(now),
+            free_since: now,
+            launched: Some(member.launch_key()),
+            session: known,
+            chain,
+            ..Live::default()
+        };
         self.live_version += 1;
         let shown: Vec<String> = launch.argv.iter().map(|a| if a.chars().count() > 80 { format!("{}…", a.chars().take(40).collect::<String>()) } else { a.clone() }).collect();
         self.store.event(pid, None, "lilad", "member_started", &format!("{mid} in {addr}: {}", shown.join(" ")), now)?;
@@ -427,7 +479,7 @@ impl<T: Terminals> Daemon<T> {
                 env.insert(k.clone(), v.clone());
             }
         }
-        let name = runtime::launch(role, "", "").argv[0].clone();
+        let name = runtime::launch(role, "", "", &runtime::Session::New(None)).argv[0].clone();
         let program = which(&name, &path).ok_or_else(|| anyhow!("{name:?} is not on PATH for role {}; add its folder to the role's env.PATH", role.id))?;
         env.insert("PATH".into(), path);
         Ok((program, env))
@@ -523,6 +575,10 @@ impl<T: Terminals> Daemon<T> {
             self.member_gone(&pid, &mid, "restarted with new settings", now, false);
         }
         let addr = self.start_member(&pid, &mid, now)?;
+        if member.is_owner {
+            let digest = self.digest(&pid)?;
+            self.store.push_outbox(&pid, &mid, &digest, now)?;
+        }
         self.pump(&pid, now);
         Ok(json!({"project": pid, "member": mid, "terminal": addr}))
     }
@@ -1311,17 +1367,20 @@ impl<T: Terminals> Daemon<T> {
         for (tid, mid) in picks {
             let Some(task) = tasks.iter().find(|(t, _)| t.id == tid).map(|(t, _)| t.clone()) else { continue };
             let live = self.projects[pid].live[&mid].clone();
-            let Some(terminal) = live.terminal else { continue };
+            let Some(terminal) = live.terminal.clone() else { continue };
             let ancestors = self.store.ancestors(pid, &tid).unwrap_or_default();
             let chain = ancestors.last().map(|t| t.id.clone()).unwrap_or_else(|| tid.clone());
             let proj = &self.projects[pid];
             let fresh = proj.team.settings.fresh_session && proj.team.member(&mid).is_some_and(|m| !m.is_owner);
             if fresh && live.chain.as_ref().is_some_and(|c| *c != chain) {
-                // A note just typed would be lost with the session: wait until it is read.
-                if !noted.contains(&mid) {
-                    self.fresh_session(pid, &mid, &tid, now);
+                let plan = self.switch_plan(pid, &mid, &live, &chain);
+                if plan != Switch::Keep {
+                    // A note just typed would be lost with the session: wait until it is read.
+                    if !noted.contains(&mid) {
+                        self.new_session(pid, &mid, &tid, plan, now);
+                    }
+                    continue;
                 }
-                continue;
             }
             // The request the chain serves: the person's words from nearest the root,
             // and every "done when" and "out of scope" set on the way down.
@@ -1338,7 +1397,10 @@ impl<T: Terminals> Daemon<T> {
                     let _ = self.store.transition(pid, &tid, Transition::Deliver, &Actor::Member("lilad".into()), &format!("to {terminal}"), now);
                     let live = self.projects.get_mut(pid).unwrap().live.get_mut(&mid).unwrap();
                     live.free_since = now;
-                    live.chain = Some(chain);
+                    live.chain = Some(chain.clone());
+                    if let Some(sid) = live.session.clone() {
+                        let _ = self.store.touch_chain(pid, &sid, &chain, now);
+                    }
                     self.say(format!("{pid}: delivered {tid} to {mid}"));
                 }
                 Err(e) => {
@@ -1352,26 +1414,163 @@ impl<T: Terminals> Daemon<T> {
         }
     }
 
-    /// Starts a free member's CLI again so `tid` (from another chain) gets an
-    /// empty context. It holds no open task, so nothing goes back to the queue;
-    /// `tid` is delivered once the new session reports idle.
-    fn fresh_session(&mut self, pid: &str, mid: &str, tid: &str, now: i64) {
+    /// How `mid` (its session on another chain) takes work from `chain`: back to
+    /// the session that did this chain before, the same session while its
+    /// context is small (`fresh_after_tokens`), else a new one.
+    fn switch_plan(&mut self, pid: &str, mid: &str, live: &Live, chain: &str) -> Switch {
+        if let Ok(Some(s)) = self.store.session_for_chain(pid, mid, chain)
+            && live.session.as_ref() != Some(&s.id)
+            && s.file.as_deref().is_some_and(|f| Path::new(f).exists())
+        {
+            return Switch::Resume(s.id);
+        }
+        let limit = self.projects[pid].team.settings.fresh_after_tokens;
+        match self.context_of(pid, live.session.as_deref()) {
+            Some(n) if limit > 0 && n < limit => Switch::Keep,
+            _ => Switch::Fresh,
+        }
+    }
+
+    /// The context of a member's session's latest turn, in tokens, when its record is readable.
+    fn context_of(&mut self, pid: &str, session: Option<&str>) -> Option<u64> {
+        let file = self.store.session(pid, session?).ok()??.file?;
+        self.contexts.of(Path::new(&file))
+    }
+
+    /// Starts a free member's CLI again for `tid` (from another chain): in the
+    /// session that did that chain before, or an empty one. It holds no open task,
+    /// so nothing goes back to the queue; `tid` goes out once the session reports idle.
+    fn new_session(&mut self, pid: &str, mid: &str, tid: &str, plan: Switch, now: i64) {
         let Some(old) = self.projects[pid].live[mid].terminal.clone() else { return };
         if let Err(e) = self.term.kill(&old) {
             self.say(format!("{pid}: kill {mid} ({old}): {e:#}"));
         }
         self.member_gone(pid, mid, &format!("new session for {tid}"), now, false);
-        let _ = self.store.event(pid, Some(tid), "lilad", "fresh_session", &format!("{mid} starts a new session for {tid}"), now);
-        if let Err(e) = self.start_member(pid, mid, now) {
+        let (session, kind, what) = match plan {
+            Switch::Resume(id) => (runtime::Session::Resume(id.clone()), "resumed_session", format!("{mid} goes back to session {id} for {tid}")),
+            _ => (runtime::Session::New(None), "fresh_session", format!("{mid} starts a new session for {tid}")),
+        };
+        let _ = self.store.event(pid, Some(tid), "lilad", kind, &what, now);
+        if let Err(e) = self.start_session(pid, mid, session, now) {
             let text = format!("{mid} could not be started again for {tid}: {e:#}. Run `lila up` once it is fixed.");
             self.say(format!("{pid}: {text}"));
             let _ = self.store.add_inbox(pid, "lost", Some(mid), None, &text, &[], now);
         }
     }
 
+    /// The PM in a new session: its context grew past `pm_refresh_tokens`. The
+    /// digest is what it needs to carry on; the details stay a `lila task show` away.
+    fn refresh_pm(&mut self, pid: &str, tokens: u64, now: i64) {
+        let owner = self.projects[pid].team.owner.clone();
+        let Some(old) = self.projects[pid].live[&owner].terminal.clone() else { return };
+        let digest = match self.digest(pid) {
+            Ok(d) => d,
+            Err(e) => return self.say(format!("{pid}: no digest for the PM: {e:#}")),
+        };
+        if let Err(e) = self.term.kill(&old) {
+            self.say(format!("{pid}: kill {owner} ({old}): {e:#}"));
+        }
+        self.member_gone(pid, &owner, "new session", now, false);
+        let detail = format!("its context reached {} tokens; it starts again with a digest of the project", crate::usage::short(tokens));
+        let _ = self.store.event(pid, None, "lilad", "pm_refreshed", &detail, now);
+        self.say(format!("{pid}: {owner}: {detail}"));
+        if let Err(e) = self.start_member(pid, &owner, now) {
+            let text = format!("{owner} could not be started again: {e:#}. Run `lila up` once it is fixed.");
+            let _ = self.store.add_inbox(pid, "lost", Some(&owner), None, &text, &[], now);
+            return;
+        }
+        let _ = self.store.push_outbox(pid, &owner, &digest, now);
+    }
+
+    /// What the PM needs in a new session, from the store: no model summarizes it,
+    /// so nothing the person decided is lost on the way.
+    fn digest(&self, pid: &str) -> Result<String> {
+        let tasks: Vec<Task> = self.store.tasks(pid)?.into_iter().map(|(t, _)| t).collect();
+        let runs: Vec<Run> = self.store.runs(pid)?.into_iter().filter(|r| r.state.is_open()).collect();
+        let team = &self.projects[pid].team;
+        let decided: Vec<String> = self
+            .store
+            .inbox(pid, true)?
+            .into_iter()
+            .filter(|i| i.kind == "question" && i.answer.is_some())
+            .map(|i| format!("{} {} → {}", i.id, i.text.trim(), i.answer.unwrap_or_default().trim()))
+            .collect();
+        let under = |root: &str, id: &str| id == root || route::ancestors(&tasks, id).iter().any(|a| a.id == root);
+        let mut open = Vec::new();
+        let mut closed = Vec::new();
+        for r in tasks.iter().filter(|t| t.parent.is_none()) {
+            let below = route::open_under(&tasks, &r.id);
+            let flows: Vec<&Run> = runs.iter().filter(|x| under(&r.id, &x.anchor)).collect();
+            if r.state.is_open() || !below.is_empty() || !flows.is_empty() {
+                let mut line = format!("{} from {} → {} [{}] \"{}\"", r.id, r.from, r.to, r.state, r.title);
+                for t in &below {
+                    line.push_str(&format!("\n    {} → {} [{}] {}", t.id, t.to, t.state, t.title));
+                }
+                for x in flows {
+                    let step = team.flows.get(&x.flow).and_then(|f| f.steps.get(x.step)).map(|s| s.action.as_str()).unwrap_or("?");
+                    line.push_str(&format!("\n    {} flow of {}: {step} ({}, fix round {})", x.flow, x.anchor, x.state.as_str(), x.round));
+                }
+                open.push(line);
+            } else if r.state == TaskState::Done {
+                closed.push(format!("{} \"{}\": {}", r.id, r.title, r.summary.as_deref().unwrap_or("").chars().take(160).collect::<String>()));
+            }
+        }
+        let waiting = self.store.inbox(pid, false)?.len();
+        Ok(message::digest(&decided, &open, &closed[closed.len().saturating_sub(8)..], waiting))
+    }
+
+    /// Codex picks its own session id: look for the rollout of members that
+    /// started without one known, for the first half hour.
+    fn find_sessions(&mut self, pid: &str, now: i64) {
+        let cwd = self.projects[pid].cwd.to_string_lossy().to_string();
+        let team = &self.projects[pid].team;
+        let missing: Vec<(String, i64, Option<String>)> = self.projects[pid]
+            .live
+            .iter()
+            .filter(|(m, l)| l.terminal.is_some() && l.session.is_none() && team.member(m).is_some_and(|x| x.role.file.runtime == lila_core::Runtime::Codex))
+            .filter_map(|(m, l)| l.started_ms.filter(|s| now - s < 30 * 60_000).map(|s| (m.clone(), s, l.chain.clone())))
+            .collect();
+        for (mid, started, chain) in missing {
+            let Some((id, file)) = sessions::find_codex(&self.sources, pid, &mid, &cwd, started) else { continue };
+            let row = SessionRow { id: id.clone(), member: mid.clone(), runtime: "codex".into(), file: Some(file.to_string_lossy().to_string()), started_ms: started };
+            if self.store.add_session(pid, &row).is_ok() {
+                if let Some(c) = &chain {
+                    let _ = self.store.touch_chain(pid, &id, c, now);
+                }
+                if let Some(l) = self.projects.get_mut(pid).and_then(|p| p.live.get_mut(&mid)) {
+                    l.session = Some(id);
+                }
+            }
+        }
+    }
+
+    /// The PM gets a new session once its context is past `pm_refresh_tokens` and
+    /// it has sat idle `pm_refresh_idle_minutes` with nothing waiting to be typed.
+    fn maybe_refresh_pm(&mut self, pid: &str, now: i64) {
+        let team = &self.projects[pid].team;
+        let (limit, idle) = (team.settings.pm_refresh_tokens, team.settings.pm_refresh_idle_minutes as i64 * 60_000);
+        let owner = team.owner.clone();
+        let live = self.projects[pid].live[&owner].clone();
+        if limit == 0 || live.terminal.is_none() || !live.status.is_free() || now - live.free_since < idle {
+            return;
+        }
+        if self.store.outbox(pid).unwrap_or_default().iter().any(|m| m.member == owner) {
+            return;
+        }
+        if let Some(n) = self.context_of(pid, live.session.as_deref())
+            && n >= limit
+        {
+            self.refresh_pm(pid, n, now);
+        }
+    }
+
     /// Every few seconds: startup timeouts, quiet members, then the pump.
     pub fn tick(&mut self, now: i64) {
         let pids: Vec<String> = self.projects.keys().cloned().collect();
+        for pid in &pids {
+            self.find_sessions(pid, now);
+            self.maybe_refresh_pm(pid, now);
+        }
         for pid in pids {
             let settings = self.projects[&pid].team.settings.clone();
             let lives: Vec<(String, Live)> = self.projects[&pid].live.iter().map(|(k, v)| (k.clone(), v.clone())).collect();

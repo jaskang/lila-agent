@@ -113,6 +113,7 @@ cargo run -p lila-app
   - 做完后只告诉往上第一个还没做完的祖先任务的负责人；没有这样的人就告诉 PM。
   - note 里带上中间环节的摘要，以及还剩什么没做完。
   - 成员在等交接出去的工作时，不发沉默提醒。
+- **会话账本**（`crates/lila/src/sessions.rs`，见 `docs/architecture-v2.md` §12）：Claude 成员启动时由 lilad 指定 `--session-id`；Codex 的会话从 `~/.codex/sessions` 里认出来。换链时，这条链以前有会话就续接（`--resume`）；上下文小于 `fresh_after_tokens` 就沿用当前会话；否则开新会话。PM 的上下文超过 `pm_refresh_tokens`、并且空闲 10 分钟后，换新会话并收到 `<lila digest>` 项目摘要。
 - **流程**（`lila_core::flow`，见 `docs/architecture-v2.md` §11）：PM 或用户派给 engineer 的活默认走 `code` 流程（实现 → `[settings] check` 检查命令 → tester 验证），由 lilad 推进。检查命令由 lilad 自己跑，失败直接退回给 engineer；tester 用 `--verdict pass|fail` 给结论，fail 由 lilad 退回给写代码的人，超过 `max_rounds` 交给 PM。进度存在 `runs` 表里。`--flow none` 不走流程。
 - **`max_working`**：默认改成 0，表示不限。同时工作多少由各成员的 `count` 决定。窗口保存项目设置时，会删掉旧配置里的 `max_working`。
 - **默认角色升级**：`defaults/roles/previous/` 存着旧版默认文件。用户角色目录里的文件如果和某个旧版一模一样，`install_defaults` 就把它换成新版；改过的不动。

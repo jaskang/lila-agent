@@ -82,7 +82,9 @@ fn world_with(project_toml: &str) -> World {
     std::fs::create_dir_all(repo.join(".lila")).unwrap();
     std::fs::write(repo.join(".lila/project.toml"), project_toml).unwrap();
     let store = Store::open(&paths.db()).unwrap();
-    let d = Daemon::new(store, Fake::default(), paths, bin.to_string_lossy().to_string(), PathBuf::from("/opt/lila/bin/lila"));
+    let mut d = Daemon::new(store, Fake::default(), paths, bin.to_string_lossy().to_string(), PathBuf::from("/opt/lila/bin/lila"));
+    // The CLIs' session records, here instead of the real ~/.claude and ~/.codex.
+    d.sources = Sources { claude: root.join("claude-home"), codex: root.join("codex-home") };
     World { d, repo, _tmp: tmp, now: 1_000_000 }
 }
 
@@ -155,9 +157,14 @@ fn up_starts_every_member_with_its_command() {
     let owner = &runs[0];
     let argv: Vec<&str> = owner["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
     assert!(argv[0].ends_with("/bin/claude"), "resolved to an absolute path: {argv:?}");
-    assert_eq!(argv[1..5], ["--model", "claude-sonnet-5-5", "--effort", "high"]);
+    assert_eq!(argv[1..3], ["--model", "claude-sonnet-5-5"]);
+    let flag = |f: &str| argv.iter().position(|a| *a == f).map(|i| argv[i + 1]).unwrap_or_else(|| panic!("{f} in {argv:?}"));
+    assert_eq!(flag("--effort"), "high");
+    // Lila picks the session id, so it knows where Claude Code records it.
+    let sid = flag("--session-id");
+    assert_eq!(w.d.store.session("shop", sid).unwrap().unwrap().member, "owner");
     // The PM's limits are the CLI's, not a line in its prompt.
-    assert_eq!(argv[5..7], ["--tools", "Read,Grep,Glob,Bash"]);
+    assert_eq!(flag("--tools"), "Read,Grep,Glob,Bash");
     let allow = argv.iter().position(|a| *a == "--allowedTools").expect("allowed rules");
     assert_eq!(argv[allow + 1], "Bash(lila:*)");
     let at = argv.iter().position(|a| *a == "--append-system-prompt-file").unwrap();
@@ -1063,4 +1070,128 @@ fn a_check_under_way_runs_again_after_a_restart() {
     w.d.on_check_done("shop", "T1", &r, w.now + 1000);
     assert_eq!(w.task("T2").title, "Verify: Search");
     assert!(w.task("T2").body.contains("Lila ran `true`: it passed."));
+}
+
+// ---------------- sessions ----------------
+
+impl World {
+    /// The member's current session, as the store has it.
+    fn session_of(&self, member: &str) -> SessionRow {
+        let id = self.d.projects["shop"].live[member].session.clone().unwrap_or_else(|| panic!("{member} has no known session"));
+        self.d.store.session("shop", &id).unwrap().unwrap()
+    }
+
+    /// Its CLI's record says the latest turn read `tokens`.
+    fn set_context(&self, member: &str, tokens: u64) {
+        let file = PathBuf::from(self.session_of(member).file.unwrap());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let line = json!({"type": "assistant", "message": {"usage": {"input_tokens": 1, "cache_read_input_tokens": tokens - 1, "output_tokens": 5}}});
+        std::fs::write(file, format!("{line}\n")).unwrap();
+    }
+
+    fn last_argv(&self) -> Vec<String> {
+        self.d.term.runs.last().unwrap()["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_owned()).collect()
+    }
+}
+
+#[test]
+fn another_chain_keeps_a_small_session_and_returns_to_the_one_that_did_the_work() {
+    let mut w = world_with(&manual(""));
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Login"}));
+    let first = w.session_of("engineer").id;
+    w.set_context("engineer", 10_000);
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "ok"}));
+
+    // Small context: the same session takes work from another chain.
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Search"}));
+    assert_eq!(w.state("T2"), TaskState::Delivered);
+    assert!(w.d.term.kills.is_empty());
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "ok"}));
+
+    // Big context: a new session.
+    w.set_context("engineer", 90_000);
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Export"}));
+    assert_eq!(w.d.term.kills.len(), 1);
+    let second = w.session_of("engineer").id;
+    assert_ne!(second, first);
+    assert!(w.last_argv().contains(&second), "started with --session-id {second}");
+    w.status("engineer", "idle");
+    w.ok(Some("engineer"), "task.done", json!({"id": "T3", "summary": "ok"}));
+
+    // Rework on Search: back to the session that wrote it.
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Search: fix paging", "parent": "T2"}));
+    assert_eq!(w.d.term.kills.len(), 2);
+    let argv = w.last_argv();
+    let at = argv.iter().position(|a| a == "--resume").expect("resumed");
+    assert_eq!(argv[at + 1], first);
+    assert!(!argv.contains(&"--session-id".to_string()));
+    assert_eq!(w.session_of("engineer").id, first);
+    w.status("engineer", "idle");
+    assert_eq!(w.state("T4"), TaskState::Delivered);
+    let kinds: Vec<String> = w.d.store.events("shop", None, 100).unwrap().into_iter().map(|e| e.kind).collect();
+    assert!(kinds.contains(&"fresh_session".to_string()) && kinds.contains(&"resumed_session".to_string()), "{kinds:?}");
+
+    // What a session did survives a lilad restart.
+    let paths = w.d.paths.clone();
+    let d2 = Daemon::new(Store::open(&paths.db()).unwrap(), Fake::default(), paths, w.d.path_env.clone(), PathBuf::from("/x/lila"));
+    assert_eq!(d2.projects["shop"].live["engineer"].chain.as_deref(), Some("T2"));
+}
+
+#[test]
+fn codex_sessions_are_found_once_their_rollout_appears() {
+    let mut w = world_with(&manual(""));
+    w.up();
+    w.all_idle();
+    assert!(w.d.projects["shop"].live["tester"].session.is_none(), "codex picks its own id");
+    let cwd = w.repo.to_string_lossy().to_string();
+    let day = w.d.sources.codex.join("sessions/2026/11/06");
+    std::fs::create_dir_all(&day).unwrap();
+    let prompt = format!("## Your team (Lila)\n\nProject: shop, working directory: {cwd}\nYou are `tester` (测试工程师).\n");
+    let lines = [
+        json!({"type": "session_meta", "payload": {"id": "cx-1", "cwd": cwd}}),
+        json!({"type": "response_item", "payload": {"role": "developer", "content": [{"type": "input_text", "text": prompt}]}}),
+        json!({"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 31000}}}}),
+    ];
+    std::fs::write(day.join("rollout-x-cx-1.jsonl"), lines.map(|l| l.to_string()).join("\n")).unwrap();
+    w.d.tick(w.now);
+    assert_eq!(w.session_of("tester").id, "cx-1");
+    assert_eq!(w.d.store.members("shop").unwrap().iter().find(|m| m.id == "tester").unwrap().session.as_deref(), Some("cx-1"));
+    assert_eq!(w.d.context_of("shop", Some("cx-1")), Some(31_000));
+}
+
+#[test]
+fn a_pm_with_a_big_context_starts_again_from_a_digest() {
+    let mut w = world_with(&manual(""));
+    w.ok(None, "project.up", json!({"brief": "Ship login"}));
+    w.all_idle();
+    w.ok(Some("owner"), "task.start", json!({"id": "T1"}));
+    w.ok(Some("owner"), "ask", json!({"question": "Which DB?", "options": ["Postgres", "SQLite"]}));
+    w.ok(None, "answer", json!({"id": "Q1", "text": "Postgres"}));
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1"}));
+    w.status("owner", "idle");
+    w.set_context("owner", 150_000);
+    let before = w.terminal("owner");
+
+    // Idle only a moment: the person may be typing to it.
+    w.d.tick(w.now);
+    assert_eq!(w.terminal("owner"), before);
+    // Ten quiet minutes later it starts again.
+    w.now += 11 * 60_000;
+    w.d.tick(w.now);
+    assert_eq!(w.d.term.kills, std::slice::from_ref(&before));
+    assert_ne!(w.terminal("owner"), before);
+    assert!(w.inbox_kinds().is_empty(), "a planned restart raises no alarm");
+    w.status("owner", "idle");
+    let digest = w.sends_to("owner").into_iter().find(|s| s.starts_with("<lila digest>")).expect("digest typed in");
+    assert!(digest.contains("- Q1 Which DB? → Postgres"), "{digest}");
+    assert!(digest.contains("- T1 from human → owner [in_progress] \"Ship login\"\n    T2 → engineer [delivered] Build login"), "{digest}");
+    let events = w.d.store.events("shop", None, 50).unwrap();
+    assert!(events.iter().any(|e| e.kind == "pm_refreshed" && e.detail.contains("150k")), "{events:?}");
+
+    // The new session is small: no second restart.
+    w.now += 30 * 60_000;
+    w.d.tick(w.now);
+    assert_eq!(w.d.term.kills.len(), 1);
 }

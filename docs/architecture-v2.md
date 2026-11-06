@@ -1,6 +1,6 @@
 # Lila 架构 v2：重新评估（草案）
 
-> 2026-11-06 · §9 的决定：全部按建议。阶段 A、B 已完成，见 §10、§11。参考资料是 README 末尾的四篇：
+> 2026-11-06 · §9 的决定：全部按建议。阶段 A、B、C 已完成，见 §10–§12。参考资料是 README 末尾的四篇：
 > ① Claude Code 文档《Subagents》；② Thariq Shihipar《A harness for every task: dynamic workflows in Claude Code》；
 > ③ DeepSeek Harness《Exploring Super-agent Design》；④ Addy Osmani《Critical thinking when agents do the work》。
 >
@@ -255,10 +255,17 @@ runs (project, anchor, flow, step, round,
 
 原计划里的 `chains` 表拆开了：原话和验收标准直接放在任务上，沿父子链往上找；流程的进度放在 `runs` 里。一条链上可以有多次运行，比如 PM 派一次返工，就会再走一遍流程。
 
+阶段 C 加的：
+
+```sql
+sessions       (project, id, member, runtime, file, started_ms)   -- Lila 启动的每个 CLI 会话
+session_chains (project, session, chain, last_ms)                 -- 哪个会话做过哪条链
+members.session                                                   -- 成员终端里正在跑的会话
+```
+
 后面阶段还要加的：
 
 ```sql
-sessions (project, member, chain, runtime, session_id, started_ms, last_ms, tokens)  -- C
 runs.budget, runs.worktree                                                           -- D、E
 -- inbox.kind 增加：review | budget | quota | runaway                                  -- D
 ```
@@ -304,7 +311,7 @@ runs.budget, runs.worktree                                                      
 |---|---|---|---|
 | **A** ✅ | 角色工具权限（`[tools]` → CLI 参数），收紧 PM；`--quote`、`--accept`、`--out-of-scope` 字段，投递时原样带上；done 加 `--decision`、`--unverified`；成员池寻址 | `config.rs`、`runtime.rs`、`prompt.rs`、`daemon.rs`、默认角色 | 低 |
 | **B** ✅ | 运行表、流程模板、`check` 由 lilad 运行、`--verdict` 和自动返工；删掉角色提示词里的流程说明 | 新的 `flow.rs`，`daemon.rs`，store | 中：要改写交接相关的测试 |
-| **C** | 会话账本（`--session-id`、resume），换链按上下文大小决定；PM 摘要换会话 | `daemon.rs`、`usage.rs`、`message.rs` | 中：需要真跑一次确认 resume |
+| **C** ✅ | 会话账本（`--session-id`、resume），换链按上下文大小决定；PM 摘要换会话 | `daemon.rs`、`usage.rs`、`message.rs` | 中：需要真跑一次确认 resume |
 | **D** | Watchdog 快路径（长时间工作、预算、额度、崩溃循环）；验收卡片；积压上限 | `dispatch.rs`、收件箱、窗口 | 低 |
 | **E** | 一条链一个 worktree，验收时合并 | 新的 `worktree.rs`，`check` 和成员启动时的 `cwd` | 中：要定合并方式 |
 | 以后 | `.lila/rules.md` 记规则、可选的模板（扇出、审阅、多方案比较）、外部事件 | | |
@@ -455,3 +462,61 @@ runs.budget, runs.worktree                                                      
 - 运行只记流程的名字。运行中途改了流程配置，步骤编号可能对不上，lilad 会在那一步停下并照常汇报。
 - 检查命令用的是 lilad 启动时的 PATH，不是角色里的 `env`。
 - 窗口里还看不到流程的进度（只有 `lila status`），要先在 HTML 原型里设计。
+
+---
+
+## 12. 阶段 C 完成记录（2026-11-06）
+
+**会话账本**（`lila-store` 的 `sessions`、`session_chains`；`crates/lila/src/sessions.rs`）
+- **Claude 成员**：启动时由 lilad 生成一个 UUID，用 `--session-id` 传进去，所以一开始就知道它的记录在 `~/.claude/projects/<目录>/<id>.jsonl`。
+- **Codex 成员**：会话 id 由 Codex 自己定。lilad 在 tick 里到 `~/.codex/sessions` 找：同一个工作目录，系统提示词里写着这个成员，而且是在它启动之后才出现的那个记录文件。只在成员启动后的半小时内找。
+- 每次给一个会话投递任务，都记下「这个会话做过这条链」。lilad 重启后，从数据库恢复每个成员当前的会话和上一条链（顺带修掉 `m3.md` 第 1 项「只记在内存里」的限制）。
+- **上下文大小**：读会话记录的最后 512KB，取最近一轮的输入。Claude 是 input、cache write、cache read 三项之和；Codex 是 `last_token_usage.input_tokens`。文件没变就不重读。
+
+**换链时怎么办**（`switch_plan`，前提是 `fresh_session` 开着，PM 除外）
+1. 这个成员以前有会话做过这条链，而且记录文件还在：**续接那个会话**（claude `--resume <id>`，codex `codex resume … <id>`）。返工回到写代码的那段上下文里。
+2. 否则，当前会话的上下文小于 `fresh_after_tokens`（默认 60k）：**沿用当前会话**，不重启。
+3. 否则，或者读不到上下文大小：**开新会话**（就是原来的做法）。
+- 动态里会分别记成 `resumed_session` 和 `fresh_session`。
+
+**PM 换会话，替代原计划的 `/compact`**
+- 换的条件（三个都要满足）：
+  - PM 的上下文 ≥ `pm_refresh_tokens`（默认 120k）；
+  - 已经空闲了 `pm_refresh_idle_minutes`（默认 10 分钟），因为你可能正在 PM 终端里打字；
+  - 没有等着发给它的消息。
+- 满足后，lilad 关掉 PM 的终端，开一个新会话，第一条消息是 `<lila digest>` 项目摘要。
+- 摘要由 lilad 从数据库直接生成，不经过模型总结，内容有：
+  - 你回答过的问题；
+  - 每个还没结束的根任务，以及它下面还没做完的任务和进行中的流程（当前步骤、第几轮返工）；
+  - 最近完成的 8 条；
+  - 收件箱里还有几条等你。
+  - 细节让 PM 用 `lila task show` 去查。
+- 你在窗口里手动重启 PM（`member.restart`）时，也会收到这份摘要。
+- 动态里记一条 `pm_refreshed`，比如「its context reached 150k tokens …」。
+- 代价：PM 终端的滚动历史会清空（你已经同意）。
+
+**新的 `[settings]`**：`fresh_after_tokens = 60000`（0 表示换链一律开新会话）、`pm_refresh_tokens = 120000`（0 表示不自动换）、`pm_refresh_idle_minutes = 10`。
+
+**真跑验证过一次**（Haiku，`-p`，临时目录）：
+- `--session-id` 指定的 id 就是记录文件名；
+- `--resume` 接着写同一个文件，从 31 行变成 44 行，模型也记得前面说过的话；
+- 读出最近一轮的上下文是 28.9k。
+- 一个空会话本身就有 2–3 万 token，所以 60k 的阈值大约相当于会话里实际的工作内容超过 3 万时才换。
+
+**验证**
+- 新增测试：
+  - `sessions` 4 个：UUID 格式、两种 CLI 的上下文、从文件末尾读、找 Codex 会话；
+  - `runtime` 1 个：新会话和续接时的参数；
+  - `store` 1 个：会话账本；
+  - `message` 1 个：摘要的格式；
+  - daemon 3 个：
+    - 换链时沿用、新开、续接三种情况，以及 lilad 重启后还记得；
+    - Codex 会话被认出来，并读出上下文；
+    - PM 上下文大时，等空闲够久才换，新会话收到含决定和进行中工作的摘要，之后不再重复换。
+- 工作区全部测试通过，Clippy 零警告。
+
+**已知限制**
+- 续接时，用的是成员当前的设置（模型、提示词）。如果中途改过设置，续接的会话会用上新的设置。
+- Codex 续接用的是 `codex resume <id>`，没有真跑验证过。Codex 这几天的周额度已经用完（会话记录里 `used_percent = 100`）。
+- 摘要里没有你在 PM 终端里说过、但还没变成任务的话。PM 的提示词已经要求它及时用 `--quote` 建任务。
+- 窗口里还没有「整理 PM 上下文」按钮，也没有显示每个成员的上下文大小，要先在 HTML 原型里设计。

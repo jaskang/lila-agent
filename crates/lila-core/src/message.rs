@@ -190,6 +190,35 @@ pub fn done_note(task: &Task, files: &[String], path: &[(&Task, Vec<String>)], w
     note(&task.id, &text)
 }
 
+/// What the PM gets first in a new session Lila started: its earlier conversation
+/// is gone, so this says what stands. `decided`: the person's answers; `open`:
+/// open work, a line each (sub-lines indented); `closed`: recently finished work;
+/// `waiting`: inbox items open.
+pub fn digest(decided: &[String], open: &[String], closed: &[String], waiting: usize) -> String {
+    let mut s = String::from(
+        "<lila digest>\nLila started you in a new session to keep your context small: your earlier conversation is not in it. This is where the project stands; `lila task show <id>` and `lila log` have the details.\n",
+    );
+    let section = |s: &mut String, head: &str, items: &[String]| {
+        if !items.is_empty() {
+            s.push_str(&format!("\n{head}\n"));
+            for i in items {
+                s.push_str(&format!("- {i}\n"));
+            }
+        }
+    };
+    section(&mut s, "The person decided:", decided);
+    section(&mut s, "Open work:", open);
+    section(&mut s, "Recently finished:", closed);
+    if open.is_empty() {
+        s.push_str("\nNothing is open.\n");
+    }
+    if waiting > 0 {
+        s.push_str(&format!("\n{waiting} item(s) wait for the person in the inbox.\n"));
+    }
+    s.push_str("Carry on from here; if the person asks about something earlier, look it up instead of guessing.\n</lila>");
+    s
+}
+
 pub fn blocked_note(task: &Task) -> String {
     note(&task.id, &format!("{} is blocked on {} \"{}\": {}", task.to, task.id, task.title, task.block_reason.as_deref().unwrap_or("(no reason)")))
 }
@@ -284,6 +313,16 @@ mod tests {
         assert!(v.starts_with("engineer finished T3 \"Add login\": done it\n  Decided: bcrypt cost 12\nFiles: src/login.rs\nLila ran `cargo test`: it passed."), "{v}");
         assert!(fix_from_check("cargo test", Some(101), "boom\n").contains("it exited with 101. The end of its output:\n\n```\nboom\n```"));
         assert!(fix_from_check("x", None, "").contains("did not finish"));
+    }
+
+    #[test]
+    fn a_digest_lists_what_stands() {
+        let d = digest(&["Q1 Which DB? → Postgres".into()], &["T1 from human → pm [in_progress] \"Ship\"\n    T2 → engineer [queued] Build".into()], &[], 2);
+        assert!(d.starts_with("<lila digest>\n") && d.ends_with("</lila>"));
+        assert!(d.contains("\nThe person decided:\n- Q1 Which DB? → Postgres\n"), "{d}");
+        assert!(d.contains("\nOpen work:\n- T1 from human → pm [in_progress] \"Ship\"\n    T2 → engineer [queued] Build\n"), "{d}");
+        assert!(d.contains("2 item(s) wait for the person"));
+        assert!(digest(&[], &[], &[], 0).contains("Nothing is open."));
     }
 
     #[test]

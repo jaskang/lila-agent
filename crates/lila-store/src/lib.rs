@@ -86,6 +86,22 @@ CREATE TABLE IF NOT EXISTS runs (
     updated_ms INTEGER NOT NULL,
     PRIMARY KEY (project, anchor)
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    project TEXT NOT NULL,
+    id TEXT NOT NULL,
+    member TEXT NOT NULL,
+    runtime TEXT NOT NULL,
+    file TEXT,
+    started_ms INTEGER NOT NULL,
+    PRIMARY KEY (project, id)
+);
+CREATE TABLE IF NOT EXISTS session_chains (
+    project TEXT NOT NULL,
+    session TEXT NOT NULL,
+    chain TEXT NOT NULL,
+    last_ms INTEGER NOT NULL,
+    PRIMARY KEY (project, session, chain)
+);
 "#;
 
 pub struct Store {
@@ -105,6 +121,19 @@ pub struct MemberRow {
     pub role: String,
     pub terminal: Option<String>,
     pub started_ms: Option<i64>,
+    /// The CLI session its terminal runs (`sessions`), when Lila knows it.
+    pub session: Option<String>,
+}
+
+/// A CLI session Lila started for a member.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRow {
+    pub id: String,
+    pub member: String,
+    pub runtime: String,
+    /// Where the CLI records it (for its context size).
+    pub file: Option<String>,
+    pub started_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +212,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("tasks", "run", "TEXT"),
     ("tasks", "run_step", "INTEGER"),
     ("tasks", "verdict", "TEXT"),
+    ("members", "session", "TEXT"),
 ];
 
 fn migrate(db: &Connection) -> Result<()> {
@@ -366,10 +396,73 @@ impl Store {
     }
 
     pub fn members(&self, project: &str) -> Result<Vec<MemberRow>> {
-        let mut st = self.db.prepare("SELECT id, role, terminal, started_ms FROM members WHERE project = ?1 ORDER BY rowid")?;
+        let mut st = self.db.prepare("SELECT id, role, terminal, started_ms, session FROM members WHERE project = ?1 ORDER BY rowid")?;
         Ok(st
-            .query_map([project], |r| Ok(MemberRow { id: r.get(0)?, role: r.get(1)?, terminal: r.get(2)?, started_ms: r.get(3)? }))?
+            .query_map([project], |r| Ok(MemberRow { id: r.get(0)?, role: r.get(1)?, terminal: r.get(2)?, started_ms: r.get(3)?, session: r.get(4)? }))?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ---------- sessions ----------
+
+    /// Records a session Lila started (or found) and makes it the member's current one.
+    pub fn add_session(&self, project: &str, s: &SessionRow) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO sessions (project, id, member, runtime, file, started_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (project, id) DO UPDATE SET file = COALESCE(?5, file)",
+            params![project, s.id, s.member, s.runtime, s.file, s.started_ms],
+        )?;
+        self.db.execute("UPDATE members SET session = ?3 WHERE project = ?1 AND id = ?2", params![project, s.member, s.id])?;
+        Ok(())
+    }
+
+    pub fn session(&self, project: &str, id: &str) -> Result<Option<SessionRow>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id, member, runtime, file, started_ms FROM sessions WHERE project = ?1 AND id = ?2",
+                params![project, id],
+                |r| Ok(SessionRow { id: r.get(0)?, member: r.get(1)?, runtime: r.get(2)?, file: r.get(3)?, started_ms: r.get(4)? }),
+            )
+            .optional()?)
+    }
+
+    /// `session` was given work from `chain`.
+    pub fn touch_chain(&self, project: &str, session: &str, chain: &str, now: i64) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO session_chains (project, session, chain, last_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (project, session, chain) DO UPDATE SET last_ms = ?4",
+            params![project, session, chain, now],
+        )?;
+        Ok(())
+    }
+
+    /// The chain `session` last had work from.
+    pub fn last_chain(&self, project: &str, session: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT chain FROM session_chains WHERE project = ?1 AND session = ?2 ORDER BY last_ms DESC, rowid DESC LIMIT 1",
+                params![project, session],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// `member`'s session that last worked on `chain`.
+    pub fn session_for_chain(&self, project: &str, member: &str, chain: &str) -> Result<Option<SessionRow>> {
+        let id: Option<String> = self
+            .db
+            .query_row(
+                "SELECT c.session FROM session_chains c JOIN sessions s ON s.project = c.project AND s.id = c.session
+                 WHERE c.project = ?1 AND s.member = ?2 AND c.chain = ?3 ORDER BY c.last_ms DESC, c.rowid DESC LIMIT 1",
+                params![project, member, chain],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => self.session(project, &id),
+            None => Ok(None),
+        }
     }
 
     pub fn remove_member(&self, project: &str, id: &str) -> Result<()> {
@@ -726,6 +819,28 @@ mod tests {
         assert!(run.state.is_open() && !RunState::Failed.is_open());
         assert_eq!(s.runs("shop").unwrap().len(), 1);
         assert!(s.run("shop", "T2").unwrap().is_none());
+    }
+
+    #[test]
+    fn the_session_ledger_knows_which_session_did_which_chain() {
+        let s = store();
+        s.set_member("shop", "engineer", "engineer", Some("t1"), Some(1)).unwrap();
+        let row = |id: &str| SessionRow { id: id.into(), member: "engineer".into(), runtime: "claude".into(), file: Some(format!("/c/{id}.jsonl")), started_ms: 1 };
+        s.add_session("shop", &row("s1")).unwrap();
+        assert_eq!(s.members("shop").unwrap()[0].session.as_deref(), Some("s1"));
+        s.touch_chain("shop", "s1", "T1", 10).unwrap();
+        s.touch_chain("shop", "s1", "T5", 20).unwrap();
+        assert_eq!(s.last_chain("shop", "s1").unwrap().as_deref(), Some("T5"));
+        s.add_session("shop", &row("s2")).unwrap();
+        s.touch_chain("shop", "s2", "T9", 30).unwrap();
+        s.touch_chain("shop", "s1", "T1", 40).unwrap();
+        assert_eq!(s.last_chain("shop", "s1").unwrap().as_deref(), Some("T1"), "touched again");
+        assert_eq!(s.session_for_chain("shop", "engineer", "T5").unwrap().unwrap().id, "s1");
+        assert_eq!(s.session_for_chain("shop", "engineer", "T9").unwrap().unwrap().file.as_deref(), Some("/c/s2.jsonl"));
+        assert!(s.session_for_chain("shop", "tester", "T9").unwrap().is_none());
+        // Found again (codex): the file fills in, nothing else changes.
+        s.add_session("shop", &SessionRow { file: None, ..row("s2") }).unwrap();
+        assert_eq!(s.session("shop", "s2").unwrap().unwrap().file.as_deref(), Some("/c/s2.jsonl"));
     }
 
     #[test]

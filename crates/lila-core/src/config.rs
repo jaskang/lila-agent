@@ -177,6 +177,14 @@ pub struct Settings {
     pub check: String,
     /// A check running longer than this fails.
     pub check_timeout_secs: u64,
+    /// With `fresh_session`: a member whose context is below this many tokens
+    /// keeps its session for work from another chain (0: always a new one).
+    pub fresh_after_tokens: u64,
+    /// The PM gets a new session, opened with a digest of the project, once its
+    /// context reaches this many tokens and it has been idle a while (0: never).
+    pub pm_refresh_tokens: u64,
+    /// How long the PM must have been idle first: the person may be typing to it.
+    pub pm_refresh_idle_minutes: u64,
 }
 
 impl Default for Settings {
@@ -191,6 +199,9 @@ impl Default for Settings {
             flow: "code".into(),
             check: String::new(),
             check_timeout_secs: 600,
+            fresh_after_tokens: 60_000,
+            pm_refresh_tokens: 120_000,
+            pm_refresh_idle_minutes: 10,
         }
     }
 }

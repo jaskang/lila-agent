@@ -10,12 +10,26 @@ pub struct Launch {
     pub argv: Vec<String>,
 }
 
-pub fn launch(role: &Role, prompt_path: &str, prompt_text: &str) -> Launch {
+/// Which conversation the CLI opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Session {
+    /// A new one; Claude Code takes the id Lila picked (Codex picks its own).
+    New(Option<String>),
+    /// An earlier one, by id: the member picks up where it left that work.
+    Resume(String),
+}
+
+pub fn launch(role: &Role, prompt_path: &str, prompt_text: &str, session: &Session) -> Launch {
     let f = &role.file;
     let mut argv: Vec<String> = Vec::new();
     match f.runtime {
         Runtime::Claude => {
             argv.extend(["claude".into(), "--model".into(), f.model.clone()]);
+            match session {
+                Session::New(Some(id)) => argv.extend(["--session-id".into(), id.clone()]),
+                Session::Resume(id) => argv.extend(["--resume".into(), id.clone()]),
+                Session::New(None) => {}
+            }
             if let Some(e) = &f.effort {
                 argv.extend(["--effort".into(), e.clone()]);
             }
@@ -33,7 +47,11 @@ pub fn launch(role: &Role, prompt_path: &str, prompt_text: &str) -> Launch {
             argv.extend(["--append-system-prompt-file".into(), prompt_path.into()]);
         }
         Runtime::Codex => {
-            argv.extend(["codex".into(), "--no-daemon".into(), "-m".into(), f.model.clone()]);
+            argv.push("codex".into());
+            if let Session::Resume(_) = session {
+                argv.push("resume".into());
+            }
+            argv.extend(["--no-daemon".into(), "-m".into(), f.model.clone()]);
             if let Some(e) = &f.effort {
                 argv.extend(["-c".into(), format!("model_reasoning_effort={}", toml_string(e))]);
             }
@@ -44,6 +62,9 @@ pub fn launch(role: &Role, prompt_path: &str, prompt_text: &str) -> Launch {
         }
     }
     argv.extend(f.extra_args.iter().cloned());
+    if let (Runtime::Codex, Session::Resume(id)) = (f.runtime, session) {
+        argv.push(id.clone());
+    }
     Launch { argv }
 }
 
@@ -78,13 +99,13 @@ mod tests {
 
     #[test]
     fn claude() {
-        let l = launch(&role(Runtime::Claude, Some("high")), "/p.md", "ignored");
+        let l = launch(&role(Runtime::Claude, Some("high")), "/p.md", "ignored", &Session::New(None));
         assert_eq!(l.argv, ["claude", "--model", "the-model", "--effort", "high", "--append-system-prompt-file", "/p.md", "--foo"]);
     }
 
     #[test]
     fn codex_quotes_prompt_as_toml() {
-        let l = launch(&role(Runtime::Codex, Some("high")), "/p.md", "Say \"hi\"\nline2 \\ end");
+        let l = launch(&role(Runtime::Codex, Some("high")), "/p.md", "Say \"hi\"\nline2 \\ end", &Session::New(None));
         assert_eq!(l.argv[..4], ["codex", "--no-daemon", "-m", "the-model"]);
         assert_eq!(l.argv[5], "model_reasoning_effort=\"high\"");
         let value = l.argv[7].strip_prefix("developer_instructions=").unwrap();
@@ -100,7 +121,7 @@ mod tests {
         r.file.tools.allow = vec!["Bash(lila:*)".into(), "Bash(git log:*)".into()];
         r.file.tools.deny = vec!["Edit".into()];
         r.file.tools.sandbox = Some("read-only".into());
-        let l = launch(&r, "/p.md", "");
+        let l = launch(&r, "/p.md", "", &Session::New(None));
         assert_eq!(
             l.argv,
             [
@@ -110,13 +131,28 @@ mod tests {
             "the sandbox is codex's"
         );
         r.file.runtime = Runtime::Codex;
-        let l = launch(&r, "/p.md", "");
+        let l = launch(&r, "/p.md", "", &Session::New(None));
         assert_eq!(l.argv[4..6], ["--sandbox", "read-only"]);
         assert!(!l.argv.iter().any(|a| a == "--tools"), "claude's lists are not codex flags");
     }
 
     #[test]
+    fn sessions_are_new_with_an_id_or_resumed() {
+        let r = role(Runtime::Claude, None);
+        let l = launch(&r, "/p", "", &Session::New(Some("abc".into())));
+        assert_eq!(l.argv[3..5], ["--session-id", "abc"]);
+        let l = launch(&r, "/p", "", &Session::Resume("abc".into()));
+        assert_eq!(l.argv[3..5], ["--resume", "abc"]);
+        let c = role(Runtime::Codex, None);
+        let l = launch(&c, "/p", "x", &Session::New(Some("ignored".into())));
+        assert!(!l.argv.contains(&"ignored".to_string()), "codex picks its own id");
+        let l = launch(&c, "/p", "x", &Session::Resume("r1".into()));
+        assert_eq!(l.argv[..3], ["codex", "resume", "--no-daemon"]);
+        assert_eq!(l.argv.last().unwrap(), "r1", "the session id comes last");
+    }
+
+    #[test]
     fn effort_is_optional() {
-        assert!(!launch(&role(Runtime::Claude, None), "/p", "").argv.contains(&"--effort".to_string()));
+        assert!(!launch(&role(Runtime::Claude, None), "/p", "", &Session::New(None)).argv.contains(&"--effort".to_string()));
     }
 }
