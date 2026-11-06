@@ -17,7 +17,8 @@ pub struct Draft {
     pub to: Option<String>,
     pub title: Entity<InputState>,
     pub body: Entity<TextareaState>,
-    pub parent: Entity<InputState>,
+    /// The task this one is a subtask of.
+    pub parent: Option<String>,
     pub error: Option<String>,
 }
 
@@ -28,24 +29,13 @@ pub struct Rewrite {
     pub body: Entity<TextareaState>,
 }
 
-fn field(title: &str, cx: &App) -> Div {
-    v_flex().gap_1().child(div().text_xs().font_semibold().text_color(cx.theme().muted_foreground).child(title.to_owned()))
-}
-
 impl LilaApp {
     /// Opens the new-task form, for `to` if given (else the owner).
     pub fn compose(&mut self, to: Option<String>, parent: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.close_task(cx);
         let to = to.or_else(|| self.members().iter().find(|m| m["owner"] == true).map(|m| s(m, "id")));
-        let title = cx.new(|cx| InputState::new(window, cx).placeholder("一句话说清要做什么"));
-        let body = cx.new(|cx| TextareaState::new(window, cx).rows(8).placeholder("细节、验收标准、相关文件……（支持 Markdown）"));
-        let parent = cx.new(|cx| {
-            let p = InputState::new(window, cx).placeholder("可选，例如 T12");
-            match &parent {
-                Some(v) => p.default_value(v.clone()),
-                None => p,
-            }
-        });
+        let title = cx.new(|cx| InputState::new(window, cx).placeholder("标题"));
+        let body = cx.new(|cx| TextareaState::new(window, cx).rows(12).placeholder("说明"));
         title.update(cx, |t, cx| t.focus(window, cx));
         self.draft = Some(Draft { to, title, body, parent, error: None });
         cx.notify();
@@ -62,8 +52,7 @@ impl LilaApp {
             return;
         }
         let body = d.body.read(cx).value().to_string();
-        let parent = d.parent.read(cx).value().trim().to_owned();
-        let params = json!({"to": to, "title": title, "body": body, "parent": (!parent.is_empty()).then_some(parent)});
+        let params = json!({"to": to, "title": title, "body": body, "parent": d.parent});
         self.request("task.new", params, cx, |this, v, cx| {
             this.draft = None;
             this.show_task(s(&v, "id"), cx);
@@ -99,8 +88,8 @@ impl LilaApp {
         Some(
             v_flex()
                 .gap_2()
-                .child(field("标题", cx).child(Input::new(&title).control()))
-                .child(field("说明", cx).child(Textarea::new(&body).area()))
+                .child(Input::new(&title).control())
+                .child(Textarea::new(&body).area())
                 .child(
                     h_flex()
                         .gap_2()
@@ -119,17 +108,6 @@ impl LilaApp {
         let d = self.draft.as_ref()?;
         let (to, title, body, parent, error) = (d.to.clone(), d.title.clone(), d.body.clone(), d.parent.clone(), d.error.clone());
         let members = self.members();
-        let chosen = members.iter().find(|m| Some(s(m, "id")) == to).cloned();
-        let hint = chosen.as_ref().map(|m| {
-            let status = s(m, "status");
-            let busy = m["task"].is_object();
-            match (status.as_str(), busy) {
-                ("gone", _) => "这个成员没有在运行：任务会排队，等团队启动后再送达。".to_owned(),
-                (_, true) => format!("{} 手上有任务，这个会排在后面。", s(m, "id")),
-                ("idle" | "done", false) => format!("{} 现在空闲，会马上收到。", s(m, "id")),
-                _ => format!("{} 空下来就会收到。", s(m, "id")),
-            }
-        });
         Some(
             v_flex()
                 .id("compose")
@@ -144,8 +122,10 @@ impl LilaApp {
                         .flex_none()
                         .border_b_1()
                         .border_color(crate::style::divider())
-                        .child(div().font_semibold().child("新建任务"))
-                        .when_some(self.draft.as_ref().map(|d| d.parent.read(cx).value().to_string()).filter(|p| !p.trim().is_empty()), |d, p| d.child(div().text_xs().text_color(theme.muted_foreground).child(format!("· 父任务 {p}"))))
+                        .child(div().font_semibold().child(match &parent {
+                            Some(p) => format!("{p} 的子任务"),
+                            None => "新建任务".into(),
+                        }))
                         .child(div().flex_1())
                         .child(Button::new("compose-close").ghost().xsmall().icon(gpui::component::IconName::Close).tooltip("关闭 (Esc)").on_click(cx.listener(|this, _, _, cx| {
                             this.draft = None;
@@ -160,11 +140,9 @@ impl LilaApp {
                         .px_5()
                         .pt_5()
                         .pb_6()
-                        .gap_5()
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(
-                            "通常把需求交给 PM，由它拆分和分派；也可以直接派给某个成员。任务以你（human）的名义发出，完成后会出现在收件箱。",
-                        ))
-                        .child(field("派给", cx).child(h_flex().gap_1().flex_wrap().children(members.iter().map(|m| {
+                        .gap_4()
+                        // Who gets it: the PM by default, which splits and hands out the work.
+                        .child(h_flex().gap_1().flex_wrap().children(members.iter().map(|m| {
                             let id = s(m, "id");
                             let active = to.as_deref() == Some(id.as_str());
                             let pick = id.clone();
@@ -181,11 +159,9 @@ impl LilaApp {
                                     }
                                     cx.notify();
                                 }))
-                        }))))
-                        .when_some(hint, |d, h| d.child(div().text_xs().text_color(theme.muted_foreground).child(h)))
-                        .child(field("标题", cx).child(Input::new(&title).control()))
-                        .child(field("说明", cx).child(Textarea::new(&body).area()))
-                        .child(field("父任务", cx).child(Input::new(&parent).control()))
+                        })))
+                        .child(Input::new(&title).control())
+                        .child(Textarea::new(&body).area())
                         .when_some(error, |d, e| d.child(div().px_3().py(px(10.)).rounded(px(8.)).bg(theme.red.opacity(0.12)).text_size(px(13.)).child(e))),
                 )
                 .child(

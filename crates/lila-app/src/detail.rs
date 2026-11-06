@@ -118,16 +118,12 @@ fn flow_block(f: &Value) -> Div {
     let head = h_flex()
         .gap(px(6.))
         .child(div().text_xs().font_semibold().text_color(muted()).child("流程"))
-        .child(div().text_xs().text_color(muted2()).child(if round > 0 {
-            format!("{} · 已返工 {round} 次，最多 {} 次", s(f, "flow"), f["max_rounds"].as_u64().unwrap_or(0))
-        } else {
-            s(f, "flow")
-        }));
+        .when(round > 0, |d| d.child(div().text_xs().text_color(muted2()).child(format!("返工 {round}/{}", f["max_rounds"].as_u64().unwrap_or(0)))));
     let check = f["last_check"].as_object().map(|c| {
         let detail = c.get("detail").and_then(Value::as_str).unwrap_or_default();
         let at = data::clock(c.get("at_ms").and_then(Value::as_i64).unwrap_or(0));
         let cmd = f["check"].as_str().unwrap_or_default();
-        if detail == "passed" { format!("上一次检查 `{cmd}` 通过了（{at}）") } else { format!("上一次检查 `{cmd}` 没通过（{at}）：{detail}") }
+        if detail == "passed" { format!("{at} `{cmd}` 通过") } else { format!("{at} `{cmd}` 没通过：{detail}") }
     });
     v_flex().gap_2().child(head).child(chips).when_some(check, |d, c| d.child(div().text_xs().text_color(muted()).child(c)))
 }
@@ -149,13 +145,10 @@ impl LilaApp {
             .flex_wrap()
             .text_xs()
             .text_color(muted())
-            .child(div().text_color(theme.muted_foreground).child(format!("{} →", s(&t, "from"))))
             .child(dot(status_color(&to_status, cx)))
             .child(div().text_color(style::fg()).child(to.clone()))
-            .when_some(t["parent"].as_str().map(String::from), |d, p| {
-                d.child(div().text_color(theme.muted_foreground).child("· 父任务")).child(task_link(&p, "parent", cx))
-            })
-            .child(div().text_color(theme.muted_foreground).child(format!("· 创建 {} · 更新 {}", data::clock(t["created_ms"].as_i64().unwrap_or(0)), data::clock(t["updated_ms"].as_i64().unwrap_or(0)))));
+            .child(div().text_color(theme.muted_foreground).child(data::clock(t["updated_ms"].as_i64().unwrap_or(0))))
+            .when_some(t["parent"].as_str().map(String::from), |d, p| d.child(div().text_color(theme.muted_foreground).child("·")).child(task_link(&p, "parent", cx)));
 
         let file = s(&t, "file");
         let actions = h_flex()
@@ -163,14 +156,14 @@ impl LilaApp {
             .flex_wrap()
             .child({
                 let m = to.clone();
-                Button::new("detail-terminal").small().small_button().outline().icon(IconName::SquareTerminal).label(format!("打开 {to} 的终端")).on_click(cx.listener(move |this, _, _, cx| {
+                Button::new("detail-terminal").small().small_button().outline().icon(IconName::SquareTerminal).label("打开终端").on_click(cx.listener(move |this, _, _, cx| {
                     this.member = Some(m.clone());
                     cx.notify();
                 }))
             })
             .when(!file.is_empty(), |d| {
                 let (cwd, file) = (cwd.clone(), file.clone());
-                d.child(Button::new("detail-file").small().small_button().ghost().icon(IconName::File).label("打开任务文件").on_click(move |_, _, _| data::open_path(&cwd, &file)))
+                d.child(Button::new("detail-file").small().small_button().ghost().icon(IconName::File).label("任务文件").on_click(move |_, _, _| data::open_path(&cwd, &file)))
             })
             .when(state == "queued" && self.rewrite.is_none(), |d| {
                 let task = t.clone();
@@ -221,7 +214,7 @@ impl LilaApp {
         let events: Vec<Value> = t["events"].as_array().cloned().unwrap_or_default();
 
         let rewrite = self.rewrite_form(&id, cx);
-        let append_hint = if state == "queued" { "还在排队：追加的内容会直接写进任务，送达时一起发出。".to_owned() } else { format!("已经送达：追加的内容会作为更新发给 {to}。") };
+        let rewriting = rewrite.is_some();
 
         crate::ui::drawer_frame(v_flex(), 600.)
             .id("task-detail")
@@ -254,26 +247,21 @@ impl LilaApp {
                     .when_some(outcome, |d, (accent, text)| {
                         d.child(div().px_3().py(px(10.)).rounded(px(8.)).bg(accent.opacity(0.12)).text_color(style::tint(accent, 0.4)).text_size(px(13.)).child(text))
                     })
-                    .when(!decisions.is_empty(), |d| d.child(block("替你做的决定", cx).child(bullets(&decisions, style::fg()))))
+                    .when(!decisions.is_empty(), |d| d.child(block("决定", cx).child(bullets(&decisions, style::fg()))))
                     .when(!unverified.is_empty(), |d| {
-                        d.child(v_flex().gap_2().child(div().text_xs().font_semibold().text_color(style::yellow()).child("没有验到的")).child(bullets(&unverified, style::fg())))
+                        d.child(v_flex().gap_2().child(div().text_xs().font_semibold().text_color(style::yellow()).child("未验证")).child(bullets(&unverified, style::fg())))
                     })
                     .when(t["flow"].is_object(), |d| d.child(flow_block(&t["flow"])))
                     .when_some(quote, |d, q| {
-                        let head = h_flex().gap(px(6.)).text_xs().child(div().font_semibold().text_color(muted()).child("你的原话")).when_some(quote_from, |h, from| {
+                        let head = h_flex().gap(px(6.)).text_xs().child(div().font_semibold().text_color(muted()).child("原话")).when_some(quote_from, |h, from| {
                             h.child(div().text_color(muted2()).child("来自")).child(task_link(&from, "quote", cx))
                         });
                         d.child(v_flex().gap_2().child(head).child(div().border_l_2().border_color(style::blue()).pl_3().py(px(2.)).text_size(px(13.)).line_height(relative(1.6)).child(q)))
                     })
-                    .when(!accept.is_empty(), |d| d.child(block("怎样算完成", cx).child(bullets(&accept, style::fg()))))
+                    .when(!accept.is_empty(), |d| d.child(block("验收标准", cx).child(bullets(&accept, style::fg()))))
                     .when(!out_of_scope.is_empty(), |d| d.child(block("不做", cx).child(bullets(&out_of_scope, muted()))))
-                    .child(block("说明", cx).child(if let Some(form) = rewrite {
-                        form
-                    } else if body.trim().is_empty() {
-                        div().text_size(px(13.)).text_color(muted()).child("（没有正文）").into_any_element()
-                    } else {
-                        div().text_size(px(13.)).child(TextView::markdown(SharedString::from(format!("body-{id}")), body.clone())).into_any_element()
-                    }))
+                    .when_some(rewrite, |d, form| d.child(form))
+                    .when(!rewriting && !body.trim().is_empty(), |d| d.child(div().text_size(px(13.)).child(TextView::markdown(SharedString::from(format!("body-{id}")), body.clone()))))
                     .when(!artifacts.is_empty(), |d| {
                         d.child(block("交付文件", cx).children(artifacts.into_iter().enumerate().map(|(n, a)| {
                             let (cwd, path) = (cwd.clone(), a.clone());
@@ -288,7 +276,7 @@ impl LilaApp {
                         })))
                     })
                     .when(!children.is_empty(), |d| {
-                        d.child(block("交出去的子任务", cx).children(children.into_iter().map(|c| {
+                        d.child(block("子任务", cx).children(children.into_iter().map(|c| {
                             let st = s(&c, "state");
                             let cid = s(&c, "id");
                             let open = cid.clone();
@@ -307,7 +295,7 @@ impl LilaApp {
                                 .on_click(cx.listener(move |this, _, window, cx| this.open_task(open.clone(), window, cx)))
                         })))
                     })
-                    .child(block("经过", cx).child({
+                    .when(!events.is_empty(), |d| d.child(block("经过", cx).child({
                         // A thin line down the left, a dot per event; the latest one is blue.
                         let n = events.len();
                         v_flex().ml_1().pl_4().gap(px(10.)).border_l_1().border_color(gpui::Hsla::from(rgba(0xffffff1a))).children(events.into_iter().enumerate().map(move |(i, e)| {
@@ -322,13 +310,12 @@ impl LilaApp {
                                 .child(div().flex_none().child(format!("{} {}", s(&e, "actor"), event_label(&s(&e, "kind")))))
                                 .when(!detail.is_empty(), |d| d.child(div().flex_1().min_w_0().text_color(muted2()).child(detail)))
                         }))
-                    }))
+                    })))
                     .when(open, |d| {
                         let tid = id.clone();
                         let field = input.clone();
                         d.child(
-                            block("追加说明", cx)
-                                .child(div().text_xs().text_color(muted()).child(append_hint))
+                            v_flex()
                                 .child(
                                     h_flex().gap(px(6.)).child(div().flex_1().child(Input::new(&input).control())).child(Button::new("detail-append").primary().label("追加").on_click(cx.listener(
                                         move |this, _, window, cx| {

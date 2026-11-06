@@ -21,11 +21,9 @@ pub struct LilaApp {
     /// holds focus itself, or ⌘, and the other shortcuts would go nowhere.
     focus: FocusHandle,
     pub snap: Snapshot,
-    /// The project shown: one of `tabs`, or none.
+    /// The project shown, or none.
     pub selected: Option<String>,
-    /// The projects open as tabs, in order.
-    pub tabs: Vec<String>,
-    /// The saved tabs were restored (after the first snapshot).
+    /// The project shown last time was restored (after the first snapshot).
     restored: bool,
     /// Projects whose missing config the window has written again (once each).
     restoring: std::collections::HashSet<String>,
@@ -136,7 +134,7 @@ impl LilaApp {
             });
         })
         .detach();
-        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
+        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
         app.start_usage(window, cx);
         app
     }
@@ -168,27 +166,29 @@ impl LilaApp {
             }
             snap
         };
-        // First look: the tabs open last time (else the first project).
+        // A database that couldn't be read says nothing new: keep what is shown.
+        if snap.projects_unknown {
+            self.snap.error = snap.error;
+            cx.notify();
+            return;
+        }
+        let mut snap = snap;
+        // First look: the project shown last time (else the first one).
         if !self.restored {
             self.restored = true;
-            let saved = data::load_tabs(&self.paths);
             let known = |id: &String| snap.projects.iter().any(|p| &p.id == id);
-            self.tabs = match &saved {
-                Some(t) => t.open.iter().filter(|id| known(id)).cloned().collect(),
-                None => snap.projects.first().map(|p| vec![p.id.clone()]).unwrap_or_default(),
-            };
-            let pick = saved.and_then(|t| t.selected).filter(|id| self.tabs.contains(id)).or_else(|| self.tabs.first().cloned());
+            let pick = data::load_last(&self.paths).filter(known).or_else(|| snap.projects.first().map(|p| p.id.clone()));
             self.snap.projects = snap.projects.clone();
             if let Some(id) = pick {
                 self.select_project(id, cx);
                 return;
             }
         }
-        // A project that went away closes its tab.
-        let before = self.tabs.len();
-        self.tabs.retain(|id| snap.projects.iter().any(|p| &p.id == id));
-        if self.tabs.len() != before {
-            self.save_tabs();
+        // The shown project went away: show the first one left, or none.
+        if let Some(id) = self.selected.clone()
+            && !snap.projects.iter().any(|p| p.id == id)
+        {
+            self.forget_project(&id, cx);
         }
         if let Some(id) = &snap.project {
             self.cache.insert(id.clone(), Snapshot { detail: None, ..snap.clone() });
@@ -205,7 +205,6 @@ impl LilaApp {
             self.right_open = true;
         }
         // A detail fetched for another task (the panel moved on meanwhile) is dropped.
-        let mut snap = snap;
         if snap.detail.as_ref().and_then(|d| d["id"].as_str()) != self.task.as_deref() {
             snap.detail = self.snap.detail.take().filter(|d| d["id"].as_str() == self.task.as_deref());
         }
@@ -221,36 +220,24 @@ impl LilaApp {
         let _ = self.kick.try_send(());
     }
 
-    fn save_tabs(&self) {
-        data::save_tabs(&self.paths, &data::Tabs { open: self.tabs.clone(), selected: self.selected.clone() });
-    }
-
-    /// Opens a project from the sidebar: its tab (added after the others) comes forward.
-    pub fn open_project(&mut self, id: String, cx: &mut Context<Self>) {
-        if !self.tabs.contains(&id) {
-            self.tabs.push(id.clone());
+    /// The project `id` is gone from the list: shows the first one left, or none.
+    pub fn forget_project(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.cache.remove(id);
+        if self.selected.as_deref() != Some(id) {
+            return;
         }
-        self.select_project(id, cx);
-    }
-
-    /// Closes a project's tab (its team keeps running). The tab beside it comes forward.
-    pub fn close_tab(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(ix) = self.tabs.iter().position(|t| t == id) else { return };
-        self.tabs.remove(ix);
-        if self.selected.as_deref() == Some(id) {
-            match self.tabs.get(ix).or(self.tabs.last()).cloned() {
-                Some(next) => self.select_project(next, cx),
-                None => {
-                    self.member = None;
-                    self.close_task(cx);
-                    self.draft = None;
-                    self.settings = None;
-                    self.selected = None;
-                    self.snap = Snapshot { daemon: self.snap.daemon, projects: std::mem::take(&mut self.snap.projects), ..Default::default() };
-                }
+        match self.snap.projects.iter().find(|p| p.id != id).map(|p| p.id.clone()) {
+            Some(next) => self.select_project(next, cx),
+            None => {
+                self.member = None;
+                self.close_task(cx);
+                self.draft = None;
+                self.settings = None;
+                self.selected = None;
+                self.snap = Snapshot { daemon: self.snap.daemon, projects: std::mem::take(&mut self.snap.projects), ..Default::default() };
+                data::save_last(&self.paths, None);
             }
         }
-        self.save_tabs();
         cx.notify();
     }
 
@@ -282,9 +269,6 @@ impl LilaApp {
 
     /// Shows another project: its last snapshot at once, then fresh data.
     pub fn select_project(&mut self, id: String, cx: &mut Context<Self>) {
-        if !self.tabs.contains(&id) {
-            self.tabs.push(id.clone());
-        }
         if self.selected.as_deref() == Some(&id) {
             self.refresh_now();
             return;
@@ -295,8 +279,8 @@ impl LilaApp {
         self.draft = None;
         let cached = self.cache.get(&id).cloned().unwrap_or_else(|| Snapshot { project: Some(id.clone()), ..Default::default() });
         self.snap = Snapshot { daemon: self.snap.daemon, projects: std::mem::take(&mut self.snap.projects), ..cached };
+        data::save_last(&self.paths, Some(&id));
         self.selected = Some(id);
-        self.save_tabs();
         self.refresh_now();
         self.usage.refresh();
         cx.notify();
@@ -317,6 +301,12 @@ impl LilaApp {
             None
         };
         (status, snap.inbox.len())
+    }
+
+    /// Whether dispatch is paused in project `id`, as last fetched.
+    pub fn paused_of(&self, id: &str) -> bool {
+        let snap = if self.snap.project.as_deref() == Some(id) { Some(&self.snap) } else { self.cache.get(id) };
+        snap.and_then(|s| s.status.as_ref()).is_some_and(|s| s["paused"] == true)
     }
 
     pub fn paths(&self) -> &Paths {
@@ -357,7 +347,7 @@ impl LilaApp {
         .detach();
     }
 
-    /// Removes `p` from Lila (after the person confirmed): its tab closes, its folder stays.
+    /// Removes `p` from Lila (after the person confirmed); its folder stays.
     pub fn remove_project(&mut self, p: data::Project, cx: &mut Context<Self>) {
         let paths = self.paths.clone();
         self.removing = None;
@@ -367,7 +357,7 @@ impl LilaApp {
             let r = cx.background_executor().spawn(async move { data::remove_project(&paths, &p) }).await;
             let _ = this.update(cx, |this, cx| {
                 match r {
-                    Ok(()) => this.close_tab(&id, cx),
+                    Ok(()) => this.forget_project(&id, cx),
                     Err(e) => this.notice = Some(format!("移除失败：{e:#}")),
                 }
                 this.refresh_now();
@@ -437,7 +427,7 @@ impl LilaApp {
     }
 
     pub fn append_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
-        self.append.get_or_insert_with(|| cx.new(|cx| InputState::new(window, cx).placeholder("补充要求或修正…"))).clone()
+        self.append.get_or_insert_with(|| cx.new(|cx| InputState::new(window, cx).placeholder("追加…"))).clone()
     }
 
     pub fn answer(&mut self, id: String, text: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
@@ -508,7 +498,7 @@ impl Render for LilaApp {
                                             gpui::base::h_resizable("work")
                                                 .with_handle_appearance(gutter(0.))
                                                 .child(resizable_panel().child(self.center(window, cx).into_any_element()))
-                                                .child(resizable_panel().visible(self.right_open).size(px(360.)).size_range(px(300.)..px(640.)).fixed().child(self.right(window, cx).into_any_element())),
+                                                .child(resizable_panel().visible(self.right_open && self.selected.is_some()).size(px(360.)).size_range(px(300.)..px(640.)).fixed().child(self.right(window, cx).into_any_element())),
                                         ),
                                     )
                                     .into_any_element(),
@@ -585,7 +575,7 @@ impl LilaApp {
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {
                 let n = (d.as_bytes()[0] - b'1') as usize;
                 if let Some(id) = self.snap.projects.get(n).map(|p| p.id.clone()) {
-                    self.open_project(id, cx);
+                    self.select_project(id, cx);
                 }
             }
             _ => return,

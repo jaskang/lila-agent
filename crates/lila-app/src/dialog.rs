@@ -22,27 +22,21 @@ pub struct Nav {
     pub icon: IconName,
     pub label: &'static str,
     pub active: bool,
-    pub badge: Option<String>,
 }
 
 pub struct Shell {
     pub id: &'static str,
-    /// Over the navigation: what the dialog is about.
-    pub heading: AnyElement,
     pub nav: Vec<(Nav, Act)>,
     pub title: String,
-    pub description: String,
     /// The page; it scrolls itself (see [`scroll`]) so a page can split.
     pub body: AnyElement,
     /// Left of the buttons: what saving will do, or an error.
     pub note: Option<AnyElement>,
     pub saving: bool,
-    /// The main button: "保存" in settings, "下一步" or "创建并启动" in the wizard.
+    /// The main button: "保存" in settings, "创建" in the new-project dialog.
     pub save_label: &'static str,
     /// Off: the main button can't be pressed yet.
     pub can_save: bool,
-    /// A "上一步" button left of cancel.
-    pub back: Option<Act>,
     pub on_save: Act,
     pub on_close: Act,
     /// Off: no button row (a page whose actions take effect at once).
@@ -152,7 +146,7 @@ impl LilaApp {
 
     pub fn dialog(&mut self, shell: Shell, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
-        let Shell { id, heading, nav, title, description, body, note, saving, save_label, can_save, back, on_save, on_close, footer } = shell;
+        let Shell { id, nav, title, body, note, saving, save_label, can_save, on_save, on_close, footer } = shell;
         let on_close: std::rc::Rc<Act> = std::rc::Rc::new(on_close);
         let (close_x, close_cancel) = (on_close.clone(), on_close);
         let offset = self.dialog_offset;
@@ -172,7 +166,6 @@ impl LilaApp {
                     .when(!n.active, |d| d.text_color(style::fg()).hover(|d| d.bg(style::hover())))
                     .child(Icon::new(n.icon).small().text_color(if n.active { style::fg() } else { style::muted() }))
                     .child(div().flex_1().child(n.label))
-                    .when_some(n.badge, |d, b| d.child(div().text_xs().text_color(style::muted()).child(b)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         f(this, cx);
                         cx.notify();
@@ -221,7 +214,7 @@ impl LilaApp {
                     .text_color(t.popover_foreground)
                     .shadow(shadows)
                     .occlude()
-                    .child(
+                    .when(!nav_items.is_empty(), |d| d.child(
                         v_flex()
                             .w(px(210.))
                             .flex_none()
@@ -233,9 +226,9 @@ impl LilaApp {
                             .px(px(10.))
                             .py(px(22.))
                             .gap(px(2.))
-                            .child(div().id(SharedString::from(format!("{id}-grip-nav"))).px_2().pt_1().pb_3().on_mouse_down(MouseButton::Left, cx.listener(|this, ev, _, _| this.drag_dialog(ev))).child(heading))
+                            .child(div().id(SharedString::from(format!("{id}-grip-nav"))).h(px(24.)).flex_none().on_mouse_down(MouseButton::Left, cx.listener(|this, ev, _, _| this.drag_dialog(ev))))
                             .children(nav_items),
-                    )
+                    ))
                     .child(
                         v_flex()
                             .flex_1()
@@ -253,8 +246,7 @@ impl LilaApp {
                                     .border_b_1()
                                     .border_color(style::divider())
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, _, _| this.drag_dialog(ev)))
-                                    .child(div().text_size(px(17.)).font_semibold().child(title))
-                                    .when(!description.is_empty(), |d| d.child(div().text_xs().text_color(style::muted()).child(description))),
+                                    .child(div().text_size(px(17.)).font_semibold().child(title)),
                             )
                             .child(v_flex().flex_1().min_h_0().child(body))
                             .children(footer.then(|| {
@@ -266,12 +258,6 @@ impl LilaApp {
                                     .border_t_1()
                                     .border_color(style::divider())
                                     .child(div().flex_1().min_w_0().text_xs().children(note))
-                                    .when_some(back, |d, back| {
-                                        d.child(Button::new(SharedString::from(format!("{id}-back"))).outline().label("上一步").disabled(saving).on_click(cx.listener(move |this, _, _, cx| {
-                                            back(this, cx);
-                                            cx.notify();
-                                        })))
-                                    })
                                     .child(Button::new(SharedString::from(format!("{id}-cancel"))).ghost().label("取消").on_click(cx.listener(move |this, _, _, cx| {
                                         close_cancel(this, cx);
                                         cx.notify();

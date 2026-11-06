@@ -7,8 +7,6 @@ use serde_json::{Value, json};
 pub struct Project {
     pub id: String,
     pub cwd: String,
-    /// The checked-out git branch, if the folder is a repository.
-    pub branch: Option<String>,
     /// `title` in project.toml: what the window calls it.
     pub title: Option<String>,
     /// Its `.lila/project.toml` is gone: registered, but lilad can't load it.
@@ -26,16 +24,6 @@ fn title(cwd: &str) -> Option<String> {
     lila_core::ProjectConfig::parse(&text).ok()?.title.filter(|t| !t.trim().is_empty())
 }
 
-/// The branch `.git/HEAD` points at (a short commit id when detached).
-fn git_branch(cwd: &str) -> Option<String> {
-    let head = std::fs::read_to_string(std::path::Path::new(cwd).join(".git").join("HEAD")).ok()?;
-    let head = head.trim();
-    Some(match head.strip_prefix("ref: refs/heads/") {
-        Some(b) => b.to_owned(),
-        None => head.chars().take(7).collect(),
-    })
-}
-
 /// `/Users/me/x` as `~/x`.
 pub fn tilde(path: &str) -> String {
     match std::env::var("HOME") {
@@ -50,11 +38,12 @@ pub struct Snapshot {
     /// The project the rest was fetched for.
     pub project: Option<String>,
     pub projects: Vec<Project>,
+    /// The database couldn't be read: `projects` is empty, not known.
+    pub projects_unknown: bool,
     /// `status` of the selected project: members, open tasks, inbox count.
     pub status: Option<Value>,
     pub tasks: Vec<Value>,
     pub inbox: Vec<Value>,
-    pub log: Vec<Value>,
     /// `task.show` of the open task: body, children, events, files.
     pub detail: Option<Value>,
     pub error: Option<String>,
@@ -65,13 +54,21 @@ pub fn caller(p: &Project) -> Value {
     json!({"cwd": p.cwd, "project": p.id, "member": null})
 }
 
-fn projects_from_db(paths: &Paths) -> Vec<Project> {
-    let Ok(store) = lila_store::Store::open(&paths.db()) else { return Vec::new() };
-    store.projects().unwrap_or_default().into_iter().map(|p| Project { branch: git_branch(&p.cwd), title: title(&p.cwd), missing: !std::path::Path::new(&p.cwd).join(".lila/project.toml").exists(), id: p.id, cwd: p.cwd }).collect()
+fn projects_from_db(paths: &Paths) -> anyhow::Result<Vec<Project>> {
+    let store = lila_store::Store::open(&paths.db())?;
+    Ok(store.projects()?.into_iter().map(|p| Project { title: title(&p.cwd), missing: !std::path::Path::new(&p.cwd).join(".lila/project.toml").exists(), id: p.id, cwd: p.cwd }).collect())
 }
 
 pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>) -> Snapshot {
-    let mut snap = Snapshot { daemon: lila::client::is_running(paths), projects: projects_from_db(paths), ..Default::default() };
+    let mut snap = Snapshot { daemon: lila::client::is_running(paths), ..Default::default() };
+    match projects_from_db(paths) {
+        Ok(p) => snap.projects = p,
+        Err(e) => {
+            snap.projects_unknown = true;
+            snap.error = Some(format!("{e:#}"));
+            return snap;
+        }
+    }
     let Some(p) = selected.and_then(|id| snap.projects.iter().find(|p| p.id == id)).cloned() else { return snap };
     snap.project = Some(p.id.clone());
     if !snap.daemon {
@@ -91,7 +88,6 @@ pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>) -> Snaps
     }
     snap.tasks = call("task.ls", json!({"all": true})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
     snap.inbox = call("inbox", json!({})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
-    snap.log = call("log", json!({"limit": 40})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
     if let Some(id) = task {
         snap.detail = call("task.show", json!({"id": id})).ok();
     }
@@ -139,26 +135,19 @@ pub fn restore_config(paths: &Paths, p: &Project, daemon: bool) -> anyhow::Resul
     Ok(())
 }
 
-/// The project tabs open in the window, kept across launches.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-pub struct Tabs {
-    pub open: Vec<String>,
-    pub selected: Option<String>,
-}
-
-fn tabs_file(paths: &Paths) -> std::path::PathBuf {
+/// The project shown last time, kept across launches.
+fn last_file(paths: &Paths) -> std::path::PathBuf {
     paths.state.join("app-tabs.json")
 }
 
-pub fn load_tabs(paths: &Paths) -> Option<Tabs> {
-    serde_json::from_str(&std::fs::read_to_string(tabs_file(paths)).ok()?).ok()
+pub fn load_last(paths: &Paths) -> Option<String> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(last_file(paths)).ok()?).ok()?;
+    v["selected"].as_str().map(String::from)
 }
 
-pub fn save_tabs(paths: &Paths, tabs: &Tabs) {
+pub fn save_last(paths: &Paths, selected: Option<&str>) {
     let _ = std::fs::create_dir_all(&paths.state);
-    if let Ok(text) = serde_json::to_string(tabs) {
-        let _ = std::fs::write(tabs_file(paths), text);
-    }
+    let _ = std::fs::write(last_file(paths), json!({ "selected": selected }).to_string());
 }
 
 /// `ms` (Unix milliseconds) in the local time zone.
@@ -174,22 +163,6 @@ pub fn clock(ms: i64) -> String {
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
-}
-
-/// Days from the local day of `now` to that of `ms`: 0 today, 1 tomorrow, -1 yesterday.
-pub fn days_from_today(ms: i64, now: i64) -> i64 {
-    (local(ms).date_naive() - local(now).date_naive()).num_days()
-}
-
-/// When something happens, for people: "今天 14:20", "明天 09:00", "11月12日 14:20".
-pub fn local_when(ms: i64, now: i64) -> String {
-    let prefix = match days_from_today(ms, now) {
-        0 => "今天".to_owned(),
-        1 => "明天".to_owned(),
-        -1 => "昨天".to_owned(),
-        _ => local(ms).format("%-m月%-d日").to_string(),
-    };
-    format!("{prefix} {}", clock(ms))
 }
 
 /// Wall clock with milliseconds, for debug logs.

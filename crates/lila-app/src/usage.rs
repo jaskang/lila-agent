@@ -75,20 +75,6 @@ fn until(ms: i64, now: i64) -> String {
     }
 }
 
-/// "今天 21:00", "明天 09:00", "11月12日 周四 11:11".
-fn when(ms: i64, now: i64) -> String {
-    use chrono::Datelike;
-    let s = data::local_when(ms, now);
-    if data::days_from_today(ms, now).abs() <= 1 {
-        return s;
-    }
-    let week = ["日", "一", "二", "三", "四", "五", "六"][data::local(ms).weekday().num_days_from_sunday() as usize];
-    match s.split_once(' ') {
-        Some((date, time)) => format!("{date} 周{week} {time}"),
-        None => s,
-    }
-}
-
 /// The fill keeps the CLI's color until the window gets tight, then warns.
 fn meter_color(used: f64, cli: Hsla) -> Hsla {
     if used >= 90.0 {
@@ -228,7 +214,7 @@ impl LilaApp {
     }
 
     fn account_add(&mut self, r: Runtime, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("账号名称，例如 工作、备用"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("账号名称"));
         input.update(cx, |i, cx| i.focus(window, cx));
         self.usage.adding = Some((r, input));
         self.usage.confirm_remove = None;
@@ -258,7 +244,7 @@ impl LilaApp {
         })();
         match started {
             Ok((account, signin)) => {
-                let code = cx.new(|cx| InputState::new(window, cx).placeholder("网页上显示了一段代码？贴在这里"));
+                let code = cx.new(|cx| InputState::new(window, cx).placeholder("授权码"));
                 self.usage.signing = Some(Signing { account, signin, url: None, code });
                 self.usage.error = None;
                 self.watch_signin(cx);
@@ -394,7 +380,6 @@ impl LilaApp {
             if !from_magpie.is_empty() {
                 list.retain(|(a, _)| !a.is_default());
             }
-            let count = list.len() + from_magpie.len();
             let adding = self.usage.adding.as_ref().filter(|(cli, _)| *cli == r).map(|(_, i)| i.clone());
             let head = h_flex()
                 .px_1()
@@ -402,7 +387,6 @@ impl LilaApp {
                 .text_size(px(11.))
                 .text_color(style::muted2())
                 .child(div().font_semibold().child(label))
-                .child(div().child(format!("{count} 个账号")))
                 .child(div().flex_1())
                 .when(adding.is_none(), |d| {
                     d.child(style::link(SharedString::from(format!("acct-add-{r}")), "添加账号", true).text_size(px(11.)).on_click(cx.listener(move |this, _, window, cx| this.account_add(r, window, cx))))
@@ -413,17 +397,6 @@ impl LilaApp {
                 cards.push(self.add_form(label, color, input, cx));
             }
             body.push(v_flex().gap_2().child(head).child(v_flex().gap_2().children(cards)).into_any_element());
-        }
-        body.push(div().text_xs().line_height(relative(1.6)).text_color(style::muted()).child("成员都用「正在使用」的账号。切换后，已经在跑的成员下次重启时才换过去。").into_any_element());
-        if !self.usage.magpie.is_empty() {
-            body.push(
-                div()
-                    .text_xs()
-                    .line_height(relative(1.6))
-                    .text_color(style::muted())
-                    .child("标着 magpie 的账号由 magpie 管理登录，Lila 不复制它们的令牌。设为当前时由 magpie 切换 CLI 自己的登录，你在终端里开的 claude / codex 也会一起换。")
-                    .into_any_element(),
-            );
         }
         dialog::scroll("prefs-usage", body)
     }
@@ -461,10 +434,6 @@ impl LilaApp {
     /// An account magpie signed in to: its own reading of the windows, picked through magpie.
     fn magpie_card(&mut self, m: &lila::magpie::MagpieAccount, own_current: bool, color: Hsla, now: i64, cx: &mut Context<Self>) -> AnyElement {
         let u = &m.usage;
-        let seen = match u.seen_ms {
-            Some(ms) => format!("{} 更新", data::clock(ms)),
-            None => "还没有记录".into(),
-        };
         let switching = self.usage.switching.as_deref() == Some(&m.user);
         let actions = if m.active && own_current {
             style::tag(style::green(), "正在使用").into_any_element()
@@ -480,7 +449,6 @@ impl LilaApp {
             .py_3()
             .min_h(px(58.))
             .gap_4()
-            .child(tile(IconName::User, color))
             .child(
                 v_flex()
                     .flex_1()
@@ -490,10 +458,8 @@ impl LilaApp {
                         h_flex()
                             .gap_2()
                             .child(div().text_size(px(13.)).font_medium().truncate().child(m.user.clone()))
-                            .when_some(u.plan.clone(), |d, p| d.child(div().text_xs().text_color(style::muted()).child(p)))
-                            .child(style::tag_neutral("magpie")),
-                    )
-                    .child(div().text_xs().text_color(style::muted2()).child(seen)),
+                            .when_some(u.plan.clone(), |d, p| d.child(div().text_xs().text_color(style::muted()).child(p))),
+                    ),
             )
             .child(actions);
         let mut rows = vec![head.into_any_element()];
@@ -511,10 +477,6 @@ impl LilaApp {
     fn account_card(&mut self, a: &Account, u: &AccountUsage, color: Hsla, now: i64, cx: &mut Context<Self>) -> AnyElement {
         let id = a.id.clone();
         let confirm = self.usage.confirm_remove.as_deref() == Some(&a.id);
-        let seen = match u.seen_ms {
-            Some(ms) if !u.windows.is_empty() => format!("{} 更新", data::clock(ms)),
-            _ => "还没有记录".into(),
-        };
         let actions = if a.current {
             style::tag(style::green(), "正在使用").into_any_element()
         } else {
@@ -526,7 +488,7 @@ impl LilaApp {
                     let remove = if confirm {
                         Button::new(SharedString::from(format!("acct-rm-{id}"))).small().danger().label("确认移除")
                     } else {
-                        Button::new(SharedString::from(format!("acct-rm-{id}"))).ghost().xsmall().icon(style::icon("lila/trash.svg")).tooltip("移除这个账号（退出登录并删除它的配置目录）")
+                        Button::new(SharedString::from(format!("acct-rm-{id}"))).ghost().xsmall().icon(style::icon("lila/trash.svg")).tooltip("移除")
                     };
                     d.child(remove.on_click(cx.listener(move |this, _, _, cx| this.account_remove(rm_id.clone(), cx))))
                 })
@@ -537,20 +499,15 @@ impl LilaApp {
             .py_3()
             .min_h(px(58.))
             .gap_4()
-            .child(tile(IconName::User, color))
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .gap(px(1.))
-                    .child(h_flex().gap_2().child(div().text_size(px(13.)).font_medium().child(a.name.clone())).when_some(u.plan.clone(), |d, p| d.child(div().text_xs().text_color(style::muted()).child(p))))
-                    .child(div().text_xs().text_color(style::muted2()).child(seen)),
+                    .child(h_flex().gap_2().child(div().text_size(px(13.)).font_medium().child(a.name.clone())).when_some(u.plan.clone(), |d, p| d.child(div().text_xs().text_color(style::muted()).child(p)))),
             )
             .child(actions);
         let mut rows = vec![head.into_any_element()];
-        if u.windows.is_empty() {
-            rows.push(h_flex().px_4().py_3().text_xs().text_color(style::muted()).child("有成员用它工作后才有数据。").into_any_element());
-        }
         rows.extend(u.windows.iter().map(|w| window_row(w, color, now)));
         let n = rows.len();
         v_flex()
@@ -575,15 +532,8 @@ impl LilaApp {
                         .px_4()
                         .py_3()
                         .gap(px(10.))
-                        .child(div().size(px(30.)).flex_none().rounded(px(8.)).flex().items_center().justify_center().bg(color.opacity(0.2)).border_1().border_color(color.opacity(0.28)).child(Spinner::new().small().color(style::tint(color, 0.4))))
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap(px(1.))
-                                .child(div().text_size(px(13.)).font_medium().child(format!("正在浏览器里登录 {label}…")))
-                                .child(div().text_xs().text_color(style::muted2()).truncate().child(format!("「{}」 · 在网页上登录后会自动回到这里", s.account.name))),
-                        )
+                        .child(Spinner::new().small().color(style::tint(color, 0.4)))
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_medium().child(format!("正在浏览器里登录「{}」…", s.account.name)))
                         .when_some(url, |d, url| d.child(style::link("acct-reopen", "重新打开登录页", false).text_size(px(13.)).on_click(move |_, _, _| open_url(&url))))
                         .child(Button::new("acct-cancel").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| this.signin_cancel(cx)))),
                 )
@@ -607,32 +557,14 @@ impl LilaApp {
             .child(
                 h_flex()
                     .px_4()
-                    .pt_3()
-                    .pb_2()
+                    .py_3()
                     .gap(px(10.))
-                    .child(tile(IconName::Plus, color))
                     .child(div().flex_1().child(Input::new(&input).control()))
                     .child(Button::new("acct-cancel").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| this.signin_cancel(cx))))
                     .child(Button::new("acct-login").primary().label("登录…").on_click(cx.listener(|this, _, window, cx| this.account_login(window, cx)))),
             )
-            .child(div().px_4().pb_3().text_xs().text_color(style::muted()).child(format!("会在浏览器里打开 {} 的登录页。", if label == "Claude Code" { "Claude" } else { "ChatGPT" })))
             .into_any_element()
     }
-}
-
-/// The 30 px account tile: an icon in the CLI's color on a soft wash.
-fn tile(icon: IconName, color: Hsla) -> Div {
-    div()
-        .size(px(30.))
-        .flex_none()
-        .rounded(px(8.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(color.opacity(0.2))
-        .border_1()
-        .border_color(color.opacity(0.28))
-        .child(Icon::new(icon).small().text_color(style::tint(color, 0.4)))
 }
 
 /// One window: its name, how much is used, when it resets, and a meter.
@@ -652,9 +584,9 @@ fn window_row(w: &UsageWindow, color: Hsla, now: i64) -> AnyElement {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(div().text_size(px(13.)).font_medium().text_color(if used >= 90.0 { rgb(0xff6961).into() } else { style::fg() }).child(format!("已用 {}%", used.round() as i64)))
+                        .child(div().text_size(px(13.)).font_medium().text_color(if used >= 90.0 { rgb(0xff6961).into() } else { style::fg() }).child(format!("{}%", used.round() as i64)))
                         .child(div().flex_1())
-                        .child(div().text_xs().text_color(style::muted()).child(format!("{}重置 · {}", until(w.resets_ms, now), when(w.resets_ms, now)))),
+                        .child(div().text_xs().text_color(style::muted()).child(format!("{}重置", until(w.resets_ms, now)))),
                 )
                 .child(
                     div()
@@ -671,16 +603,14 @@ fn window_row(w: &UsageWindow, color: Hsla, now: i64) -> AnyElement {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's own `test` macro would stand in for `#[test]`.
-    use super::{until, when};
+    use super::until;
 
     #[test]
-    fn reset_times_read_like_the_prototype() {
+    fn reset_times_read_short() {
         let now = 1_000_000_000_000;
         assert_eq!(until(now + 30 * 60_000, now), "30 分钟后");
         assert_eq!(until(now + 125 * 60_000, now), "2 小时 5 分后");
         assert_eq!(until(now + 3 * 86_400_000, now), "3 天后");
         assert_eq!(until(now + (3 * 24 + 4) * 3_600_000, now), "3 天 4 小时后");
-        assert!(when(now + 5 * 86_400_000, now).contains(" 周"), "{}", when(now + 5 * 86_400_000, now));
-        assert!(!when(now, now).contains('周'));
     }
 }

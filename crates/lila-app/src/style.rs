@@ -23,8 +23,8 @@ pub const ROW_GAP: f32 = 2.;
 /// A member's two-line row, and the room under it (the tree's lines run through it).
 pub const MEMBER_ROW: f32 = 46.;
 pub const MEMBER_GAP: f32 = 4.;
-/// The status bar card.
-pub const STATUS: f32 = 34.;
+
+
 
 fn c(hex: u32) -> Hsla {
     rgba(hex).into()
@@ -159,11 +159,6 @@ pub fn pill(color: Hsla, text: impl Into<SharedString>) -> Div {
     tag(color, text).rounded(px(9.)).min_w(px(18.)).justify_center().px(px(5.))
 }
 
-/// A key cap in the status bar's shortcut hints.
-pub fn kbd(text: &'static str) -> Div {
-    div().px(px(4.)).py(px(1.)).rounded(px(4.)).text_size(px(10.)).font_medium().text_color(muted()).bg(c(0xffffff12)).child(text)
-}
-
 /// Which CLI a member runs, as a small tile: Claude Code's asterisk in its
 /// orange, Codex as a neutral prompt.
 pub fn cli_tile(runtime: &str, size: f32) -> Div {
@@ -227,7 +222,6 @@ impl AssetSource for Assets {
         let own: Option<&'static [u8]> = match path {
             "lila/claude.svg" => Some(include_bytes!("../assets/lila/claude.svg")),
             "lila/prompt.svg" => Some(include_bytes!("../assets/lila/prompt.svg")),
-            "lila/branch.svg" => Some(include_bytes!("../assets/lila/branch.svg")),
             "lila/trash.svg" => Some(include_bytes!("../assets/lila/trash.svg")),
             _ => None,
         };

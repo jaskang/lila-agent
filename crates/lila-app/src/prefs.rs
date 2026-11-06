@@ -1,18 +1,17 @@
 //! Global settings, a dialog: the role library (every project's members start
-//! from a role) and where Lila keeps things. Roles are saved with
+//! from a role), usage per account, and where Lila keeps things. Roles are saved with
 //! `lila::roles`; every project lilad runs reads them again.
 
 use crate::app::LilaApp;
 use crate::data;
 use crate::dialog::{self, Act, Nav, Shell, block, group, row, value_text};
-use crate::settings::{ModelSelect, effort_control, model_control, model_select, notice, selected_model};
+use crate::settings::{ModelSelect, effort_control, model_control, model_select, selected_model};
 use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::checkbox::Checkbox;
 use gpui::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui::component::scroll::ScrollableElement;
-use gpui::component::tag::Tag;
-use gpui::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
+use gpui::component::{ActiveTheme, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
 use crate::style::Control as _;
 use gpui::prelude::*;
 use gpui::*;
@@ -245,8 +244,8 @@ impl LilaApp {
         let theme = cx.theme().clone();
         let Some(p) = self.prefs.as_ref() else { return div().into_any_element() };
         let selected = p.selected.min(p.roles.len().saturating_sub(1));
-        let items: Vec<(String, String, bool, bool)> = p.roles.iter().map(|r| (r.value(cx).id, r.name.read(cx).value().to_string(), r.base.is_none(), r.changed(cx))).collect();
-        let templates: Vec<(usize, String)> = items.iter().enumerate().map(|(i, (_, name, _, _))| (i, name.clone())).collect();
+        let items: Vec<(String, String)> = p.roles.iter().map(|r| (r.value(cx).id, r.name.read(cx).value().to_string())).collect();
+        let templates: Vec<(usize, String)> = items.iter().enumerate().map(|(i, (_, name))| (i, name.clone())).collect();
         let weak = cx.entity().downgrade();
         let list = v_flex()
             .w(px(200.))
@@ -254,7 +253,7 @@ impl LilaApp {
             .h_full()
             .border_r_1()
             .border_color(theme.border)
-            .child(v_flex().id("role-list").flex_1().min_h_0().overflow_y_scrollbar().p_2().gap_0p5().children(items.iter().enumerate().map(|(ix, (id, name, new, changed))| {
+            .child(v_flex().id("role-list").flex_1().min_h_0().overflow_y_scrollbar().p_2().gap_0p5().children(items.iter().enumerate().map(|(ix, (id, name))| {
                 let active = ix == selected;
                 h_flex()
                     .id(SharedString::from(format!("role-item-{ix}")))
@@ -265,10 +264,7 @@ impl LilaApp {
                     .cursor_pointer()
                     .when(active, |d| d.bg(crate::style::accent()))
                     .when(!active, |d| d.hover(|d| d.bg(crate::style::hover())))
-                    .child(Icon::new(IconName::User).small().text_color(theme.muted_foreground))
                     .child(v_flex().flex_1().min_w_0().child(div().text_size(px(13.)).font_medium().truncate().child(name.clone())).child(div().text_xs().text_color(theme.muted_foreground).truncate().child(id.clone())))
-                    .when(*new, |d| d.child(Tag::success().xsmall().child("新")))
-                    .when(*changed && !*new, |d| d.child(div().size(px(6.)).rounded_full().bg(theme.blue)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(p) = this.prefs.as_mut() {
                             p.selected = ix;
@@ -277,7 +273,6 @@ impl LilaApp {
                     }))
             })))
             .child(div().p_2().border_t_1().border_color(theme.border).child(Button::new("add-role").ghost().small().small_button().w_full().icon(IconName::Plus).label("新建角色").dropdown_menu(move |mut menu, _, _| {
-                menu = menu.label("以这个角色为模板");
                 for (ix, name) in &templates {
                     let (weak, ix) = (weak.clone(), *ix);
                     menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, window, cx| {
@@ -286,7 +281,7 @@ impl LilaApp {
                 }
                 menu
             })));
-        let editor = if items.is_empty() { div().p_6().text_color(theme.muted_foreground).child("还没有角色。").into_any_element() } else { self.role_editor(selected, cx) };
+        let editor = if items.is_empty() { div().into_any_element() } else { self.role_editor(selected, cx) };
         h_flex().size_full().child(list).child(v_flex().flex_1().min_w_0().h_full().child(editor)).into_any_element()
     }
 
@@ -299,44 +294,13 @@ impl LilaApp {
         let is_pm = v.id == lila::roles::PM_ROLE;
         let used = p.users.get(&r.id).cloned().filter(|_| r.base.is_some()).unwrap_or_default();
         let others: Vec<(String, String)> = p.roles.iter().enumerate().filter(|(i, _)| *i != ix).map(|(_, o)| (o.value(cx).id, o.name.read(cx).value().to_string())).collect();
-        let is_default = lila::roles::DEFAULTS.iter().any(|(d, _, _)| *d == v.id);
-
-        let header = h_flex()
-            .gap_3()
-            .child(div().size(px(36.)).flex_none().rounded(px(10.)).bg(crate::style::fill()).border_1().border_color(crate::style::hairline()).flex().items_center().justify_center().child(Icon::new(IconName::User).text_color(crate::style::muted())))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().text_base().font_semibold().child(if v.name.is_empty() { v.id.clone() } else { v.name.clone() }))
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(if used.is_empty() { format!("{} · 没有项目在用", v.id) } else { format!("{} · 用在 {}", v.id, used.join("、")) })),
-            )
-            .child(
-                Button::new(SharedString::from(format!("role-delete-{ix}")))
-                    .outline()
-                    .small()
-                    .label("删除角色")
-                    .disabled(is_pm || !used.is_empty())
-                    .tooltip(if is_pm {
-                        "每个项目都有且只有一个 PM，这个角色不能删除".to_owned()
-                    } else if used.is_empty() {
-                        "保存后删除它的文件".to_owned()
-                    } else {
-                        format!("{} 在用它，先把那些成员换成别的角色", used.join("、"))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| this.delete_role(ix, cx))),
-            );
 
         let mut rows = Vec::new();
         if let Some(input) = &id_input {
-            rows.push(row("角色编号", Some("项目配置里写的 role".into()), div().w(px(280.)).child(Input::new(input).control()), cx));
+            rows.push(row("编号", None, div().w(px(280.)).child(Input::new(input).control()), cx));
         }
-        rows.push(row("名称", Some("界面里显示的名字。".into()), div().w(px(280.)).child(Input::new(&name_input).control()), cx));
-        let cli = match v.runtime {
-            Runtime::Claude => "Claude Code",
-            Runtime::Codex => "Codex（ChatGPT）",
-        };
-        rows.push(row("模型", Some(cli.into()), model_control(&select), cx));
+        rows.push(row("名称", None, div().w(px(280.)).child(Input::new(&name_input).control()), cx));
+        rows.push(row("模型", None, model_control(&select), cx));
         rows.push(row(
             "努力程度",
             None,
@@ -355,7 +319,7 @@ impl LilaApp {
         let assign = h_flex().gap_4().flex_wrap().children(others.into_iter().map(|(id, name)| {
             let on = can_assign.contains(&id);
             let target = id.clone();
-            Checkbox::new(SharedString::from(format!("role-assign-{ix}-{id}"))).label(format!("{name}（{id}）")).checked(on).on_click(cx.listener(move |this, on: &bool, _, cx| {
+            Checkbox::new(SharedString::from(format!("role-assign-{ix}-{id}"))).label(name).checked(on).on_click(cx.listener(move |this, on: &bool, _, cx| {
                 if let Some(r) = this.pref_role(ix) {
                     r.can_assign.retain(|a| *a != target);
                     if *on {
@@ -365,22 +329,19 @@ impl LilaApp {
                 cx.notify();
             }))
         }));
-        let assign_row = block("默认可以派给", Some("项目里没单独设置指派规则时，这个角色的成员可以把任务派给哪些角色的成员。PM 总是可以派给所有人。".into()), assign, None, cx);
-
-        let mut body = vec![header.into_any_element(), group(Some("运行"), rows, cx)];
-        if is_pm {
-            body.push(notice(IconName::Info, theme.muted_foreground, "每个项目都有且只有一个 PM：它和你对话，可以把任务派给任何人。", cx));
-        } else {
-            body.push(group(Some("协作"), vec![assign_row], cx));
+        let mut body = vec![group(None, rows, cx)];
+        // The PM may hand work to anyone.
+        if !is_pm {
+            body.push(group(None, vec![block("可以派给", None, assign, None, cx)], cx));
         }
         // Edit, or see what a member is started with: this prompt plus Lila's part.
         let shown = p.preview.as_ref().filter(|pv| pv.role == ix).map(|pv| (pv.project.clone(), pv.text.clone()));
         let first = used.first().cloned();
         let toggle = (!used.is_empty()).then(|| {
-            dialog::segmented(&format!("prompt-view-{ix}"), &["编辑", "预览最终提示词"], shown.is_some() as usize, move |this, i, _, cx| this.preview_role(ix, if i == 1 { first.clone() } else { None }, cx), cx)
+            dialog::segmented(&format!("prompt-view-{ix}"), &["编辑", "预览"], shown.is_some() as usize, move |this, i, _, cx| this.preview_role(ix, if i == 1 { first.clone() } else { None }, cx), cx)
         });
         let prompt_block = match shown {
-            None => block("预设提示词", Some("每个用这个角色、又没有自己提示词的成员都会用它。Lila 会在后面接上协作协议。".into()), Textarea::new(&prompt).area(), toggle, cx),
+            None => block("提示词", None, Textarea::new(&prompt).area(), toggle, cx),
             Some((project, text)) => {
                 let weak = cx.entity().downgrade();
                 let picker = Button::new(SharedString::from(format!("prompt-project-{ix}"))).outline().small().small_button().label(project.clone()).dropdown_caret(true).dropdown_menu({
@@ -396,13 +357,10 @@ impl LilaApp {
                     }
                 });
                 let content = match text {
-                    Ok((member, text)) => {
-                        let tokens = text.chars().count() as u64 / 3;
+                    Ok((_, text)) => {
                         let copy = text.clone();
                         v_flex()
                             .gap_2()
-                            .child(h_flex().gap_2().text_xs().text_color(theme.muted_foreground).child("按这个项目里的").child(picker).child(format!("成员 {member} 生成")))
-                            .child(div().text_xs().text_color(crate::style::muted2()).child("角色提示词（含没保存的改动），加上 Lila 接的项目信息和协作协议。只读。"))
                             .child(
                                 div()
                                     .id(SharedString::from(format!("prompt-preview-{ix}")))
@@ -418,22 +376,21 @@ impl LilaApp {
                             )
                             .child(
                                 h_flex()
-                                    .child(div().flex_1().text_xs().text_color(crate::style::muted2()).child(format!("约 {:.1}k token", tokens as f64 / 1000.)))
+                                    .child(picker)
+                                    .child(div().flex_1())
                                     .child(Button::new(SharedString::from(format!("prompt-copy-{ix}"))).ghost().small().small_button().icon(IconName::Copy).label("复制").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone())))),
                             )
                             .into_any_element()
                     }
                     Err(e) => div().text_xs().text_color(theme.red).child(format!("生成不了：{e}")).into_any_element(),
                 };
-                block("最终提示词", None, content, toggle, cx)
+                block("提示词", None, content, toggle, cx)
             }
         };
-        body.extend([group(Some("提示词"), vec![prompt_block], cx)]);
-        if is_default {
-            body.push(notice(IconName::Info, theme.muted_foreground, "这是 Lila 自带的角色。改动保存在你的角色目录里，Lila 升级不会覆盖。", cx));
-        }
-        if !used.is_empty() {
-            body.push(notice(IconName::Info, theme.yellow, "保存后，正在运行、用这个角色的成员会标「待重启」，重启后才用上新设置。", cx));
+        body.push(group(None, vec![prompt_block], cx));
+        // A role in use, or the PM's, can't go: no button then.
+        if !is_pm && used.is_empty() {
+            body.push(h_flex().child(Button::new(SharedString::from(format!("role-delete-{ix}"))).outline().small().small_button().text_color(crate::style::red()).label("删除角色").on_click(cx.listener(move |this, _, _, cx| this.delete_role(ix, cx)))).into_any_element());
         }
         dialog::scroll(SharedString::from(format!("role-editor-{ix}")), body)
     }
@@ -441,30 +398,12 @@ impl LilaApp {
     fn about_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let paths = self.paths().clone();
         let tilde = |p: std::path::PathBuf| data::tilde(&p.to_string_lossy());
-        let socket = paths.socket().map(tilde).unwrap_or_default();
         let daemon = if self.snap.daemon { "运行中" } else { "没有运行" };
         dialog::scroll(
             "prefs-about",
             vec![
-                group(
-                    Some("Lila"),
-                    vec![
-                        row("版本", None, value_text(env!("CARGO_PKG_VERSION"), cx), cx),
-                        row("lilad", Some("唯一写状态的后台进程；团队启动时自动启动。".into()), value_text(daemon, cx), cx),
-                        row("项目数", None, value_text(self.snap.projects.len().to_string(), cx), cx),
-                    ],
-                    cx,
-                ),
-                group(
-                    Some("文件位置"),
-                    vec![
-                        row("角色", Some("每个角色一个 .toml 和一个 .md 提示词。".into()), value_text(tilde(paths.roles()), cx), cx),
-                        row("数据库", Some("任务、收件箱和动态。".into()), value_text(tilde(paths.db()), cx), cx),
-                        row("状态目录", Some("lilad 的日志、成员提示词和窗口标签。".into()), value_text(tilde(paths.state.clone()), cx), cx),
-                        row("socket", None, value_text(socket, cx), cx),
-                    ],
-                    cx,
-                ),
+                group(None, vec![row("版本", None, value_text(env!("CARGO_PKG_VERSION"), cx), cx), row("lilad", None, value_text(daemon, cx), cx)], cx),
+                group(None, vec![row("角色", None, value_text(tilde(paths.roles()), cx), cx), row("数据库", None, value_text(tilde(paths.db()), cx), cx), row("日志", None, value_text(tilde(paths.state.clone()), cx), cx)], cx),
             ],
         )
     }
@@ -472,17 +411,13 @@ impl LilaApp {
     pub fn prefs_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let p = self.prefs.as_ref()?;
         let theme = cx.theme().clone();
-        let (page, error, saving, count) = (p.page, p.error.clone(), p.saving, p.roles.len());
-        let dirty = !p.deleted.is_empty() || p.roles.iter().any(|r| r.changed(cx));
-        let (title, description, body) = match page {
-            PrefPage::Roles => ("角色", "项目成员从角色开始：用哪个 CLI、模型、努力程度和提示词。项目设置里可以再按成员覆盖。", self.roles_page(cx)),
-            PrefPage::Usage => ("用量", "", self.usage_page(cx)),
-            PrefPage::About => ("关于", "Lila 的版本，以及它把东西放在哪里。", self.about_page(cx)),
+        let (page, error, saving) = (p.page, p.error.clone(), p.saving);
+        let (title, body) = match page {
+            PrefPage::Roles => ("角色", self.roles_page(cx)),
+            PrefPage::Usage => ("用量", self.usage_page(cx)),
+            PrefPage::About => ("关于", self.about_page(cx)),
         };
-        let note = match error {
-            Some(e) => Some(h_flex().gap_2().text_color(theme.red).child(Icon::new(IconName::CircleAlert).small()).child(div().truncate().child(e)).into_any_element()),
-            None => dirty.then(|| div().text_color(theme.muted_foreground).child("有未保存的更改").into_any_element()),
-        };
+        let note = error.map(|e| h_flex().gap_2().text_color(theme.red).child(Icon::new(IconName::CircleAlert).small()).child(div().truncate().child(e)).into_any_element());
         let go = |pg: PrefPage| -> Act {
             Box::new(move |this: &mut LilaApp, _| {
                 if let Some(p) = this.prefs.as_mut() {
@@ -491,24 +426,20 @@ impl LilaApp {
             })
         };
         let nav = vec![
-            (Nav { id: "pref-nav-roles", icon: IconName::User, label: "角色", active: page == PrefPage::Roles, badge: Some(count.to_string()) }, go(PrefPage::Roles)),
-            (Nav { id: "pref-nav-usage", icon: IconName::ChartPie, label: "用量", active: page == PrefPage::Usage, badge: None }, go(PrefPage::Usage)),
-            (Nav { id: "pref-nav-about", icon: IconName::Info, label: "关于", active: page == PrefPage::About, badge: None }, go(PrefPage::About)),
+            (Nav { id: "pref-nav-roles", icon: IconName::User, label: "角色", active: page == PrefPage::Roles }, go(PrefPage::Roles)),
+            (Nav { id: "pref-nav-usage", icon: IconName::ChartPie, label: "用量", active: page == PrefPage::Usage }, go(PrefPage::Usage)),
+            (Nav { id: "pref-nav-about", icon: IconName::Info, label: "关于", active: page == PrefPage::About }, go(PrefPage::About)),
         ];
-        let heading = v_flex().gap_1().child(div().text_xs().text_color(theme.muted_foreground).child("全局设置")).child(div().font_semibold().child("Lila")).into_any_element();
         Some(self.dialog(
             Shell {
                 id: "prefs",
-                heading,
                 nav,
                 title: title.into(),
-                description: description.into(),
                 body,
                 note,
                 saving,
                 save_label: if saving { "保存中…" } else { "保存" },
                 can_save: true,
-                back: None,
                 on_save: Box::new(|this, cx| this.save_prefs(cx)),
                 on_close: Box::new(|this, _| this.prefs = None),
                 footer: page != PrefPage::Usage,

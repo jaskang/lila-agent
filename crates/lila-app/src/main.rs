@@ -144,10 +144,9 @@ fn main() {
                         })
                         .detach();
                 }
-                // The new-project wizard, on this folder (empty: none yet) and step.
+                // The new-project dialog, on this folder (empty: none yet).
                 if let Ok(dir) = std::env::var("LILA_APP_NEW") {
                     let view = view.clone();
-                    let step = crate::wizard::Step::parse(&std::env::var("LILA_APP_NEW_STEP").unwrap_or_default());
                     window
                         .spawn(cx, async move |cx| {
                             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
@@ -155,7 +154,6 @@ fn main() {
                                 v.new_project(window, cx);
                                 if !dir.is_empty() {
                                     v.wizard_set_folder(dir.into(), window, cx);
-                                    v.wizard_go(step, cx);
                                 }
                             }));
                         })
