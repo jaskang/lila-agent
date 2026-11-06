@@ -84,7 +84,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | `lila-store` | SQLite：projects、members（含 `session`）、tasks（含简报、结果、run）、task_events、artifacts、inbox、outbox、runs（流程运行、预算、暂停）、sessions、session_chains。新列在 `ADDED_COLUMNS` 里，打开旧数据库时自动加上。 |
 | `hc-client` | herdr-core JSON-RPC 客户端 |
 | `lila` | CLI 和 lilad，详见下面几行 |
-| ↳ `daemon.rs` | `Daemon::handle` 处理所有请求，负责流程推进、验收、Watchdog、会话切换、PM 摘要。测试在 `daemon_tests.rs`，用 Fake 终端，CLI 的会话记录目录指向临时目录 |
+| ↳ `daemon/` | lilad。`mod.rs`：状态、herdr-core 的事件、pump（投递和通知）、spool。`requests.rs`：`Daemon::handle` 和每个请求。`flows.rs`：流程推进、检查命令。`session.rs`：换链时的会话、PM 摘要。`review.rs`：验收卡片、一条链占目录、验收时提交、预算。`watch.rs`：Watchdog 和 `tick`。`server.rs`：socket、事件流和后台线程。`tests.rs` 用 Fake 终端，CLI 的会话记录目录指向临时目录 |
 | ↳ `check.rs` | 后台跑流程的检查命令（进程组、超时） |
 | ↳ `sessions.rs` | Claude 会话记录的位置、找 Codex 的会话、读上下文大小 |
 | ↳ `accounts.rs` | 订阅账号（`accounts.toml`）、成员用哪个账号、读每个账号的额度 |
