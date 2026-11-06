@@ -519,6 +519,11 @@ fn fmt_status(v: &Value) -> String {
     if held > 0 {
         s.push_str(&format!("  {held} new task(s) wait: {} results wait for the person's review\n", v["unreviewed"].as_u64().unwrap_or(0)));
     }
+    let folder = v["held_for_folder"].as_u64().unwrap_or(0);
+    if folder > 0 {
+        let open: Vec<&str> = v["open_chains"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
+        s.push_str(&format!("  {folder} task(s) wait for the project folder: chain {} has it until the person signs it off\n", open.join(", ")));
+    }
     if v["codex_paused_until"].is_i64() {
         s.push_str("  Codex's usage limit is used up: its members get no work until it resets\n");
     }

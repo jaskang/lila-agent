@@ -59,6 +59,8 @@ pub fn launch(role: &Role, prompt_path: &str, prompt_text: &str, session: &Sessi
                 argv.extend(["--sandbox".into(), mode.clone()]);
             }
             argv.extend(["-c".into(), format!("developer_instructions={}", toml_string(prompt_text))]);
+            // Nobody answers "update now?" in a member's terminal, and updating exits Codex.
+            argv.extend(["-c".into(), "check_for_update_on_startup=false".into()]);
         }
     }
     argv.extend(f.extra_args.iter().cloned());
@@ -111,6 +113,7 @@ mod tests {
         let value = l.argv[7].strip_prefix("developer_instructions=").unwrap();
         let parsed: toml::Value = toml::from_str(&format!("v = {value}")).unwrap();
         assert_eq!(parsed["v"].as_str().unwrap(), "Say \"hi\"\nline2 \\ end");
+        assert_eq!(l.argv[8..10], ["-c", "check_for_update_on_startup=false"], "no update prompt in a member's terminal");
         assert_eq!(l.argv.last().unwrap(), "--foo");
     }
 

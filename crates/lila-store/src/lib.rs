@@ -389,6 +389,17 @@ impl Store {
         Ok(st.query_map([], Self::project_from)?.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Forgets a project and everything Lila recorded for it. Its folder is not touched.
+    pub fn remove_project(&self, project: &str) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for table in ["members", "tasks", "task_events", "artifacts", "inbox", "outbox", "runs", "sessions", "session_chains"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [project])?;
+        }
+        tx.execute("DELETE FROM projects WHERE id = ?1", [project])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_paused(&self, project: &str, paused: bool) -> Result<()> {
         self.db.execute("UPDATE projects SET paused = ?2 WHERE id = ?1", params![project, paused as i64])?;
         Ok(())
@@ -867,6 +878,21 @@ mod tests {
         // Found again (codex): the file fills in, nothing else changes.
         s.add_session("shop", &SessionRow { file: None, ..row("s2") }).unwrap();
         assert_eq!(s.session("shop", "s2").unwrap().unwrap().file.as_deref(), Some("/c/s2.jsonl"));
+    }
+
+    #[test]
+    fn a_removed_project_leaves_nothing_behind() {
+        let mut s = store();
+        s.upsert_project("temp", "/repo/temp", 1).unwrap();
+        for p in ["shop", "temp"] {
+            s.create_task(p, new("eng", None), 1).unwrap();
+            s.event(p, Some("T1"), "x", "made", "", 1).unwrap();
+            s.add_inbox(p, "report", None, Some("T1"), "hi", &[], 1).unwrap();
+        }
+        s.remove_project("shop").unwrap();
+        assert!(s.project("shop").unwrap().is_none());
+        assert!(s.tasks("shop").unwrap().is_empty() && s.inbox("shop", true).unwrap().is_empty() && s.events("shop", None, 10).unwrap().is_empty());
+        assert_eq!((s.tasks("temp").unwrap().len(), s.inbox("temp", true).unwrap().len()), (1, 1), "other projects stay");
     }
 
     #[test]

@@ -233,6 +233,29 @@ pub fn review_card(task: &Task, steps: &[String]) -> String {
     s
 }
 
+/// The commit lilad makes when the person accepts `task`'s chain: its title,
+/// what came of it and the person's words, and the task it was.
+pub fn commit_message(task: &Task) -> String {
+    let subject: String = task.title.lines().next().unwrap_or_default().trim().chars().take(72).collect();
+    let mut s = if subject.is_empty() { task.id.clone() } else { subject };
+    let mut body = Vec::new();
+    if let Some(sum) = task.summary.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        body.push(sum.to_owned());
+    }
+    if let Some(q) = task.brief.quote.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        body.push(format!("Asked: {q}"));
+    }
+    if !task.outcome.decisions.is_empty() {
+        body.push(format!("Decided: {}", task.outcome.decisions.join("; ")));
+    }
+    if !body.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(&body.join("\n\n"));
+    }
+    s.push_str(&format!("\n\nLila-Task: {}", task.id));
+    s
+}
+
 /// A member working a long time without telling Lila anything.
 pub fn runaway(task: &Task, minutes: u64) -> String {
     note(
@@ -384,6 +407,19 @@ mod tests {
         assert!(runaway(&t, 30).contains("for 30 minutes without a `lila` call"));
         assert!(over_budget(&t, "code", 312_000, 300_000).contains("used 312k tokens of its 300k budget"));
         assert_eq!((short_tokens(999), short_tokens(1_250), short_tokens(2_500_000)), ("999".into(), "1.2k".into(), "2.5M".into()));
+    }
+
+    #[test]
+    fn commit_messages() {
+        let mut t = task("");
+        t.brief.quote = Some("能登录就行".into());
+        t.outcome.decisions = vec!["24h tokens".into()];
+        assert_eq!(commit_message(&t), "Add login\n\ndone it\n\nAsked: 能登录就行\n\nDecided: 24h tokens\n\nLila-Task: T3");
+        t.title = "x".repeat(100);
+        t.summary = None;
+        t.brief.quote = None;
+        t.outcome.decisions.clear();
+        assert_eq!(commit_message(&t), format!("{}\n\nLila-Task: T3", "x".repeat(72)));
     }
 
     #[test]

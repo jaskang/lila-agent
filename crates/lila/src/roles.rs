@@ -176,6 +176,19 @@ pub fn users(projects: &[(String, PathBuf)]) -> BTreeMap<String, Vec<String>> {
     out
 }
 
+/// The system prompt a member using role `id` in the project at `cwd` starts
+/// with, the role's prompt being `prompt` (edits not saved yet). A member with
+/// its own prompt (`prompt_file`) keeps it. Returns that member's id and the text.
+pub fn preview(roles_dir: &Path, cwd: &Path, id: &str, prompt: &str) -> Result<(String, String)> {
+    let team = crate::daemon::load_team(cwd, roles_dir)?;
+    let saved = load(roles_dir)?.get(id).map(|r| r.prompt.clone());
+    let mut member = team.members.iter().find(|m| m.role.id == id).cloned().ok_or_else(|| anyhow!("no member of {} uses role {id}", team.project))?;
+    if saved.as_deref() == Some(member.role.prompt.as_str()) {
+        member.role.prompt = prompt.to_owned();
+    }
+    Ok((member.id.clone(), lila_core::prompt::render(&team, &member, &cwd.to_string_lossy())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +297,20 @@ mod tests {
         let u = users(&[("shop".into(), repo), ("gone".into(), dir.path().join("nope"))]);
         assert_eq!(u["tester"], ["shop"]);
         assert!(!u.contains_key("qa"));
+    }
+
+    #[test]
+    fn previews_show_unsaved_prompts_with_lilas_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let roles = dir.path().join("roles");
+        install_defaults(&roles).unwrap();
+        let repo = dir.path().join("shop");
+        std::fs::create_dir_all(repo.join(".lila")).unwrap();
+        std::fs::write(repo.join(".lila/project.toml"), crate::init::default_project("shop")).unwrap();
+        let (member, text) = preview(&roles, &repo, "tester", "You test things, carefully.").unwrap();
+        assert_eq!(member, "tester");
+        assert!(text.starts_with("You test things, carefully.\n\n---\n\n## Your team (Lila)"), "{text}");
+        assert!(text.contains("You are `tester`"), "{text}");
+        assert!(preview(&roles, &repo, "qa", "").is_err(), "no member uses it");
     }
 }

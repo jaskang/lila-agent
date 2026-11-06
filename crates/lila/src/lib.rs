@@ -4,6 +4,7 @@
 pub mod accounts;
 pub mod check;
 pub mod client;
+pub mod commit;
 pub mod daemon;
 pub mod init;
 pub mod magpie;

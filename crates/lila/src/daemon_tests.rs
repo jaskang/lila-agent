@@ -92,6 +92,11 @@ fn world() -> World {
     world_with(PROJECT)
 }
 
+/// Several chains may work in the folder at once (`max_chains = 0`), with these `[settings]` lines.
+fn parallel(settings: &str) -> String {
+    format!("{PROJECT}\n[settings]\nmax_chains = 0\n{settings}")
+}
+
 /// Members hand work on themselves (no flow), with these `[settings]` lines.
 fn manual(settings: &str) -> String {
     format!("{PROJECT}\n[settings]\nflow = \"none\"\n{settings}")
@@ -174,11 +179,13 @@ fn up_starts_every_member_with_its_command() {
     assert_eq!(owner["env"]["LILA_MEMBER"], "owner");
     assert_eq!(owner["env"]["LILA_ROOT"], w.repo.to_string_lossy().as_ref());
     assert!(owner["env"]["PATH"].as_str().unwrap().starts_with("/opt/lila/bin:"), "members can run lila");
+    assert_eq!(owner["env"]["CLAUDE_CODE_NO_FLICKER"], "1", "Claude Code full-screen: its input stays at the bottom");
     assert_eq!(owner["name"], "lila-shop-owner");
     assert_eq!(owner["no_parent"], true);
     let tester = &runs[2];
     assert!(tester["argv"][0].as_str().unwrap().ends_with("/bin/codex"));
     assert!(tester["argv"][7].as_str().unwrap().starts_with("developer_instructions=\""));
+    assert!(tester["env"]["CLAUDE_CODE_NO_FLICKER"].is_null(), "Codex is full-screen anyway");
 
     // A second `up` leaves running members alone.
     let r = w.up();
@@ -270,7 +277,7 @@ fn brief_goes_to_the_owner_once_it_reports_idle() {
 
 #[test]
 fn full_handoff_flow_respects_the_working_limit() {
-    let mut w = world_with(&manual("max_working = 1\n"));
+    let mut w = world_with(&manual("max_chains = 0\nmax_working = 1\n"));
     w.up();
     w.all_idle();
     // Owner plans two tasks; only one non-owner member may work at a time.
@@ -308,7 +315,7 @@ fn full_handoff_flow_respects_the_working_limit() {
 
 #[test]
 fn the_persons_words_and_the_bar_reach_every_step() {
-    let mut w = world_with(&manual(""));
+    let mut w = world_with(&manual("max_chains = 0\n"));
     w.ok(None, "project.up", json!({"brief": "加一个登录页\n用邮箱和密码"}));
     w.all_idle();
     // Work under the person's task carries their words without the PM copying them.
@@ -436,7 +443,7 @@ fn assignment_rules_and_ownership_are_enforced() {
 
 #[test]
 fn blocked_tasks_reach_the_assigner_and_the_owner() {
-    let mut w = world();
+    let mut w = world_with(&parallel(""));
     w.up();
     w.all_idle();
     w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build"}));
@@ -527,6 +534,15 @@ fn a_lost_member_returns_its_work_to_the_queue() {
     assert_eq!(r["started"].as_array().unwrap().len(), 1);
     w.status("engineer", "idle");
     assert_eq!(w.state("T1"), TaskState::Delivered);
+
+    // A member with nothing in hand ends: the person hears, the PM is left alone.
+    let notes = w.sends_to("owner").len();
+    let t = w.terminal("tester");
+    w.now += 1000;
+    w.d.on_event(&json!({"method":"event","params":{"type":"finished","terminal":t,"data":{"reason":"exited"}}}), w.now);
+    w.status("owner", "idle");
+    assert_eq!(w.inbox_kinds(), ["lost", "lost"]);
+    assert_eq!(w.sends_to("owner").len(), notes, "{:?}", w.sends_to("owner"));
 }
 
 #[test]
@@ -558,11 +574,78 @@ fn the_person_signs_off_or_sends_work_back() {
     w.ok(None, "answer", json!({"id": q, "text": "通过"}));
     assert!(w.inbox_kinds().is_empty());
     assert!(w.d.store.events("shop", Some("T4"), 20).unwrap().iter().any(|e| e.kind == "accepted"));
+    // Accepted: the chain's changes become one commit, under its first title.
+    let jobs = w.d.take_commits();
+    assert_eq!(jobs.len(), 1, "only the accepted card commits");
+    assert_eq!((jobs[0].chain.as_str(), jobs[0].cwd.as_path()), ("T1", w.repo.as_path()));
+    assert_eq!(jobs[0].message, "Ship it\n\nfixed the footer\n\nAsked: Ship it\n\nLila-Task: T1");
+}
+
+#[test]
+fn one_chain_has_the_folder_until_the_person_signs_it_off() {
+    let mut w = world_with(&manual("fresh_session = false\n"));
+    w.up();
+    w.all_idle();
+    w.ok(None, "task.new", json!({"to": "architect", "title": "Plan A"}));
+    assert_eq!(w.state("T1"), TaskState::Delivered);
+    // Another chain waits, even for an idle member; the PM's own work does not.
+    let held = w.ok(None, "task.new", json!({"to": "engineer", "title": "Build B"}));
+    assert_eq!(held["state"], "queued");
+    assert!(held["held"].as_str().unwrap().contains("holds chain T1 until the person signs it off"), "{held}");
+    assert_eq!(w.ok(None, "status", json!({}))["held_for_folder"], 1);
+    let pm = w.ok(None, "task.new", json!({"to": "owner", "title": "Talk"}));
+    assert_eq!(pm["state"], "delivered");
+    // Work inside the open chain goes on.
+    w.ok(Some("architect"), "task.new", json!({"to": "engineer", "title": "Sketch A", "parent": "T1"}));
+    assert_eq!(w.state("T4"), TaskState::Delivered);
+    w.ok(Some("engineer"), "task.done", json!({"id": "T4", "summary": "sketched"}));
+    w.status("engineer", "idle");
+    w.ok(Some("architect"), "task.done", json!({"id": "T1", "summary": "planned"}));
+    w.status("architect", "idle");
+    // Finished but not signed off: the folder is still A's.
+    assert_eq!(w.inbox_kinds(), ["review"]);
+    assert_eq!(w.state("T2"), TaskState::Queued);
+    // Accepted: B still waits while A's commit is made, then starts.
+    w.ok(None, "answer", json!({"id": "Q1"}));
+    let jobs = w.d.take_commits();
+    assert_eq!(jobs.iter().map(|j| j.chain.as_str()).collect::<Vec<_>>(), ["T1"]);
+    w.status("engineer", "idle");
+    assert_eq!(w.state("T2"), TaskState::Queued, "the commit is under way");
+    w.now += 1000;
+    w.d.on_commit_done("shop", "T1", &CommitResult::Committed("abc1234".into()), w.now);
+    assert_eq!(w.state("T2"), TaskState::Delivered);
+    assert!(w.d.store.events("shop", Some("T1"), 20).unwrap().iter().any(|e| e.kind == "committed" && e.detail.contains("abc1234")));
+}
+
+#[test]
+fn a_failed_commit_is_the_persons_to_make() {
+    let mut w = world_with(&manual("fresh_session = false\n"));
+    w.up();
+    w.all_idle();
+    w.ok(None, "task.new", json!({"to": "architect", "title": "Plan A"}));
+    w.ok(Some("architect"), "task.done", json!({"id": "T1", "summary": "planned"}));
+    w.ok(None, "answer", json!({"id": "Q1", "text": "ok"}));
+    assert_eq!(w.d.take_commits().len(), 1);
+    w.d.on_commit_done("shop", "T1", &CommitResult::Failed("pre-commit: lint failed".into()), w.now);
+    let inbox = w.ok(None, "inbox", json!({}));
+    assert!(inbox[0]["text"].as_str().unwrap().contains("could not commit T1's changes") && inbox[0]["text"].as_str().unwrap().contains("lint failed"), "{inbox}");
+    // Off: no commit, and the folder is free once the card is answered.
+    let mut w = world_with(&manual("fresh_session = false\ncommit_on_accept = false\n"));
+    w.up();
+    w.all_idle();
+    w.ok(None, "task.new", json!({"to": "architect", "title": "Plan A"}));
+    w.ok(Some("architect"), "task.done", json!({"id": "T1", "summary": "planned"}));
+    w.status("architect", "idle");
+    w.ok(None, "task.new", json!({"to": "architect", "title": "Plan B"}));
+    assert_eq!(w.state("T2"), TaskState::Queued);
+    w.ok(None, "answer", json!({"id": "Q1"}));
+    assert!(w.d.take_commits().is_empty());
+    assert_eq!(w.state("T2"), TaskState::Delivered);
 }
 
 #[test]
 fn new_work_waits_while_results_wait_for_review() {
-    let mut w = world_with(&manual("max_unreviewed = 2\nfresh_session = false\n"));
+    let mut w = world_with(&manual("max_chains = 0\nmax_unreviewed = 2\nfresh_session = false\n"));
     w.up();
     w.all_idle();
     for n in 0..2 {
@@ -876,7 +959,7 @@ fn fresh_sessions_can_be_turned_off() {
 
 #[test]
 fn a_waiting_note_is_read_before_a_new_session() {
-    let mut w = world();
+    let mut w = world_with(&parallel(""));
     w.up();
     w.all_idle();
     w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "A"}));
@@ -1077,7 +1160,7 @@ fn members_do_not_hand_on_inside_a_flow() {
 
 #[test]
 fn which_work_runs_a_flow() {
-    let mut w = world();
+    let mut w = world_with(&parallel(""));
     w.up();
     w.all_idle();
     assert!(w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Docs", "flow": "none"}))["run"].is_null());
@@ -1331,7 +1414,7 @@ fn a_flow_over_budget_waits_for_the_person() {
 
 #[test]
 fn codex_work_waits_while_its_quota_is_used_up() {
-    let mut w = world_with(&manual(""));
+    let mut w = world_with(&manual("max_chains = 0\n"));
     w.up();
     w.all_idle();
     let cwd = w.repo.to_string_lossy().to_string();
@@ -1408,4 +1491,48 @@ fn magpies_reading_of_the_signed_in_codex_account_wins_over_old_records() {
     assert!(w.inbox_kinds().is_empty(), "{:?}", w.d.store.inbox("shop", false));
     let t = w.ok(Some("owner"), "task.new", json!({"to": "tester", "title": "Verify"}));
     assert_eq!(t["state"], "delivered");
+}
+
+#[test]
+fn the_window_sees_contexts_flows_and_the_chains_brief() {
+    let mut w = world_with(&with_check("cargo test", ""));
+    w.ok(None, "project.up", json!({"brief": "加一个登录页"}));
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1", "accept": ["401 on a bad password"]}));
+    w.set_context("engineer", 47_000);
+    let st = w.ok(None, "status", json!({}));
+    let member = |id: &str| st["members"].as_array().unwrap().iter().find(|m| m["id"] == id).unwrap().clone();
+    assert_eq!((member("engineer")["context"].clone(), member("engineer")["context_limit"].clone()), (json!(47_000), json!(60_000)));
+    assert_eq!(member("owner")["context_limit"], 120_000);
+    assert!(member("tester")["context"].is_null(), "nothing read yet");
+    assert_eq!((st["runs"][0]["steps"].clone(), st["runs"][0]["step_index"].clone()), (json!(["implement", "check", "verify"]), json!(0)));
+
+    // Back from a failed check: the flow says where it is and what the check said.
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "login added"}));
+    w.finish_check("T2", Some(1), "1 failed");
+    let fix = w.d.store.tasks("shop").unwrap().into_iter().map(|(t, _)| t).next_back().unwrap();
+    let show = w.ok(None, "task.show", json!({"id": fix.id}));
+    let flow = &show["flow"];
+    assert_eq!((flow["anchor"].as_str(), flow["round"].as_u64(), flow["check"].as_str()), (Some("T2"), Some(1), Some("cargo test")));
+    assert!(flow["last_check"]["detail"].as_str().unwrap().starts_with("failed"), "{flow}");
+    // The person's words come from T1; what counts as done gathers along the chain.
+    assert_eq!((show["brief"]["quote"].as_str(), show["brief"]["quote_from"].as_str()), (Some("加一个登录页"), Some("T1")));
+    assert_eq!(show["brief"]["accept"], json!(["401 on a bad password"]));
+}
+
+#[test]
+fn a_removed_project_is_stopped_and_forgotten() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build"}));
+    assert!(w.call(Some("owner"), "project.remove", json!({})).is_err(), "only the person");
+    let r = w.ok(None, "project.remove", json!({}));
+    assert_eq!(r["stopped"].as_array().unwrap().len(), 4);
+    assert!(w.d.store.project("shop").unwrap().is_none() && w.d.store.tasks("shop").unwrap().is_empty());
+    assert!(!w.d.projects.contains_key("shop"));
+    assert!(w.repo.join(".lila/project.toml").exists(), "the folder stays");
+    // Added again: a fresh start.
+    w.up();
+    assert!(w.d.store.tasks("shop").unwrap().is_empty());
 }
