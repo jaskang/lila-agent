@@ -71,6 +71,12 @@ enum Cmd {
         #[arg(long)]
         task: Option<String>,
     },
+    /// Tokens each member used, from the session records Claude Code and Codex keep here.
+    Usage {
+        /// Only the last N days (default: all).
+        #[arg(long)]
+        days: Option<u64>,
+    },
     /// Stop delivering tasks (notes still go out).
     Pause,
     /// Resume delivering tasks.
@@ -226,6 +232,7 @@ fn run() -> Result<()> {
         Cmd::Inbox { all } => out(call("inbox", json!({"all": all}))?, &fmt_inbox),
         Cmd::Answer { id, text } => out(call("answer", json!({"id": id, "text": text}))?, &|v| format!("{} resolved", v["id"].as_str().unwrap_or("?"))),
         Cmd::Log { limit, task } => out(call("log", json!({"limit": limit, "task": task}))?, &fmt_log),
+        Cmd::Usage { days } => usage(days, cli.json)?,
         Cmd::Pause => out(call("pause", json!({}))?, &|_| "paused: no new tasks are delivered".into()),
         Cmd::Resume => out(call("resume", json!({}))?, &|_| "resumed".into()),
         Cmd::Daemon { cmd: DaemonCmd::Run } => daemon::serve(paths.clone(), client::hc_bin())?,
@@ -301,6 +308,42 @@ fn init(paths: &Paths, name: Option<String>) -> Result<()> {
         println!("installed roles in {}: {}", paths.roles().display(), out.roles_installed.join(", "));
     }
     println!("next: edit the team if you like, then `lila up --brief \"what you want built\"`");
+    Ok(())
+}
+
+fn usage(days: Option<u64>, as_json: bool) -> Result<()> {
+    use lila::usage::{Scanner, Sources, short};
+    let cwd = std::env::current_dir()?;
+    let root = lila::paths::find_project_root(&cwd).context("no .lila/project.toml here or above")?;
+    let text = std::fs::read_to_string(root.join(".lila/project.toml"))?;
+    let name = lila_core::ProjectConfig::parse(&text).map_err(anyhow::Error::msg)?.name;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+    let since = days.map(|d| now - d as i64 * 86_400_000);
+    let u = Scanner::default().usage(&Sources::from_env(), &name, &root.to_string_lossy(), since);
+    if as_json {
+        let members: Vec<Value> = u
+            .members
+            .iter()
+            .map(|m| json!({"member": m.member, "runtime": m.runtime, "sessions": m.sessions, "input": m.tokens.input, "cache_write": m.tokens.cache_write, "cache_read": m.tokens.cache_read, "output": m.tokens.output, "total": m.tokens.total(), "models": m.models.keys().collect::<Vec<_>>()}))
+            .collect();
+        let limits: Vec<Value> = u.codex_limits.iter().map(|l| json!({"used_percent": l.used_percent, "window_minutes": l.window_minutes, "resets_at_ms": l.resets_at_ms, "seen_ms": l.seen_ms, "plan": l.plan})).collect();
+        println!("{}", serde_json::to_string_pretty(&json!({"project": name, "members": members, "codex_limits": limits}))?);
+        return Ok(());
+    }
+    if u.members.is_empty() {
+        println!("no sessions of {name}'s members found{}", if days.is_some() { " in that time" } else { "" });
+    }
+    for m in &u.members {
+        let t = &m.tokens;
+        let models: Vec<&str> = m.models.keys().map(String::as_str).collect();
+        println!("{:<14} {:>7}  in {:>6}  cache w {:>6} r {:>7}  out {:>6}  {} session(s)  {}", m.member, short(t.total()), short(t.input), short(t.cache_write), short(t.cache_read), short(t.output), m.sessions, models.join(", "));
+    }
+    if !u.members.is_empty() {
+        println!("{:<14} {:>7}", "total", short(u.total.total()));
+    }
+    for l in &u.codex_limits {
+        println!("codex: {:.0}% of the {}-minute window used, resets in {} min", l.used_percent, l.window_minutes, ((l.resets_at_ms - now) / 60_000).max(0));
+    }
     Ok(())
 }
 

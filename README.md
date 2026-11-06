@@ -51,6 +51,7 @@ lila status                   # 谁在做什么
 lila inbox                    # 需要你的事：PM 的提问、终端里的权限确认、完成报告
 lila answer Q3 "用 Stripe"     # 回答问题（不带文字则表示忽略这条）
 lila log                      # 最近的动态
+lila usage [--days 7]         # 每个成员用了多少 token，读本机的 Claude Code / Codex 会话记录
 lila task edit T5 --append "…" # 给已派出的任务补充要求
 lila task ls --all            # 所有任务
 lila pause / lila resume      # 暂停 / 恢复派发

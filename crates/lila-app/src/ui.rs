@@ -468,6 +468,8 @@ impl LilaApp {
         let inbox_el = self.inbox_list(cx).into_any_element();
         let tasks_el = self.task_board(cx).into_any_element();
         let log_el = self.activity(cx).into_any_element();
+        let usage_el = self.usage_panel(cx);
+        let periods = self.usage_periods(cx);
         v_flex()
             .size_full()
             .bg(theme.sidebar)
@@ -496,6 +498,9 @@ impl LilaApp {
                     .child(div().mx_4().mt_3().h(px(1.)).bg(theme.sidebar_border))
                     .child(section("任务", open_tasks, cx))
                     .child(tasks_el)
+                    .child(div().mx_4().mt_3().h(px(1.)).bg(theme.sidebar_border))
+                    .child(section("用量", 0, cx).pr_4().child(div().flex_1()).child(periods))
+                    .child(usage_el)
                     .child(div().mx_4().mt_3().h(px(1.)).bg(theme.sidebar_border))
                     .child(section("动态", 0, cx))
                     .child(log_el),

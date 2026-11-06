@@ -9,6 +9,7 @@ mod dialog;
 mod prefs;
 mod settings;
 mod ui;
+mod usage;
 mod wizard;
 
 use gpui::*;
@@ -92,6 +93,9 @@ fn main() {
                             }));
                         })
                         .detach();
+                }
+                if let Ok(p) = std::env::var("LILA_APP_USAGE") {
+                    view.update(cx, |v, cx| v.set_period(crate::usage::Period::parse(&p), cx));
                 }
                 if let Ok(to) = std::env::var("LILA_APP_COMPOSE") {
                     view.update(cx, |v, cx| v.compose(Some(to).filter(|t| !t.is_empty()), None, window, cx));

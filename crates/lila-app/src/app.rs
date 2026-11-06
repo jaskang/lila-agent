@@ -29,6 +29,8 @@ pub struct LilaApp {
     pub settings: Option<crate::settings::Form>,
     /// The global settings (role library), while open.
     pub prefs: Option<crate::prefs::Prefs>,
+    /// The 用量 section: tokens per member, read in the background.
+    pub usage: crate::usage::UsageState,
     /// The new-project wizard, while open.
     pub wizard: Option<crate::wizard::Wizard>,
     /// Where the open dialog was dragged to, from the window's center.
@@ -126,7 +128,9 @@ impl LilaApp {
             });
         })
         .detach();
-        LilaApp { paths, snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll }
+        let mut app = LilaApp { paths, usage: Default::default(), snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
+        app.start_usage(window, cx);
+        app
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
@@ -260,6 +264,7 @@ impl LilaApp {
         self.selected = Some(id);
         self.save_tabs();
         self.refresh_now();
+        self.usage.refresh();
         cx.notify();
     }
 

@@ -150,11 +150,11 @@ pub fn save_tabs(paths: &Paths, tabs: &Tabs) {
     }
 }
 
-/// HH:MM in local time.
-pub fn clock(ms: i64) -> String {
+/// The local time zone's offset from UTC, in seconds (asked once).
+pub fn utc_offset_s() -> i64 {
     use std::sync::OnceLock;
     static OFFSET: OnceLock<i64> = OnceLock::new();
-    let offset = *OFFSET.get_or_init(|| {
+    *OFFSET.get_or_init(|| {
         std::process::Command::new("date")
             .arg("+%z")
             .output()
@@ -170,9 +170,47 @@ pub fn clock(ms: i64) -> String {
                 Some(sign * (d[..2].parse::<i64>().ok()? * 3600 + d[2..].parse::<i64>().ok()? * 60))
             })
             .unwrap_or(0)
-    });
-    let t = (ms / 1000 + offset).rem_euclid(86_400);
+    })
+}
+
+/// HH:MM in local time.
+pub fn clock(ms: i64) -> String {
+    let t = (ms / 1000 + utc_offset_s()).rem_euclid(86_400);
     format!("{:02}:{:02}", t / 3600, t / 60 % 60)
+}
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// The start of the local day `ms` is in.
+pub fn local_midnight_ms(ms: i64) -> i64 {
+    let off = utc_offset_s() * 1000;
+    (ms + off).div_euclid(86_400_000) * 86_400_000 - off
+}
+
+/// When something happens, for people: "今天 14:20", "明天 09:00", "11月12日 14:20".
+pub fn local_when(ms: i64, now: i64) -> String {
+    let day = |t: i64| (t + utc_offset_s() * 1000).div_euclid(86_400_000);
+    let (d, today) = (day(ms), day(now));
+    let prefix = match d - today {
+        0 => "今天".to_owned(),
+        1 => "明天".to_owned(),
+        -1 => "昨天".to_owned(),
+        _ => {
+            // Month and day from days since 1970-01-01 (civil_from_days).
+            let z = d + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let dd = doy - (153 * mp + 2) / 5 + 1;
+            let mm = if mp < 10 { mp + 3 } else { mp - 9 };
+            format!("{mm}月{dd}日")
+        }
+    };
+    format!("{prefix} {}", clock(ms))
 }
 
 /// Wall clock with milliseconds, for debug logs.

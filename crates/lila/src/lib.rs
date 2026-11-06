@@ -7,3 +7,4 @@ pub mod init;
 pub mod paths;
 pub mod roles;
 pub mod settings;
+pub mod usage;

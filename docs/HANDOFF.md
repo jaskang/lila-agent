@@ -77,12 +77,13 @@ cargo run -p lila-app
 | ↳ `daemon.rs` | `Daemon::handle` 处理所有请求；测试在 `daemon_tests.rs`，用 Fake 终端 |
 | ↳ `settings.rs` | 项目设置读写：成员、count、指派规则、`[settings]`，用 toml_edit 保留注释 |
 | ↳ `roles.rs` | 角色读写删、默认角色、旧版默认文件升级 |
+| ↳ `usage.rs` | 读本机的 Claude Code / Codex 会话记录，按系统提示词里的 `Project: … You are \`成员\`` 认人，统计 token 和 Codex 额度；`lila usage` 和窗口共用 |
 | ↳ 其他 | `init.rs`（默认项目模板；`create_project` 按向导选的团队建项目）、`client.rs`、`paths.rs`、`skill.md`（agent 协议说明） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app）。`view.rs` 处理按键、IME、选择、复制粘贴、滚动、搜索、链接 |
 | `lila-app` | 窗口，详见下一行 |
 | ↳ 主体 | `app.rs`：状态、刷新循环、快捷键、对话框位置、缺配置自动重建。`ui.rs`：侧栏、项目右键菜单、标签栏、终端卡片、右侧概览、状态栏。`data.rs`：拉数据、标签持久化、`restore_config` |
 | ↳ 设置 | `dialog.rs`：设置对话框外壳（导航、分组行、分段控件、步进器、拖动）。`settings.rs`：项目设置四页，以及分组的模型 Select。`prefs.rs`：全局设置，即角色库和关于 |
-| ↳ 其他 | `wizard.rs`（新建项目向导：文件夹 → 团队 → 简介）、`detail.rs`（任务详情）、`compose.rs`（新建/改写任务）、`build.rs`（链接成 15.5 SDK） |
+| ↳ 其他 | `wizard.rs`（新建项目向导：文件夹 → 团队 → 简介）、`usage.rs`（右侧「用量」一节）、`detail.rs`（任务详情）、`compose.rs`（新建/改写任务）、`build.rs`（链接成 15.5 SDK） |
 
 ### 关键机制
 
@@ -140,6 +141,7 @@ cargo run -p lila-app
 - `LILA_APP_SWITCH=a,b,...`：每 3 秒切换到下一个项目。
 - `LILA_APP_SETTINGS=general|members|assign|rules`：打开项目设置的那一页；再加 `LILA_APP_SETTINGS_ADD=<角色>` 会加一个新成员。
 - `LILA_APP_PREFS=roles|about`：打开全局设置的那一页。
+- `LILA_APP_USAGE=today|week|all`：右侧「用量」切到那个时间段。
 - `LILA_APP_NEW=<文件夹>`：打开新建项目向导并选好文件夹，空字符串表示还没选；再加 `LILA_APP_NEW_STEP=team|brief` 跳到那一步。
 - `LILA_APP_OPEN_TASK=T3`、`LILA_APP_COMPOSE=<成员>`、`LILA_APP_DEBUG=1`。
 
@@ -176,11 +178,10 @@ macOS 没有 `timeout` 命令，可以这样让程序跑一会儿再停：`prog 
 ## 待办
 
 - **M3 剩下的**（顺序见 `docs/m3.md`）：
-  - 第 5 项：用量统计；
   - 第 6 项：每成员独立 worktree，要先和用户确定合并方式；
   - 第 7 项：远程机器。
 - **角色库**：还缺「预览最终提示词」。
-- **未观察到的情况**：订阅额度用完时成员会怎样（见 `docs/m1.md`）。
+- **未完全观察到的情况**：额度用完时成员在终端里会怎样。Codex 用完的记录已经在会话记录里看到了，当时成员的表现没记下（见 `docs/m1.md`）。
 - **终端**：Option 当 Alt 用、kitty 图片。
 - **项目编号改名**：现在只能改显示名，改编号会牵涉数据库和终端名。
 - **从列表移除项目**：已经提议放进右键菜单，用户还没表态。
