@@ -128,7 +128,7 @@ impl LilaApp {
             let _ = this.update(cx, |this, cx| {
                 match core {
                     Ok(c) => this.core = Some(c),
-                    Err(e) => this.core_error = Some(format!("cannot connect to herdr-core: {e:#}")),
+                    Err(e) => this.core_error = Some(format!("连不上 herdr-core（hc）：{e:#}")),
                 }
                 cx.notify();
             });
@@ -507,7 +507,7 @@ impl Render for LilaApp {
             )
             .children(compose.map(|c| overlay(div()).child(c)))
             .when_some(detail, |d, t| d.child(self.detail_panel(t, window, cx)))
-            .when(loading, |d| d.child(overlay(div()).flex().items_center().justify_center().text_color(crate::style::muted()).child("正在读取任务…")))
+            .when(loading, |d| d.child(overlay(div()).flex().items_center().justify_center().child(gpui::component::spinner::Spinner::new().color(crate::style::muted()))))
             .children(dialog)
     }
 }

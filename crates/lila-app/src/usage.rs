@@ -292,7 +292,6 @@ impl LilaApp {
                 Ok(()) => {
                     self.usage.adding = None;
                     self.usage.error = None;
-                    self.notice = Some(format!("已添加账号「{}」。设为当前后，成员重启时会用它。", s.account.name));
                 }
                 Err(e) => self.usage.error = Some(format!("登录成功，但没能保存账号：{e:#}")),
             },
