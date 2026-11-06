@@ -627,4 +627,5 @@ runs.worktree                                                                   
 - 第一次 PM 自己用 Bash 建了文件：用户的 Claude Code 默认是 auto 模式，`--allowedTools` 之外的命令也不问就跑，PM 的工具限制形同虚设。现在有 `allow` 规则的角色启动时带 `--permission-mode manual`（`runtime::launch`），其他命令要问人；角色的 `extra_args` 在后面，可以改回来。
 - 修好后：PM 派给 engineer → engineer 做完 → lilad 跑检查通过 → 收件箱出现中文验收卡片，列出每一步 → 「通过」后提交一次，提交信息带原话和 `Lila-Task: T1`。
 - 一行的简介不再把同一句话既当标题又当正文发给 PM。
+- 再跑一轮带 tester（也用 Haiku）：检查通过后 lilad 派出 `Verify:`，tester 看到原话、验收标准和不做什么，给出 PASS，验收卡片按时间列出四步。
 
