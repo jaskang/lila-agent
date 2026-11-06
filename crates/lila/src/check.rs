@@ -3,8 +3,9 @@
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 /// A check lilad wants run; the result comes back as `Daemon::on_check_done`.
 #[derive(Debug, Clone, PartialEq)]
@@ -74,32 +75,36 @@ pub fn run(job: &CheckJob) -> CheckResult {
         }
         let _ = tx.send(());
     });
-    let started = Instant::now();
-    let exit = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.code(),
-            Ok(None) if started.elapsed() >= job.timeout => {
-                let _ = Command::new("kill").args(["-KILL", &format!("-{}", child.id())]).status();
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(_) => break None,
+    let (exit, timed_out) = match child.wait_timeout(job.timeout) {
+        Ok(Some(status)) => (status.code(), false),
+        Ok(None) => {
+            kill_group(&child);
+            let _ = child.wait();
+            (None, true)
         }
+        Err(_) => (None, false),
     };
     let _ = eof.recv_timeout(Duration::from_secs(2));
     let out = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     let mut t = tail(&out);
-    if exit.is_none() && started.elapsed() >= job.timeout {
+    if timed_out {
         t.push_str(&format!("\n(stopped after {} s: `check_timeout_secs`)", job.timeout.as_secs()));
     }
     CheckResult { exit, tail: t }
 }
 
+/// Stops a check and everything it started: it leads its own process group.
+fn kill_group(child: &Child) {
+    // SAFETY: killpg only sends a signal; the group is the child's own (`process_group(0)`).
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn job(cmd: &str, timeout_ms: u64) -> CheckJob {
         CheckJob {

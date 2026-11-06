@@ -132,32 +132,14 @@ fn find_prompt(v: &Value) -> Option<&str> {
 
 /// `2026-11-05T07:30:04.123Z` (or with an offset) as Unix milliseconds.
 pub fn parse_time(s: &str) -> Option<i64> {
+    use chrono::{DateTime, NaiveDateTime};
     let s = s.trim();
-    let (date, time) = s.split_once('T')?;
-    let mut d = date.split('-');
-    let (y, m, day): (i64, i64, i64) = (d.next()?.parse().ok()?, d.next()?.parse().ok()?, d.next()?.parse().ok()?);
-    let (clock, offset_s) = if let Some(c) = time.strip_suffix('Z') {
-        (c, 0)
-    } else if let Some(i) = time.rfind(['+', '-']) {
-        let (c, z) = time.split_at(i);
-        let sign = if z.starts_with('-') { -1 } else { 1 };
-        let z = z[1..].replace(':', "");
-        let (h, mi) = (z.get(..2)?.parse::<i64>().ok()?, z.get(2..4).unwrap_or("00").parse::<i64>().ok()?);
-        (c, sign * (h * 3600 + mi * 60))
-    } else {
-        (time, 0)
-    };
-    let mut c = clock.split(':');
-    let (h, mi): (i64, i64) = (c.next()?.parse().ok()?, c.next()?.parse().ok()?);
-    let sec: f64 = c.next().unwrap_or("0").parse().ok()?;
-    // Days from 1970-01-01 (Howard Hinnant's days_from_civil).
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some((days * 86_400 + h * 3600 + mi * 60 - offset_s) * 1000 + (sec * 1000.0).round() as i64)
+    DateTime::parse_from_rfc3339(s)
+        .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z"))
+        .map(|t| t.timestamp_millis())
+        .ok()
+        // No offset: UTC, as the CLIs write it.
+        .or_else(|| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok().map(|t| t.and_utc().timestamp_millis()))
 }
 
 fn num(v: &Value, key: &str) -> u64 {
@@ -253,18 +235,10 @@ fn codex_cwd(first_line: &str) -> Option<String> {
     v["payload"]["cwd"].as_str().map(String::from)
 }
 
+/// The `.jsonl` files in `dir` and up to `depth` folders below it.
 fn jsonl_under(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            if depth > 0 {
-                jsonl_under(&p, out, depth - 1);
-            }
-        } else if p.extension().is_some_and(|x| x == "jsonl") {
-            out.push(p);
-        }
-    }
+    let files = walkdir::WalkDir::new(dir).min_depth(1).max_depth(depth + 1).into_iter().filter_map(Result::ok);
+    out.extend(files.filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl")).map(|e| e.into_path()));
 }
 
 /// Reads session files once and again only when they change.

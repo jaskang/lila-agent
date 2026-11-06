@@ -105,11 +105,12 @@ pub fn write_browser(dir: &Path) -> Result<PathBuf> {
     Ok(p)
 }
 
-/// The first https link in a line the login printed (terminal escapes and OSC 8 hyperlinks allowed).
+/// The first https link in a line the login printed. Its terminal escapes stay
+/// in: Claude Code's OSC 8 hyperlink holds the whole link, its text a shortened one.
 pub fn link_in(line: &str) -> Option<String> {
-    let at = line.find("https://")?;
-    let url: String = line[at..].chars().take_while(|c| !c.is_whitespace() && *c != '\u{1b}' && *c != '\u{7}').collect();
-    Some(url.trim_end_matches(['.', ',', ')', '"']).to_owned())
+    let mut finder = linkify::LinkFinder::new();
+    finder.kinds(&[linkify::LinkKind::Url]);
+    finder.links(line).map(|l| l.as_str()).find(|u| u.starts_with("https://")).map(String::from)
 }
 
 /// Starts `a`'s login. `program`: the CLI (absolute); `path_env`: its PATH.
@@ -208,37 +209,7 @@ fn watch(child: Arc<Mutex<Child>>, stdin: Arc<Mutex<Option<ChildStdin>>>, printe
 }
 
 fn strip_escapes(s: &str) -> String {
-    let mut out = String::new();
-    let mut it = s.chars().peekable();
-    while let Some(c) = it.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match it.next() {
-            // CSI: up to a letter.
-            Some('[') => {
-                for d in it.by_ref() {
-                    if d.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            // OSC: up to BEL or ST.
-            Some(']') => {
-                while let Some(d) = it.next() {
-                    if d == '\u{7}' || (d == '\u{1b}' && it.peek() == Some(&'\\')) {
-                        if d == '\u{1b}' {
-                            it.next();
-                        }
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
+    String::from_utf8_lossy(&strip_ansi_escapes::strip(s)).into_owned()
 }
 
 #[cfg(test)]

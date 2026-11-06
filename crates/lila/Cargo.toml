@@ -23,6 +23,14 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 toml_edit = "0.25"
+chrono.workspace = true
+libc = "0.2"
+linkify = "0.10"
+strip-ansi-escapes = "0.2"
+uuid = { version = "1", features = ["v4"] }
+wait-timeout = "0.2"
+walkdir = "2"
+which = "8"
 
 [dev-dependencies]
 tempfile.workspace = true

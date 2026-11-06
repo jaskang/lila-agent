@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 tempfile = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # GPUI and the terminal parse megabytes per frame: optimize dependencies in dev builds.
 [profile.dev.package."*"]

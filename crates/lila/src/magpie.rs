@@ -12,8 +12,10 @@ use anyhow::{Context, Result, bail};
 use lila_core::Runtime;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 /// One subscription account magpie knows.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,24 +40,27 @@ pub fn find(path: &str) -> Option<PathBuf> {
 /// Runs magpie with `args`, giving up after `timeout`.
 fn run(bin: &Path, args: &[&str], timeout: Duration) -> Result<String> {
     let mut child = Command::new(bin).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().with_context(|| format!("run {}", bin.display()))?;
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let out = child.wait_with_output()?;
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            if !status.success() {
-                let err = String::from_utf8_lossy(&out.stderr);
-                let why = err.lines().chain(text.lines()).map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_owned();
-                bail!("magpie {} failed: {why}", args.join(" "));
-            }
-            return Ok(text);
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            bail!("magpie {} took longer than {} s", args.join(" "), timeout.as_secs());
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    // Read while it runs, so a full pipe never stalls it.
+    let read = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = r.read_to_string(&mut s);
+            s
+        })
+    };
+    let out = read(Box::new(child.stdout.take().expect("piped")));
+    let err = read(Box::new(child.stderr.take().expect("piped")));
+    let Some(status) = child.wait_timeout(timeout)? else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("magpie {} took longer than {} s", args.join(" "), timeout.as_secs());
+    };
+    let (text, err) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    if !status.success() {
+        let why = err.lines().chain(text.lines()).map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_owned();
+        bail!("magpie {} failed: {why}", args.join(" "));
     }
+    Ok(text)
 }
 
 fn window_name(magpie: &str) -> String {

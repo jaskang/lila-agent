@@ -77,13 +77,12 @@ fn until(ms: i64, now: i64) -> String {
 
 /// "今天 21:00", "明天 09:00", "11月12日 周四 11:11".
 fn when(ms: i64, now: i64) -> String {
-    let day = |t: i64| (t + data::utc_offset_s() * 1000).div_euclid(86_400_000);
+    use chrono::Datelike;
     let s = data::local_when(ms, now);
-    if (day(ms) - day(now)).abs() <= 1 {
+    if data::days_from_today(ms, now).abs() <= 1 {
         return s;
     }
-    // 1970-01-01 was a Thursday.
-    let week = ["日", "一", "二", "三", "四", "五", "六"][(day(ms) + 4).rem_euclid(7) as usize];
+    let week = ["日", "一", "二", "三", "四", "五", "六"][data::local(ms).weekday().num_days_from_sunday() as usize];
     match s.split_once(' ') {
         Some((date, time)) => format!("{date} 周{week} {time}"),
         None => s,

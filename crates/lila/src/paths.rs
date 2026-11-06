@@ -102,16 +102,8 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
 
 /// `name` resolved on `path` (a PATH-style list), or `name` itself if it has a slash.
 pub fn which(name: &str, path: &str) -> Option<PathBuf> {
-    if name.contains('/') {
-        let p = PathBuf::from(name);
-        return is_executable(&p).then_some(p);
-    }
-    std::env::split_paths(path).map(|d| d.join(name)).find(|p| is_executable(p))
-}
-
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    p.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    ::which::which_in(name, Some(path), cwd).ok()
 }
 
 #[cfg(test)]

@@ -611,31 +611,10 @@ fn fmt_task_show(v: &Value) -> String {
     s
 }
 
-/// HH:MM:SS in UTC offset-free local-ish form: good enough for a log.
+/// HH:MM:SS in local time.
 fn clock(ms: i64) -> String {
-    let secs = ms / 1000;
-    let offset = local_offset_secs();
-    let t = (secs + offset).rem_euclid(86_400);
-    format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60)
-}
-
-fn local_offset_secs() -> i64 {
-    // `date +%z` is cheap and avoids a timezone dependency.
-    std::process::Command::new("date")
-        .arg("+%z")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|z| {
-            let z = z.trim();
-            let sign = if z.starts_with('-') { -1 } else { 1 };
-            let digits = z.trim_start_matches(['+', '-']);
-            if digits.len() != 4 {
-                return None;
-            }
-            Some(sign * (digits[..2].parse::<i64>().ok()? * 3600 + digits[2..].parse::<i64>().ok()? * 60))
-        })
-        .unwrap_or(0)
+    use chrono::TimeZone;
+    chrono::Local.timestamp_millis_opt(ms).single().map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_default()
 }
 
 

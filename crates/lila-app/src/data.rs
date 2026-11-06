@@ -150,65 +150,38 @@ pub fn save_tabs(paths: &Paths, tabs: &Tabs) {
     }
 }
 
-/// The local time zone's offset from UTC, in seconds (asked once).
-pub fn utc_offset_s() -> i64 {
-    use std::sync::OnceLock;
-    static OFFSET: OnceLock<i64> = OnceLock::new();
-    *OFFSET.get_or_init(|| {
-        std::process::Command::new("date")
-            .arg("+%z")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|z| {
-                let z = z.trim();
-                let sign = if z.starts_with('-') { -1 } else { 1 };
-                let d = z.trim_start_matches(['+', '-']);
-                if d.len() != 4 {
-                    return None;
-                }
-                Some(sign * (d[..2].parse::<i64>().ok()? * 3600 + d[2..].parse::<i64>().ok()? * 60))
-            })
-            .unwrap_or(0)
-    })
+/// `ms` (Unix milliseconds) in the local time zone.
+pub fn local(ms: i64) -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone;
+    chrono::Local.timestamp_millis_opt(ms).single().unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::UNIX_EPOCH.with_timezone(&chrono::Local))
 }
 
 /// HH:MM in local time.
 pub fn clock(ms: i64) -> String {
-    let t = (ms / 1000 + utc_offset_s()).rem_euclid(86_400);
-    format!("{:02}:{:02}", t / 3600, t / 60 % 60)
+    local(ms).format("%H:%M").to_string()
 }
 
 pub fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Days from the local day of `now` to that of `ms`: 0 today, 1 tomorrow, -1 yesterday.
+pub fn days_from_today(ms: i64, now: i64) -> i64 {
+    (local(ms).date_naive() - local(now).date_naive()).num_days()
 }
 
 /// When something happens, for people: "今天 14:20", "明天 09:00", "11月12日 14:20".
 pub fn local_when(ms: i64, now: i64) -> String {
-    let day = |t: i64| (t + utc_offset_s() * 1000).div_euclid(86_400_000);
-    let (d, today) = (day(ms), day(now));
-    let prefix = match d - today {
+    let prefix = match days_from_today(ms, now) {
         0 => "今天".to_owned(),
         1 => "明天".to_owned(),
         -1 => "昨天".to_owned(),
-        _ => {
-            // Month and day from days since 1970-01-01 (civil_from_days).
-            let z = d + 719_468;
-            let era = z.div_euclid(146_097);
-            let doe = z - era * 146_097;
-            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-            let mp = (5 * doy + 2) / 153;
-            let dd = doy - (153 * mp + 2) / 5 + 1;
-            let mm = if mp < 10 { mp + 3 } else { mp - 9 };
-            format!("{mm}月{dd}日")
-        }
+        _ => local(ms).format("%-m月%-d日").to_string(),
     };
     format!("{prefix} {}", clock(ms))
 }
 
 /// Wall clock with milliseconds, for debug logs.
 pub fn clock_ms() -> String {
-    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    format!("{}:{:02}.{:03}", clock(ms), ms / 1000 % 60, ms % 1000)
+    chrono::Local::now().format("%H:%M:%S%.3f").to_string()
 }

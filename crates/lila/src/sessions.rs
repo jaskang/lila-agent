@@ -14,17 +14,7 @@ use std::time::SystemTime;
 
 /// A random (version 4) UUID, as Claude Code's `--session-id` wants.
 pub fn new_uuid() -> String {
-    let mut b = [0u8; 16];
-    let read = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
-    if read.is_err() {
-        // No urandom: time and pid are unique enough for a session id.
-        let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        b = (t ^ ((std::process::id() as u128) << 64)).to_le_bytes();
-    }
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Where Claude Code records session `id` started in `cwd`.
@@ -38,38 +28,25 @@ pub fn find_codex(src: &Sources, project: &str, member: &str, cwd: &str, after_m
     let after = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(after_ms.saturating_sub(5_000).max(0) as u64);
     let mut found: Vec<(SystemTime, String, PathBuf)> = Vec::new();
     // Rollouts sit in sessions/YYYY/MM/DD/: only folders touched since the start can hold it.
-    let mut stack = vec![(src.codex.join("sessions"), 3)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for e in entries.flatten() {
-            let p = e.path();
-            let Ok(meta) = e.metadata() else { continue };
-            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            if modified < after {
-                continue;
-            }
-            if meta.is_dir() {
-                if depth > 0 {
-                    stack.push((p, depth - 1));
-                }
-                continue;
-            }
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
-                continue;
-            }
-            let head = read_head(&p, 256 * 1024);
-            let mut lines = head.lines();
-            let Some(meta_line) = lines.next().and_then(|l| serde_json::from_str::<Value>(l).ok()) else { continue };
-            let payload = &meta_line["payload"];
-            if payload["cwd"].as_str() != Some(cwd) {
-                continue;
-            }
-            let Some(id) = payload["id"].as_str().or(payload["session_id"].as_str()) else { continue };
-            let who = head.find("## Your team (Lila)").and_then(|at| identity(&unescape(&head[at..])));
-            if who.is_some_and(|(p, m)| p == project && m == member) {
-                found.push((modified, id.to_owned(), p));
-            }
+    let modified = |e: &walkdir::DirEntry| e.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
+    let walk = walkdir::WalkDir::new(src.codex.join("sessions")).max_depth(4).into_iter().filter_entry(|e| e.depth() == 0 || modified(e) >= after);
+    for e in walk.filter_map(Result::ok).filter(|e| e.file_type().is_file()) {
+        let (p, modified) = (e.path().to_path_buf(), modified(&e));
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
+            continue;
+        }
+        let head = read_head(&p, 256 * 1024);
+        let mut lines = head.lines();
+        let Some(meta_line) = lines.next().and_then(|l| serde_json::from_str::<Value>(l).ok()) else { continue };
+        let payload = &meta_line["payload"];
+        if payload["cwd"].as_str() != Some(cwd) {
+            continue;
+        }
+        let Some(id) = payload["id"].as_str().or(payload["session_id"].as_str()) else { continue };
+        let who = head.find("## Your team (Lila)").and_then(|at| identity(&unescape(&head[at..])));
+        if who.is_some_and(|(p, m)| p == project && m == member) {
+            found.push((modified, id.to_owned(), p));
         }
     }
     found.sort();
@@ -89,7 +66,8 @@ fn read_head(p: &Path, max: usize) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn read_tail(p: &Path, max: u64) -> String {
+/// The last `max` bytes of a JSONL file, from its first whole line.
+pub(crate) fn read_tail(p: &Path, max: u64) -> String {
     let Ok(mut f) = std::fs::File::open(p) else { return String::new() };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(max);

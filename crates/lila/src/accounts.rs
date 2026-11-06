@@ -294,22 +294,16 @@ fn window_name(minutes: u64) -> String {
 /// The newest rate-limit record in a Codex sessions folder (`YYYY/MM/DD/rollout-*.jsonl`).
 pub fn codex_usage(sessions: &Path) -> AccountUsage {
     // The newest days first, the newest files in them first; stop at the first record.
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    let mut stack = vec![(sessions.to_path_buf(), 3)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() && depth > 0 {
-                stack.push((p, depth - 1));
-            } else if p.extension().is_some_and(|x| x == "jsonl") {
-                files.push((e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p));
-            }
-        }
-    }
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = walkdir::WalkDir::new(sessions)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
+        .map(|e| (e.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(std::time::UNIX_EPOCH), e.into_path()))
+        .collect();
     files.sort_by_key(|f| std::cmp::Reverse(f.0));
     for (_, f) in files.into_iter().take(30) {
-        if let Some(u) = codex_record(&tail(&f, 256 * 1024)) {
+        if let Some(u) = codex_record(&crate::sessions::read_tail(&f, 256 * 1024)) {
             return u;
         }
     }
@@ -344,16 +338,6 @@ fn codex_record(text: &str) -> Option<AccountUsage> {
         });
     }
     None
-}
-
-fn tail(p: &Path, max: u64) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(p) else { return String::new() };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let _ = f.seek(SeekFrom::Start(len.saturating_sub(max)));
-    let mut buf = Vec::new();
-    let _ = f.read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[cfg(test)]

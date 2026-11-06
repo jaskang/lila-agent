@@ -1247,10 +1247,9 @@ fn a_pm_with_a_big_context_starts_again_from_a_digest() {
 
 // ---------------- the watchdog ----------------
 
-/// Fake times are early on 1970-01-01: their ISO form, as the CLIs write it.
+/// A fake time in ISO form, as the CLIs write it.
 fn iso(ms: i64) -> String {
-    let s = ms / 1000;
-    format!("1970-01-01T{:02}:{:02}:{:02}.{:03}Z", s / 3600, s / 60 % 60, s % 60, ms % 1000)
+    chrono::DateTime::from_timestamp_millis(ms).expect("in range").to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 impl World {
