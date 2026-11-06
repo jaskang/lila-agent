@@ -185,6 +185,9 @@ mod shots {
 
     pub fn start(window: &mut Window, cx: &mut App) {
         let Ok(path) = std::env::var("LILA_APP_SHOT") else { return };
+        // A window behind others isn't drawn again: keep it in front while shooting.
+        cx.activate(true);
+        window.activate_window();
         window
             .spawn(cx, async move |cx| {
                 loop {

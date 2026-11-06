@@ -22,6 +22,8 @@ pub struct Pick {
     pub name: String,
     pub on: bool,
     pub count: u32,
+    /// Its CLI, when it isn't installed: the role can't be picked.
+    pub missing: Option<String>,
 }
 
 /// A folder that already is (or is inside) a Lila project: its team is kept.
@@ -98,7 +100,16 @@ impl LilaApp {
         let order = |id: &str| lila::roles::DEFAULTS.iter().position(|(d, _, _)| *d == id).unwrap_or(usize::MAX);
         let mut roles: Vec<_> = roles.into_values().collect();
         roles.sort_by(|a, b| (order(&a.id), &a.id).cmp(&(order(&b.id), &b.id)));
-        let picks = roles.iter().map(|r| Pick { role: r.id.clone(), name: r.file.name.clone(), on: default_team.contains(&r.id.as_str()), count: 1 }).collect();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let picks = roles
+            .iter()
+            .map(|r| {
+                let cli = r.file.runtime.to_string();
+                let role_path = r.file.env.get("PATH").map(|p| format!("{p}:{path}")).unwrap_or_else(|| path.clone());
+                let missing = lila::paths::which(&cli, &role_path).is_none().then_some(cli);
+                Pick { role: r.id.clone(), name: r.file.name.clone(), on: default_team.contains(&r.id.as_str()) && missing.is_none(), count: 1, missing }
+            })
+            .collect();
         self.settings = None;
         self.prefs = None;
         self.draft = None;
@@ -222,7 +233,8 @@ impl LilaApp {
                 .enumerate()
                 .map(|(i, p)| {
                     let (on, count, is_pm) = (p.on, p.count, p.role == lila::roles::PM_ROLE);
-                    let check = Checkbox::new(SharedString::from(format!("wizard-role-{}", p.role))).checked(on || is_pm).disabled(is_pm).on_click(cx.listener(move |this, on: &bool, _, cx| {
+                    let missing = p.missing.clone();
+                    let check = Checkbox::new(SharedString::from(format!("wizard-role-{}", p.role))).checked(on || is_pm).disabled(is_pm || missing.is_some()).on_click(cx.listener(move |this, on: &bool, _, cx| {
                         let on = *on;
                         this.wizard_edit(cx, |w| w.picks[i].on = on)
                     }));
@@ -240,6 +252,7 @@ impl LilaApp {
                         .child(check)
                         .child(div().flex_1().min_w_0().text_size(px(13.)).font_medium().text_color(if on || is_pm { t.foreground } else { t.muted_foreground }).child(p.name.clone()))
                         .children(control)
+                        .when_some(missing, |d, cli| d.child(div().text_xs().text_color(t.muted_foreground).child(format!("未安装 {cli}"))))
                         .into_any_element()
                 })
                 .collect();

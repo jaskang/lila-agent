@@ -166,6 +166,9 @@ impl LilaApp {
             }
             snap
         };
+        if std::env::var_os("LILA_APP_DEBUG").is_some() {
+            eprintln!("[lila-app] apply: {} projects (unknown {}), for {:?}, selected {:?}, err {:?}", snap.projects.len(), snap.projects_unknown, snap.project, self.selected, snap.error);
+        }
         // A database that couldn't be read says nothing new: keep what is shown.
         if snap.projects_unknown {
             self.snap.error = snap.error;
