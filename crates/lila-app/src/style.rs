@@ -1,4 +1,4 @@
-//! The window's look, from the HTML prototype (`prototype/lila-window.html`):
+//! The window's look (DESIGN.md has the why):
 //! a graphite frosted-glass window, content on 12 px cards one step lighter
 //! than the glass, Apple's dark system colors, fills instead of borders.
 //!
@@ -111,7 +111,7 @@ pub const CTL: f32 = 32.;
 /// Compact buttons inside cards and rows.
 pub const CTL_SM: f32 = 28.;
 
-/// Form controls at the prototype's sizes. gpui-kit's own presets are 14 px
+/// Form controls at the window's sizes. gpui-kit's own presets are 14 px
 /// text and 24 px for `small`; these apply after them.
 pub trait Control: Styled + Sized {
     /// An input or select: 32 tall, 13 px text, 12 px in from the edges.

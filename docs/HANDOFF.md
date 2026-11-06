@@ -1,12 +1,11 @@
 # 交接说明（给接手的模型）
 
-更新于 2026-11-06 晚。用户用中文交流，回复也用中文。用户会换一台电脑继续，那台电脑上没有这一台的 Claude 记忆，所以该知道的都写在这里。
+更新于 2026-11-07。用户用中文交流，回复也用中文。用户会换一台电脑继续，那台电脑上没有这一台的 Claude 记忆，所以该知道的都写在这里。
 
 先读这份。需要细节时再读：
-- `docs/architecture-v2.md`：参考四篇文章（README 末尾）重新评估后的架构，分阶段落地。阶段 A–D 已完成，记录在 §10–§13；阶段 E 还没做。
-- `DESIGN.md`（仓库根目录）：界面的设计规范，包括颜色、字号、间距、组件、该做和不该做的，以及和 `style.rs` 的对照。
-- `docs/design.md`：最初的总体设计。部分内容已经被 v2 取代，以 v2 为准。
-- `docs/m1.md`、`docs/m2.md`、`docs/m3.md`：编排层、GUI 第一版、M3 增强的记录。
+- `docs/architecture-v2.md`：参考四篇文章（README 末尾）重新评估后的架构，分阶段落地。阶段 A–E 已完成，记录在 §10–§14；§15 是第一版上线前的精简。
+- `DESIGN.md`（仓库根目录）：界面规范。第一条规则：不写说明文字，看不懂就改布局。
+- 各阶段的旧记录（m1–m3、spikes、最初的 design.md）和 HTML 原型已经从仓库里去掉，要查就看 git 历史。
 - `AGENTS.md`（仓库根目录）：项目规则，包括用中文交流，以及优先用社区成熟的库、不自己造复杂的轮子。
 
 ## 这是什么
@@ -31,7 +30,8 @@ Lila 是一个管理编程 agent 团队的桌面工具。
 - **省 token 只看 Lila 自己造成的消耗**：不算 CLI 自带的工具、MCP 和 skills。**并行的结果不要攒着一起发**：用户明确否决过，做完一件就通知一件；只有已经在排队的消息可以合成一条。
 - **不复制 magpie 或任何别的工具的登录令牌**：两家的刷新令牌都会轮换，复制后总会有一边被登出（见下文「magpie」）。
 - **代码规则**（`AGENTS.md`）：能用成熟的库就用，比如时间用 `chrono`、UUID 用 `uuid`、遍历目录用 `walkdir`、在 PATH 上找命令用 `which`、进程超时用 `wait-timeout`、去终端转义用 `strip-ansi-escapes`、找链接用 `linkify`。2026-11-06 已经按这条规则梳理过一遍。
-- **界面改动先改 HTML 原型**（`crates/lila-app/prototype/lila-window.html`），用户认可后再改 GPUI；改完要截图自查，并说明哪些需要用户亲手点。原型和窗口在 2026-11-06 对齐过：除了用量页按原型来，其他都以实际窗口为准。
+- **界面直接改 GPUI**：HTML 原型在 2026-11-07 去掉了，窗口本身就是设计稿。改完用 `--features shots` 截图自查，并说明哪些需要用户亲手点。
+- **不写说明文字**（2026-11-07 用户定的目标：像 Linear 官网、苹果备忘录一样干净）：不加标语、提示、次要标签；看不懂就改布局。每个决定都要同时让用户、开发者、agent 更好用。
 - **工作方式**：
   - 提交信息用英文，末尾加 `Co-Authored-By` 署名行。
   - 只在用户要求时提交。在 `main` 上开发，用户已同意直接推送到 `main`。
@@ -80,7 +80,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 | crate | 内容 |
 |---|---|
-| `lila-core` | 纯逻辑，不做 IO。`config.rs`：角色（含 `[tools]`）、ProjectConfig、`[settings]`、成员池、Team::build、`flow_for`。`flow.rs`：流程模板和 `after`（下一步做什么）。`task.rs`：状态机、Brief（原话、验收标准、不做什么）、Outcome（决定、没验到的、verdict）。`prompt.rs`：系统提示词和协议，PM 还有 Flows 一节。`runtime.rs`：claude/codex 启动参数（工具限制、`--session-id`、`--resume`）。`dispatch.rs`：派发、沉默判定、`pick_slot`。`route.rs`：完成通知给谁。`message.rs`：所有打进终端的文字（投递、通知、摘要、验收卡片等）。 |
+| `lila-core` | 纯逻辑，不做 IO。`config.rs`：角色（含 `[tools]`）、ProjectConfig、`[settings]`、成员池、Team::build、`flow_for`。`flow.rs`：流程模板和 `after`（下一步做什么）。`task.rs`：状态机、Brief（原话、验收标准、不做什么）、Outcome（决定、没验到的、verdict）。`prompt.rs`：系统提示词和协议，PM 还有 Flows 一节。`runtime.rs`：claude/codex 启动参数（工具限制、`--session-id`、`--resume`）。`dispatch.rs`：派发、沉默判定、`pick_slot`。`route.rs`：完成通知给谁。`message.rs`：所有打进终端的文字（投递、通知、摘要等，英文）。`inbox.rs`：给人看的收件箱文字（验收卡片等，中文）。 |
 | `lila-store` | SQLite：projects、members（含 `session`）、tasks（含简报、结果、run）、task_events、artifacts、inbox、outbox、runs（流程运行、预算、暂停）、sessions、session_chains。新列在 `ADDED_COLUMNS` 里，打开旧数据库时自动加上。 |
 | `hc-client` | herdr-core JSON-RPC 客户端 |
 | `lila` | CLI 和 lilad，详见下面几行 |
@@ -93,7 +93,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | ↳ `usage.rs` | 按成员统计 token（读两个 CLI 的会话记录）、时间解析 |
 | ↳ 其他 | `settings.rs`（项目设置读写，用 toml_edit 保留注释）、`roles.rs`（角色和默认角色升级）、`init.rs`、`client.rs`、`paths.rs`、`skill.md`（给 agent 的协议说明） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app） |
-| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、窗口自己的焦点。`ui.rs`：侧栏卡片、中间卡片（项目标题行、终端、状态行）、概览（需要你 / 任务 / 动态）、收件箱卡片（含验收、预算）、状态栏。`style.rs`：配色和小部件。`tree.rs`：成员树动画。`data.rs`：拉数据、本地时间。`dialog.rs`：对话框外壳（`footer: false` 不显示保存栏）。`settings.rs`：项目设置。`prefs.rs`：全局设置（角色 / 用量 / 关于）。`usage.rs`：用量页（账号、浏览器登录、magpie）。`wizard.rs`、`detail.rs`、`compose.rs`、`build.rs`。 |
+| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、窗口自己的焦点。`ui.rs`：侧栏卡片、中间卡片（标题行、终端）、概览（需要你 / 任务）、收件箱卡片（含验收、预算）。`style.rs`：配色和小部件。`tree.rs`：成员树动画。`data.rs`：拉数据、本地时间。`dialog.rs`：对话框外壳（`footer: false` 不显示保存栏）。`settings.rs`：项目设置。`prefs.rs`：全局设置（角色 / 用量 / 关于）。`usage.rs`：用量页（账号、浏览器登录、magpie）。`wizard.rs`（新建项目）、`detail.rs`（任务详情）、`compose.rs`（新建任务）、`build.rs`。 |
 
 ## 关键机制（v2 之后）
 
@@ -136,19 +136,20 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 ## 界面现状
 
-- **风格**（`style.rs` 是唯一来源，数值照抄原型的 `:root`）：
+- **风格**（`style.rs` 是唯一来源）：
   - 石墨色毛玻璃窗口，内边距 8，卡片之间的缝是 8，也是拖动改宽度的把手。
-  - 12px 圆角卡片，靠填充色区分层次。左、中、右三栏都是卡片，侧栏卡片的第一行是红绿灯和「Lila」。
+  - 12px 圆角卡片，靠填充色区分层次。左、中、右三栏都是卡片，侧栏卡片的第一行是红绿灯、「Lila」和设置按钮。
   - 字号：正文 13、次要 12、说明 11。
 - **布局**：
-  - 侧栏是项目列表，加上两层的成员树（PM 在根上），底部是启动团队、暂停派发和设置。
-  - 中间一张卡片：项目标题行（项目名、目录、分支、团队状态、项目设置、概览开关）、成员的卡片头和终端、状态行。没有标签页，项目在侧栏里切换。
-  - 右边是概览（需要你 / 任务 / 动态）。
-- **收件箱卡片**：PM 在问你、终端在等你、等你验收（通过 / 写意见打回）、超出预算（继续 / 取消）、额度用完、可能在打转等。
+  - 侧栏是项目列表，加上两层的成员树（PM 在根上）。暂停派发在项目右键菜单里。
+  - 中间一张卡片：一行标题（项目 › 成员、状态胶囊、上下文、整理上下文、搜索、项目设置、面板开关）和终端。成员没在运行时只有一个「启动团队」按钮。没有状态栏，也没有标签页。
+  - 右边：「需要你」（有事时才出现）和任务（一行一个）。没有动态卡片。
+- **收件箱卡片**：PM 在问你、终端在等你、等你验收（通过 / 写意见打回）、超出预算（继续 / 取消）、额度用完、可能在打转等。文字来自 `lila_core::inbox`（中文）；给成员的消息在 `lila_core::message`（英文，协议）。
 - **设置**：
   - 全局设置（⌘,）：角色、用量、关于。
-  - 项目设置（⇧⌘,）：通用、成员、指派规则、运行规则。
-  - 两个都是居中对话框，用户确认过保持两个。
+  - 项目设置（⇧⌘,）：通用（名称、目录、运行规则）、成员。指派规则只在 `.lila/project.toml` 的 `[assign]` 里。
+  - 新建项目：一页（文件夹、名称、团队、简介）；编号由文件夹名生成，不是 git 仓库就自动 `git init`，没装 CLI 的角色不能勾。
+  - 都是居中对话框，用户确认过全局和项目设置保持两个。
 - **快捷键**：⌘N 新建任务、⌘1–9 按侧栏顺序切换项目、⌘, 全局设置、⇧⌘, 项目设置、⌘I 右侧面板、Esc 关闭。
 
 ## 无法点鼠标时怎么验证
@@ -157,15 +158,17 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 - `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG（不含红绿灯，也截不到真实的毛玻璃）。
 - `LILA_APP_KEYS="cmd-, cmd-i"`：启动后按这些键，经过窗口自己的按键分发，用来验证快捷键。
-- `LILA_APP_PREFS=roles|usage|about`、`LILA_APP_SETTINGS=general|members|assign|rules`（加 `LILA_APP_SETTINGS_ADD=<角色>`）。
+- `LILA_APP_PREFS=roles|usage|about`、`LILA_APP_SETTINGS=general|members`（加 `LILA_APP_SETTINGS_ADD=<角色>`）。
 - `LILA_APP_SIGNIN=claude:<名称>`：直接开始添加账号；`LILA_APP_NO_OPEN=1` 不打开浏览器。截完图要 `pkill -f "claude auth login"`。
-- `LILA_APP_FAKE_STATUS=designer:working,tester:blocked`、`LILA_APP_OPEN_TASK=T5`、`LILA_APP_COMPOSE=<成员>`、`LILA_APP_NEW=<文件夹>`（加 `LILA_APP_NEW_STEP=team|brief`）、`LILA_APP_SWITCH=a,b`、`LILA_APP_GUTTERS=1`、`LILA_APP_DEBUG=1`。
+- `LILA_APP_FAKE_STATUS=designer:working,tester:blocked`、`LILA_APP_OPEN_TASK=T5`、`LILA_APP_COMPOSE=<成员>`、`LILA_APP_NEW=<文件夹>`（空：还没选文件夹）、`LILA_APP_SWITCH=a,b`、`LILA_APP_GUTTERS=1`、`LILA_APP_DEBUG=1`。
 
 截图用临时的 `LILA_HOME`，不碰用户的真实数据：
 1. 建一个目录并 `git init`，在里面运行 `LILA_HOME=<home> target/debug/lila init`；
 2. 用 `lila-store` 源码里的 SCHEMA 建 `<home>/data/lila.db`，再插入 `projects` 行 `(id, cwd, created_ms)`；要看收件箱就插 `inbox` 行；
 3. 窗口的数据来自 lilad，所以要先 `LILA_HOME=<home> target/debug/lila daemon run &`，截完 `lila daemon stop`；
-4. 设计稿用 Chrome 截图：`--headless=new --virtual-time-budget=2000 --screenshot=… "file://…/lila-window.html?scene=running&open=prefs:usage"`。
+4. 收件箱的 `options` 用 `char(31)` 分隔，正文的换行用 `char(10)`。
+
+**显示器睡着时截不到新画面**：窗口不重绘，PNG 一直是第一帧（多半是空的）。先看 `pmset -g assertions` 或 `system_profiler SPDisplaysDataType | grep Asleep`。刚编译出的二进制第一次启动慢，至少等 8 秒再截。
 
 macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; kill $P`；裁剪截图用 `sips -c H W --cropOffset Y X`。
 
@@ -188,13 +191,14 @@ macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; ki
   - 验收卡片的通过和打回、预算卡片；
   - 拖动面板和右键菜单；红绿灯的位置（截图里没有红绿灯）；
   - 设置对话框里的各种控件；
-  - 新建项目向导的「创建并启动」。
+  - 新建项目的「创建」（会 `git init`、写配置、启动团队）。
 - **终端**：Tab 和 Shift-Tab、平滑滚动、中文输入法、复制粘贴、⌘点击链接。
 
 ## 待办
 
 - **阶段 E 的 worktree**（`docs/architecture-v2.md` §4.8）：第一版没做，改成一条链占目录、验收时提交（§14）。以后要真正并行时再做每条链一个 worktree。
 - PM 自己开的链（终端里提的需求）没有验收卡片，也就不会提交（§14 已知限制）。
+- **2026-11-07 的精简**见 `docs/architecture-v2.md` §15。
 - **窗口里已经补上的**（2026-11-06）：任务详情里的流程进度、原话、验收标准、不做、决定和没验到的；任务列表里的当前步骤；终端卡片头的上下文大小；PM 的「整理上下文」（就是 `member.restart`，新会话收到摘要）；角色页的「预览最终提示词」（`lila::roles::preview`）；项目右键「从列表移除」（`project.remove`：停团队、删数据库记录，目录不动）。布局改成三栏卡片，去掉了标签页。
 - **已知限制**：
   - Claude 额度用完时 lilad 还发现不了，它的会话记录里没有额度信息；可以考虑在 lilad 里读 `.claude.json` 或 magpie。
