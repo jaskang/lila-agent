@@ -570,7 +570,9 @@ fn split_brief(brief: &str) -> (String, String) {
     let brief = brief.trim();
     let first = brief.lines().next().unwrap_or_default();
     let title: String = first.chars().take(80).collect();
-    (title, brief.to_owned())
+    // A one-line brief is all title: the body would only say it again.
+    let body = if title == brief { String::new() } else { brief.to_owned() };
+    (title, body)
 }
 
 fn ensure_gitignore(root: &Path) -> Result<()> {

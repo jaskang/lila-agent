@@ -622,3 +622,9 @@ runs.worktree                                                                   
 
 **文档**
 - 各阶段记录（m1–m3、spikes、最初的 design.md）和旧截图从仓库里去掉了，git 历史里还在。现在的文档只有 README、DESIGN.md、本文和 HANDOFF。
+
+**真跑一轮**（Haiku、low，PM 加 engineer，`check = "test -f hello.txt"`）
+- 第一次 PM 自己用 Bash 建了文件：用户的 Claude Code 默认是 auto 模式，`--allowedTools` 之外的命令也不问就跑，PM 的工具限制形同虚设。现在有 `allow` 规则的角色启动时带 `--permission-mode manual`（`runtime::launch`），其他命令要问人；角色的 `extra_args` 在后面，可以改回来。
+- 修好后：PM 派给 engineer → engineer 做完 → lilad 跑检查通过 → 收件箱出现中文验收卡片，列出每一步 → 「通过」后提交一次，提交信息带原话和 `Lila-Task: T1`。
+- 一行的简介不再把同一句话既当标题又当正文发给 PM。
+

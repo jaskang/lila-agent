@@ -44,6 +44,11 @@ pub fn launch(role: &Role, prompt_path: &str, prompt_text: &str, session: &Sessi
                     argv.extend(rules.iter().cloned());
                 }
             }
+            // Allow rules mean "everything else asks": in auto mode (a person's
+            // default) nothing asks, and the PM could do the work itself.
+            if !t.allow.is_empty() {
+                argv.extend(["--permission-mode".into(), "manual".into()]);
+            }
             argv.extend(["--append-system-prompt-file".into(), prompt_path.into()]);
         }
         Runtime::Codex => {
@@ -129,7 +134,7 @@ mod tests {
             l.argv,
             [
                 "claude", "--model", "the-model", "--tools", "Read,Bash", "--allowedTools", "Bash(lila:*)", "Bash(git log:*)",
-                "--disallowedTools", "Edit", "--append-system-prompt-file", "/p.md", "--foo"
+                "--disallowedTools", "Edit", "--permission-mode", "manual", "--append-system-prompt-file", "/p.md", "--foo"
             ],
             "the sandbox is codex's"
         );
