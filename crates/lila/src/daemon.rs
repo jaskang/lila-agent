@@ -922,22 +922,31 @@ impl<T: Terminals> Daemon<T> {
             return;
         }
         // Notes first: they are information the member should have before new work.
-        let mut noted: Vec<String> = Vec::new();
+        // A member's notes go out as one message: one turn when it is idle.
+        let mut ready: Vec<(String, Vec<lila_store::OutMessage>)> = Vec::new();
         for msg in self.store.outbox(pid).unwrap_or_default() {
-            let Some(live) = self.projects[pid].live.get(&msg.member).cloned() else {
+            if !self.projects[pid].live.contains_key(&msg.member) {
                 let _ = self.store.pop_outbox(msg.id);
                 continue;
-            };
-            let (Some(t), true) = (live.terminal.as_deref(), live.status.accepts_notes()) else { continue };
-            match self.term.send(t, &msg.text, None) {
+            }
+            match ready.iter_mut().find(|(m, _)| *m == msg.member) {
+                Some((_, msgs)) => msgs.push(msg),
+                None => ready.push((msg.member.clone(), vec![msg])),
+            }
+        }
+        let mut noted: Vec<String> = Vec::new();
+        for (member, msgs) in ready {
+            let live = &self.projects[pid].live[&member];
+            let (Some(t), true) = (live.terminal.clone(), live.status.accepts_notes()) else { continue };
+            let text = msgs.iter().map(|m| m.text.as_str()).collect::<Vec<_>>().join("\n");
+            noted.push(member.clone());
+            match self.term.send(&t, &text, None) {
                 Ok(()) => {
-                    let _ = self.store.pop_outbox(msg.id);
-                    noted.push(msg.member.clone());
+                    for m in &msgs {
+                        let _ = self.store.pop_outbox(m.id);
+                    }
                 }
-                Err(e) => {
-                    noted.push(msg.member.clone());
-                    self.say(format!("{pid}: note to {} not sent yet: {e:#}", msg.member));
-                }
+                Err(e) => self.say(format!("{pid}: note to {member} not sent yet: {e:#}")),
             }
         }
 

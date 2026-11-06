@@ -249,6 +249,21 @@ fn the_pm_hears_when_a_chain_under_its_task_ends_and_is_not_nudged_meanwhile() {
 }
 
 #[test]
+fn a_members_waiting_notes_go_out_as_one_message() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    w.status("owner", "blocked"); // in a dialog: notes pile up
+    w.d.store.push_outbox("shop", "owner", "<lila note about=\"T1\">one</lila>", w.now).unwrap();
+    w.d.store.push_outbox("shop", "owner", "<lila note about=\"T2\">two</lila>", w.now).unwrap();
+    w.d.pump("shop", w.now);
+    assert!(w.sends_to("owner").is_empty());
+    w.status("owner", "idle");
+    assert_eq!(w.sends_to("owner"), ["<lila note about=\"T1\">one</lila>\n<lila note about=\"T2\">two</lila>"]);
+    assert!(w.d.store.outbox("shop").unwrap().is_empty());
+}
+
+#[test]
 fn assignment_rules_and_ownership_are_enforced() {
     let mut w = world();
     w.up();
