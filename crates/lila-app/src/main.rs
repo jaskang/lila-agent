@@ -226,7 +226,7 @@ mod shots {
         // The window is translucent glass; lay it on a dark desktop color so
         // the PNG looks like it does over a wallpaper (without the blur).
         let mut pixels = image.as_raw().clone();
-        for px in pixels.chunks_exact_mut(4) {
+        for px in pixels.as_chunks_mut::<4>().0 {
             let a = px[3] as f32 / 255.;
             for (c, bg) in px[..3].iter_mut().zip([0x1c_u8, 0x1d, 0x2e]) {
                 *c = (*c as f32 * a + bg as f32 * (1. - a)).round() as u8;

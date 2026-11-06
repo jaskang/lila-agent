@@ -70,7 +70,7 @@ fn role_form(r: &RoleEdit, new: bool, window: &mut Window, cx: &mut Context<Lila
         id: r.id.clone(),
         effort: r.effort.clone(),
         can_assign: r.can_assign.clone(),
-        name: cx.new(|cx| InputState::new(window, cx).placeholder("显示名，比如 工程师").default_value(r.name.clone())),
+        name: cx.new(|cx| InputState::new(window, cx).default_value(r.name.clone())),
         model: model_select(&r.model, r.runtime, window, cx),
         prompt: cx.new(|cx| TextareaState::new(window, cx).rows(14).default_value(r.prompt.clone())),
         id_input: new.then(|| cx.new(|cx| InputState::new(window, cx).placeholder("角色编号").default_value(r.id.clone()))),

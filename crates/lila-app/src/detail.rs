@@ -65,7 +65,7 @@ pub fn task_link(id: &str, key: &str, cx: &mut Context<LilaApp>) -> Stateful<Div
         .text_color(cx.theme().blue)
         .hover(|d| d.underline())
         .child(id.to_owned())
-        .on_click(cx.listener(move |this, _, window, cx| this.open_task(open.clone(), window, cx)))
+        .on_click(cx.listener(move |this, _, _, cx| this.show_task(open.clone(), cx)))
 }
 
 fn block(title: &str, _cx: &App) -> Div {
@@ -292,7 +292,7 @@ impl LilaApp {
                                 .child(state_tag(&st, cid))
                                 .child(div().flex_1().min_w_0().truncate().child(s(&c, "title")))
                                 .child(div().text_xs().text_color(muted()).flex_none().child(s(&c, "to")))
-                                .on_click(cx.listener(move |this, _, window, cx| this.open_task(open.clone(), window, cx)))
+                                .on_click(cx.listener(move |this, _, _, cx| this.show_task(open.clone(), cx)))
                         })))
                     })
                     .when(!events.is_empty(), |d| d.child(block("经过", cx).child({

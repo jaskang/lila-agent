@@ -391,10 +391,6 @@ impl LilaApp {
         .detach();
     }
 
-    pub fn open_task(&mut self, id: String, _window: &mut Window, cx: &mut Context<Self>) {
-        self.show_task(id, cx);
-    }
-
     /// Shows a task in the detail panel; its details load with the next poll (and now).
     pub fn show_task(&mut self, id: String, cx: &mut Context<Self>) {
         self.draft = None;

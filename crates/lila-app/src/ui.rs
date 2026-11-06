@@ -597,7 +597,7 @@ impl LilaApp {
                             .cursor_pointer()
                             .when(active, |d| d.bg(style::accent()))
                             .when(!active, |d| d.hover(|d| d.bg(style::hover())))
-                            .on_click(cx.listener(move |this, _, window, cx| this.open_task(open.clone(), window, cx)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.show_task(open.clone(), cx)))
                             .child(crate::detail::state_tag(&state, id.clone()))
                             .child(div().flex_1().min_w_0().text_size(px(13.)).truncate().child(s(&t, "title")))
                             .child(div().flex_none().max_w(px(120.)).truncate().text_xs().text_color(muted2()).child(place))
