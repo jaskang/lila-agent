@@ -268,7 +268,11 @@ impl LilaApp {
         let theme = cx.theme().clone();
         let (busy, error) = (w.busy, w.error.clone());
         // A folder whose config doesn't load can't go on; any other failure can be tried again.
-        let ready = w.folder.as_ref().is_some_and(|f| f.existing.as_ref().is_none_or(|e| e.error.is_none()));
+        let ready = w.folder.as_ref().is_some_and(|f| match &f.existing {
+            Some(e) => e.error.is_none(),
+            // A new team needs its PM's CLI.
+            None => !w.picks.iter().any(|p| p.role == lila::roles::PM_ROLE && p.missing.is_some()),
+        });
         let existing = w.folder.as_ref().is_some_and(|f| f.existing.is_some());
         let body = self.wizard_page(cx);
         let note = error.clone().map(|e| h_flex().gap_2().text_color(theme.red).child(Icon::new(IconName::CircleAlert).small()).child(div().truncate().child(e)).into_any_element());
