@@ -749,7 +749,7 @@ impl Render for TerminalView {
             .id(SharedString::from(format!("term-{}", self.address)))
             .flex_1().min_h_0().w_full()
             .relative()
-            .bg(hsla(vt::theme().bg))
+            .when(!crate::theme::transparent(), |d| d.bg(hsla(vt::theme().bg)))
             .cursor(if hovered.is_some() { CursorStyle::PointingHand } else { CursorStyle::IBeam })
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
@@ -889,7 +889,9 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, l
     let marked = g.marked.clone();
     drop(g);
 
-    window.paint_quad(fill(bounds, hsla(frame.bg)));
+    if !crate::theme::transparent() {
+        window.paint_quad(fill(bounds, hsla(frame.bg)));
+    }
     let at = |x: usize, y: usize| origin + point(cell.width * x as f32, cell.height * y as f32);
     let snap_box = |b: Bounds<Pixels>| {
         let (x0, x1) = (snap(b.origin.x), snap(b.origin.x + b.size.width));

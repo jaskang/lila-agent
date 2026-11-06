@@ -8,6 +8,8 @@ mod detail;
 mod dialog;
 mod prefs;
 mod settings;
+mod tree;
+mod style;
 mod ui;
 mod usage;
 mod wizard;
@@ -15,17 +17,22 @@ mod wizard;
 use gpui::*;
 
 fn main() {
-    // The component icons (Lucide) come from gpui-kit's bundled assets.
-    gpui::application().with_assets(gpui::assets::Assets).run(|cx: &mut App| {
+    // The component icons (Lucide) come from gpui-kit's bundled assets, Lila's own from assets/lila.
+    gpui::application().with_assets(style::Assets).run(|cx: &mut App| {
         gpui::init(cx);
         lila_term::view::init(cx);
-        gpui::component::Theme::change(gpui::component::ThemeMode::Dark, None, cx);
+        // Terminals sit on the glass cards, so they leave their background unpainted.
+        lila_term::theme::set_transparent(true);
+        style::install(cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            // No separate title bar: the traffic lights sit in the sidebar's top row
-            // and the top row of every column drags the window (see ui::drag_bar).
-            titlebar: Some(TitlebarOptions { title: Some("Lila".into()), appears_transparent: true, traffic_light_position: Some(point(px(12.), px(14.))) }),
+            // No separate title bar: the traffic lights sit in the sidebar's top row,
+            // centered on the tab row beside it (window padding 8 + 18), and the top
+            // row of every column drags the window (see ui::drag_bar).
+            titlebar: Some(TitlebarOptions { title: Some("Lila".into()), appears_transparent: true, traffic_light_position: Some(point(px(20.), px(18.))) }),
+            // Graphite frosted glass: the root paints a translucent graphite over the blur.
+            window_background: WindowBackgroundAppearance::Blurred,
             ..Default::default()
         };
         let (_window, _view) = gpui::open_window(options, cx, |window, cx| {
@@ -35,7 +42,13 @@ fn main() {
                 shots::start(window, cx);
                 // Checks without a mouse: open this task's panel on start.
                 if let Ok(task) = std::env::var("LILA_APP_OPEN_TASK") {
-                    view.update(cx, |v, _| v.task = Some(task));
+                    let view = view.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                            let _ = cx.update(|_, cx| view.update(cx, |v, cx| v.show_task(task, cx)));
+                        })
+                        .detach();
                 }
                 // Switch through these projects (comma-separated), one every 3 s.
                 if let Ok(list) = std::env::var("LILA_APP_SWITCH") {
@@ -97,8 +110,15 @@ fn main() {
                 if let Ok(p) = std::env::var("LILA_APP_USAGE") {
                     view.update(cx, |v, cx| v.set_period(crate::usage::Period::parse(&p), cx));
                 }
+                // The new-task form, once the shown project has loaded.
                 if let Ok(to) = std::env::var("LILA_APP_COMPOSE") {
-                    view.update(cx, |v, cx| v.compose(Some(to).filter(|t| !t.is_empty()), None, window, cx));
+                    let view = view.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.compose(Some(to).filter(|t| !t.is_empty()), None, window, cx)));
+                        })
+                        .detach();
                 }
             }
             view
@@ -151,8 +171,18 @@ mod shots {
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), image.width(), image.height());
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
+        // The window is translucent glass; lay it on a dark desktop color so
+        // the PNG looks like it does over a wallpaper (without the blur).
+        let mut pixels = image.as_raw().clone();
+        for px in pixels.chunks_exact_mut(4) {
+            let a = px[3] as f32 / 255.;
+            for (c, bg) in px[..3].iter_mut().zip([0x1c_u8, 0x1d, 0x2e]) {
+                *c = (*c as f32 * a + bg as f32 * (1. - a)).round() as u8;
+            }
+            px[3] = 255;
+        }
         if let Ok(mut w) = encoder.write_header() {
-            let _ = w.write_image_data(image.as_raw());
+            let _ = w.write_image_data(&pixels);
         }
     }
 }

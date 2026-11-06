@@ -24,6 +24,18 @@ pub fn terminal() -> Theme {
     }
 }
 
+/// Off by default. On, the terminal leaves its default background unpainted so
+/// the surface under it shows through (cells with their own color still paint).
+static TRANSPARENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_transparent(on: bool) {
+    TRANSPARENT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn transparent() -> bool {
+    TRANSPARENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The monospace font and size cells are measured in.
 pub const FONT: &str = "Menlo";
 pub const FONT_SIZE: f32 = 13.0;

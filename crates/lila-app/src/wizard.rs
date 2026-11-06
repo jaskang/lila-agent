@@ -11,6 +11,7 @@ use gpui::component::checkbox::Checkbox;
 use gpui::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui::component::switch::Switch;
 use gpui::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
+use crate::style::Control as _;
 use gpui::prelude::*;
 use gpui::*;
 use lila::init::NewProject;
@@ -306,11 +307,11 @@ impl LilaApp {
                 .gap_3()
                 .px_12()
                 .child(Icon::new(IconName::FolderOpen).large().text_color(t.muted_foreground))
-                .child(div().text_sm().text_center().text_color(t.muted_foreground).child("选一个代码仓库，或者一个空文件夹。团队的成员会在这个文件夹里读写文件。"))
+                .child(div().text_size(px(13.)).text_center().text_color(t.muted_foreground).child("选一个代码仓库，或者一个空文件夹。团队的成员会在这个文件夹里读写文件。"))
                 .child(Button::new("wizard-pick-big").primary().label("选择文件夹…").on_click(cx.listener(|this, _, window, cx| this.wizard_pick_folder(window, cx))))
                 .into_any_element();
         };
-        let change = Button::new("wizard-pick").outline().small().label("更换…").on_click(cx.listener(|this, _, window, cx| this.wizard_pick_folder(window, cx)));
+        let change = Button::new("wizard-pick").outline().small().small_button().label("更换…").on_click(cx.listener(|this, _, window, cx| this.wizard_pick_folder(window, cx)));
         let mut body = vec![group(None, vec![row("文件夹", None, h_flex().gap_3().child(value_text(tail(&crate::data::tilde(&f.dir.to_string_lossy()), 44), cx)).child(change), cx)], cx)];
         match &f.existing {
             Some(e) => {
@@ -324,9 +325,9 @@ impl LilaApp {
             None => {
                 let id_row = match &f.registered {
                     Some(id) => row("项目编号", Some("这个文件夹以前登记过，编号沿用原来的。".into()), value_text(id.clone(), cx), cx),
-                    None => row("项目编号", Some("用在终端名和命令里：小写字母、数字和 -。以后不能改。".into()), div().w(px(250.)).child(Input::new(&id_input).small()), cx),
+                    None => row("项目编号", Some("用在终端名和命令里：小写字母、数字和 -。以后不能改。".into()), div().w(px(280.)).child(Input::new(&id_input).control()), cx),
                 };
-                let title_row = row("显示名称", Some("侧栏和标签上显示的名字，以后可以在项目设置里改。".into()), div().w(px(250.)).child(Input::new(&title_input).small()), cx);
+                let title_row = row("显示名称", Some("侧栏和标签上显示的名字，以后可以在项目设置里改。".into()), div().w(px(280.)).child(Input::new(&title_input).control()), cx);
                 body.push(group(Some("项目"), vec![id_row, title_row], cx));
                 if f.registered.is_some() {
                     body.push(notice(IconName::Info, t.muted_foreground, "它的 .lila/project.toml 不在了，会按下一步选的团队重新创建。以前的任务和动态还在。", cx));
@@ -381,7 +382,7 @@ impl LilaApp {
                     .py_3()
                     .gap_3()
                     .child(check)
-                    .child(v_flex().flex_1().min_w_0().gap_0p5().child(h_flex().gap_2().child(div().text_sm().font_medium().child(name)).child(div().text_xs().text_color(t.muted_foreground).child(role))).child(div().text_xs().text_color(t.muted_foreground).child(about)))
+                    .child(v_flex().flex_1().min_w_0().gap_0p5().child(h_flex().gap_2().child(div().text_size(px(13.)).font_medium().child(name)).child(div().text_xs().text_color(t.muted_foreground).child(role))).child(div().text_xs().text_color(t.muted_foreground).child(about)))
                     .child(div().flex_none().child(control))
                     .into_any_element()
             })
@@ -418,11 +419,11 @@ impl LilaApp {
             }
             will.push(if plan.brief.is_some() { "把简介作为第一个任务交给 PM，它会拆分、分派".to_owned() } else { "不写简介：之后直接在 PM 的终端里说要做什么".to_owned() });
         }
-        let will_rows = will.into_iter().map(|s| h_flex().px_4().py_2p5().gap_2().text_sm().child(Icon::new(IconName::Check).small().text_color(t.muted_foreground)).child(s).into_any_element()).collect();
+        let will_rows = will.into_iter().map(|s| h_flex().px_4().py_2p5().gap_2().text_size(px(13.)).child(Icon::new(IconName::Check).small().text_color(t.muted_foreground)).child(s).into_any_element()).collect();
         crate::dialog::scroll(
             "wizard-brief",
             vec![
-                group(None, vec![block("项目简介", Some("第一行作为任务标题，其余是说明，支持 Markdown。写清楚要做什么、给谁用、做到什么程度算完成。".into()), Textarea::new(&brief), None, cx)], cx),
+                group(None, vec![block("项目简介", Some("第一行作为任务标题，其余是说明，支持 Markdown。写清楚要做什么、给谁用、做到什么程度算完成。".into()), Textarea::new(&brief).area(), None, cx)], cx),
                 group(Some("接下来会"), will_rows, cx),
             ],
         )

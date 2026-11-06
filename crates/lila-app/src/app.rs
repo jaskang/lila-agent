@@ -4,7 +4,7 @@
 use crate::data::{self, Project, Snapshot};
 use crate::ui::s;
 use gpui::component::input::InputState;
-use gpui::component::{ActiveTheme, h_resizable, resizable_panel, v_flex};
+use gpui::component::{resizable_panel, v_flex};
 use gpui::prelude::*;
 use gpui::*;
 use lila::paths::Paths;
@@ -134,6 +134,22 @@ impl LilaApp {
     }
 
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
+        // Checks without running agents: `LILA_APP_FAKE_STATUS=designer:working,engineer:blocked`.
+        #[cfg(feature = "shots")]
+        let snap = {
+            let mut snap = snap;
+            if let (Ok(spec), Some(members)) = (std::env::var("LILA_APP_FAKE_STATUS"), snap.status.as_mut().and_then(|s| s["members"].as_array_mut())) {
+                for pair in spec.split(',') {
+                    if let Some((id, st)) = pair.split_once(':')
+                        && let Some(m) = members.iter_mut().find(|m| m["id"] == id)
+                    {
+                        m["status"] = json!(st);
+                        m["msg"] = json!(match st { "working" => "画结算页的三种状态", "blocked" => "终端在等确认：运行 pnpm test", _ => "" });
+                    }
+                }
+            }
+            snap
+        };
         // First look: the tabs open last time (else the first project).
         if !self.restored {
             self.restored = true;
@@ -419,32 +435,66 @@ impl LilaApp {
 
 impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
         let compose = self.compose_panel(cx);
         let dialog = self.settings_dialog(cx).or_else(|| self.prefs_dialog(cx)).or_else(|| self.wizard_dialog(cx));
         let detail = if compose.is_some() { None } else { self.task.as_ref().and(self.snap.detail.clone()) };
         let loading = compose.is_none() && self.task.is_some() && detail.is_none();
-        let overlay = |d: Div| d.absolute().top_0().right_0().bottom(px(26.)).w(px(600.)).bg(theme.popover).border_l_1().border_color(theme.border).shadow_lg().occlude();
+        let overlay = |d: Div| crate::ui::drawer_frame(d, 600.);
+        let pad = px(crate::style::GAP);
         v_flex()
             .size_full()
             .relative()
-            .bg(theme.sidebar)
-            .text_color(theme.foreground)
+            .p(pad)
+            .bg(crate::style::glass())
+            .text_color(crate::style::fg())
+            .text_size(px(13.))
             .on_key_down(cx.listener(Self::shortcut))
             .child(
                 div().flex_1().min_h_0().child(
-                    h_resizable("main")
-                        .child(resizable_panel().size(px(250.)).size_range(px(200.)..px(420.)).fixed().child(self.sidebar(cx).into_any_element()))
-                        .child(resizable_panel().child(self.center(window, cx).into_any_element()))
-                        .child(resizable_panel().visible(self.right_open).size(px(360.)).size_range(px(300.)..px(640.)).fixed().child(self.right(window, cx).into_any_element())),
+                    // The gutters between the sidebar, the terminal and the overview are the resize handles.
+                    gpui::base::h_resizable("main")
+                        .with_handle_appearance(gutter(crate::ui::TAB_BAR))
+                        .child(resizable_panel().size(px(250.)).size_range(px(200.)..px(420.)).fixed().child(div().size_full().pr(px(3.)).child(self.sidebar(cx)).into_any_element()))
+                        .child(
+                            resizable_panel().child(
+                                v_flex()
+                                    .size_full()
+                                    .pl(px(4.))
+                                    .child(self.tab_bar(cx))
+                                    .child(
+                                        div().flex_1().min_h_0().child(
+                                            gpui::base::h_resizable("work")
+                                                .with_handle_appearance(gutter(0.))
+                                                .child(resizable_panel().child(self.center(window, cx).into_any_element()))
+                                                .child(resizable_panel().visible(self.right_open).size(px(360.)).size_range(px(300.)..px(640.)).fixed().child(self.right(window, cx).into_any_element())),
+                                        ),
+                                    )
+                                    .child(self.status_bar(cx))
+                                    .into_any_element(),
+                            ),
+                        ),
                 ),
             )
-            .child(self.status_bar(cx))
             .children(compose.map(|c| overlay(div()).child(c)))
             .when_some(detail, |d, t| d.child(self.detail_panel(t, window, cx)))
-            .when(loading, |d| d.child(overlay(div()).flex().items_center().justify_center().text_color(theme.muted_foreground).child("正在读取任务…")))
+            .when(loading, |d| d.child(overlay(div()).flex().items_center().justify_center().text_color(crate::style::muted()).child("正在读取任务…")))
             .children(dialog)
     }
+}
+
+/// A gutter between cards that resizes them: nothing at rest, a thin blue line
+/// while the pointer is on it or dragging. The line runs along the cards beside
+/// it: `top` leaves out what sits above them (the tab row, beside the sidebar).
+fn gutter(top: f32) -> gpui::base::ResizeHandleRenderer {
+    std::rc::Rc::new(move |handle, _, _| {
+        let mut on = !matches!(handle.state(), gpui::base::ResizeHandleState::Idle);
+        // Checks without a mouse: `LILA_APP_GUTTERS=1` shows every line.
+        if cfg!(feature = "shots") && std::env::var_os("LILA_APP_GUTTERS").is_some() {
+            on = true;
+        }
+        let line = div().absolute().top(px(top)).bottom_0().left(px(-0.5)).w(px(2.)).rounded(px(1.)).bg(crate::style::blue());
+        Some(div().flex_none().relative().w(px(1.)).h_full().when(on, |d| d.child(line)).into_any_element())
+    })
 }
 
 impl LilaApp {

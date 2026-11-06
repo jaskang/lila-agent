@@ -13,6 +13,7 @@ use gpui::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui::component::scroll::ScrollableElement;
 use gpui::component::tag::Tag;
 use gpui::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
+use crate::style::Control as _;
 use gpui::prelude::*;
 use gpui::*;
 use lila::roles::RoleEdit;
@@ -218,15 +219,15 @@ impl LilaApp {
                 let active = ix == selected;
                 h_flex()
                     .id(SharedString::from(format!("role-item-{ix}")))
+                    .h(px(52.))
                     .px_2()
-                    .py_1p5()
-                    .gap_2()
-                    .rounded_md()
+                    .gap(px(10.))
+                    .rounded(px(8.))
                     .cursor_pointer()
-                    .when(active, |d| d.bg(theme.accent).text_color(theme.accent_foreground))
-                    .when(!active, |d| d.hover(|d| d.bg(theme.accent.opacity(0.5))))
+                    .when(active, |d| d.bg(crate::style::accent()))
+                    .when(!active, |d| d.hover(|d| d.bg(crate::style::hover())))
                     .child(Icon::new(IconName::User).small().text_color(theme.muted_foreground))
-                    .child(v_flex().flex_1().min_w_0().child(div().text_sm().font_medium().truncate().child(name.clone())).child(div().text_xs().text_color(theme.muted_foreground).truncate().child(id.clone())))
+                    .child(v_flex().flex_1().min_w_0().child(div().text_size(px(13.)).font_medium().truncate().child(name.clone())).child(div().text_xs().text_color(theme.muted_foreground).truncate().child(id.clone())))
                     .when(*new, |d| d.child(Tag::success().xsmall().child("新")))
                     .when(*changed && !*new, |d| d.child(div().size(px(6.)).rounded_full().bg(theme.blue)))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -236,7 +237,7 @@ impl LilaApp {
                         cx.notify();
                     }))
             })))
-            .child(div().p_2().border_t_1().border_color(theme.border).child(Button::new("add-role").ghost().small().w_full().icon(IconName::Plus).label("新建角色").dropdown_menu(move |mut menu, _, _| {
+            .child(div().p_2().border_t_1().border_color(theme.border).child(Button::new("add-role").ghost().small().small_button().w_full().icon(IconName::Plus).label("新建角色").dropdown_menu(move |mut menu, _, _| {
                 menu = menu.label("以这个角色为模板");
                 for (ix, name) in &templates {
                     let (weak, ix) = (weak.clone(), *ix);
@@ -263,7 +264,7 @@ impl LilaApp {
 
         let header = h_flex()
             .gap_3()
-            .child(div().size(px(36.)).flex_none().rounded_lg().bg(theme.accent).flex().items_center().justify_center().child(Icon::new(IconName::User).text_color(theme.accent_foreground)))
+            .child(div().size(px(36.)).flex_none().rounded(px(10.)).bg(crate::style::fill()).border_1().border_color(crate::style::hairline()).flex().items_center().justify_center().child(Icon::new(IconName::User).text_color(crate::style::muted())))
             .child(
                 v_flex()
                     .flex_1()
@@ -289,9 +290,9 @@ impl LilaApp {
 
         let mut rows = Vec::new();
         if let Some(input) = &id_input {
-            rows.push(row("角色编号", Some("项目配置里写的 role".into()), div().w(px(250.)).child(Input::new(input).small()), cx));
+            rows.push(row("角色编号", Some("项目配置里写的 role".into()), div().w(px(280.)).child(Input::new(input).control()), cx));
         }
-        rows.push(row("名称", Some("界面里显示的名字。".into()), div().w(px(250.)).child(Input::new(&name_input).small()), cx));
+        rows.push(row("名称", Some("界面里显示的名字。".into()), div().w(px(280.)).child(Input::new(&name_input).control()), cx));
         let cli = match v.runtime {
             Runtime::Claude => "Claude Code",
             Runtime::Codex => "Codex（ChatGPT）",
@@ -333,7 +334,7 @@ impl LilaApp {
         } else {
             body.push(group(Some("协作"), vec![assign_row], cx));
         }
-        body.extend([group(Some("提示词"), vec![block("预设提示词", Some("每个用这个角色、又没有自己提示词的成员都会用它。Lila 会在后面接上协作协议。".into()), Textarea::new(&prompt), None, cx)], cx)]);
+        body.extend([group(Some("提示词"), vec![block("预设提示词", Some("每个用这个角色、又没有自己提示词的成员都会用它。Lila 会在后面接上协作协议。".into()), Textarea::new(&prompt).area(), None, cx)], cx)]);
         if is_default {
             body.push(notice(IconName::Info, theme.muted_foreground, "这是 Lila 自带的角色。改动保存在你的角色目录里，Lila 升级不会覆盖。", cx));
         }

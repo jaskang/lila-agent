@@ -139,26 +139,29 @@ impl LilaApp {
         cx.notify();
     }
 
-    /// Small period switch for the section header.
+    /// Small period switch for the section header: a segmented control, the
+    /// chosen segment a raised thumb.
     pub fn usage_periods(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = cx.theme().clone();
         let now = self.usage.period;
         h_flex()
             .gap(px(2.))
-            .p(px(2.))
-            .rounded_md()
-            .bg(t.muted.opacity(0.6))
+            .p(px(3.))
+            .rounded(px(8.))
+            .bg(crate::style::well())
             .children(Period::ALL.into_iter().map(|p| {
                 let on = p == now;
                 div()
                     .id(SharedString::from(format!("usage-{}", p.label())))
-                    .px_1p5()
-                    .py(px(1.))
-                    .rounded(px(4.))
+                    .h(px(22.))
+                    .px(px(9.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.))
                     .text_xs()
+                    .font_medium()
                     .cursor_pointer()
-                    .when(on, |d| d.bg(t.primary).text_color(t.primary_foreground).font_medium())
-                    .when(!on, |d| d.text_color(t.muted_foreground).hover(|d| d.text_color(t.foreground)))
+                    .when(on, |d| d.bg(gpui::Hsla::from(rgba(0xffffff29))).text_color(crate::style::fg()).shadow_xs())
+                    .when(!on, |d| d.text_color(crate::style::muted()).hover(|d| d.text_color(crate::style::fg())))
                     .child(p.label())
                     .on_click(cx.listener(move |this, _, _, cx| this.set_period(p, cx)))
             }))
@@ -170,14 +173,14 @@ impl LilaApp {
         let muted = |text: String| div().text_xs().text_color(t.muted_foreground).child(text);
         let current = self.selected.clone();
         let Some(shown) = self.usage.shown.as_ref().filter(|s| Some(&s.project) == current.as_ref() && s.period == self.usage.period) else {
-            return div().px_4().child(muted("正在读取…".into())).into_any_element();
+            return div().px_4().pb_3().child(muted("正在读取…".into())).into_any_element();
         };
         // The team as lilad has it; unknown while it is down (then nobody is marked as gone).
         let team: Option<Vec<String>> = self.snap.status.as_ref().map(|_| self.members().iter().map(|m| s(m, "id")).collect());
         let u = &shown.usage;
         let now = data::now_ms();
         let max = u.members.iter().map(|m| m.tokens.total()).max().unwrap_or(1).max(1);
-        let mut out = v_flex().px_4().gap_2();
+        let mut out = v_flex().px_4().pb(px(14.)).gap_2();
         if u.members.is_empty() {
             let when = match shown.period {
                 Period::Today => "今天",
@@ -210,9 +213,9 @@ impl LilaApp {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(div().text_sm().flex_none().when(!in_team, |d| d.text_color(t.muted_foreground)).child(m.member.clone()))
+                            .child(div().text_size(px(13.)).flex_none().when(!in_team, |d| d.text_color(t.muted_foreground)).child(m.member.clone()))
                             .child(div().flex_1().min_w_0().truncate().text_xs().text_color(t.muted_foreground).child(if in_team { models.join("、") } else { "已不在团队".into() }))
-                            .child(div().text_sm().font_medium().child(short(tk.total()))),
+                            .child(div().text_size(px(13.)).font_medium().child(short(tk.total()))),
                     )
                     .child(div().h(px(3.)).w_full().rounded_full().bg(t.muted.opacity(0.6)).child(div().h_full().rounded_full().bg(bar.opacity(0.8)).w(relative(frac.max(0.02))))),
             );

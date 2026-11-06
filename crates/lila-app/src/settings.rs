@@ -17,6 +17,7 @@ use gpui::component::scroll::ScrollableElement;
 use gpui::component::switch::Switch;
 use gpui::component::tag::Tag;
 use gpui::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
+use crate::style::Control as _;
 use gpui::prelude::*;
 use gpui::*;
 use lila::settings::{MemberSettings, ProjectSettings};
@@ -176,7 +177,7 @@ pub fn selected_model(select: &ModelSelect, cx: &App) -> Option<(Runtime, String
 }
 
 pub fn model_control(select: &ModelSelect) -> AnyElement {
-    div().w(px(250.)).child(Select::new(select).small().placeholder("选择模型")).into_any_element()
+    div().w(px(280.)).child(Select::new(select).select_control().placeholder("选择模型")).into_any_element()
 }
 
 impl MemberForm {
@@ -337,7 +338,7 @@ impl LilaApp {
         dialog::scroll(
             "settings-general",
             vec![
-                group(None, vec![row("项目名称", Some("窗口里显示的名字，可以用中文。".into()), div().w(px(250.)).child(Input::new(&title).small()), cx)], cx),
+                group(None, vec![row("项目名称", Some("窗口里显示的名字，可以用中文。".into()), div().w(px(280.)).child(Input::new(&title).control()), cx)], cx),
                 group(
                     Some("位置"),
                     vec![
@@ -367,6 +368,7 @@ impl LilaApp {
             changed: bool,
             owner: bool,
             running: bool,
+            codex: bool,
         }
         let items: Vec<Item> = f
             .members
@@ -381,6 +383,7 @@ impl LilaApp {
                     changed: m.changed(cx) || v.count != m.base.count,
                     owner: v.ids().contains(&owner),
                     running: v.ids().iter().any(|i| running.contains(i)),
+                    codex: m.choice(cx).0 == Runtime::Codex,
                 }
             })
             .collect();
@@ -397,22 +400,23 @@ impl LilaApp {
                     let active = ix == selected;
                     h_flex()
                         .id(SharedString::from(format!("member-item-{ix}")))
+                        .h(px(52.))
                         .px_2()
-                        .py_1p5()
-                        .gap_2()
-                        .rounded_md()
+                        .gap(px(10.))
+                        .rounded(px(8.))
                         .cursor_pointer()
-                        .when(active, |d| d.bg(theme.accent).text_color(theme.accent_foreground))
-                        .when(!active, |d| d.hover(|d| d.bg(theme.accent.opacity(0.5))))
-                        .child(Icon::new(IconName::Bot).small().text_color(if it.running { theme.green } else { theme.muted_foreground }))
+                        .when(active, |d| d.bg(crate::style::accent()))
+                        .when(!active, |d| d.hover(|d| d.bg(crate::style::hover())))
+                        .child(crate::style::cli_tile(if it.codex { "codex" } else { "claude" }, 22.))
                         .child(
                             v_flex()
                                 .flex_1()
                                 .min_w_0()
-                                .child(h_flex().gap_1().child(div().text_sm().font_medium().truncate().child(if it.id.is_empty() { "（未命名）".to_owned() } else { it.id.clone() })).when(it.count > 1, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(format!("×{}", it.count)))))
+                                .child(h_flex().gap_1().child(div().text_size(px(13.)).font_medium().truncate().child(if it.id.is_empty() { "（未命名）".to_owned() } else { it.id.clone() })).when(it.count > 1, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(format!("×{}", it.count)))))
                                 .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(it.role.clone())),
                         )
-                        .when(it.owner, |d| d.child(Tag::secondary().xsmall().child("PM")))
+                        .when(it.running, |d| d.child(crate::ui::dot(theme.green)))
+                        .when(it.owner, |d| d.child(div().text_xs().font_medium().child("PM")))
                         .when(it.new, |d| d.child(Tag::success().xsmall().child("新")))
                         .when(it.changed && !it.new, |d| d.child(dot(theme.blue)))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -424,7 +428,7 @@ impl LilaApp {
                 })),
             )
             .child(
-                div().p_2().border_t_1().border_color(theme.border).child(Button::new("add-member").ghost().small().w_full().icon(IconName::Plus).label("添加成员").dropdown_menu(move |mut menu, _, _| {
+                div().p_2().border_t_1().border_color(theme.border).child(Button::new("add-member").ghost().small().small_button().w_full().icon(IconName::Plus).label("添加成员").dropdown_menu(move |mut menu, _, _| {
                     menu = menu.label("按角色添加");
                     for (id, name) in &roles {
                         let (weak, id) = (weak.clone(), id.clone());
@@ -454,7 +458,7 @@ impl LilaApp {
 
         let header = h_flex()
             .gap_3()
-            .child(div().size(px(36.)).flex_none().rounded_lg().bg(theme.accent).flex().items_center().justify_center().child(Icon::new(IconName::Bot).text_color(theme.accent_foreground)))
+            .child(crate::style::cli_tile(if runtime == Runtime::Codex { "codex" } else { "claude" }, 36.))
             .child(
                 v_flex()
                     .flex_1()
@@ -463,12 +467,12 @@ impl LilaApp {
                     .child(div().text_xs().text_color(theme.muted_foreground).child(format!("角色：{}（{}）{}", base.role_name, base.role, if is_running { " · 正在运行" } else { "" }))),
             )
             .when(!is_owner, |d| {
-                d.child(Button::new(SharedString::from(format!("remove-{ix}"))).outline().small().label("移出团队").tooltip(if is_running { "保存后停掉它的终端，没做完的任务会取消" } else { "保存后从项目里去掉" }).on_click(cx.listener(move |this, _, _, cx| this.remove_member(ix, cx))))
+                d.child(Button::new(SharedString::from(format!("remove-{ix}"))).outline().small().small_button().label("移出团队").tooltip(if is_running { "保存后停掉它的终端，没做完的任务会取消" } else { "保存后从项目里去掉" }).on_click(cx.listener(move |this, _, _, cx| this.remove_member(ix, cx))))
             });
 
         let mut rows = Vec::new();
         if let Some(input) = &id_input {
-            rows.push(row("成员编号", Some("a-z 0-9 - _，字母开头".into()), div().w(px(250.)).child(Input::new(input).small()), cx));
+            rows.push(row("成员编号", Some("a-z 0-9 - _，字母开头".into()), div().w(px(280.)).child(Input::new(input).control()), cx));
         }
         let cli = match runtime {
             Runtime::Claude => "Claude Code",
@@ -494,7 +498,7 @@ impl LilaApp {
         let prompt_row = block(
             "预设提示词",
             Some(if own_prompt { format!("只给这个成员用，保存在 .lila/prompts/{}.md", base.id) } else { format!("和角色「{}」的默认提示词一样", base.role_name) }),
-            Textarea::new(&prompt),
+            Textarea::new(&prompt).area(),
             own_prompt.then(|| Button::new(SharedString::from(format!("prompt-reset-{ix}"))).ghost().xsmall().icon(IconName::Undo2).label("恢复角色默认").on_click(cx.listener(move |this, _, window, cx| this.reset_prompt(ix, window, cx))).into_any_element()),
             cx,
         );
@@ -547,7 +551,7 @@ impl LilaApp {
                 h_flex()
                     .h(px(40.))
                     .when(n % 2 == 1, |d| d.bg(theme.muted.opacity(0.35)))
-                    .child(h_flex().w(px(NAME)).flex_none().px_3().gap_1().child(div().text_sm().font_medium().truncate().child(from.clone())).when(is_owner, |d| d.child(Tag::secondary().xsmall().child("PM"))))
+                    .child(h_flex().w(px(NAME)).flex_none().px_3().gap_1().child(div().text_size(px(13.)).font_medium().truncate().child(from.clone())).when(is_owner, |d| d.child(Tag::secondary().xsmall().child("PM"))))
                     .children(ids.iter().map(|to| {
                         let cell = div().w(px(CELL)).flex_none().flex().justify_center();
                         if *to == from {
@@ -667,7 +671,7 @@ impl LilaApp {
         let heading = v_flex()
             .gap_1()
             .child(div().text_xs().text_color(theme.muted_foreground).child("项目设置"))
-            .child(h_flex().gap_2().child(crate::ui::avatar(&id, cx)).child(div().font_semibold().truncate().child(label)))
+            .child(h_flex().gap_2().child(crate::ui::avatar(&id, 20., cx)).child(div().font_semibold().truncate().child(label)))
             .into_any_element();
         Some(self.dialog(
             Shell {

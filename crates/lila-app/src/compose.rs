@@ -7,6 +7,7 @@ use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui::component::scroll::ScrollableElement;
 use gpui::component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
+use crate::style::Control as _;
 use gpui::prelude::*;
 use gpui::*;
 use serde_json::{Value, json};
@@ -98,13 +99,13 @@ impl LilaApp {
         Some(
             v_flex()
                 .gap_2()
-                .child(field("标题", cx).child(Input::new(&title)))
-                .child(field("说明", cx).child(Textarea::new(&body)))
+                .child(field("标题", cx).child(Input::new(&title).control()))
+                .child(field("说明", cx).child(Textarea::new(&body).area()))
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(Button::new("rewrite-save").small().primary().label("保存").on_click(cx.listener(|this, _, _, cx| this.save_rewrite(cx))))
-                        .child(Button::new("rewrite-discard").small().ghost().label("放弃").on_click(cx.listener(|this, _, _, cx| {
+                        .child(Button::new("rewrite-save").small().small_button().primary().label("保存").on_click(cx.listener(|this, _, _, cx| this.save_rewrite(cx))))
+                        .child(Button::new("rewrite-discard").small().small_button().ghost().label("放弃").on_click(cx.listener(|this, _, _, cx| {
                             this.rewrite = None;
                             cx.notify();
                         }))),
@@ -136,14 +137,17 @@ impl LilaApp {
                 .text_color(theme.popover_foreground)
                 .child(
                     h_flex()
-                        .h(px(40.))
-                        .px_3()
+                        .h(px(48.))
+                        .pl(px(18.))
+                        .pr(px(10.))
+                        .gap_2()
                         .flex_none()
                         .border_b_1()
-                        .border_color(theme.border)
+                        .border_color(crate::style::divider())
                         .child(div().font_semibold().child("新建任务"))
+                        .when_some(self.draft.as_ref().map(|d| d.parent.read(cx).value().to_string()).filter(|p| !p.trim().is_empty()), |d, p| d.child(div().text_xs().text_color(theme.muted_foreground).child(format!("· 父任务 {p}"))))
                         .child(div().flex_1())
-                        .child(Button::new("compose-close").small().ghost().label("关闭").on_click(cx.listener(|this, _, _, cx| {
+                        .child(Button::new("compose-close").ghost().xsmall().icon(gpui::component::IconName::Close).tooltip("关闭 (Esc)").on_click(cx.listener(|this, _, _, cx| {
                             this.draft = None;
                             cx.notify();
                         }))),
@@ -153,9 +157,11 @@ impl LilaApp {
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scrollbar()
-                        .p_4()
-                        .gap_4()
-                        .child(div().text_sm().text_color(theme.muted_foreground).child(
+                        .px_5()
+                        .pt_5()
+                        .pb_6()
+                        .gap_5()
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
                             "通常把需求交给 PM，由它拆分和分派；也可以直接派给某个成员。任务以你（human）的名义发出，完成后会出现在收件箱。",
                         ))
                         .child(field("派给", cx).child(h_flex().gap_1().flex_wrap().children(members.iter().map(|m| {
@@ -167,6 +173,7 @@ impl LilaApp {
                                 .small()
                                 .when(active, |b| b.primary())
                                 .when(!active, |b| b.outline())
+                                .rounded_full()
                                 .child(h_flex().gap_1().child(dot(status_color(&status, cx))).child(id.clone()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(d) = &mut this.draft {
@@ -176,19 +183,25 @@ impl LilaApp {
                                 }))
                         }))))
                         .when_some(hint, |d, h| d.child(div().text_xs().text_color(theme.muted_foreground).child(h)))
-                        .child(field("标题", cx).child(Input::new(&title)))
-                        .child(field("说明", cx).child(Textarea::new(&body)))
-                        .child(field("父任务", cx).child(Input::new(&parent).small()))
-                        .when_some(error, |d, e| d.child(div().p_2().rounded_md().border_l_2().border_color(theme.red).bg(theme.red.opacity(0.12)).text_sm().child(e)))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(Button::new("compose-send").primary().label("派出").on_click(cx.listener(|this, _, _, cx| this.submit_draft(cx))))
-                                .child(Button::new("compose-cancel").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| {
-                                    this.draft = None;
-                                    cx.notify();
-                                }))),
-                        ),
+                        .child(field("标题", cx).child(Input::new(&title).control()))
+                        .child(field("说明", cx).child(Textarea::new(&body).area()))
+                        .child(field("父任务", cx).child(Input::new(&parent).control()))
+                        .when_some(error, |d, e| d.child(div().px_3().py(px(10.)).rounded(px(8.)).bg(theme.red.opacity(0.12)).text_size(px(13.)).child(e))),
+                )
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .px_4()
+                        .py_3()
+                        .gap_2()
+                        .justify_end()
+                        .border_t_1()
+                        .border_color(crate::style::divider())
+                        .child(Button::new("compose-cancel").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| {
+                            this.draft = None;
+                            cx.notify();
+                        })))
+                        .child(Button::new("compose-send").primary().label("派出").on_click(cx.listener(|this, _, _, cx| this.submit_draft(cx)))),
                 )
                 .into_any_element(),
         )

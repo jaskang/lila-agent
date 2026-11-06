@@ -8,6 +8,7 @@ use gpui::component::scroll::ScrollableElement;
 use gpui::component::{ActiveTheme, Disableable, Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::*;
+use crate::style;
 
 /// Something a dialog does to the app (a click, a page switch).
 pub type Act = Box<dyn Fn(&mut LilaApp, &mut Context<LilaApp>)>;
@@ -46,19 +47,14 @@ pub struct Shell {
     pub on_close: Act,
 }
 
-/// A color a step lighter in a dark theme (raised surfaces), unchanged in a light one.
-pub fn raised(c: Hsla, step: f32, cx: &App) -> Hsla {
-    if cx.theme().is_dark() { Hsla { l: (c.l + step).min(1.), ..c } } else { c }
-}
-
 /// The dialog's own surface: above the dimmed window.
-pub fn surface(cx: &App) -> Hsla {
-    raised(cx.theme().popover, 0.06, cx)
+pub fn surface(_cx: &App) -> Hsla {
+    style::popover()
 }
 
-/// Cards on the dialog's surface.
-pub fn card(cx: &App) -> Hsla {
-    raised(cx.theme().popover, 0.095, cx)
+/// Grouped rows on the dialog's surface: a faint fill with a hairline.
+pub fn card(_cx: &App) -> Hsla {
+    style::fill()
 }
 
 /// A scrolling column for a page's content.
@@ -68,18 +64,18 @@ pub fn scroll(id: impl Into<ElementId>, children: Vec<AnyElement>) -> AnyElement
 
 /// A titled block of rows on a card, divided by hairlines.
 pub fn group(title: Option<&str>, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
-    let t = cx.theme();
+    let _ = cx;
     let n = rows.len();
     v_flex()
         .gap_2()
-        .when_some(title, |d, title| d.child(div().px_1().text_xs().font_semibold().text_color(t.muted_foreground).child(title.to_owned())))
+        .when_some(title, |d, title| d.child(div().px_1().text_size(px(11.)).font_semibold().text_color(style::muted2()).child(title.to_owned())))
         .child(
             v_flex()
-                .rounded_lg()
+                .rounded(px(10.))
                 .border_1()
-                .border_color(t.border)
+                .border_color(style::hairline())
                 .bg(card(cx))
-                .children(rows.into_iter().enumerate().map(|(i, r)| div().when(i + 1 < n, |d| d.border_b_1().border_color(t.border.opacity(0.6))).child(r))),
+                .children(rows.into_iter().enumerate().map(|(i, r)| div().when(i + 1 < n, |d| d.border_b_1().border_color(gpui::Hsla::from(rgba(0xffffff0d)))).child(r))),
         )
         .into_any_element()
 }
@@ -90,13 +86,14 @@ pub fn row(title: impl Into<SharedString>, about: Option<String>, control: impl 
     h_flex()
         .px_4()
         .py_3()
-        .gap_6()
+        .min_h(px(58.))
+        .gap_4()
         .child(
             v_flex()
                 .flex_1()
                 .min_w_0()
                 .gap_0p5()
-                .child(div().text_sm().font_medium().child(title.into()))
+                .child(div().text_size(px(13.)).font_medium().child(title.into()))
                 .when_some(about, |d, a| d.child(div().text_xs().text_color(t.muted_foreground).child(a))),
         )
         .child(div().flex_none().child(control))
@@ -113,7 +110,7 @@ pub fn block(title: impl Into<SharedString>, about: Option<String>, control: imp
         .child(
             h_flex()
                 .gap_2()
-                .child(v_flex().flex_1().min_w_0().gap_0p5().child(div().text_sm().font_medium().child(title.into())).when_some(about, |d, a| d.child(div().text_xs().text_color(t.muted_foreground).child(a))))
+                .child(v_flex().flex_1().min_w_0().gap_0p5().child(div().text_size(px(13.)).font_medium().child(title.into())).when_some(about, |d, a| d.child(div().text_xs().text_color(t.muted_foreground).child(a))))
                 .children(aside),
         )
         .child(control)
@@ -122,7 +119,7 @@ pub fn block(title: impl Into<SharedString>, about: Option<String>, control: imp
 
 /// Read-only text in a row's control spot.
 pub fn value_text(text: impl Into<SharedString>, cx: &App) -> Div {
-    div().text_sm().text_color(cx.theme().muted_foreground).max_w(px(360.)).truncate().child(text.into())
+    div().text_size(px(13.)).text_color(cx.theme().muted_foreground).max_w(px(360.)).truncate().child(text.into())
 }
 
 /// − value + for a number.
@@ -132,16 +129,16 @@ pub fn stepper(id: &str, text: String, down: Option<Act>, up: Option<Act>, cx: &
         let disabled = f.is_none();
         Button::new(SharedString::from(name)).ghost().xsmall().icon(icon).disabled(disabled).when_some(f, |b, f| b.on_click(cx.listener(move |this, _, _, cx| f(this, cx))))
     };
+    let _ = t;
     h_flex()
-        .h(px(28.))
-        .px_0p5()
-        .rounded_md()
+        .h(px(32.))
+        .rounded(px(8.))
         .border_1()
-        .border_color(t.border)
-        .bg(surface(cx))
-        .child(button(format!("{id}-down"), IconName::Minus, down, cx))
-        .child(div().w(px(76.)).text_center().text_sm().child(text))
-        .child(button(format!("{id}-up"), IconName::Plus, up, cx))
+        .border_color(style::hairline())
+        .bg(style::well())
+        .child(button(format!("{id}-down"), IconName::Minus, down, cx).size(px(30.)))
+        .child(div().min_w(px(64.)).px_1().text_center().text_size(px(13.)).child(text))
+        .child(button(format!("{id}-up"), IconName::Plus, up, cx).size(px(30.)))
         .into_any_element()
 }
 
@@ -157,7 +154,7 @@ impl LilaApp {
         let on_close: std::rc::Rc<Act> = std::rc::Rc::new(on_close);
         let (close_x, close_cancel) = (on_close.clone(), on_close);
         let offset = self.dialog_offset;
-        let (surface, nav_bg) = (surface(cx), raised(t.sidebar, 0.03, cx));
+        let (surface, nav_bg) = (surface(cx), gpui::Hsla::from(rgba(0x0000002e)));
         let nav_items: Vec<AnyElement> = nav
             .into_iter()
             .map(|(n, f)| {
@@ -166,14 +163,14 @@ impl LilaApp {
                     .h(px(32.))
                     .px_2()
                     .gap_2()
-                    .rounded_md()
+                    .rounded(px(8.))
                     .cursor_pointer()
-                    .text_sm()
-                    .when(n.active, |d| d.bg(t.sidebar_accent).text_color(t.sidebar_accent_foreground).font_medium())
-                    .when(!n.active, |d| d.text_color(t.sidebar_foreground.opacity(0.85)).hover(|d| d.bg(t.sidebar_accent.opacity(0.5))))
-                    .child(Icon::new(n.icon).small().text_color(if n.active { t.sidebar_accent_foreground } else { t.muted_foreground }))
+                    .text_size(px(13.))
+                    .when(n.active, |d| d.bg(style::accent()).text_color(style::fg()))
+                    .when(!n.active, |d| d.text_color(style::fg()).hover(|d| d.bg(style::hover())))
+                    .child(Icon::new(n.icon).small().text_color(if n.active { style::fg() } else { style::muted() }))
                     .child(div().flex_1().child(n.label))
-                    .when_some(n.badge, |d, b| d.child(div().text_xs().text_color(t.muted_foreground).child(b)))
+                    .when_some(n.badge, |d, b| d.child(div().text_xs().text_color(style::muted()).child(b)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         f(this, cx);
                         cx.notify();
@@ -190,7 +187,7 @@ impl LilaApp {
             .id(SharedString::from(format!("{id}-backdrop")))
             .absolute()
             .inset_0()
-            .bg(gpui::black().opacity(0.62))
+            .bg(gpui::black().opacity(0.42))
             .occlude()
             .flex()
             .items_center()
@@ -215,9 +212,9 @@ impl LilaApp {
                     .max_w(relative(0.94))
                     .h(px(HEIGHT))
                     .max_h(relative(0.9))
-                    .rounded_xl()
+                    .rounded(px(16.))
                     .border_1()
-                    .border_color(t.foreground.opacity(0.16))
+                    .border_color(gpui::Hsla::from(rgba(0xffffff1a)))
                     .bg(surface)
                     .text_color(t.popover_foreground)
                     .shadow(shadows)
@@ -227,12 +224,13 @@ impl LilaApp {
                             .w(px(210.))
                             .flex_none()
                             .h_full()
-                            .rounded_l_xl()
+                            .rounded_l(px(16.))
                             .bg(nav_bg)
                             .border_r_1()
-                            .border_color(t.sidebar_border)
-                            .p_3()
-                            .gap_1()
+                            .border_color(style::divider())
+                            .px(px(10.))
+                            .py(px(22.))
+                            .gap(px(2.))
                             .child(div().id(SharedString::from(format!("{id}-grip-nav"))).px_2().pt_1().pb_3().on_mouse_down(MouseButton::Left, cx.listener(|this, ev, _, _| this.drag_dialog(ev))).child(heading))
                             .children(nav_items),
                     )
@@ -246,25 +244,25 @@ impl LilaApp {
                                     .id(SharedString::from(format!("{id}-grip")))
                                     .flex_none()
                                     .pl_6()
-                                    .pr_12()
-                                    .pt_5()
+                                    .pr(px(56.))
+                                    .pt(px(22.))
                                     .pb_4()
                                     .gap_1()
                                     .border_b_1()
-                                    .border_color(t.border)
+                                    .border_color(style::divider())
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, ev, _, _| this.drag_dialog(ev)))
-                                    .child(div().text_lg().font_semibold().child(title))
-                                    .child(div().text_xs().text_color(t.muted_foreground).child(description)),
+                                    .child(div().text_size(px(17.)).font_semibold().child(title))
+                                    .when(!description.is_empty(), |d| d.child(div().text_xs().text_color(style::muted()).child(description))),
                             )
                             .child(v_flex().flex_1().min_h_0().child(body))
                             .child(
                                 h_flex()
                                     .flex_none()
-                                    .px_6()
+                                    .px_5()
                                     .py_3()
                                     .gap_2()
                                     .border_t_1()
-                                    .border_color(t.border)
+                                    .border_color(style::divider())
                                     .child(div().flex_1().min_w_0().text_xs().children(note))
                                     .when_some(back, |d, back| {
                                         d.child(Button::new(SharedString::from(format!("{id}-back"))).outline().label("上一步").disabled(saving).on_click(cx.listener(move |this, _, _, cx| {
@@ -279,7 +277,7 @@ impl LilaApp {
                                     .child(Button::new(SharedString::from(format!("{id}-save"))).primary().label(save_label).disabled(saving || !can_save).on_click(cx.listener(move |this, _, _, cx| on_save(this, cx)))),
                             ),
                     )
-                    .child(div().absolute().top_3().right_3().child(Button::new(SharedString::from(format!("{id}-x"))).ghost().small().icon(IconName::Close).tooltip("关闭 (Esc)").on_click(cx.listener(move |this, _, _, cx| {
+                    .child(div().absolute().top(px(16.)).right(px(14.)).child(Button::new(SharedString::from(format!("{id}-x"))).ghost().xsmall().icon(IconName::Close).tooltip("关闭 (Esc)").on_click(cx.listener(move |this, _, _, cx| {
                         close_x(this, cx);
                         cx.notify();
                     })))),
@@ -293,26 +291,31 @@ impl LilaApp {
 pub fn segmented(id: &str, options: &[&str], selected: usize, pick: impl Fn(&mut LilaApp, usize, &mut Window, &mut Context<LilaApp>) + 'static, cx: &mut Context<LilaApp>) -> AnyElement {
     let t = cx.theme().clone();
     let pick = std::rc::Rc::new(pick);
+    let _ = &t;
     h_flex()
-        .h(px(28.))
-        .p(px(2.))
+        .h(px(32.))
+        .p(px(3.))
         .gap(px(2.))
-        .rounded_md()
-        .bg(t.muted)
+        .rounded(px(8.))
+        .border_1()
+        .border_color(style::hairline())
+        .bg(style::well())
         .children(options.iter().enumerate().map(|(i, label)| {
             let on = i == selected;
             let pick = pick.clone();
             div()
                 .id(SharedString::from(format!("{id}-{i}")))
                 .h_full()
-                .px_2p5()
+                .px_3()
                 .flex()
                 .items_center()
-                .rounded(px(5.))
-                .text_sm()
+                .rounded(px(6.))
+                .text_size(px(13.))
+                .font_medium()
                 .cursor_pointer()
-                .when(on, |d| d.bg(t.primary).text_color(t.primary_foreground).font_medium().shadow_xs())
-                .when(!on, |d| d.text_color(t.muted_foreground).hover(|d| d.text_color(t.foreground).bg(t.background.opacity(0.5))))
+                // The chosen segment is a raised thumb, not an inverted block.
+                .when(on, |d| d.bg(gpui::Hsla::from(rgba(0xffffff29))).text_color(style::fg()).shadow_xs())
+                .when(!on, |d| d.text_color(style::muted()).hover(|d| d.text_color(style::fg())))
                 .child(label.to_string())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     pick(this, i, window, cx);
