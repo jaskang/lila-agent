@@ -4,7 +4,7 @@
 
 每个成员都是官方 CLI（`claude` / `codex`）的交互会话，用你的订阅登录，不需要 API key。
 
-设计见 [docs/design.md](docs/design.md)，技术验证见 [docs/spikes.md](docs/spikes.md)，各阶段记录见 [docs/m1.md](docs/m1.md)（编排）、[docs/m2.md](docs/m2.md)（桌面应用）和 [docs/m3.md](docs/m3.md)（增强）。接手开发先读 [docs/HANDOFF.md](docs/HANDOFF.md)。
+当前架构见 [docs/architecture-v2.md](docs/architecture-v2.md)（PM 只做路由、流程由 lilad 推进、原话传到每一步、验收和 Watchdog），最初的设计见 [docs/design.md](docs/design.md)，技术验证见 [docs/spikes.md](docs/spikes.md)，各阶段记录见 [docs/m1.md](docs/m1.md)、[docs/m2.md](docs/m2.md)、[docs/m3.md](docs/m3.md)。界面规范见 [DESIGN.md](DESIGN.md)。接手开发先读 [docs/HANDOFF.md](docs/HANDOFF.md)。
 
 ![lila-app](docs/images/m2-redesign-working.png)
 
@@ -28,11 +28,11 @@ lila-app
 
 没有项目时，点窗口里的「新建项目…」（侧栏「项目」右边的 `+`），按三步走：选文件夹、挑团队（哪些角色、各开几个）、写一段给 PM 的简介。Lila 会创建 `.lila/project.toml`、启动团队，并把简介作为第一个任务交给 PM，不需要用命令行。登记过、但 `.lila/project.toml` 不在了的项目，打开时会自动用默认团队重新创建。
 
-窗口左边是团队和每个成员正在做什么，中间是选中成员的终端（默认 PM，可以直接在里面对话），右边是需要你的事、任务看板和动态。
+窗口左边是团队和每个成员正在做什么，中间是选中成员的终端（默认 PM，可以直接在里面对话），右边是需要你的事、任务看板和动态。你派的工作做完后，「需要你」里会出现一张验收卡片，列出每一步的证据：点「通过」就结束，写下意见就打回给 PM。
 
 终端内按 ⌘F 搜索历史，Enter / ⇧Enter 跳转匹配，Esc 关闭搜索；按住 ⌘ 悬停可预览链接，⌘点击打开网页或文件。
 
-设置分两处：侧栏底部「设置」（⌘,）是全局设置（角色库、关于）；在项目上右键「项目设置…」（⇧⌘,）是这个项目的设置（名称、成员、指派规则、运行规则）。项目右键菜单里还有「新建任务…」（⌘N）。
+设置分两处：侧栏底部「设置」（⌘,）是全局设置（角色库、用量、关于）。用量页按订阅账号显示 Claude Code 和 Codex 的额度：可以添加账号（在浏览器里登录）、设为当前（成员都用它）、移除。装了 [magpie](https://github.com/yetone/magpie) 的话，它登录的账号也会列出来，切换由 magpie 完成，Lila 不复制它的令牌。在项目上右键「项目设置…」（⇧⌘,）是这个项目的设置（名称、成员、指派规则、运行规则）。项目右键菜单里还有「新建任务…」（⌘N）。
 
 ## 使用
 
@@ -52,6 +52,7 @@ lila inbox                    # 需要你的事：PM 的提问、终端里的权
 lila answer Q3 "用 Stripe"     # 回答问题（不带文字则表示忽略这条）
 lila log                      # 最近的动态
 lila usage [--days 7]         # 每个成员用了多少 token，读本机的 Claude Code / Codex 会话记录
+lila accounts                 # 订阅账号和各自的额度（含 magpie 的账号）
 lila task edit T5 --append "…" # 给已派出的任务补充要求
 lila task ls --all            # 所有任务
 lila pause / lila resume      # 暂停 / 恢复派发
@@ -74,7 +75,17 @@ lila down                     # 停止成员（任务会保留）
 
   Codex 的沙箱会拦截 `lila` 用来连接 lilad 的 Unix socket。这时 `lila` 会自动改为通过项目里的 `.lila/spool/` 收发文件，所以不需要给 Codex 开网络，也不需要逐条批准。
 
-- **项目**：仓库内的 `.lila/project.toml`，包括可选的显示名 `title`、成员列表（每个成员可以覆盖角色的 `runtime`、`model`、`effort`，用 `prompt_file` 指向 `.lila/prompts/` 下自己的提示词；窗口里的「项目设置」会写这些）、成员的 `count`（同时开几个：`engineer`、`engineer-2`……）、可选的 `[assign]` 指派规则和 `[settings]`（`fresh_session`、`stall_minutes`、`startup_timeout_secs`、`max_chain_depth`、`max_rounds`；`max_working` 默认 0 表示不限，窗口保存时会去掉它）。`.lila/tasks/` 存放任务正文，`.lila/spool/` 是给沙箱用的文件通道，两者都已加入 `.lila/.gitignore`。
+- **项目**：仓库内的 `.lila/project.toml`，包括：
+  - 可选的显示名 `title`；
+  - 成员列表：每个成员可以覆盖角色的 `runtime`、`model`、`effort`，用 `prompt_file` 指向 `.lila/prompts/` 下自己的提示词（窗口里的「项目设置」会写这些）；
+  - 成员的 `count`：同时开几个（`engineer`、`engineer-2`……），派活时写 `--to engineer` 就由 Lila 挑一个；
+  - 可选的 `[assign]` 指派规则；
+  - 可选的 `[flows.<名字>]` 自定义流程；
+  - `[settings]`：
+    - 流程：`flow`（默认 `code`：实现 → 检查 → 验证）、`check`（检查命令，比如 `cargo test`，由 Lila 运行）、`check_timeout_secs`、`max_rounds`；
+    - 会话：`fresh_session`、`fresh_after_tokens`、`pm_refresh_tokens`、`pm_refresh_idle_minutes`；
+    - 提醒和限制：`stall_minutes`、`runaway_minutes`、`max_unreviewed`、`startup_timeout_secs`、`max_chain_depth`。
+    - `max_working` 默认 0 表示不限，窗口保存时会去掉它。`.lila/tasks/` 存放任务正文，`.lila/spool/` 是给沙箱用的文件通道，两者都已加入 `.lila/.gitignore`。
 
 - **PM**：项目经理，负责统筹、和你对话，每个项目有且只有一个，`pm` 角色不能删除。由 `owner = "<成员 id>"` 指定（`lila init` 写的是 `pm`）。不写时先找 `pm`，再找 `owner`，所以改名之前建的项目照常能用。
 
@@ -86,10 +97,12 @@ lila down                     # 停止成员（任务会保留）
 
 ```sh
 lila task start T12
-lila task done T12 --summary "…" [--file path]
+lila task done T12 --summary "…" [--file path] [--decision "…"] [--unverified "…"]
+lila task done T13 --verdict pass|fail --summary "…"   # 流程里的验证步骤
 lila task block T12 --reason "…"
 lila task new --to tester --title "…" --body "…" --parent T12
 lila task edit T13 --append "…"          # 修正或补充已派出的任务
+lila task new --to engineer --title "…" --quote "<用户原话>" --accept "<验收标准>" [--flow quick|none] [--budget 300k]   # PM
 lila ask "…" --option A --option B      # 仅 PM 可用
 ```
 
