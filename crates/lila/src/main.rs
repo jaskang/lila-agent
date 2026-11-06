@@ -83,7 +83,7 @@ enum Cmd {
     Pause,
     /// Resume delivering tasks.
     Resume,
-    /// The daemon.
+    /// lilad, the background process that delivers tasks and keeps the state.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
@@ -143,9 +143,11 @@ enum TaskCmd {
         #[arg(long)]
         append: Option<String>,
     },
+    /// Say you started a task delivered to you.
     Start {
         id: String,
     },
+    /// Finish a task delivered to you.
     Done {
         id: String,
         #[arg(long)]
@@ -163,23 +165,28 @@ enum TaskCmd {
         #[arg(long, value_parser = ["pass", "fail"])]
         verdict: Option<String>,
     },
+    /// Stop on a task: say exactly what you need. Whoever assigned it hears.
     Block {
         id: String,
         #[arg(long)]
         reason: String,
     },
+    /// Withdraw a task you assigned.
     Cancel {
         id: String,
         #[arg(long)]
         reason: Option<String>,
     },
+    /// One task with its history and files.
     Show {
         id: String,
     },
+    /// Open tasks.
     Ls {
         /// Only tasks assigned to or by you.
         #[arg(long)]
         mine: bool,
+        /// Only tasks in this state (queued, delivered, in_progress, blocked, done, cancelled).
         #[arg(long)]
         state: Option<String>,
         /// Include closed tasks.

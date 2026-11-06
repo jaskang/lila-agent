@@ -13,7 +13,7 @@ use lila_core::dispatch::{self, AgentStatus, MemberView, QueuedTask, StallAction
 use lila_core::flow::{self, Flow, Next};
 use lila_core::message::StepHint;
 use lila_core::route::{self, DoneRoute};
-use lila_core::{Actor, Brief, Outcome, ProjectConfig, Task, TaskState, Team, Transition, message, prompt, runtime};
+use lila_core::{Actor, Brief, Outcome, ProjectConfig, Task, TaskState, Team, Transition, inbox, message, prompt, runtime};
 use lila_store::{NewTask, Run, RunState, SessionRow, Store};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -142,16 +142,6 @@ enum Switch {
 const LILAD: &str = "lilad";
 
 /// A duration ahead, for people: "in 3 days 4 h", "in 2 h 5 min", "in 12 min".
-fn in_words(ms: i64) -> String {
-    let m = (ms.max(0) + 59_999) / 60_000;
-    let (d, h, min) = (m / 1440, m % 1440 / 60, m % 60);
-    match (d, h) {
-        (0, 0) => format!("in {min} min"),
-        (0, _) => format!("in {h} h {min} min"),
-        _ => format!("in {d} days {h} h"),
-    }
-}
-
 fn capitalized(s: &str) -> String {
     let mut c = s.chars();
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
@@ -946,8 +936,7 @@ impl<T: Terminals> Daemon<T> {
         let owner = self.projects[pid].team.owner.clone();
         match &self.assigner(pid, task) {
             Actor::Human => {
-                let body = format!("{} blocked: {}", task.id, task.block_reason.clone().unwrap_or_default());
-                self.store.add_inbox(pid, "report", Some(&task.to), Some(&task.id), &body, &[], now)?;
+                self.store.add_inbox(pid, "report", Some(&task.to), Some(&task.id), &inbox::blocked(task), &[], now)?;
             }
             Actor::Member(m) => {
                 self.store.push_outbox(pid, m, &text, now)?;
@@ -1035,7 +1024,8 @@ impl<T: Terminals> Daemon<T> {
                 self.store.set_run(pid, anchor, at, run.round, RunState::Failed, now)?;
                 self.store.event(pid, Some(anchor), LILAD, "flow_failed", &format!("still failing after {} rounds", run.round), now)?;
                 let text = message::gave_up(&anchor_task, &run.flow, run.round, failure);
-                self.tell_lead(pid, &anchor_task, &text, now)?;
+                let person = inbox::gave_up(&anchor_task, run.round, failure);
+                self.tell_lead(pid, &anchor_task, &text, &person, now)?;
             }
             Next::Check { step } => {
                 self.store.set_run(pid, anchor, step, run.round, RunState::Checking, now)?;
@@ -1096,11 +1086,11 @@ impl<T: Terminals> Daemon<T> {
         self.report_done(pid, last, &files, now)
     }
 
-    /// News about a run for whoever started it, and the PM.
-    fn tell_lead(&mut self, pid: &str, anchor: &Task, text: &str, now: i64) -> Result<()> {
+    /// News about a run for whoever started it (`person`: what the person reads), and the PM.
+    fn tell_lead(&mut self, pid: &str, anchor: &Task, text: &str, person: &str, now: i64) -> Result<()> {
         let owner = self.projects[pid].team.owner.clone();
         if anchor.from == Actor::Human {
-            self.store.add_inbox(pid, "report", Some(&anchor.to), Some(&anchor.id), text, &[], now)?;
+            self.store.add_inbox(pid, "report", Some(&anchor.to), Some(&anchor.id), person, &[], now)?;
         } else if anchor.from.as_str() != owner {
             self.store.push_outbox(pid, anchor.from.as_str(), text, now)?;
         }
@@ -1402,8 +1392,8 @@ impl<T: Terminals> Daemon<T> {
             self.resolve_open(pid, "runaway", mid, now);
         }
         if new == AgentStatus::Blocked && old != AgentStatus::Blocked && self.store.open_inbox_for(pid, "terminal", mid).map(|v| v.is_empty()).unwrap_or(false) {
-            let what = if msg.is_empty() { format!("waiting in its terminal ({})", kind.as_deref().unwrap_or("input")) } else { msg };
-            let _ = self.store.add_inbox(pid, "terminal", Some(mid), None, &format!("{mid} needs you in its terminal: {what}"), &[], now);
+            let what = if msg.is_empty() { kind.as_deref().unwrap_or("input").to_owned() } else { msg };
+            let _ = self.store.add_inbox(pid, "terminal", Some(mid), None, &inbox::terminal(mid, &what), &[], now);
         }
         if old == AgentStatus::Blocked && new != AgentStatus::Blocked {
             self.resolve_open(pid, "terminal", mid, now);
@@ -1446,7 +1436,7 @@ impl<T: Terminals> Daemon<T> {
         self.say(format!("{pid}: {mid} ended ({why}); requeued {requeued:?}"));
         if unexpected {
             let tail = if requeued.is_empty() { String::new() } else { format!(" Its tasks {} went back to the queue.", requeued.join(", ")) };
-            let _ = self.store.add_inbox(pid, "lost", Some(mid), None, &format!("{mid} ended unexpectedly ({why}). Run `lila up` to restart it.{tail}"), &[], now);
+            let _ = self.store.add_inbox(pid, "lost", Some(mid), None, &inbox::lost(mid, why, &requeued), &[], now);
             // The PM hears only when there is something for it to do (work to hand
             // elsewhere): every note is a turn, and the person sees it in the PM's terminal.
             let owner = self.projects[pid].team.owner.clone();
@@ -1610,9 +1600,8 @@ impl<T: Terminals> Daemon<T> {
         };
         let _ = self.store.event(pid, Some(tid), "lilad", kind, &what, now);
         if let Err(e) = self.start_session(pid, mid, session, now) {
-            let text = format!("{mid} could not be started again for {tid}: {e:#}. Run `lila up` once it is fixed.");
-            self.say(format!("{pid}: {text}"));
-            let _ = self.store.add_inbox(pid, "lost", Some(mid), None, &text, &[], now);
+            self.say(format!("{pid}: {mid} could not be started again for {tid}: {e:#}"));
+            let _ = self.store.add_inbox(pid, "lost", Some(mid), None, &inbox::restart_failed(mid, &format!("{e:#}")), &[], now);
         }
     }
 
@@ -1633,8 +1622,7 @@ impl<T: Terminals> Daemon<T> {
         let _ = self.store.event(pid, None, "lilad", "pm_refreshed", &detail, now);
         self.say(format!("{pid}: {owner}: {detail}"));
         if let Err(e) = self.start_member(pid, &owner, now) {
-            let text = format!("{owner} could not be started again: {e:#}. Run `lila up` once it is fixed.");
-            let _ = self.store.add_inbox(pid, "lost", Some(&owner), None, &text, &[], now);
+            let _ = self.store.add_inbox(pid, "lost", Some(&owner), None, &inbox::restart_failed(&owner, &format!("{e:#}")), &[], now);
             return;
         }
         let _ = self.store.push_outbox(pid, &owner, &digest, now);
@@ -1776,8 +1764,7 @@ impl<T: Terminals> Daemon<T> {
         };
         let _ = self.store.event(pid, Some(chain), LILAD, kind, &detail, now);
         if let CommitResult::Failed(why) = r {
-            let text = format!("Lila could not commit {chain}'s changes after you accepted it; they are still in the project folder, uncommitted. Commit them yourself (git said: {why})");
-            let _ = self.store.add_inbox(pid, "report", None, Some(chain), &text, &[], now);
+            let _ = self.store.add_inbox(pid, "report", None, Some(chain), &inbox::commit_failed(chain, why), &[], now);
         }
         self.say(format!("{pid}: {detail}"));
         self.pump(pid, now);
@@ -1790,23 +1777,18 @@ impl<T: Terminals> Daemon<T> {
         let under = |id: &str| id == task.id || route::ancestors(&tasks, id).iter().any(|a| a.id == task.id);
         let mut lines: Vec<(i64, String)> = Vec::new();
         for t in tasks.iter().filter(|t| t.id != task.id && t.state == TaskState::Done && under(&t.id)) {
-            let mut line = format!("{} {}: {}", t.id, t.to, t.summary.as_deref().unwrap_or("(no summary)"));
             let files = self.store.artifacts(pid, &t.id)?;
-            if !files.is_empty() {
-                line.push_str(&format!(" (files: {})", files.join(", ")));
-            }
-            line.push_str(&message::outcome_text(&t.outcome));
-            lines.push((t.updated_ms, line));
+            lines.push((t.updated_ms, inbox::step_done(t, &files)));
         }
         let check = self.check_cmd(pid).unwrap_or_default();
         for e in self.store.events(pid, None, 1000)? {
             if e.kind == "check" && !e.detail.starts_with("running") && e.task.as_deref().is_some_and(under) {
-                lines.push((e.at_ms, format!("check `{check}` on {}: {}", e.task.unwrap_or_default(), e.detail)));
+                lines.push((e.at_ms, inbox::step_check(&check, &e.task.unwrap_or_default(), &e.detail)));
             }
         }
         lines.sort_by_key(|(at, _)| *at);
         let steps: Vec<String> = lines.into_iter().map(|(_, l)| l).collect();
-        let text = message::review_card(task, &steps);
+        let text = inbox::review(task, &steps);
         self.store.add_inbox(pid, "review", Some(&task.to), Some(&task.id), &text, &["通过".to_owned()], now)?;
         Ok(())
     }
@@ -1865,7 +1847,8 @@ impl<T: Terminals> Daemon<T> {
         self.store.set_run(pid, &run.anchor, at, run.round, RunState::Held, now)?;
         let text = message::over_budget(anchor, &run.flow, spent, budget);
         self.store.event(pid, Some(&run.anchor), LILAD, "flow_held", &text, now)?;
-        self.store.add_inbox(pid, "budget", Some(&anchor.to), Some(&run.anchor), &text, &["继续".to_owned(), "取消".to_owned()], now)?;
+        let person = inbox::over_budget(anchor, &message::short_tokens(spent), &message::short_tokens(budget));
+        self.store.add_inbox(pid, "budget", Some(&anchor.to), Some(&run.anchor), &person, &["继续".to_owned(), "取消".to_owned()], now)?;
         let owner = self.projects[pid].team.owner.clone();
         self.store.push_outbox(pid, &owner, &message::note(&run.anchor, &format!("{text} You hear when they do.")), now)?;
         Ok(())
@@ -1927,13 +1910,7 @@ impl<T: Terminals> Daemon<T> {
                     let _ = self.store.event(pid, Some(&t.id), LILAD, "runaway", &format!("{mid} worked {minutes} min without a lila call; reminded"), now);
                 }
                 Some(at) if now - at >= limit && self.store.open_inbox_for(pid, "runaway", &mid).map(|v| v.is_empty()).unwrap_or(false) => {
-                    let text = format!(
-                        "{mid} has been working on {} \"{}\" for over {} minutes without a `lila` call, even after a reminder. It may be going round in circles: look at its terminal.",
-                        t.id,
-                        t.title,
-                        2 * minutes
-                    );
-                    let _ = self.store.add_inbox(pid, "runaway", Some(&mid), Some(&t.id), &text, &[], now);
+                    let _ = self.store.add_inbox(pid, "runaway", Some(&mid), Some(&t.id), &inbox::runaway(&mid, t, 2 * minutes), &[], now);
                 }
                 _ => {}
             }
@@ -1968,13 +1945,8 @@ impl<T: Terminals> Daemon<T> {
                 self.codex_paused.insert(pid.to_owned(), t);
                 if open.is_empty() && self.quota_told.get(pid) != Some(&t) {
                     self.quota_told.insert(pid.to_owned(), t);
-                    let text = format!(
-                        "Codex's usage limit is used up; it resets {}. Work for {} waits until then. To go on now, give them a Claude model in the project settings.",
-                        in_words(t - now),
-                        codex.join(", ")
-                    );
-                    let _ = self.store.add_inbox(pid, "quota", None, None, &text, &[], now);
-                    let _ = self.store.event(pid, None, LILAD, "quota", &text, now);
+                    let _ = self.store.add_inbox(pid, "quota", None, None, &inbox::quota(t - now, &codex), &[], now);
+                    let _ = self.store.event(pid, None, LILAD, "quota", &format!("used up; resets in {} min; {} wait", (t - now) / 60_000, codex.join(", ")), now);
                 }
             }
             None => {
@@ -2049,11 +2021,7 @@ impl<T: Terminals> Daemon<T> {
                     && live.started_ms.is_some_and(|s| now - s >= settings.startup_timeout_secs as i64 * 1000)
                     && self.store.open_inbox_for(&pid, "startup", mid).map(|v| v.is_empty()).unwrap_or(false)
                 {
-                    let text = format!(
-                        "{mid} has not reported a status since it started. It may be waiting in its terminal (a trust prompt, a login). Open terminal {} and check.",
-                        live.terminal.as_deref().unwrap_or("?")
-                    );
-                    let _ = self.store.add_inbox(&pid, "startup", Some(mid), None, &text, &[], now);
+                    let _ = self.store.add_inbox(&pid, "startup", Some(mid), None, &inbox::startup(mid), &[], now);
                     self.say(format!("{pid}: {mid} has not reported a status"));
                 }
             }
@@ -2090,7 +2058,7 @@ impl<T: Terminals> Daemon<T> {
                         let owner = self.projects[&pid].team.owner.clone();
                         let text = format!("{} went quiet on {} \"{}\" and did not answer a reminder.", t.to, t.id, t.title);
                         if t.to == owner {
-                            let _ = self.store.add_inbox(&pid, "stalled", Some(&t.to), Some(&t.id), &text, &[], now);
+                            let _ = self.store.add_inbox(&pid, "stalled", Some(&t.to), Some(&t.id), &inbox::stalled(&t), &[], now);
                         } else {
                             let _ = self.store.push_outbox(&pid, &owner, &message::note(&t.id, &format!("{text} Check its terminal, re-assign, or cancel it.")), now);
                         }

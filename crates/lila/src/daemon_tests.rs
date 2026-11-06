@@ -359,7 +359,7 @@ fn decisions_and_unchecked_points_travel_with_done() {
     assert_eq!(inbox[0]["kind"], "review");
     assert_eq!(
         inbox[0]["text"],
-        "T1 \"Ship login\" is finished: login is in\n  Decided: tokens last 24h\n  Not checked: load\nSteps:\n- T2 engineer: built\n  Decided: tokens last 24h\n  Not checked: load"
+        "T1「Ship login」做完了：login is in\n  决定：tokens last 24h\n  没验证：load\n· T2 engineer：built\n  决定：tokens last 24h\n  没验证：load"
     );
 }
 
@@ -558,8 +558,8 @@ fn the_person_signs_off_or_sends_work_back() {
     let inbox = w.ok(None, "inbox", json!({}));
     assert_eq!((inbox[0]["kind"].as_str(), inbox[0]["options"].clone()), (Some("review"), json!(["通过"])));
     let card = inbox[0]["text"].as_str().unwrap();
-    assert!(card.starts_with("T1 \"Ship it\" is finished: shipped v1\nSteps:\n- T2 engineer: built (files: src/a.rs)\n"), "{card}");
-    assert!(card.contains("- check `cargo test` on T2: passed\n- T3 tester: PASS\n  Not checked: load"), "evidence in order: {card}");
+    assert!(card.starts_with("T1「Ship it」做完了：shipped v1\n· T2 engineer：built（文件：src/a.rs）\n"), "{card}");
+    assert!(card.contains("· 检查 `cargo test`（T2）：通过\n· T3 tester：PASS\n  没验证：load"), "evidence in order: {card}");
 
     // Sent back: the comment goes to the PM as a task in the same chain.
     w.status("owner", "idle");
@@ -628,7 +628,7 @@ fn a_failed_commit_is_the_persons_to_make() {
     assert_eq!(w.d.take_commits().len(), 1);
     w.d.on_commit_done("shop", "T1", &CommitResult::Failed("pre-commit: lint failed".into()), w.now);
     let inbox = w.ok(None, "inbox", json!({}));
-    assert!(inbox[0]["text"].as_str().unwrap().contains("could not commit T1's changes") && inbox[0]["text"].as_str().unwrap().contains("lint failed"), "{inbox}");
+    assert!(inbox[0]["text"].as_str().unwrap().contains("没能提交 T1 的改动") && inbox[0]["text"].as_str().unwrap().contains("lint failed"), "{inbox}");
     // Off: no commit, and the folder is free once the card is answered.
     let mut w = world_with(&manual("fresh_session = false\ncommit_on_accept = false\n"));
     w.up();
@@ -1183,7 +1183,7 @@ fn which_work_runs_a_flow() {
     w.ok(Some("tester"), "task.done", json!({"id": "T5", "summary": "PASS", "verdict": "pass"}));
     let inbox = w.ok(None, "inbox", json!({}));
     assert_eq!(inbox[0]["kind"], "review");
-    assert_eq!(inbox[0]["text"], "T4 \"Fix the footer\" is finished: fixed\nSteps:\n- T5 tester: PASS");
+    assert_eq!(inbox[0]["text"], "T4「Fix the footer」做完了：fixed\n· T5 tester：PASS");
 }
 
 #[test]
@@ -1369,7 +1369,7 @@ fn a_member_busy_without_a_word_is_reminded_then_reported() {
     w.now += 31 * 60_000;
     w.d.tick(w.now);
     assert_eq!(w.inbox_kinds(), ["runaway"]);
-    assert!(w.d.store.inbox("shop", false).unwrap()[0].text.contains("look at its terminal"));
+    assert!(w.d.store.inbox("shop", false).unwrap()[0].text.contains("看看它的终端"));
     // It finishes its turn: the alarm goes.
     w.status("engineer", "idle");
     assert!(w.inbox_kinds().is_empty());
@@ -1391,7 +1391,7 @@ fn a_flow_over_budget_waits_for_the_person() {
     assert!(w.d.store.task("shop", "T2").unwrap().is_none());
     let item = w.d.store.inbox("shop", false).unwrap().pop().unwrap();
     assert_eq!((item.kind.as_str(), item.options.clone()), ("budget", vec!["继续".to_string(), "取消".to_string()]));
-    assert!(item.text.contains("has used 800 tokens of its 500 budget"), "{}", item.text);
+    assert!(item.text.contains("用了 800 token，超过预算 500"), "{}", item.text);
     w.status("owner", "idle");
     assert!(w.sends_to("owner").iter().any(|s| s.contains("has used 800 tokens")), "the PM knows");
     // Go on: a bigger budget, and the verification starts.
@@ -1432,7 +1432,7 @@ fn codex_work_waits_while_its_quota_is_used_up() {
     write(100.0, w.now);
     w.d.tick(w.now);
     assert_eq!(w.inbox_kinds(), ["quota"]);
-    assert!(w.d.store.inbox("shop", false).unwrap()[0].text.contains("resets in 1 h 0 min. Work for tester waits"), "{:?}", w.d.store.inbox("shop", false));
+    assert!(w.d.store.inbox("shop", false).unwrap()[0].text.contains("1 小时后重置。tester 的工作等到那时"), "{:?}", w.d.store.inbox("shop", false));
     // Seen and dismissed: not raised again for the same reset.
     let q = w.d.store.inbox("shop", false).unwrap()[0].id.clone();
     w.ok(None, "answer", json!({"id": q}));

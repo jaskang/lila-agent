@@ -5,6 +5,7 @@
 pub mod config;
 pub mod dispatch;
 pub mod flow;
+pub mod inbox;
 pub mod message;
 pub mod prompt;
 pub mod route;

@@ -332,10 +332,7 @@ impl LilaApp {
             BoxShadow { color: gpui::black().opacity(0.55), offset: point(px(0.), px(24.)), blur_radius: px(64.), spread_radius: px(0.), inset: false },
             BoxShadow { color: gpui::black().opacity(0.35), offset: point(px(0.), px(2.)), blur_radius: px(8.), spread_radius: px(0.), inset: false },
         ];
-        let text = format!(
-            "{}Lila 会删掉它的任务、动态和收件箱。项目目录和里面的 .lila/ 不动，以后在这个文件夹新建项目可以重新加回来，只是历史没了。",
-            if running { "团队会先停止。" } else { "" }
-        );
+        let text = format!("{}任务和收件箱会删掉，文件夹不动。", if running { "团队会先停止，" } else { "" });
         Some(
             div()
                 .id("remove-backdrop")
@@ -366,7 +363,6 @@ impl LilaApp {
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(div().text_size(px(15.)).font_semibold().child(format!("从列表移除「{}」？", p.label())))
                         .child(div().text_size(px(13.)).text_color(muted()).line_height(relative(1.6)).child(text))
-                        .child(div().text_xs().text_color(muted2()).child(data::tilde(&p.cwd)))
                         .child(
                             h_flex()
                                 .mt(px(6.))
