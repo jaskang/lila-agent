@@ -185,6 +185,12 @@ pub struct Settings {
     pub pm_refresh_tokens: u64,
     /// How long the PM must have been idle first: the person may be typing to it.
     pub pm_refresh_idle_minutes: u64,
+    /// A member working this long without a `lila` call gets a reminder, then
+    /// the person hears (0: never).
+    pub runaway_minutes: u64,
+    /// Results waiting for the person's review beyond which new work the PM
+    /// starts waits too: more output than anyone can check (0: no limit).
+    pub max_unreviewed: u32,
 }
 
 impl Default for Settings {
@@ -202,6 +208,8 @@ impl Default for Settings {
             fresh_after_tokens: 60_000,
             pm_refresh_tokens: 120_000,
             pm_refresh_idle_minutes: 10,
+            runaway_minutes: 30,
+            max_unreviewed: 3,
         }
     }
 }

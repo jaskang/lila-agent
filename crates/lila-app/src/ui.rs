@@ -1,8 +1,9 @@
 //! How the window looks (see `prototype/lila-window.html`): a graphite glass
-//! window; the sidebar sits straight on the glass from top to bottom (every
-//! project, then the team as a tree under the PM); beside it the tabs of the
-//! open projects, then a terminal card and the overview cards (what needs
-//! you, the task board, usage, activity), then a status bar card.
+//! window; the sidebar card holds every project, then the team as a tree
+//! under the PM. The window controls and app name sit above it, beside the
+//! open project tabs, then a terminal card and the overview cards (what needs
+//! you, the task board, activity), then a status bar card. Usage per account
+//! is a page of the global settings (`usage.rs`).
 
 use crate::app::LilaApp;
 use crate::data;
@@ -231,10 +232,12 @@ impl LilaApp {
         let pm_row = pm.as_ref().map(|m| self.member_row(m, None, shown.as_deref(), cx));
         let crew_rows: Vec<AnyElement> = crew.iter().zip(branches).map(|(m, b)| self.member_row(m, Some(b), shown.as_deref(), cx)).collect();
 
-        v_flex()
-            .size_full()
-            .text_color(style::fg())
-            .child(drag_bar(h_flex().id("sidebar-top"), cx).h(px(TAB_BAR - style::GAP)).mb(px(style::GAP)).flex_none().pl(px(TRAFFIC_LIGHTS)))
+        let body = card()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .pt(px(6.))
             .child(
                 h_flex()
                     .pl_4()
@@ -300,7 +303,20 @@ impl LilaApp {
                             .child(div().text_xs().text_color(muted2()).child("⌘,"))
                             .on_click(cx.listener(|this, _, window, cx| this.open_prefs(crate::prefs::PrefPage::Roles, window, cx))),
                     ),
+            );
+
+        v_flex()
+            .size_full()
+            .text_color(style::fg())
+            .child(
+                drag_bar(h_flex().id("sidebar-top"), cx)
+                    .h(px(TAB_BAR - style::GAP))
+                    .mb(px(style::GAP))
+                    .flex_none()
+                    .pl(px(TRAFFIC_LIGHTS))
+                    .child(div().text_size(px(13.)).font_semibold().child("Lila")),
             )
+            .child(body)
     }
 
     /// The right-click menu of a project (sidebar row or tab).
@@ -510,18 +526,19 @@ impl LilaApp {
 
     pub fn right(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         for i in &self.snap.inbox {
-            if i["kind"] == "question" {
-                let id = s(i, "id");
-                self.answers.entry(id).or_insert_with(|| cx.new(|cx| gpui::component::input::InputState::new(window, cx).placeholder("或者写下你的回答…")));
-            }
+            let placeholder = match i["kind"].as_str() {
+                Some("question") => "或者写下你的回答…",
+                Some("review") => "或者写下要返工的地方…",
+                _ => continue,
+            };
+            let id = s(i, "id");
+            self.answers.entry(id).or_insert_with(|| cx.new(|cx| gpui::component::input::InputState::new(window, cx).placeholder(placeholder)));
         }
         let inbox = self.snap.inbox.len();
         let open_tasks = self.snap.tasks.iter().filter(|t| !matches!(t["state"].as_str(), Some("done" | "cancelled"))).count();
         let inbox_el = self.inbox_list(cx).into_any_element();
         let tasks_el = self.task_board(cx).into_any_element();
         let log_el = self.activity(cx).into_any_element();
-        let usage_el = self.usage_panel(cx);
-        let periods = self.usage_periods(cx);
         let has_project = self.project().is_some();
         v_flex()
             .size_full()
@@ -538,7 +555,6 @@ impl LilaApp {
                     .child(card_head("任务", open_tasks).when(has_project, |d| d.child(style::link("task-new", "新建", true).text_size(px(13.)).on_click(cx.listener(|this, _, window, cx| this.compose(None, None, window, cx))))))
                     .child(tasks_el),
             )
-            .child(card().flex_none().flex().flex_col().child(card_head("用量", 0).child(periods)).child(usage_el))
             .child(card().flex_shrink(1.).flex_basis(relative(0.24)).min_h(px(84.)).flex().flex_col().child(card_head("动态", 0)).child(log_el))
     }
 
@@ -648,8 +664,14 @@ impl LilaApp {
             "stalled" => (IconName::TriangleAlert, style::yellow(), "没有回应"),
             "lost" => (IconName::CircleX, style::red(), "成员退出"),
             "report" => (IconName::CircleCheck, style::green(), "完成报告"),
+            "review" => (IconName::CircleCheck, style::green(), "等你验收"),
+            "budget" => (IconName::TriangleAlert, style::yellow(), "超出预算"),
+            "quota" => (IconName::CircleX, style::red(), "额度用完"),
+            "runaway" => (IconName::TriangleAlert, style::yellow(), "可能在打转"),
             _ => (IconName::Info, muted(), "提醒"),
         };
+        // A review signs off with 通过 or sends back what the person wrote; it has its own row.
+        let review = kind == "review";
         let options: Vec<String> = item["options"].as_array().into_iter().flatten().filter_map(|o| o.as_str().map(String::from)).collect();
         let input = self.answers.get(&id).cloned();
         let card_id = id.clone();
@@ -670,7 +692,7 @@ impl LilaApp {
                     .child(div().text_xs().text_color(muted2()).child(who)),
             )
             .child(div().text_size(px(13.)).line_height(relative(1.55)).child(s(&item, "text")))
-            .when(!options.is_empty(), |d| {
+            .when(!options.is_empty() && !review, |d| {
                 d.child(h_flex().gap(px(6.)).flex_wrap().children(options.into_iter().enumerate().map(|(n, opt)| {
                     let (id, text) = (id.clone(), opt.clone());
                     Button::new(SharedString::from(format!("opt-{id}-{n}"))).small().small_button().outline().rounded_full().label(opt).on_click(cx.listener(move |this, _, window, cx| this.answer(id.clone(), Some(text.clone()), window, cx)))
@@ -678,17 +700,30 @@ impl LilaApp {
             })
             .when_some(input, |d, input| {
                 let (id, field) = (card_id.clone(), input.clone());
+                let accept_id = card_id.clone();
                 d.child(
-                    h_flex().gap(px(6.)).child(div().flex_1().child(Input::new(&input).control())).child(Button::new(SharedString::from(format!("send-{card_id}"))).primary().label("回答").on_click(cx.listener(move |this, _, window, cx| {
-                        let text = field.read(cx).value().to_string();
-                        if !text.trim().is_empty() {
-                            this.answer(id.clone(), Some(text), window, cx);
-                        }
-                    }))),
+                    h_flex()
+                        .gap(px(6.))
+                        .when(review, |d| {
+                            d.child(Button::new(SharedString::from(format!("accept-{card_id}"))).primary().label("通过").on_click(cx.listener(move |this, _, window, cx| {
+                                this.answer(accept_id.clone(), Some("通过".into()), window, cx)
+                            })))
+                        })
+                        .child(div().flex_1().child(Input::new(&input).control()))
+                        .child({
+                            let send = Button::new(SharedString::from(format!("send-{card_id}"))).label(if review { "打回" } else { "回答" });
+                            let send = if review { send.ghost() } else { send.primary() };
+                            send.on_click(cx.listener(move |this, _, window, cx| {
+                                let text = field.read(cx).value().to_string();
+                                if !text.trim().is_empty() {
+                                    this.answer(id.clone(), Some(text), window, cx);
+                                }
+                            }))
+                        }),
                 )
             })
-            .when(kind != "question", |d| {
-                let open = member.clone().filter(|_| matches!(kind.as_str(), "terminal" | "startup" | "stalled"));
+            .when(!matches!(kind.as_str(), "question" | "review" | "budget"), |d| {
+                let open = member.clone().filter(|_| matches!(kind.as_str(), "terminal" | "startup" | "stalled" | "runaway"));
                 let id = card_id.clone();
                 d.child(
                     h_flex()

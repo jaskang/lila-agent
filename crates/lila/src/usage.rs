@@ -341,6 +341,17 @@ impl Scanner {
     }
 
     /// Use per member since `since_ms` (`None`: all of it), most first.
+    /// Tokens (all kinds) `member` used between `from_ms` and `to_ms`.
+    pub fn tokens_between(&mut self, src: &Sources, project: &str, cwd: &str, member: &str, from_ms: i64, to_ms: i64) -> u64 {
+        self.sessions(src, project, cwd)
+            .iter()
+            .filter(|f| f.who.as_ref().is_some_and(|(p, m)| p == project && m == member))
+            .flat_map(|f| f.entries.iter())
+            .filter(|e| e.ms >= from_ms && e.ms <= to_ms)
+            .map(|e| e.tokens.total())
+            .sum()
+    }
+
     pub fn usage(&mut self, src: &Sources, project: &str, cwd: &str, since_ms: Option<i64>) -> Usage {
         let sessions = self.sessions(src, project, cwd);
         let mut members: BTreeMap<String, MemberUsage> = BTreeMap::new();

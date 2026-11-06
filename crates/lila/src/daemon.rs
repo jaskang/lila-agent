@@ -6,7 +6,7 @@ use crate::check::{CheckJob, CheckResult};
 use crate::paths::{Paths, which};
 use crate::roles;
 use crate::sessions::{self, Contexts};
-use crate::usage::Sources;
+use crate::usage::{Scanner, Sources};
 use anyhow::{Context, Result, anyhow, bail};
 use lila_core::dispatch::{self, AgentStatus, MemberView, QueuedTask, StallAction};
 use lila_core::flow::{self, Flow, Next};
@@ -76,11 +76,13 @@ struct Live {
     /// The CLI session the terminal runs (the store's `sessions`), once known:
     /// at start for Claude Code, when its rollout turns up for Codex.
     session: Option<String>,
+    /// When it last started working (a turn began).
+    busy_since: i64,
 }
 
 impl Default for Live {
     fn default() -> Self {
-        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None, chain: None, session: None }
+        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None, chain: None, session: None, busy_since: 0 }
     }
 }
 
@@ -110,6 +112,15 @@ pub struct Daemon<T: Terminals> {
     /// Where the CLIs record their sessions, and the context sizes read from them.
     sources: Sources,
     contexts: Contexts,
+    /// Token use per member and window, from the same records (budgets, quotas).
+    scanner: Scanner,
+    /// Per project: when Codex's quota was last read, and until when it is used up.
+    quota_checked: BTreeMap<String, i64>,
+    codex_paused: BTreeMap<String, i64>,
+    /// The reset time the person was told about: once per time Codex runs out.
+    quota_told: BTreeMap<String, i64>,
+    /// magpie's command line, when it is installed (set by `serve`; tests leave it out).
+    pub magpie: Option<PathBuf>,
 }
 
 /// How a member gets work from another chain than its session's.
@@ -125,6 +136,17 @@ enum Switch {
 
 /// The actor lilad writes as: it creates a flow's later steps.
 const LILAD: &str = "lilad";
+
+/// A duration ahead, for people: "in 3 days 4 h", "in 2 h 5 min", "in 12 min".
+fn in_words(ms: i64) -> String {
+    let m = (ms.max(0) + 59_999) / 60_000;
+    let (d, h, min) = (m / 1440, m % 1440 / 60, m % 60);
+    match (d, h) {
+        (0, 0) => format!("in {min} min"),
+        (0, _) => format!("in {h} h {min} min"),
+        _ => format!("in {d} days {h} h"),
+    }
+}
 
 fn capitalized(s: &str) -> String {
     let mut c = s.chars();
@@ -185,6 +207,11 @@ impl<T: Terminals> Daemon<T> {
             checking: BTreeSet::new(),
             sources: Sources::from_env(),
             contexts: Contexts::default(),
+            scanner: Scanner::default(),
+            quota_checked: BTreeMap::new(),
+            codex_paused: BTreeMap::new(),
+            quota_told: BTreeMap::new(),
+            magpie: None,
         };
         let rows = d.store.projects().unwrap_or_default();
         for p in rows {
@@ -444,7 +471,7 @@ impl<T: Terminals> Daemon<T> {
         };
         let mut chain = None;
         if let Some(id) = &known {
-            let file = (rt == lila_core::Runtime::Claude).then(|| sessions::claude_file(&self.sources, &cwd, id).to_string_lossy().to_string());
+            let file = (rt == lila_core::Runtime::Claude).then(|| sessions::claude_file(&self.live_sources(), &cwd, id).to_string_lossy().to_string());
             self.store.add_session(pid, &SessionRow { id: id.clone(), member: mid.to_owned(), runtime: rt.to_string(), file, started_ms: now })?;
             chain = self.store.last_chain(pid, id)?;
         }
@@ -457,6 +484,7 @@ impl<T: Terminals> Daemon<T> {
             launched: Some(member.launch_key()),
             session: known,
             chain,
+            busy_since: now,
             ..Live::default()
         };
         self.live_version += 1;
@@ -482,7 +510,24 @@ impl<T: Terminals> Daemon<T> {
         let name = runtime::launch(role, "", "", &runtime::Session::New(None)).argv[0].clone();
         let program = which(&name, &path).ok_or_else(|| anyhow!("{name:?} is not on PATH for role {}; add its folder to the role's env.PATH", role.id))?;
         env.insert("PATH".into(), path);
+        // Members run on their CLI's current account (`accounts`): its own config folder.
+        if let Some((var, dir)) = self.account(role.file.runtime).and_then(|a| a.env()) {
+            env.insert(var.into(), dir);
+        }
         Ok((program, env))
+    }
+
+    /// A CLI's current subscription account (`~/.config/lila/accounts.toml`).
+    fn account(&self, r: lila_core::Runtime) -> Option<crate::accounts::Account> {
+        let list = crate::accounts::load(&self.paths.accounts()).ok()?;
+        crate::accounts::current(&list, r).cloned()
+    }
+
+    /// Where the CLIs record sessions now: the current accounts' folders, or the
+    /// defaults (`sources`) for an account in the CLI's own folder.
+    fn live_sources(&self) -> Sources {
+        let pick = |r: lila_core::Runtime, default: &PathBuf| self.account(r).and_then(|a| a.dir).unwrap_or_else(|| default.clone());
+        Sources { claude: pick(lila_core::Runtime::Claude, &self.sources.claude), codex: pick(lila_core::Runtime::Codex, &self.sources.codex) }
     }
 
     /// Reads project.toml and the roles again (after the settings changed).
@@ -540,7 +585,7 @@ impl<T: Terminals> Daemon<T> {
             }
             cancelled.push(format!("{} \"{}\" (from {})", t.id, t.title, t.from));
         }
-        for kind in ["terminal", "startup", "lost", "stalled"] {
+        for kind in ["terminal", "startup", "lost", "stalled", "runaway"] {
             self.resolve_open(pid, kind, mid, now);
         }
         let detail = if cancelled.is_empty() { String::new() } else { format!("; cancelled {}", cancelled.join(", ")) };
@@ -637,7 +682,12 @@ impl<T: Terminals> Daemon<T> {
                 json!({"anchor": r.anchor, "title": title, "flow": r.flow, "step": step, "round": r.round, "state": r.state.as_str()})
             })
             .collect();
-        Ok(json!({"project": pid, "cwd": proj.cwd, "paused": paused, "members": members, "open_tasks": open, "inbox": inbox, "runs": runs}))
+        let held = tasks.iter().filter(|(t, _)| t.state == TaskState::Queued && self.held_for_review(&pid, t)).count();
+        let codex_until = self.codex_paused.get(&pid).copied();
+        Ok(json!({
+            "project": pid, "cwd": proj.cwd, "paused": paused, "members": members, "open_tasks": open, "inbox": inbox, "runs": runs,
+            "held_for_review": held, "unreviewed": self.unreviewed(&pid), "codex_paused_until": codex_until,
+        }))
     }
 
     fn create_task(&mut self, pid: &str, new: NewTask, now: i64) -> Result<Task> {
@@ -672,6 +722,10 @@ impl<T: Terminals> Daemon<T> {
             bail!("{p} is a step of the {} flow; {how}", run.flow);
         }
         let flow_name = team.flow_for(s(params, "flow"), &to, &actor).map_err(anyhow::Error::msg)?;
+        let budget = params.get("budget").and_then(Value::as_u64).filter(|b| *b > 0);
+        if budget.is_some() && flow_name.is_none() {
+            bail!("a budget is for a flow run; this task runs no flow (give --flow)");
+        }
         let max_depth = team.settings.max_chain_depth;
         if let Some(p) = &parent
             && self.store.depth(&pid, p)? + 1 >= max_depth
@@ -703,12 +757,16 @@ impl<T: Terminals> Daemon<T> {
         };
         let task = self.create_task(&pid, new, now)?;
         if let Some(f) = &flow_name {
-            self.store.start_run(&pid, &task.id, f, now)?;
+            self.store.start_run(&pid, &task.id, f, budget, now)?;
             self.store.event(&pid, Some(&task.id), LILAD, "flow", &format!("{f} flow starts"), now)?;
         }
         self.pump(&pid, now);
         let task = self.store.task(&pid, &task.id)?.expect("exists");
-        Ok(task_json(&task))
+        let mut v = task_json(&task);
+        if task.state == TaskState::Queued && self.held_for_review(&pid, &task) {
+            v["held"] = json!(format!("{} results wait for the person's review; new work starts once they look at them", self.unreviewed(&pid)));
+        }
+        Ok(v)
     }
 
     /// A pool id (`engineer` with `count = 2`) becomes one of its members: the one
@@ -803,10 +861,7 @@ impl<T: Terminals> Daemon<T> {
         let owner = self.projects[pid].team.owner.clone();
         let tasks: Vec<Task> = self.store.tasks(pid)?.into_iter().map(|(t, _)| t).collect();
         match route::route_done(&tasks, &task.id, &owner) {
-            DoneRoute::Inbox => {
-                let body = format!("{} done: {}{}", task.id, task.summary.clone().unwrap_or_default(), message::outcome_text(&task.outcome));
-                self.store.add_inbox(pid, "report", Some(&task.to), Some(&task.id), &body, &[], now)?;
-            }
+            DoneRoute::Inbox => self.add_review(pid, task, now)?,
             DoneRoute::Hold | DoneRoute::Nobody => {}
             DoneRoute::Tell { member, waiting, path } => {
                 let path: Vec<(&Task, Vec<String>)> =
@@ -895,7 +950,16 @@ impl<T: Terminals> Daemon<T> {
             return self.report_done(pid, last, &files, now);
         };
         let check = self.check_cmd(pid);
-        match flow::after(&f, at, passed, run.round, max, check.is_some()) {
+        let next = flow::after(&f, at, passed, run.round, max, check.is_some());
+        if !matches!(next, Next::Finished | Next::GiveUp)
+            && let Some(budget) = run.budget
+        {
+            let spent = self.run_tokens(pid, &run, now);
+            if spent >= budget {
+                return self.hold_run(pid, &run, &anchor_task, (at, passed, &last.id, failure), spent, budget, now);
+            }
+        }
+        match next {
             Next::Finished => {
                 self.store.set_run(pid, anchor, at, run.round, RunState::Done, now)?;
                 self.store.event(pid, Some(anchor), LILAD, "flow_done", &format!("{} flow passed", run.flow), now)?;
@@ -959,17 +1023,8 @@ impl<T: Terminals> Daemon<T> {
     /// Every step passed: whoever started the run hears once, like for any finished chain.
     fn finish_run(&mut self, pid: &str, anchor: &Task, flow_name: &str, last: &Task, now: i64) -> Result<()> {
         if anchor.from == Actor::Human {
-            let mut text = format!(
-                "{} done, {flow_name} flow passed: {}{}",
-                anchor.id,
-                anchor.summary.as_deref().unwrap_or_default(),
-                message::outcome_text(&anchor.outcome)
-            );
-            if last.id != anchor.id {
-                text.push_str(&format!("\n{} {}: {}{}", last.to, last.id, last.summary.as_deref().unwrap_or_default(), message::outcome_text(&last.outcome)));
-            }
-            self.store.add_inbox(pid, "report", Some(&anchor.to), Some(&anchor.id), &text, &[], now)?;
-            return Ok(());
+            let _ = flow_name;
+            return self.add_review(pid, anchor, now);
         }
         let files = self.store.artifacts(pid, &last.id)?;
         self.report_done(pid, last, &files, now)
@@ -1137,10 +1192,15 @@ impl<T: Terminals> Daemon<T> {
             return Ok(json!({"id": item.id, "resolved": true, "already": true}));
         }
         let text = s(params, "text");
-        if item.kind == "question" {
-            let text = text.ok_or_else(|| anyhow!("{} is a question; give an answer", item.id))?;
-            let to = item.member.clone().unwrap_or_else(|| self.projects[&pid].team.owner.clone());
-            self.store.push_outbox(&pid, &to, &message::answer(&item.id, &item.text, text), now)?;
+        match item.kind.as_str() {
+            "question" => {
+                let text = text.ok_or_else(|| anyhow!("{} is a question; give an answer", item.id))?;
+                let to = item.member.clone().unwrap_or_else(|| self.projects[&pid].team.owner.clone());
+                self.store.push_outbox(&pid, &to, &message::answer(&item.id, &item.text, text), now)?;
+            }
+            "review" => self.review_answer(&pid, &item, text, now)?,
+            "budget" => self.budget_answer(&pid, &item, text, now)?,
+            _ => {}
         }
         self.store.resolve_inbox(&pid, &item.id, text, now)?;
         self.store.event(&pid, item.task.as_deref(), "human", "answered", &format!("{}: {}", item.id, text.unwrap_or("dismissed")), now)?;
@@ -1242,12 +1302,19 @@ impl<T: Terminals> Daemon<T> {
         if new.is_free() && !old.is_free() {
             live.free_since = now;
         }
+        if new == AgentStatus::Working && old != AgentStatus::Working {
+            live.busy_since = now;
+        }
+        let back_free = new.is_free() && !old.is_free();
         if new != AgentStatus::Unknown {
             live.reported = true;
         }
         let (msg, kind, reported) = (live.msg.clone(), live.kind.clone(), live.reported);
         if reported {
             self.resolve_open(pid, "startup", mid, now);
+        }
+        if back_free {
+            self.resolve_open(pid, "runaway", mid, now);
         }
         if new == AgentStatus::Blocked && old != AgentStatus::Blocked && self.store.open_inbox_for(pid, "terminal", mid).map(|v| v.is_empty()).unwrap_or(false) {
             let what = if msg.is_empty() { format!("waiting in its terminal ({})", kind.as_deref().unwrap_or("input")) } else { msg };
@@ -1358,9 +1425,12 @@ impl<T: Terminals> Daemon<T> {
                 }
             })
             .collect();
+        let codex_until = self.codex_paused.get(pid).copied().filter(|t| *t > now);
         let queued: Vec<QueuedTask> = tasks
             .iter()
             .filter(|(t, _)| t.state == TaskState::Queued)
+            .filter(|(t, _)| !self.held_for_review(pid, t))
+            .filter(|(t, _)| codex_until.is_none() || proj.team.member(&t.to).is_none_or(|m| m.role.file.runtime != lila_core::Runtime::Codex))
             .map(|(t, meta)| QueuedTask { id: t.id.clone(), to: t.to.clone(), priority: t.priority, seq: meta.seq })
             .collect();
         let picks = dispatch::pick_deliveries(&views, &queued, proj.team.settings.max_working);
@@ -1519,6 +1589,223 @@ impl<T: Terminals> Daemon<T> {
         Ok(message::digest(&decided, &open, &closed[closed.len().saturating_sub(8)..], waiting))
     }
 
+    // ---------------- the person's review ----------------
+
+    /// Results waiting for the person to sign off.
+    fn unreviewed(&self, pid: &str) -> usize {
+        self.store.inbox(pid, false).map(|v| v.iter().filter(|i| i.kind == "review").count()).unwrap_or(0)
+    }
+
+    /// New work the PM starts waits while `max_unreviewed` results wait for the
+    /// person: more output than anyone checks is hoping, not reviewing. The
+    /// person's own requests and work within a chain go on.
+    fn held_for_review(&self, pid: &str, task: &Task) -> bool {
+        let max = self.projects[pid].team.settings.max_unreviewed as usize;
+        max > 0 && task.parent.is_none() && task.from != Actor::Human && self.unreviewed(pid) >= max
+    }
+
+    /// The person's work is finished: a card for them to sign off, with what each
+    /// step reported and every check Lila ran under it.
+    fn add_review(&mut self, pid: &str, task: &Task, now: i64) -> Result<()> {
+        let tasks: Vec<Task> = self.store.tasks(pid)?.into_iter().map(|(t, _)| t).collect();
+        let under = |id: &str| id == task.id || route::ancestors(&tasks, id).iter().any(|a| a.id == task.id);
+        let mut lines: Vec<(i64, String)> = Vec::new();
+        for t in tasks.iter().filter(|t| t.id != task.id && t.state == TaskState::Done && under(&t.id)) {
+            let mut line = format!("{} {}: {}", t.id, t.to, t.summary.as_deref().unwrap_or("(no summary)"));
+            let files = self.store.artifacts(pid, &t.id)?;
+            if !files.is_empty() {
+                line.push_str(&format!(" (files: {})", files.join(", ")));
+            }
+            line.push_str(&message::outcome_text(&t.outcome));
+            lines.push((t.updated_ms, line));
+        }
+        let check = self.check_cmd(pid).unwrap_or_default();
+        for e in self.store.events(pid, None, 1000)? {
+            if e.kind == "check" && !e.detail.starts_with("running") && e.task.as_deref().is_some_and(under) {
+                lines.push((e.at_ms, format!("check `{check}` on {}: {}", e.task.unwrap_or_default(), e.detail)));
+            }
+        }
+        lines.sort_by_key(|(at, _)| *at);
+        let steps: Vec<String> = lines.into_iter().map(|(_, l)| l).collect();
+        let text = message::review_card(task, &steps);
+        self.store.add_inbox(pid, "review", Some(&task.to), Some(&task.id), &text, &["通过".to_owned()], now)?;
+        Ok(())
+    }
+
+    /// Accept (no text, or 通过/accept/ok), or anything else: what to do again,
+    /// which goes to the PM as a new task in the same chain.
+    fn review_answer(&mut self, pid: &str, item: &lila_store::InboxItem, text: Option<&str>, now: i64) -> Result<()> {
+        let id = item.task.clone().context("a review without its task")?;
+        let accepted = text.is_none_or(|t| matches!(t.trim().to_lowercase().as_str(), "通过" | "accept" | "accepted" | "ok" | "pass" | "yes"));
+        if accepted {
+            self.store.event(pid, Some(&id), "human", "accepted", &format!("{id} signed off"), now)?;
+            return Ok(());
+        }
+        let task = self.store.task(pid, &id)?.context("the reviewed task is gone")?;
+        let owner = self.projects[pid].team.owner.clone();
+        let comment = text.unwrap_or_default().trim().to_owned();
+        let new = NewTask {
+            title: format!("Rework: {}", task.title),
+            body: format!("The person did not accept {id} \"{}\":\n\n{comment}", task.title),
+            from: Actor::Human,
+            to: owner,
+            parent: Some(id.clone()),
+            priority: 0,
+            brief: Brief::default(),
+            run: None,
+        };
+        let rework = self.create_task(pid, new, now)?;
+        self.store.event(pid, Some(&id), "human", "rejected", &format!("{comment} → {}", rework.id), now)?;
+        Ok(())
+    }
+
+    // ---------------- budgets ----------------
+
+    /// Tokens a run's step tasks used: each member's use while it held its task.
+    fn run_tokens(&mut self, pid: &str, run: &Run, now: i64) -> u64 {
+        let cwd = self.projects[pid].cwd.to_string_lossy().to_string();
+        let tasks: Vec<Task> = self.store.tasks(pid).unwrap_or_default().into_iter().map(|(t, _)| t).filter(|t| t.run.as_ref().is_some_and(|(a, _)| *a == run.anchor)).collect();
+        let mut spent = 0;
+        let src = self.live_sources();
+        for t in tasks {
+            let events = self.store.events(pid, Some(&t.id), 200).unwrap_or_default();
+            let Some(from) = events.iter().filter(|e| e.kind == "delivered").map(|e| e.at_ms).min() else { continue };
+            let to = events.iter().filter(|e| matches!(e.kind.as_str(), "done" | "cancelled")).map(|e| e.at_ms).max().unwrap_or(now);
+            spent += self.scanner.tokens_between(&src, pid, &cwd, &t.to, from, to);
+        }
+        spent
+    }
+
+    /// Over budget before its next step: the run holds what it would do next until the person decides.
+    #[allow(clippy::too_many_arguments)]
+    fn hold_run(&mut self, pid: &str, run: &Run, anchor: &Task, next: (usize, bool, &str, &str), spent: u64, budget: u64, now: i64) -> Result<()> {
+        let (at, passed, last, failure) = next;
+        let hold = json!({"at": at, "passed": passed, "last": last, "failure": failure}).to_string();
+        self.store.set_run_hold(pid, &run.anchor, run.budget, Some(&hold))?;
+        self.store.set_run(pid, &run.anchor, at, run.round, RunState::Held, now)?;
+        let text = message::over_budget(anchor, &run.flow, spent, budget);
+        self.store.event(pid, Some(&run.anchor), LILAD, "flow_held", &text, now)?;
+        self.store.add_inbox(pid, "budget", Some(&anchor.to), Some(&run.anchor), &text, &["继续".to_owned(), "取消".to_owned()], now)?;
+        let owner = self.projects[pid].team.owner.clone();
+        self.store.push_outbox(pid, &owner, &message::note(&run.anchor, &format!("{text} You hear when they do.")), now)?;
+        Ok(())
+    }
+
+    /// Go on (with twice the budget, or more than it spent) or cancel the run.
+    fn budget_answer(&mut self, pid: &str, item: &lila_store::InboxItem, text: Option<&str>, now: i64) -> Result<()> {
+        let anchor = item.task.clone().context("a budget item without its run")?;
+        let Some(run) = self.store.run(pid, &anchor)? else { return Ok(()) };
+        if run.state != RunState::Held {
+            return Ok(());
+        }
+        let owner = self.projects[pid].team.owner.clone();
+        if text.is_some_and(|t| matches!(t.trim().to_lowercase().as_str(), "取消" | "cancel" | "stop")) {
+            self.store.set_run_hold(pid, &anchor, run.budget, None)?;
+            self.store.set_run(pid, &anchor, run.step, run.round, RunState::Cancelled, now)?;
+            self.store.event(pid, Some(&anchor), "human", "flow_cancelled", "over budget", now)?;
+            self.store.push_outbox(pid, &owner, &message::note(&anchor, &format!("The person stopped the {} flow of {anchor} over its budget.", run.flow)), now)?;
+            return Ok(());
+        }
+        let spent = self.run_tokens(pid, &run, now);
+        let old = run.budget.unwrap_or(0);
+        let budget = (old * 2).max(spent + old.max(1));
+        let hold: Value = serde_json::from_str(run.hold.as_deref().unwrap_or("{}")).unwrap_or_default();
+        self.store.set_run_hold(pid, &anchor, Some(budget), None)?;
+        self.store.set_run(pid, &anchor, run.step, run.round, RunState::Running, now)?;
+        self.store.event(pid, Some(&anchor), "human", "budget", &format!("raised to {}", message::short_tokens(budget)), now)?;
+        let last = hold["last"].as_str().and_then(|id| self.store.task(pid, id).ok().flatten()).context("the held run lost its last step")?;
+        let at = hold["at"].as_u64().unwrap_or(run.step as u64) as usize;
+        self.advance(pid, &anchor, at, hold["passed"].as_bool().unwrap_or(true), &last, hold["failure"].as_str().unwrap_or(""), now)
+    }
+
+    // ---------------- the watchdog ----------------
+
+    /// A member working `runaway_minutes` without a `lila` call is reminded once;
+    /// if it still says nothing, the person hears. Busy is not progress.
+    fn watch_runaways(&mut self, pid: &str, now: i64) {
+        let limit = self.projects[pid].team.settings.runaway_minutes as i64 * 60_000;
+        if limit == 0 {
+            return;
+        }
+        let working: Vec<(String, i64)> =
+            self.projects[pid].live.iter().filter(|(_, l)| l.status == AgentStatus::Working && l.terminal.is_some()).map(|(m, l)| (m.clone(), l.busy_since)).collect();
+        if working.is_empty() {
+            return;
+        }
+        let tasks = self.store.tasks(pid).unwrap_or_default();
+        let events = self.store.events(pid, None, 500).unwrap_or_default();
+        for (mid, busy_since) in working {
+            let Some(t) = tasks.iter().map(|(t, _)| t).find(|t| t.to == mid && matches!(t.state, TaskState::Delivered | TaskState::InProgress)) else { continue };
+            let last_call = events.iter().filter(|e| e.actor == mid).map(|e| e.at_ms).max().unwrap_or(0);
+            let delivered = events.iter().filter(|e| e.kind == "delivered" && e.task.as_deref() == Some(&t.id)).map(|e| e.at_ms).max().unwrap_or(0);
+            let since = busy_since.max(last_call).max(delivered);
+            let nudged = events.iter().filter(|e| e.kind == "runaway" && e.task.as_deref() == Some(&t.id) && e.at_ms >= since).map(|e| e.at_ms).max();
+            let minutes = (limit / 60_000) as u64;
+            match nudged {
+                None if now - since >= limit => {
+                    let _ = self.store.push_outbox(pid, &mid, &message::runaway(t, minutes), now);
+                    let _ = self.store.event(pid, Some(&t.id), LILAD, "runaway", &format!("{mid} worked {minutes} min without a lila call; reminded"), now);
+                }
+                Some(at) if now - at >= limit && self.store.open_inbox_for(pid, "runaway", &mid).map(|v| v.is_empty()).unwrap_or(false) => {
+                    let text = format!(
+                        "{mid} has been working on {} \"{}\" for over {} minutes without a `lila` call, even after a reminder. It may be going round in circles: look at its terminal.",
+                        t.id,
+                        t.title,
+                        2 * minutes
+                    );
+                    let _ = self.store.add_inbox(pid, "runaway", Some(&mid), Some(&t.id), &text, &[], now);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Codex's usage window, from its own records once a minute: used up, work
+    /// for Codex members waits until it resets, and the person hears once.
+    fn watch_quota(&mut self, pid: &str, now: i64) {
+        let codex: Vec<String> =
+            self.projects[pid].team.members.iter().filter(|m| m.role.file.runtime == lila_core::Runtime::Codex).map(|m| m.id.clone()).collect();
+        if codex.is_empty() || now - self.quota_checked.get(pid).copied().unwrap_or(i64::MIN / 2) < 60_000 {
+            return;
+        }
+        self.quota_checked.insert(pid.to_owned(), now);
+        let cwd = self.projects[pid].cwd.to_string_lossy().to_string();
+        // magpie reads the account Codex is signed in to now; a session record may be
+        // an earlier account's (one magpie switched away from), which would hold
+        // Codex's members back until that account resets.
+        let active = self.magpie.as_ref().and_then(|b| crate::magpie::accounts(b).ok()).and_then(|l| l.into_iter().find(|m| m.runtime == lila_core::Runtime::Codex && m.active));
+        let until = match active {
+            Some(m) => m.usage.windows.iter().filter(|w| w.used_percent >= 100.0 && w.resets_ms > now).map(|w| w.resets_ms).max(),
+            None => {
+                let src = self.live_sources();
+                let usage = self.scanner.usage(&src, pid, &cwd, Some(now));
+                usage.codex_limits.iter().filter(|l| l.used_percent >= 100.0 && l.resets_at_ms > now).map(|l| l.resets_at_ms).max()
+            }
+        };
+        let open: Vec<String> = self.store.inbox(pid, false).unwrap_or_default().into_iter().filter(|i| i.kind == "quota").map(|i| i.id).collect();
+        match until {
+            Some(t) => {
+                self.codex_paused.insert(pid.to_owned(), t);
+                if open.is_empty() && self.quota_told.get(pid) != Some(&t) {
+                    self.quota_told.insert(pid.to_owned(), t);
+                    let text = format!(
+                        "Codex's usage limit is used up; it resets {}. Work for {} waits until then. To go on now, give them a Claude model in the project settings.",
+                        in_words(t - now),
+                        codex.join(", ")
+                    );
+                    let _ = self.store.add_inbox(pid, "quota", None, None, &text, &[], now);
+                    let _ = self.store.event(pid, None, LILAD, "quota", &text, now);
+                }
+            }
+            None => {
+                self.codex_paused.remove(pid);
+                for id in open {
+                    let _ = self.store.resolve_inbox(pid, &id, None, now);
+                }
+            }
+        }
+    }
+
     /// Codex picks its own session id: look for the rollout of members that
     /// started without one known, for the first half hour.
     fn find_sessions(&mut self, pid: &str, now: i64) {
@@ -1531,7 +1818,7 @@ impl<T: Terminals> Daemon<T> {
             .filter_map(|(m, l)| l.started_ms.filter(|s| now - s < 30 * 60_000).map(|s| (m.clone(), s, l.chain.clone())))
             .collect();
         for (mid, started, chain) in missing {
-            let Some((id, file)) = sessions::find_codex(&self.sources, pid, &mid, &cwd, started) else { continue };
+            let Some((id, file)) = sessions::find_codex(&self.live_sources(), pid, &mid, &cwd, started) else { continue };
             let row = SessionRow { id: id.clone(), member: mid.clone(), runtime: "codex".into(), file: Some(file.to_string_lossy().to_string()), started_ms: started };
             if self.store.add_session(pid, &row).is_ok() {
                 if let Some(c) = &chain {
@@ -1570,6 +1857,8 @@ impl<T: Terminals> Daemon<T> {
         for pid in &pids {
             self.find_sessions(pid, now);
             self.maybe_refresh_pm(pid, now);
+            self.watch_runaways(pid, now);
+            self.watch_quota(pid, now);
         }
         for pid in pids {
             let settings = self.projects[&pid].team.settings.clone();
@@ -1802,7 +2091,8 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
     let hc = hc_client::Hc::connect(&hc_bin)?;
     let path_env = std::env::var("PATH").unwrap_or_default();
     let lila_bin = std::env::current_exe()?;
-    let mut daemon = Daemon::new(store, HcTerminals(hc), paths.clone(), path_env, lila_bin);
+    let mut daemon = Daemon::new(store, HcTerminals(hc), paths.clone(), path_env.clone(), lila_bin);
+    daemon.magpie = crate::magpie::find(&path_env);
     eprintln!("[lilad] listening on {} (pid {})", sock.display(), std::process::id());
 
     let (tx, rx) = mpsc::channel::<Input>();

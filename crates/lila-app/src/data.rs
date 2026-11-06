@@ -183,12 +183,6 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// The start of the local day `ms` is in.
-pub fn local_midnight_ms(ms: i64) -> i64 {
-    let off = utc_offset_s() * 1000;
-    (ms + off).div_euclid(86_400_000) * 86_400_000 - off
-}
-
 /// When something happens, for people: "今天 14:20", "明天 09:00", "11月12日 14:20".
 pub fn local_when(ms: i64, now: i64) -> String {
     let day = |t: i64| (t + utc_offset_s() * 1000).div_euclid(86_400_000);

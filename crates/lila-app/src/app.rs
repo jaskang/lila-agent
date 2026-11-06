@@ -16,6 +16,10 @@ use std::time::Duration;
 
 pub struct LilaApp {
     paths: Paths,
+    /// The window's own focus. Keys only reach `shortcut` along the focused
+    /// element's path, so with no terminal focused (no team running) the window
+    /// holds focus itself, or ⌘, and the other shortcuts would go nowhere.
+    focus: FocusHandle,
     pub snap: Snapshot,
     /// The project shown: one of `tabs`, or none.
     pub selected: Option<String>,
@@ -128,7 +132,7 @@ impl LilaApp {
             });
         })
         .detach();
-        let mut app = LilaApp { paths, usage: Default::default(), snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
+        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, tabs: Vec::new(), restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
         app.start_usage(window, cx);
         app
     }
@@ -441,7 +445,12 @@ impl Render for LilaApp {
         let loading = compose.is_none() && self.task.is_some() && detail.is_none();
         let overlay = |d: Div| crate::ui::drawer_frame(d, 600.);
         let pad = px(crate::style::GAP);
+        if window.focused(cx).is_none() {
+            let focus = self.focus.clone();
+            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        }
         v_flex()
+            .track_focus(&self.focus)
             .size_full()
             .relative()
             .p(pad)

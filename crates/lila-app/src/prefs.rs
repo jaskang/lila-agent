@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefPage {
     Roles,
+    Usage,
     About,
 }
 
@@ -382,6 +383,7 @@ impl LilaApp {
         let dirty = !p.deleted.is_empty() || p.roles.iter().any(|r| r.changed(cx));
         let (title, description, body) = match page {
             PrefPage::Roles => ("角色", "项目成员从角色开始：用哪个 CLI、模型、努力程度和提示词。项目设置里可以再按成员覆盖。", self.roles_page(cx)),
+            PrefPage::Usage => ("用量", "", self.usage_page(cx)),
             PrefPage::About => ("关于", "Lila 的版本，以及它把东西放在哪里。", self.about_page(cx)),
         };
         let note = match error {
@@ -397,6 +399,7 @@ impl LilaApp {
         };
         let nav = vec![
             (Nav { id: "pref-nav-roles", icon: IconName::User, label: "角色", active: page == PrefPage::Roles, badge: Some(count.to_string()) }, go(PrefPage::Roles)),
+            (Nav { id: "pref-nav-usage", icon: IconName::ChartPie, label: "用量", active: page == PrefPage::Usage, badge: None }, go(PrefPage::Usage)),
             (Nav { id: "pref-nav-about", icon: IconName::Info, label: "关于", active: page == PrefPage::About, badge: None }, go(PrefPage::About)),
         ];
         let heading = v_flex().gap_1().child(div().text_xs().text_color(theme.muted_foreground).child("全局设置")).child(div().font_semibold().child("Lila")).into_any_element();
@@ -415,6 +418,7 @@ impl LilaApp {
                 back: None,
                 on_save: Box::new(|this, cx| this.save_prefs(cx)),
                 on_close: Box::new(|this, _| this.prefs = None),
+                footer: page != PrefPage::Usage,
             },
             cx,
         ))

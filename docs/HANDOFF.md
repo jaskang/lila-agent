@@ -113,6 +113,7 @@ cargo run -p lila-app
   - 做完后只告诉往上第一个还没做完的祖先任务的负责人；没有这样的人就告诉 PM。
   - note 里带上中间环节的摘要，以及还剩什么没做完。
   - 成员在等交接出去的工作时，不发沉默提醒。
+- **验收和 Watchdog**（见 `docs/architecture-v2.md` §13）：你派的工作完成后，收件箱里出现「等你验收」卡片，「通过」就结束，写意见就作为「Rework:」任务交给 PM。等你验收的超过 `max_unreviewed` 时，PM 新开的链先排队。成员工作超过 `runaway_minutes` 没调用 `lila` 时提醒；流程设了 `--budget` 超出时，在步骤之间暂停等你决定；Codex 额度用完时，给 Codex 成员的任务排队到重置时间。
 - **会话账本**（`crates/lila/src/sessions.rs`，见 `docs/architecture-v2.md` §12）：Claude 成员启动时由 lilad 指定 `--session-id`；Codex 的会话从 `~/.codex/sessions` 里认出来。换链时，这条链以前有会话就续接（`--resume`）；上下文小于 `fresh_after_tokens` 就沿用当前会话；否则开新会话。PM 的上下文超过 `pm_refresh_tokens`、并且空闲 10 分钟后，换新会话并收到 `<lila digest>` 项目摘要。
 - **流程**（`lila_core::flow`，见 `docs/architecture-v2.md` §11）：PM 或用户派给 engineer 的活默认走 `code` 流程（实现 → `[settings] check` 检查命令 → tester 验证），由 lilad 推进。检查命令由 lilad 自己跑，失败直接退回给 engineer；tester 用 `--verdict pass|fail` 给结论，fail 由 lilad 退回给写代码的人，超过 `max_rounds` 交给 PM。进度存在 `runs` 表里。`--flow none` 不走流程。
 - **`max_working`**：默认改成 0，表示不限。同时工作多少由各成员的 `count` 决定。窗口保存项目设置时，会删掉旧配置里的 `max_working`。
@@ -125,7 +126,7 @@ cargo run -p lila-app
 - **设计稿**：`crates/lila-app/prototype/lila-window.html`（假数据的 HTML 原型，`?scene=running|fresh|stopped|none`、`?open=task:T7|compose|settings:<页>|prefs:<页>|wizard:<步>`）。界面改动先在原型里定，用户认可后再改 GPUI。2026-11-06 已把原型整体搬进代码。
 - **风格**（`style.rs` 是配色和小部件的唯一来源，数值照抄原型的 `:root`）：
   - 窗口是石墨色毛玻璃（`WindowBackgroundAppearance::Blurred` + 半透明底色），内边距 8，卡片之间的缝也是 8，缝就是拖动改宽度的把手（悬停时出现一条蓝线）。
-  - 内容放在 12px 圆角的卡片里，靠填充色区分层次，不用边框；侧栏直接放在玻璃上，没有卡片。
+  - 内容放在 12px 圆角的卡片里，靠填充色区分层次，不用边框；侧栏也是一张卡片，它上方的顶行（红绿灯和「Lila」）在玻璃上。
   - 字号按 macOS：正文 13、次要 12、说明 11（代码里统一写 `text_size(px(13.))`，不用 `text_sm`）。
   - gpui-kit 的主题也换成同一套颜色（`style::install`），所以按钮、输入框、菜单、下拉都跟着变。菜单悬停是系统蓝。
   - 终端不画自己的背景（`lila_term::theme::set_transparent`），直接透出卡片的玻璃色。
@@ -141,10 +142,15 @@ cargo run -p lila-app
   - 侧栏底部是「启动团队」「暂停/恢复派发」和「设置」，其中「设置」打开全局设置。
   - 缺少配置的项目标「缺少配置」，打开时自动重建。
 - **终端卡片**：卡片头是 CLI 图标、编号、角色、模型 · 努力程度、当前消息、状态胶囊和搜索。工作中卡片描一圈淡蓝，等你描一圈淡红。
-- **概览**：「需要你」「任务」「用量」「动态」四张卡片。原型里「用量」已经挪到全局设置，按订阅账号显示额度，还能添加、切换账号；这需要多账号的后端，还没做，所以代码里暂时保留在概览里。
+- **概览**：「需要你」「任务」「动态」三张卡片。
+- **用量**在全局设置里（⌘, → 用量）：按订阅账号显示各 CLI 的额度窗口，可以添加账号（打开 Terminal 登录）、设为当前、移除。账号写在 `~/.config/lila/accounts.toml`，没有这个文件时每个 CLI 只有用它自己目录的「默认」账号；成员用当前账号启动（`CLAUDE_CONFIG_DIR` / `CODEX_HOME`）。后端在 `crates/lila/src/accounts.rs`，命令行是 `lila accounts`。
+  - **添加账号的登录**（`crates/lila/src/signin.rs`，做法照 magpie）：在后台运行 CLI 自己的登录，指向新账号的目录，并在浏览器里打开供应商的登录页，不开终端。Claude 是 `claude auth login --claudeai`：把 `$BROWSER` 换成一个只记下链接的小脚本，再由 Lila 打开链接；网页回不到本机时，可以把网页上的代码贴进窗口。Codex 是 `codex login`：它不认 `$BROWSER`，会自己打开浏览器，Lila 从它的输出里读出链接，留作「重新打开登录页」。CLI 正常退出就算登录成功，这时才写进 `accounts.toml`；失败、取消或 10 分钟没完成，就删掉目录。开发钩子：`LILA_APP_SIGNIN=claude:<名称>` 直接开始添加，`LILA_APP_NO_OPEN=1` 不打开浏览器。
+  - **magpie**（`crates/lila/src/magpie.rs`）：装了 magpie 时，用量页通过 `magpie accounts --json` 列出它登录的 Claude / Codex 账号和额度，代替该 CLI 的「默认」卡片。「设为当前」先运行 `magpie accounts switch <claude|codex> <邮箱>`，让 magpie 把 CLI 自己的登录换成这个账号，再把 Lila 的当前账号设为 CLI 自己的目录。**Lila 从不复制 magpie 的令牌**：两家的刷新令牌都会轮换，复制后总会有一边被登出（magpie 自己的导入也会登出来源工具）。代价是切换会影响你在终端里开的 claude / codex，而且每个 CLI 同一时间只能用一个 magpie 账号。lilad 判断 Codex 额度是否用完时，装了 magpie 就用 magpie 读到的当前账号的额度：项目会话记录里最新的那条可能来自切走之前的账号。
+- **窗口焦点**：窗口自己有一个焦点句柄，没有别的元素有焦点时（比如团队没启动、没有终端）焦点落在窗口上，这样 ⌘, 等快捷键才收得到。
 - **设置是两个分开的居中对话框**，用户确认过保持两个：
   - **全局设置**（侧栏「设置」或 ⌘,）：
     - 角色：增删改。PM 角色不能删，有项目在用的角色不能删。
+    - 用量：按订阅账号的额度，添加、切换、移除账号。
     - 关于。
   - **项目设置**（右键或 ⇧⌘,）：
     - 通用；
@@ -163,8 +169,8 @@ cargo run -p lila-app
 - `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG，画面不含红绿灯。
 - `LILA_APP_SWITCH=a,b,...`：每 3 秒切换到下一个项目。
 - `LILA_APP_SETTINGS=general|members|assign|rules`：打开项目设置的那一页；再加 `LILA_APP_SETTINGS_ADD=<角色>` 会加一个新成员。
-- `LILA_APP_PREFS=roles|about`：打开全局设置的那一页。
-- `LILA_APP_USAGE=today|week|all`：右侧「用量」切到那个时间段。
+- `LILA_APP_PREFS=roles|usage|about`：打开全局设置的那一页。
+- `LILA_APP_KEYS="cmd-, cmd-i"`：启动后按这些键（经过窗口自己的按键分发），用来验证快捷键能不能用。
 - `LILA_APP_FAKE_STATUS=designer:working,tester:blocked`：把成员状态改成假的，不用真跑 agent 就能看成员树的线、卡片的圈和状态胶囊。
 - `LILA_APP_OPEN_TASK=T5`：项目加载后打开这个任务的详情。
 - `LILA_APP_GUTTERS=1`：一直显示卡片缝上的蓝线（平时鼠标放上去才出现），用来看它对不对齐。

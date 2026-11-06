@@ -478,6 +478,7 @@ impl LilaApp {
                         this.wizard = None;
                     }
                 }),
+                footer: true,
             },
             cx,
         ))

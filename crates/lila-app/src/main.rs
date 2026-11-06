@@ -79,10 +79,40 @@ fn main() {
                         })
                         .detach();
                 }
-                // Open the global settings: `roles` or `about`.
+                // Press keys as a person would (`cmd-,`, space-separated), through the
+                // window's own dispatch: checks that shortcuts reach the app.
+                if let Ok(keys) = std::env::var("LILA_APP_KEYS") {
+                    let keys: &'static str = Box::leak(keys.into_boxed_str());
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                            let strokes: Vec<gpui::Keystroke> = keys.split_whitespace().filter_map(|k| gpui::Keystroke::parse(k).ok()).collect();
+                            for stroke in strokes {
+                                {
+                                    let _ = cx.update(|window, cx| window.dispatch_keystroke(stroke, cx));
+                                }
+                            }
+                        })
+                        .detach();
+                }
+                // Add an account (`claude:<name>`): the usage page, its login started.
+                if let Ok(spec) = std::env::var("LILA_APP_SIGNIN") {
+                    let view = view.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.dev_signin(&spec, window, cx)));
+                        })
+                        .detach();
+                }
+                // Open the global settings: `roles`, `usage` or `about`.
                 if let Ok(page) = std::env::var("LILA_APP_PREFS") {
                     let view = view.clone();
-                    let page = if page == "about" { crate::prefs::PrefPage::About } else { crate::prefs::PrefPage::Roles };
+                    let page = match page.as_str() {
+                        "about" => crate::prefs::PrefPage::About,
+                        "usage" => crate::prefs::PrefPage::Usage,
+                        _ => crate::prefs::PrefPage::Roles,
+                    };
                     window
                         .spawn(cx, async move |cx| {
                             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
@@ -106,9 +136,6 @@ fn main() {
                             }));
                         })
                         .detach();
-                }
-                if let Ok(p) = std::env::var("LILA_APP_USAGE") {
-                    view.update(cx, |v, cx| v.set_period(crate::usage::Period::parse(&p), cx));
                 }
                 // The new-task form, once the shown project has loaded.
                 if let Ok(to) = std::env::var("LILA_APP_COMPOSE") {

@@ -349,7 +349,11 @@ fn decisions_and_unchecked_points_travel_with_done() {
     // The PM passes them on to the person, who signs off on them.
     w.ok(Some("owner"), "task.done", json!({"id": "T1", "summary": "login is in", "decisions": ["tokens last 24h"], "unverified": ["load"]}));
     let inbox = w.ok(None, "inbox", json!({}));
-    assert_eq!(inbox[0]["text"], "T1 done: login is in\n  Decided: tokens last 24h\n  Not checked: load");
+    assert_eq!(inbox[0]["kind"], "review");
+    assert_eq!(
+        inbox[0]["text"],
+        "T1 \"Ship login\" is finished: login is in\n  Decided: tokens last 24h\n  Not checked: load\nSteps:\n- T2 engineer: built\n  Decided: tokens last 24h\n  Not checked: load"
+    );
 }
 
 #[test]
@@ -526,16 +530,60 @@ fn a_lost_member_returns_its_work_to_the_queue() {
 }
 
 #[test]
-fn human_tasks_report_to_the_inbox() {
-    let mut w = world();
+fn the_person_signs_off_or_sends_work_back() {
+    let mut w = world_with(&with_check("cargo test", ""));
     w.ok(None, "project.up", json!({"brief": "Ship it"}));
     w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build it", "parent": "T1"}));
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "built", "files": ["src/a.rs"]}));
+    w.finish_check("T2", Some(0), "");
+    w.ok(Some("tester"), "task.done", json!({"id": "T3", "summary": "PASS", "verdict": "pass", "unverified": ["load"]}));
     w.ok(Some("owner"), "task.done", json!({"id": "T1", "summary": "shipped v1"}));
     let inbox = w.ok(None, "inbox", json!({}));
-    assert_eq!(inbox[0]["kind"], "report");
-    assert_eq!(inbox[0]["text"], "T1 done: shipped v1");
-    w.ok(None, "answer", json!({"id": "Q1"}));
+    assert_eq!((inbox[0]["kind"].as_str(), inbox[0]["options"].clone()), (Some("review"), json!(["通过"])));
+    let card = inbox[0]["text"].as_str().unwrap();
+    assert!(card.starts_with("T1 \"Ship it\" is finished: shipped v1\nSteps:\n- T2 engineer: built (files: src/a.rs)\n"), "{card}");
+    assert!(card.contains("- check `cargo test` on T2: passed\n- T3 tester: PASS\n  Not checked: load"), "evidence in order: {card}");
+
+    // Sent back: the comment goes to the PM as a task in the same chain.
+    w.status("owner", "idle");
+    w.ok(None, "answer", json!({"id": "Q1", "text": "The footer still overlaps on mobile"}));
+    let rework = w.task("T4");
+    assert_eq!((rework.from.as_str(), rework.to.as_str(), rework.parent.as_deref(), rework.title.as_str()), ("human", "owner", Some("T1"), "Rework: Ship it"));
+    assert!(rework.body.contains("The footer still overlaps on mobile"));
+    assert!(w.sends_to("owner").iter().any(|s| s.contains("<lila task=\"T4\"")), "delivered to the PM");
+    // The rework finishes: a new card; this one is accepted.
+    w.ok(Some("owner"), "task.done", json!({"id": "T4", "summary": "fixed the footer"}));
+    let q = w.ok(None, "inbox", json!({}))[0]["id"].as_str().unwrap().to_owned();
+    w.ok(None, "answer", json!({"id": q, "text": "通过"}));
     assert!(w.inbox_kinds().is_empty());
+    assert!(w.d.store.events("shop", Some("T4"), 20).unwrap().iter().any(|e| e.kind == "accepted"));
+}
+
+#[test]
+fn new_work_waits_while_results_wait_for_review() {
+    let mut w = world_with(&manual("max_unreviewed = 2\nfresh_session = false\n"));
+    w.up();
+    w.all_idle();
+    for n in 0..2 {
+        w.ok(None, "task.new", json!({"to": "architect", "title": format!("Note {n}")}));
+        let id = format!("T{}", n + 1);
+        w.ok(Some("architect"), "task.done", json!({"id": id, "summary": "written"}));
+        w.status("architect", "idle");
+    }
+    assert_eq!(w.inbox_kinds(), ["review", "review"]);
+    // The PM's new chain waits; the person's own request and work inside a chain go on.
+    let held = w.ok(Some("owner"), "task.new", json!({"to": "architect", "title": "Plan B"}));
+    assert_eq!(held["state"], "queued");
+    assert!(held["held"].as_str().unwrap().contains("2 results wait for the person's review"), "{held}");
+    assert_eq!(w.ok(None, "status", json!({}))["held_for_review"], 1);
+    let mine = w.ok(None, "task.new", json!({"to": "engineer", "title": "Mine"}));
+    assert_eq!(mine["state"], "delivered");
+    w.ok(Some("engineer"), "task.new", json!({"to": "tester", "title": "Check mine", "parent": mine["id"].as_str().unwrap()}));
+    assert_eq!(w.state("T5"), TaskState::Delivered, "inside a chain");
+    // One looked at: the held chain starts.
+    w.ok(None, "answer", json!({"id": "Q1"}));
+    assert_eq!(w.state("T3"), TaskState::Delivered);
 }
 
 #[test]
@@ -1051,7 +1099,8 @@ fn which_work_runs_a_flow() {
     assert!(w.inbox_kinds().is_empty(), "verification first");
     w.ok(Some("tester"), "task.done", json!({"id": "T5", "summary": "PASS", "verdict": "pass"}));
     let inbox = w.ok(None, "inbox", json!({}));
-    assert_eq!(inbox[0]["text"], "T4 done, code flow passed: fixed\ntester T5: PASS");
+    assert_eq!(inbox[0]["kind"], "review");
+    assert_eq!(inbox[0]["text"], "T4 \"Fix the footer\" is finished: fixed\nSteps:\n- T5 tester: PASS");
 }
 
 #[test]
@@ -1194,4 +1243,170 @@ fn a_pm_with_a_big_context_starts_again_from_a_digest() {
     w.now += 30 * 60_000;
     w.d.tick(w.now);
     assert_eq!(w.d.term.kills.len(), 1);
+}
+
+// ---------------- the watchdog ----------------
+
+/// Fake times are early on 1970-01-01: their ISO form, as the CLIs write it.
+fn iso(ms: i64) -> String {
+    let s = ms / 1000;
+    format!("1970-01-01T{:02}:{:02}:{:02}.{:03}Z", s / 3600, s / 60 % 60, s % 60, ms % 1000)
+}
+
+impl World {
+    /// The member's Claude record: who it is, then one reply per (time, tokens).
+    fn record(&self, member: &str, replies: &[(i64, u64)]) {
+        let file = PathBuf::from(self.session_of(member).file.unwrap());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let cwd = self.repo.to_string_lossy();
+        let mut lines = vec![json!({"type": "system", "prompt_snapshot": format!("## Your team (Lila)\n\nProject: shop, working directory: {cwd}\nYou are `{member}` (x).")})];
+        for (n, (at, tokens)) in replies.iter().enumerate() {
+            lines.push(json!({"type": "assistant", "timestamp": iso(*at), "message": {"id": format!("m{n}"), "model": "m", "usage": {"input_tokens": tokens, "output_tokens": 0}}}));
+        }
+        std::fs::write(file, lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
+    }
+}
+
+#[test]
+fn a_member_busy_without_a_word_is_reminded_then_reported() {
+    let mut w = world_with(&manual(""));
+    w.up();
+    w.all_idle();
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Search"}));
+    w.status("engineer", "working");
+    w.now += 20 * 60_000;
+    w.d.tick(w.now);
+    assert!(!w.sends_to("engineer").iter().any(|s| s.contains("without a `lila` call")), "20 minutes is fine");
+    w.now += 11 * 60_000;
+    w.d.tick(w.now);
+    let reminders = |w: &World| w.sends_to("engineer").iter().filter(|s| s.contains("for 30 minutes without a `lila` call")).count();
+    assert_eq!(reminders(&w), 1);
+    w.d.tick(w.now + 5000);
+    assert_eq!(reminders(&w), 1, "once");
+    assert!(w.inbox_kinds().is_empty());
+    w.now += 31 * 60_000;
+    w.d.tick(w.now);
+    assert_eq!(w.inbox_kinds(), ["runaway"]);
+    assert!(w.d.store.inbox("shop", false).unwrap()[0].text.contains("look at its terminal"));
+    // It finishes its turn: the alarm goes.
+    w.status("engineer", "idle");
+    assert!(w.inbox_kinds().is_empty());
+}
+
+#[test]
+fn a_flow_over_budget_waits_for_the_person() {
+    let mut w = world_with(&format!("{PROJECT}\n[settings]\nfresh_session = false\n"));
+    w.up();
+    w.all_idle();
+    let e = w.call(Some("owner"), "task.new", json!({"to": "architect", "title": "x", "budget": 500})).unwrap_err();
+    assert!(e.to_string().contains("a budget is for a flow run"), "{e}");
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Search", "budget": 500}));
+    let at = w.now;
+    w.record("engineer", &[(at + 200, 300), (at + 400, 500), (at - 60_000, 9_999)]);
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "done"}));
+    // 800 of 500 (the older reply was before the task): held before the verification.
+    assert_eq!(w.run("T1").state, RunState::Held);
+    assert!(w.d.store.task("shop", "T2").unwrap().is_none());
+    let item = w.d.store.inbox("shop", false).unwrap().pop().unwrap();
+    assert_eq!((item.kind.as_str(), item.options.clone()), ("budget", vec!["继续".to_string(), "取消".to_string()]));
+    assert!(item.text.contains("has used 800 tokens of its 500 budget"), "{}", item.text);
+    w.status("owner", "idle");
+    assert!(w.sends_to("owner").iter().any(|s| s.contains("has used 800 tokens")), "the PM knows");
+    // Go on: a bigger budget, and the verification starts.
+    w.ok(None, "answer", json!({"id": item.id, "text": "继续"}));
+    let run = w.run("T1");
+    assert_eq!((run.state, run.budget), (RunState::Running, Some(1300)));
+    assert_eq!(w.task("T2").title, "Verify: Search");
+
+    // Another run, stopped.
+    w.ok(Some("tester"), "task.done", json!({"id": "T2", "summary": "PASS", "verdict": "pass"}));
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Export", "budget": 100}));
+    let at = w.now;
+    w.record("engineer", &[(at + 300, 400)]);
+    w.ok(Some("engineer"), "task.done", json!({"id": "T3", "summary": "done"}));
+    let item = w.d.store.inbox("shop", false).unwrap().into_iter().find(|i| i.kind == "budget").unwrap();
+    w.ok(None, "answer", json!({"id": item.id, "text": "取消"}));
+    assert_eq!(w.run("T3").state, RunState::Cancelled);
+    assert!(w.d.store.task("shop", "T4").unwrap().is_none());
+}
+
+#[test]
+fn codex_work_waits_while_its_quota_is_used_up() {
+    let mut w = world_with(&manual(""));
+    w.up();
+    w.all_idle();
+    let cwd = w.repo.to_string_lossy().to_string();
+    let day = w.d.sources.codex.join("sessions/2026/11/06");
+    std::fs::create_dir_all(&day).unwrap();
+    let write = |used: f64, now: i64| {
+        let prompt = format!("## Your team (Lila)\n\nProject: shop, working directory: {cwd}\nYou are `tester` (t).\n");
+        let lines = [
+            json!({"type": "session_meta", "timestamp": iso(now), "payload": {"id": "cx", "cwd": cwd}}),
+            json!({"type": "response_item", "payload": {"role": "developer", "content": [{"type": "input_text", "text": prompt}]}}),
+            json!({"type": "event_msg", "timestamp": iso(now), "payload": {"type": "token_count", "rate_limits": {"primary": {"used_percent": used, "window_minutes": 10080, "resets_at": now / 1000 + 3600}, "plan_type": "pro"}}}),
+        ];
+        std::fs::write(day.join("rollout-x-cx.jsonl"), lines.map(|l| l.to_string()).join("\n")).unwrap();
+    };
+    write(100.0, w.now);
+    w.d.tick(w.now);
+    assert_eq!(w.inbox_kinds(), ["quota"]);
+    assert!(w.d.store.inbox("shop", false).unwrap()[0].text.contains("resets in 1 h 0 min. Work for tester waits"), "{:?}", w.d.store.inbox("shop", false));
+    // Seen and dismissed: not raised again for the same reset.
+    let q = w.d.store.inbox("shop", false).unwrap()[0].id.clone();
+    w.ok(None, "answer", json!({"id": q}));
+    w.d.tick(w.now + 61_000);
+    assert!(w.inbox_kinds().is_empty());
+    let t = w.ok(Some("owner"), "task.new", json!({"to": "tester", "title": "Verify"}));
+    assert_eq!(t["state"], "queued", "the tester is free but out of quota");
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build"}));
+    assert_eq!(w.state("T2"), TaskState::Delivered, "Claude members go on");
+    // A newer record: room again.
+    write(20.0, w.now + 30_000);
+    w.d.tick(w.now + 130_000);
+    assert!(w.inbox_kinds().is_empty());
+    assert_eq!(w.state("T1"), TaskState::Delivered);
+}
+
+#[test]
+fn members_run_on_their_clis_current_account() {
+    let mut w = world();
+    let root = w.d.paths.account_dirs();
+    let work = crate::accounts::add(&w.d.paths.accounts(), &root, lila_core::Runtime::Claude, "work").unwrap();
+    crate::accounts::set_current(&w.d.paths.accounts(), &work.id).unwrap();
+    w.up();
+    let env_of = |w: &World, n: usize| w.d.term.runs[n]["env"].clone();
+    let dir = work.dir.unwrap().to_string_lossy().to_string();
+    assert_eq!(env_of(&w, 0)["CLAUDE_CONFIG_DIR"], dir.as_str(), "the PM (Claude) on the work account");
+    assert!(env_of(&w, 2)["CODEX_HOME"].is_null(), "the tester (Codex) on Codex's own folder");
+    // Its session record is looked for in that account's folder.
+    let file = w.session_of("owner").file.unwrap();
+    assert!(file.starts_with(&dir), "{file}");
+}
+
+#[test]
+fn magpies_reading_of_the_signed_in_codex_account_wins_over_old_records() {
+    let mut w = world_with(&manual(""));
+    w.up();
+    w.all_idle();
+    // An old session record says Codex is used up (another account's)...
+    let cwd = w.repo.to_string_lossy().to_string();
+    let day = w.d.sources.codex.join("sessions/2026/11/06");
+    std::fs::create_dir_all(&day).unwrap();
+    let prompt = format!("## Your team (Lila)\n\nProject: shop, working directory: {cwd}\nYou are `tester` (t).\n");
+    let lines = [
+        json!({"type": "session_meta", "timestamp": iso(w.now), "payload": {"id": "cx", "cwd": cwd}}),
+        json!({"type": "response_item", "payload": {"role": "developer", "content": [{"type": "input_text", "text": prompt}]}}),
+        json!({"type": "event_msg", "timestamp": iso(w.now), "payload": {"type": "token_count", "rate_limits": {"primary": {"used_percent": 100.0, "window_minutes": 10080, "resets_at": w.now / 1000 + 3600}}}}),
+    ];
+    std::fs::write(day.join("rollout-x-cx.jsonl"), lines.map(|l| l.to_string()).join("\n")).unwrap();
+    // ...but magpie switched Codex to an account with room.
+    let bin = w.repo.join("fake-magpie");
+    let json = r#"[{"agent":"codex","user":"b@x.com","plan":"pro","active":true,"windows":[{"name":"7 days","used":3,"resetsAt":"2026-11-13T16:34:16+08:00"}]}]"#;
+    std::fs::write(&bin, format!("#!/bin/sh\necho '{json}'\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    w.d.magpie = Some(bin);
+    w.d.tick(w.now);
+    assert!(w.inbox_kinds().is_empty(), "{:?}", w.d.store.inbox("shop", false));
+    let t = w.ok(Some("owner"), "task.new", json!({"to": "tester", "title": "Verify"}));
+    assert_eq!(t["state"], "delivered");
 }

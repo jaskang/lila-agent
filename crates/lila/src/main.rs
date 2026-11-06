@@ -77,6 +77,8 @@ enum Cmd {
         #[arg(long)]
         days: Option<u64>,
     },
+    /// Subscription accounts and how much of each usage window is used.
+    Accounts,
     /// Stop delivering tasks (notes still go out).
     Pause,
     /// Resume delivering tasks.
@@ -124,6 +126,9 @@ enum TaskCmd {
         /// Default: the project's flow, for work from the PM or the person.
         #[arg(long)]
         flow: Option<String>,
+        /// Tokens the flow may use (300k, 1.5M); over it, it waits for the person between steps.
+        #[arg(long, value_parser = parse_tokens)]
+        budget: Option<u64>,
     },
     /// Change a task you assigned: rewrite it while queued, or --append an update once delivered.
     Edit {
@@ -255,6 +260,7 @@ fn run() -> Result<()> {
         Cmd::Answer { id, text } => out(call("answer", json!({"id": id, "text": text}))?, &|v| format!("{} resolved", v["id"].as_str().unwrap_or("?"))),
         Cmd::Log { limit, task } => out(call("log", json!({"limit": limit, "task": task}))?, &fmt_log),
         Cmd::Usage { days } => usage(days, cli.json)?,
+        Cmd::Accounts => accounts(&paths, cli.json)?,
         Cmd::Pause => out(call("pause", json!({}))?, &|_| "paused: no new tasks are delivered".into()),
         Cmd::Resume => out(call("resume", json!({}))?, &|_| "resumed".into()),
         Cmd::Daemon { cmd: DaemonCmd::Run } => daemon::serve(paths.clone(), client::hc_bin())?,
@@ -278,21 +284,40 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// "300k", "1.5M", "250000".
+fn parse_tokens(s: &str) -> Result<u64, String> {
+    let t = s.trim().to_lowercase();
+    let (num, mul) = match t.chars().last() {
+        Some('k') => (&t[..t.len() - 1], 1e3),
+        Some('m') => (&t[..t.len() - 1], 1e6),
+        _ => (t.as_str(), 1.0),
+    };
+    let n: f64 = num.trim().parse().map_err(|_| format!("{s:?}: give tokens like 300k or 1.5M"))?;
+    if n <= 0.0 {
+        return Err("a budget must be above 0".into());
+    }
+    Ok((n * mul).round() as u64)
+}
+
 type Out<'a> = dyn Fn(Value, &dyn Fn(&Value) -> String) + 'a;
 
 fn task(cmd: TaskCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out) -> Result<()> {
     match cmd {
-        TaskCmd::New { to, title, body, body_file, parent, priority, quote, accept, out_of_scope, flow } => {
+        TaskCmd::New { to, title, body, body_file, parent, priority, quote, accept, out_of_scope, flow, budget } => {
             let body = match body_file {
                 Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?,
                 None => body.unwrap_or_default(),
             };
             let v = call(
                 "task.new",
-                json!({"to": to, "title": title, "body": body, "parent": parent, "priority": priority, "quote": quote, "accept": accept, "out_of_scope": out_of_scope, "flow": flow}),
+                json!({"to": to, "title": title, "body": body, "parent": parent, "priority": priority, "quote": quote, "accept": accept, "out_of_scope": out_of_scope, "flow": flow, "budget": budget}),
             )?;
             out(v, &|v| {
-                let when = if v["state"] == "delivered" { "delivered now" } else { "queued until they are free" };
+                let when = match v["held"].as_str() {
+                    Some(why) => format!("queued: {why}"),
+                    None if v["state"] == "delivered" => "delivered now".into(),
+                    None => "queued until they are free".into(),
+                };
                 format!("{} → {}: {} ({when})", v["id"].as_str().unwrap_or("?"), v["to"].as_str().unwrap_or("?"), v["title"].as_str().unwrap_or(""))
             });
         }
@@ -336,6 +361,53 @@ fn init(paths: &Paths, name: Option<String>) -> Result<()> {
         println!("installed roles in {}: {}", paths.roles().display(), out.roles_installed.join(", "));
     }
     println!("next: edit the team if you like, then `lila up --brief \"what you want built\"`");
+    Ok(())
+}
+
+fn accounts(paths: &Paths, as_json: bool) -> Result<()> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let list = lila::accounts::load(&paths.accounts())?;
+    let rows: Vec<(lila::accounts::Account, lila::accounts::AccountUsage)> = list.into_iter().map(|a| {
+        let u = lila::accounts::usage(&a, &home);
+        (a, u)
+    }).collect();
+    if as_json {
+        let v: Vec<Value> = rows
+            .iter()
+            .map(|(a, u)| {
+                json!({"id": a.id, "runtime": a.runtime.to_string(), "name": a.name, "dir": a.dir, "current": a.current, "plan": u.plan, "seen_ms": u.seen_ms,
+                    "windows": u.windows.iter().map(|w| json!({"name": w.name, "used_percent": w.used_percent, "resets_ms": w.resets_ms})).collect::<Vec<_>>()})
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    for (a, u) in rows {
+        let mark = if a.current { "*" } else { " " };
+        println!("{mark} {:<16} {:<6} {} {}", a.id, a.runtime, a.name, u.plan.unwrap_or_default());
+        for w in &u.windows {
+            println!("      {:<8} {:>5.1}%  resets {}", w.name, w.used_percent, clock(w.resets_ms));
+        }
+        if u.windows.is_empty() {
+            println!("      no usage recorded yet");
+        }
+    }
+    // magpie's accounts, read through magpie (their tokens stay with it).
+    let path = std::env::var("PATH").unwrap_or_default();
+    if let Some(bin) = lila::magpie::find(&path) {
+        match lila::magpie::accounts(&bin) {
+            Ok(list) => {
+                for m in list {
+                    let mark = if m.active { "*" } else { " " };
+                    println!("{mark} {:<16} {:<6} {} {} (magpie)", m.user, m.runtime, m.usage.plan.unwrap_or_default(), if m.active { "signed in" } else { "" });
+                    for w in &m.usage.windows {
+                        println!("      {:<8} {:>5.1}%  resets {}", w.name, w.used_percent, clock(w.resets_ms));
+                    }
+                }
+            }
+            Err(e) => println!("magpie: {e:#}"),
+        }
+    }
     Ok(())
 }
 
@@ -442,6 +514,13 @@ fn fmt_status(v: &Value) -> String {
             r["step"].as_str().unwrap_or(""),
             r["state"].as_str().unwrap_or(""),
         ));
+    }
+    let held = v["held_for_review"].as_u64().unwrap_or(0);
+    if held > 0 {
+        s.push_str(&format!("  {held} new task(s) wait: {} results wait for the person's review\n", v["unreviewed"].as_u64().unwrap_or(0)));
+    }
+    if v["codex_paused_until"].is_i64() {
+        s.push_str("  Codex's usage limit is used up: its members get no work until it resets\n");
     }
     let open = v["open_tasks"].as_array().map(|a| a.len()).unwrap_or(0);
     s.push_str(&format!("{open} open task(s)"));
@@ -559,3 +638,14 @@ fn local_offset_secs() -> i64 {
         .unwrap_or(0)
 }
 
+
+#[cfg(test)]
+mod budget_tests {
+    #[test]
+    fn budgets_read_like_people_write_them() {
+        assert_eq!(super::parse_tokens("300k"), Ok(300_000));
+        assert_eq!(super::parse_tokens("1.5M"), Ok(1_500_000));
+        assert_eq!(super::parse_tokens("250000"), Ok(250_000));
+        assert!(super::parse_tokens("lots").is_err() && super::parse_tokens("0").is_err());
+    }
+}

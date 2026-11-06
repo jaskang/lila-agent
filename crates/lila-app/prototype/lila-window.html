@@ -127,6 +127,9 @@ body {
 
 /* ---------- sidebar: sits straight on the glass, no card of its own ---------- */
 .side { flex: none; display: flex; flex-direction: column; min-height: 0; }
+/* the sidebar's content is a card like the others; the app's name sits above it, beside the traffic lights */
+.side-card { flex: 1; min-height: 0; display: flex; flex-direction: column; padding-top: 6px;
+  background: var(--block); box-shadow: inset 0 0 0 1px var(--block-line), var(--sheen); border-radius: var(--r-block); overflow: hidden; }
 .side-sec { padding: 6px 10px 6px 16px; gap: 5px; }
 .row.tall { height: 46px; gap: 10px; }
 /* member tree: the trunk drops from the PM's tile, an elbow curves into each member */
@@ -477,6 +480,9 @@ const TASKS = [
 const INBOX = [
   { id: 'Q3', kind: 'question', task: 'T4', member: 'pm', at: ago(4), text: '结算页要不要支持游客下单？支持的话订单要另存一份联系方式，T6 和 T8 都要跟着改。', options: ['支持游客下单', '先登录再下单'] },
   { id: 'N7', kind: 'terminal', task: 'T8', member: 'engineer-2', at: ago(2), text: 'engineer-2 的终端停在确认提示上：要不要运行 pnpm test。' },
+  { id: 'Q5', kind: 'review', task: 'T2', member: 'pm', at: ago(6), options: ['通过'],
+    text: 'T2 "登录与注册" is finished: 邮箱登录和注册都已上线\n  Decided: token 有效期 24 小时\n  Not checked: 并发登录\nSteps:\n- T5 engineer: 加了 POST /login 和 /signup (files: src/api/auth.ts)\n- check `pnpm test` on T5: passed\n- T6 tester: PASS: 12 个用例' },
+  { id: 'Q6', kind: 'budget', task: 'T7', member: 'pm', at: ago(1), options: ['继续', '取消'], text: 'T7 "购物车" (code flow) has used 312k tokens of its 300k budget; it stops before its next step until the person decides.' },
 ];
 const LOG = [
   { at: ago(2), actor: 'engineer-2', task: 'T8', kind: '在等你', detail: '终端停在确认提示上' },
@@ -499,8 +505,13 @@ const ACCOUNTS = [
     { name: '5 小时', used: .93, reset: hrs(0.6) },
     { name: '本周', used: .81, reset: hrs(31.2) },
   ] },
-  { id: 'cx-personal', cli: 'Codex', name: '个人', plan: 'ChatGPT Pro', current: true, dir: '~/.config/lila/accounts/codex-personal', seen: ago(5), windows: [
-    { name: '本周', used: .41, reset: hrs(144.9) },
+  // From magpie (github.com/yetone/magpie), when it is installed: its sign-ins for the CLI's own folder.
+  // Lila never copies their tokens; picking one has magpie switch the CLI's own sign-in to it.
+  { id: 'mg-cx-1', cli: 'Codex', name: 'me@example.com', plan: 'ChatGPT Pro', current: true, magpie: true, seen: ago(1), windows: [
+    { name: '本周', used: .0, reset: hrs(167.2) },
+  ] },
+  { id: 'mg-cx-2', cli: 'Codex', name: 'work@example.com', plan: 'ChatGPT Pro', current: false, magpie: true, seen: ago(1), windows: [
+    { name: '本周', used: 1, reset: hrs(42.1) },
   ] },
 ];
 const CLIS = [{ cli: 'Claude Code', color: '#e88a5d', windows: ['5 小时', '本周'] }, { cli: 'Codex', color: 'var(--blue)', windows: ['本周'] }];
@@ -531,6 +542,7 @@ const S = {
   prefsRole: 'pm',
   accounts: ACCOUNTS.map(a => ({ ...a })),
   addAcct: null,       // CLI name while its "add account" form is open
+  signing: null,       // {cli, name} while that account signs in in the browser
   rmAcct: null,        // account id waiting for a second click to remove
 };
 
@@ -611,7 +623,8 @@ function sidebar(v) {
   // two levels: the PM at the root, everyone it hands work to hanging off it
   const pm = v.members.find(m => m.id === 'pm'), crew = v.members.filter(m => m !== pm);
   return `<aside class="side" style="width:${S.sideW}px" data-anno="侧栏 ${S.sideW}px（200–420）">
-    <div class="side-top flex" data-anno="顶行 44 · 拖动窗口"></div>
+    <div class="side-top flex" data-anno="顶行 44 · 拖动窗口"><span class="sm b">Lila</span></div>
+    <div class="side-card" data-anno="侧栏卡片">
     <div class="side-sec flex"><span class="label">项目</span><span class="grow"></span>
       <button class="btn ghost xs" data-act="wizard" title="新建项目…">${I('plus', 'sm')}</button></div>
     ${v.projects.map(p => {
@@ -633,6 +646,7 @@ function sidebar(v) {
       ${v.project && (!v.daemon || v.members.some(m => m.status === 'gone')) ? `<div class="row flex" data-act="up"><span style="color:var(--green);display:flex">${I('play', 'sm')}</span><span class="sm">启动团队</span></div>` : ''}
       ${v.daemon && v.project ? `<div class="row flex" data-act="pause"><span class="mut" style="display:flex">${I(S.paused ? 'play' : 'pause', 'sm')}</span><span class="sm">${S.paused ? '恢复派发' : '暂停派发'}</span>${S.paused ? '<span class="grow"></span><span class="tag warn">已暂停</span>' : ''}</div>` : ''}
       <div class="row flex" data-act="prefs"><span class="mut" style="display:flex">${I('settings', 'sm')}</span><span class="sm">设置</span><span class="grow"></span><span class="xs mut2">⌘,</span></div>
+    </div>
     </div>
   </aside>`;
 }
@@ -751,17 +765,24 @@ function inboxCard(i) {
     question: ['circleAlert', 'var(--yellow)', 'PM 在问你'], terminal: ['terminal', 'var(--red)', '终端在等你'],
     startup: ['triangle', 'var(--red)', '启动卡住'], stalled: ['triangle', 'var(--yellow)', '没有回应'],
     lost: ['circleX', 'var(--red)', '成员退出'], report: ['circleCheck', 'var(--green)', '完成报告'],
+    review: ['circleCheck', 'var(--green)', '等你验收'], budget: ['triangle', 'var(--yellow)', '超出预算'],
+    quota: ['circleX', 'var(--red)', '额度用完'], runaway: ['triangle', 'var(--yellow)', '可能在打转'],
   }[i.kind] || ['info', 'var(--muted)', '提醒'];
   return `<div class="ibx col">
     <div class="flex" style="gap:7px"><span style="color:${color};display:flex">${I(icon, 'sm')}</span><span class="sm b">${label}</span><span class="grow"></span>
       ${i.task ? `<button class="link xs" data-act="task" data-id="${i.task}">${i.task}</button>` : ''}
       <span class="xs mut2">${i.member} · ${clock(i.at)}</span></div>
-    <div class="sm msg">${esc(i.text)}</div>
-    ${i.kind === 'question' ? `
+    <div class="sm msg" style="white-space:pre-wrap">${esc(i.text)}</div>
+    ${i.kind === 'review' ? `
+      <div class="flex" style="gap:6px"><button class="btn primary" data-act="answer" data-id="${i.id}">通过</button>
+        <input class="input grow" placeholder="或者写下要返工的地方…"><button class="btn" data-act="answer" data-id="${i.id}">打回</button></div>`
+    : i.kind === 'budget' ? `
+      <div class="flex" style="gap:6px">${i.options.map(o => `<button class="btn pill small" data-act="answer" data-id="${i.id}">${esc(o)}</button>`).join('')}</div>`
+    : i.kind === 'question' ? `
       <div class="flex" style="gap:6px;flex-wrap:wrap">${i.options.map(o => `<button class="btn pill small" data-act="answer" data-id="${i.id}">${esc(o)}</button>`).join('')}</div>
       <div class="flex" style="gap:6px"><input class="input grow" placeholder="或者写下你的回答…"><button class="btn primary" data-act="answer" data-id="${i.id}">回答</button></div>`
     : `<div class="flex" style="gap:6px">
-        ${['terminal', 'startup', 'stalled'].includes(i.kind) ? `<button class="btn pill small" data-act="member" data-id="${i.member}">${I('terminal', 'sm')}打开终端</button>` : ''}
+        ${['terminal', 'startup', 'stalled', 'runaway'].includes(i.kind) ? `<button class="btn pill small" data-act="member" data-id="${i.member}">${I('terminal', 'sm')}打开终端</button>` : ''}
         <span class="grow"></span><button class="link sm" data-act="answer" data-id="${i.id}">知道了</button></div>`}
   </div>`;
 }
@@ -951,9 +972,10 @@ function usagePage() {
   const acct = (a, c) => `<div class="group acct ${a.current ? 'current' : ''}">
     <div class="grow-row flex"><span class="acct-ic" style="--c:${c.color}">${I('user', 'sm')}</span>
       <div class="col grow" style="align-items:flex-start;gap:1px">
-        <div class="flex" style="gap:8px"><span class="sm m">${esc(a.name)}</span><span class="xs mut">${a.plan}</span></div>
+        <div class="flex" style="gap:8px"><span class="sm m">${esc(a.name)}</span><span class="xs mut">${a.plan}</span>${a.magpie ? '<span class="tag" title="这个登录由 magpie 管理">magpie</span>' : ''}</div>
         <span class="xs mut2" title="${a.dir}">${a.windows.length ? `${clock(a.seen)} 更新` : '还没有记录'}</span></div>
       ${a.current ? '<span class="tag ok">正在使用</span>'
+        : a.magpie ? `<button class="link sm" data-act="acct-use" data-id="${a.id}" title="由 magpie 把 ${a.cli} 自己的登录换成这个账号">设为当前</button>`
         : `<button class="link sm" data-act="acct-use" data-id="${a.id}">设为当前</button>
            ${S.rmAcct === a.id ? `<button class="btn pill small danger" data-act="acct-remove" data-id="${a.id}">确认移除</button>`
              : `<button class="btn ghost xs" data-act="acct-remove" data-id="${a.id}" title="移除这个账号（退出登录并删除它的配置目录）">${I('trash', 'sm')}</button>`}`}
@@ -965,11 +987,19 @@ function usagePage() {
         <div class="meter"><i style="width:${w.used * 100}%;background:${meterColor(w.used, c.color)}"></i></div></div>
     </div>`).join('') : `<div class="grow-row flex xs mut">有成员用它工作后才有数据。</div>`}
   </div>`;
-  const addForm = c => `<div class="group acct-add">
+  // Adding: name it, then sign in in the vendor's web page (the CLI's own login runs in the background).
+  const addForm = c => S.signing?.cli === c.cli ? `<div class="group acct-add">
+    <div class="grow-row flex" style="gap:10px"><span class="acct-ic" style="--c:${c.color}"><span class="spin"></span></span>
+      <div class="col grow" style="align-items:flex-start;gap:1px"><span class="sm m">正在浏览器里登录 ${c.cli}…</span>
+        <span class="xs mut2">「${esc(S.signing.name)}」 · 在网页上登录后会自动回到这里</span></div>
+      <button class="link sm" data-act="acct-reopen">重新打开登录页</button><button class="btn ghost" data-act="acct-cancel">取消</button></div>
+    ${c.cli === 'Claude Code' ? `<div class="grow-row flex" style="gap:8px;min-height:0;padding-top:0">
+      <input class="input grow" placeholder="网页上显示了一段代码？贴在这里"><button class="btn" data-act="acct-code">提交</button></div>` : ''}
+  </div>` : `<div class="group acct-add">
     <div class="grow-row flex" style="gap:10px"><span class="acct-ic" style="--c:${c.color}">${I('plus', 'sm')}</span>
       <input class="input grow" id="acct-name" placeholder="账号名称，例如 工作、备用" autofocus>
       <button class="btn ghost" data-act="acct-cancel">取消</button><button class="btn primary" data-act="acct-login" data-id="${c.cli}">登录…</button></div>
-    <div class="grow-row xs mut" style="min-height:0;padding-top:0;line-height:1.6">会打开一个终端完成 ${c.cli} 的登录。</div>
+    <div class="grow-row xs mut" style="min-height:0;padding-top:0;line-height:1.6">会在浏览器里打开 ${c.cli === 'Claude Code' ? 'Claude' : 'ChatGPT'} 的登录页。</div>
   </div>`;
   return `<div style="padding:4px 24px 24px">${CLIS.map(c => {
     const list = S.accounts.filter(a => a.cli === c.cli);
@@ -978,6 +1008,7 @@ function usagePage() {
       <div class="col" style="gap:8px;align-items:stretch">${list.map(a => acct(a, c)).join('')}${S.addAcct === c.cli ? addForm(c) : ''}</div>`;
   }).join('')}
     <div class="xs mut" style="margin-top:16px;line-height:1.6">成员都用「正在使用」的账号。切换后，已经在跑的成员下次重启时才换过去。</div>
+    ${S.accounts.some(a => a.magpie) ? `<div class="xs mut" style="margin-top:6px;line-height:1.6">标着 magpie 的账号由 magpie 管理登录，Lila 不复制它们的令牌。设为当前时由 magpie 切换 CLI 自己的登录，你在终端里开的 claude / codex 也会一起换。</div>` : ''}
   </div>`;
 }
 
@@ -1176,12 +1207,19 @@ const A = {
   'prefs-page': id => { S.dialog.page = id; },
   'prefs-role': id => { S.prefsRole = id; },
   'acct-add': id => { S.addAcct = id; S.rmAcct = null; },
-  'acct-cancel': () => { S.addAcct = null; },
+  'acct-cancel': () => { S.addAcct = null; S.signing = null; },
+  'acct-reopen': () => {},
+  'acct-code': () => {},
   'acct-login': (cli, el) => {
     const name = (el.closest('.group').querySelector('input').value || '').trim() || `账号 ${S.accounts.filter(a => a.cli === cli).length + 1}`;
-    const slug = 'acct-' + Date.now().toString(36);
-    S.accounts.push({ id: slug, cli, name, plan: '登录后识别套餐', current: false, dir: `~/.config/lila/accounts/${slug}`, seen: now, windows: [] });
-    S.addAcct = null;
+    S.signing = { cli, name };
+    // the vendor's page signs in, the CLI's login exits, the account appears
+    setTimeout(() => {
+      if (S.signing?.cli !== cli) return;
+      const slug = 'acct-' + Date.now().toString(36);
+      S.accounts.push({ id: slug, cli, name, plan: cli === 'Codex' ? 'ChatGPT Plus' : 'Claude Pro', current: false, dir: `~/.config/lila/accounts/${slug}`, seen: Date.now(), windows: [] });
+      S.signing = null; S.addAcct = null; render();
+    }, 4000);
   },
   'acct-use': id => { const a = S.accounts.find(a => a.id === id); S.accounts.forEach(x => { if (x.cli === a.cli) x.current = x === a; }); S.rmAcct = null; },
   'acct-remove': id => { if (S.rmAcct !== id) { S.rmAcct = id; return; } S.accounts = S.accounts.filter(a => a.id !== id); S.rmAcct = null; },

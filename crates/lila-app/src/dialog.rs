@@ -45,6 +45,8 @@ pub struct Shell {
     pub back: Option<Act>,
     pub on_save: Act,
     pub on_close: Act,
+    /// Off: no button row (a page whose actions take effect at once).
+    pub footer: bool,
 }
 
 /// The dialog's own surface: above the dimmed window.
@@ -150,7 +152,7 @@ impl LilaApp {
 
     pub fn dialog(&mut self, shell: Shell, cx: &mut Context<Self>) -> AnyElement {
         let t = cx.theme().clone();
-        let Shell { id, heading, nav, title, description, body, note, saving, save_label, can_save, back, on_save, on_close } = shell;
+        let Shell { id, heading, nav, title, description, body, note, saving, save_label, can_save, back, on_save, on_close, footer } = shell;
         let on_close: std::rc::Rc<Act> = std::rc::Rc::new(on_close);
         let (close_x, close_cancel) = (on_close.clone(), on_close);
         let offset = self.dialog_offset;
@@ -255,7 +257,7 @@ impl LilaApp {
                                     .when(!description.is_empty(), |d| d.child(div().text_xs().text_color(style::muted()).child(description))),
                             )
                             .child(v_flex().flex_1().min_h_0().child(body))
-                            .child(
+                            .children(footer.then(|| {
                                 h_flex()
                                     .flex_none()
                                     .px_5()
@@ -274,8 +276,8 @@ impl LilaApp {
                                         close_cancel(this, cx);
                                         cx.notify();
                                     })))
-                                    .child(Button::new(SharedString::from(format!("{id}-save"))).primary().label(save_label).disabled(saving || !can_save).on_click(cx.listener(move |this, _, _, cx| on_save(this, cx)))),
-                            ),
+                                    .child(Button::new(SharedString::from(format!("{id}-save"))).primary().label(save_label).disabled(saving || !can_save).on_click(cx.listener(move |this, _, _, cx| on_save(this, cx))))
+                            })),
                     )
                     .child(div().absolute().top(px(16.)).right(px(14.)).child(Button::new(SharedString::from(format!("{id}-x"))).ghost().xsmall().icon(IconName::Close).tooltip("关闭 (Esc)").on_click(cx.listener(move |this, _, _, cx| {
                         close_x(this, cx);

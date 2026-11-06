@@ -219,6 +219,56 @@ pub fn digest(decided: &[String], open: &[String], closed: &[String], waiting: u
     s
 }
 
+/// A finished piece of the person's work, for them to sign off: what it says it
+/// did, then each step with its evidence (`steps`, one line each, oldest first).
+pub fn review_card(task: &Task, steps: &[String]) -> String {
+    let mut s = format!("{} \"{}\" is finished: {}", task.id, task.title, task.summary.as_deref().unwrap_or("(no summary)"));
+    s.push_str(&outcome_text(&task.outcome));
+    if !steps.is_empty() {
+        s.push_str("\nSteps:");
+        for line in steps {
+            s.push_str(&format!("\n- {line}"));
+        }
+    }
+    s
+}
+
+/// A member working a long time without telling Lila anything.
+pub fn runaway(task: &Task, minutes: u64) -> String {
+    note(
+        &task.id,
+        &format!(
+            "You have been working on {} \"{}\" for {minutes} minutes without a `lila` call. If you are going round in circles, stop and run `lila task block {} --reason \"<what keeps failing>\"`. If it is going well, carry on.",
+            task.id, task.title, task.id
+        ),
+    )
+}
+
+/// A flow run that used its budget, held before its next step.
+pub fn over_budget(anchor: &Task, flow: &str, spent: u64, budget: u64) -> String {
+    format!(
+        "{} \"{}\" ({flow} flow) has used {} tokens of its {} budget; it stops before its next step until the person decides.",
+        anchor.id,
+        anchor.title,
+        short_tokens(spent),
+        short_tokens(budget)
+    )
+}
+
+/// 1234 → 1.2k, 2_500_000 → 2.5M.
+pub fn short_tokens(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{}k", trim_point(n as f64 / 1e3)),
+        _ => format!("{}M", trim_point(n as f64 / 1e6)),
+    }
+}
+
+fn trim_point(x: f64) -> String {
+    let s = if x >= 100.0 { format!("{x:.0}") } else { format!("{x:.1}") };
+    s.strip_suffix(".0").map(String::from).unwrap_or(s)
+}
+
 pub fn blocked_note(task: &Task) -> String {
     note(&task.id, &format!("{} is blocked on {} \"{}\": {}", task.to, task.id, task.title, task.block_reason.as_deref().unwrap_or("(no reason)")))
 }
@@ -323,6 +373,17 @@ mod tests {
         assert!(d.contains("\nOpen work:\n- T1 from human → pm [in_progress] \"Ship\"\n    T2 → engineer [queued] Build\n"), "{d}");
         assert!(d.contains("2 item(s) wait for the person"));
         assert!(digest(&[], &[], &[], 0).contains("Nothing is open."));
+    }
+
+    #[test]
+    fn review_cards_and_watchdog_text() {
+        let mut t = task("");
+        t.outcome.unverified = vec!["load".into()];
+        let c = review_card(&t, &["T4 engineer: built it".into(), "check `cargo test` on T4: passed".into()]);
+        assert_eq!(c, "T3 \"Add login\" is finished: done it\n  Not checked: load\nSteps:\n- T4 engineer: built it\n- check `cargo test` on T4: passed");
+        assert!(runaway(&t, 30).contains("for 30 minutes without a `lila` call"));
+        assert!(over_budget(&t, "code", 312_000, 300_000).contains("used 312k tokens of its 300k budget"));
+        assert_eq!((short_tokens(999), short_tokens(1_250), short_tokens(2_500_000)), ("999".into(), "1.2k".into(), "2.5M".into()));
     }
 
     #[test]

@@ -90,6 +90,12 @@ Start each piece of work the person asks for with their words and the bar:
 Work under a task from the person (`--parent T1`) carries their words already.
 The PM has no tools to edit files or run builds: it plans and delegates.
 
+When work for the person is finished, they get a review card with each step's
+evidence. If they send it back, their comment comes as a `Rework:` task. While
+several results wait for review, a new chain the PM starts waits too.
+`--budget 300k` on `lila task new` caps a flow's tokens: over it, the flow
+waits for the person before its next step.
+
     lila ask "<question>" [--option "<A>" --option "<B>"] [--task T12]
 
 asks the person; their answer arrives as `<lila answer>`. Other members report

@@ -40,6 +40,16 @@ impl Paths {
         }
     }
 
+    /// The subscription accounts (`accounts`).
+    pub fn accounts(&self) -> PathBuf {
+        self.config.join("accounts.toml")
+    }
+
+    /// Where accounts Lila adds keep their CLI config folders.
+    pub fn account_dirs(&self) -> PathBuf {
+        self.config.join("accounts")
+    }
+
     pub fn roles(&self) -> PathBuf {
         self.config.join("roles")
     }

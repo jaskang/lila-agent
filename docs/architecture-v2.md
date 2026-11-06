@@ -1,6 +1,6 @@
 # Lila 架构 v2：重新评估（草案）
 
-> 2026-11-06 · §9 的决定：全部按建议。阶段 A、B、C 已完成，见 §10–§12。参考资料是 README 末尾的四篇：
+> 2026-11-06 · §9 的决定：全部按建议。阶段 A–D 已完成，见 §10–§13。参考资料是 README 末尾的四篇：
 > ① Claude Code 文档《Subagents》；② Thariq Shihipar《A harness for every task: dynamic workflows in Claude Code》；
 > ③ DeepSeek Harness《Exploring Super-agent Design》；④ Addy Osmani《Critical thinking when agents do the work》。
 >
@@ -263,11 +263,12 @@ session_chains (project, session, chain, last_ms)                 -- 哪个会�
 members.session                                                   -- 成员终端里正在跑的会话
 ```
 
+阶段 D 加的：`runs.budget`、`runs.hold`（暂停时记下的下一步），`inbox.kind` 增加了 `review`、`budget`、`quota`、`runaway`。
+
 后面阶段还要加的：
 
 ```sql
-runs.budget, runs.worktree                                                           -- D、E
--- inbox.kind 增加：review | budget | quota | runaway                                  -- D
+runs.worktree                                                                        -- E
 ```
 
 检查的结果没有单独建表，记在 `task_events` 里（`kind = check`），失败的输出写进退回的 Fix 任务正文。
@@ -312,7 +313,7 @@ runs.budget, runs.worktree                                                      
 | **A** ✅ | 角色工具权限（`[tools]` → CLI 参数），收紧 PM；`--quote`、`--accept`、`--out-of-scope` 字段，投递时原样带上；done 加 `--decision`、`--unverified`；成员池寻址 | `config.rs`、`runtime.rs`、`prompt.rs`、`daemon.rs`、默认角色 | 低 |
 | **B** ✅ | 运行表、流程模板、`check` 由 lilad 运行、`--verdict` 和自动返工；删掉角色提示词里的流程说明 | 新的 `flow.rs`，`daemon.rs`，store | 中：要改写交接相关的测试 |
 | **C** ✅ | 会话账本（`--session-id`、resume），换链按上下文大小决定；PM 摘要换会话 | `daemon.rs`、`usage.rs`、`message.rs` | 中：需要真跑一次确认 resume |
-| **D** | Watchdog 快路径（长时间工作、预算、额度、崩溃循环）；验收卡片；积压上限 | `dispatch.rs`、收件箱、窗口 | 低 |
+| **D** ✅ | Watchdog 快路径（长时间工作、预算、额度、崩溃循环）；验收卡片；积压上限 | `dispatch.rs`、收件箱、窗口 | 低 |
 | **E** | 一条链一个 worktree，验收时合并 | 新的 `worktree.rs`，`check` 和成员启动时的 `cwd` | 中：要定合并方式 |
 | 以后 | `.lila/rules.md` 记规则、可选的模板（扇出、审阅、多方案比较）、外部事件 | | |
 
@@ -520,3 +521,54 @@ runs.budget, runs.worktree                                                      
 - Codex 续接用的是 `codex resume <id>`，没有真跑验证过。Codex 这几天的周额度已经用完（会话记录里 `used_percent = 100`）。
 - 摘要里没有你在 PM 终端里说过、但还没变成任务的话。PM 的提示词已经要求它及时用 `--quote` 建任务。
 - 窗口里还没有「整理 PM 上下文」按钮，也没有显示每个成员的上下文大小，要先在 HTML 原型里设计。
+
+---
+
+## 13. 阶段 D 完成记录（2026-11-06）
+
+**验收卡片**（`inbox.kind = review`）
+- 你派的工作完成时，收件箱里不再是一条 report，而是一张验收卡片，「完成」包括两种情况：
+  - PM 关掉你给的任务；
+  - 你直接派给 engineer 的任务，流程全部通过。
+- 卡片内容：
+  - 第一行：任务的摘要，以及它做的决定和没验到的；
+  - 接着按时间顺序列出每一步：成员的摘要、交付的文件、决定、没验到的，以及 lilad 跑过的每次检查和结果。
+- 你的两种回答：
+  - **通过**（不写内容，或者写「通过 / accept / ok」）：记一条 `accepted`。
+  - **其他任何文字**算打回：lilad 新建一个你派给 PM 的任务「Rework: …」，挂在被打回的任务下面，正文是你的意见。它在同一条链上，所以原话会带下去，返工给 engineer 时也会回到原来的会话。原计划是把意见直接交给 engineer、不经过 PM；现在改成先交给 PM，因为打回的意见可能要换人或重新规划，由 PM 来判断更稳。
+- 窗口：卡片标题是「等你验收」，下面是「通过」按钮、写返工意见的输入框和「打回」按钮。先改了 HTML 原型，再搬进 GPUI，两边都截图看过。
+
+**积压上限**（`[settings] max_unreviewed`，默认 3，0 表示不限）
+- 等你验收的卡片达到上限时，PM 新开的链（没有父任务）先排队不派发。`lila task new` 会提示「N results wait for the person's review…」，`lila status` 也会显示有几个在等。
+- 你自己派的活、链里面的后续工作不受影响。
+- 你验收一张，排队的就开始派发。
+
+**Watchdog**（在 `tick` 里，全部用代码判断，不调用模型）
+- **长时间没有进展**（`runaway_minutes`，默认 30）：成员一直在工作、超过这个时间没有调用过 `lila`，先给它发一次提醒（可以 block，也可以继续）；再过同样长的时间还是没有调用，收件箱里出现「可能在打转」，带「打开终端」按钮。它停下来空闲时，这条提醒自动消失。
+- **预算**（`lila task new … --budget 300k`，只能用在走流程的任务上）：
+  - 统计方法：流程每一步的成员，从任务送达到完成这段时间里，会话记录中用了多少 token。
+  - 只在步骤之间检查：超了就不开下一步，运行进入 `held`，记下下一步要做什么。收件箱里出现「超出预算」，有「继续」「取消」两个按钮，PM 也会收到一条通知。
+  - 选「继续」：预算翻倍（至少是已用的量再加原预算），然后接着走；选「取消」：这次运行取消。
+- **Codex 额度**：每分钟读一次项目里 Codex 会话记录中的额度。用到 100%、还没到重置时间时，给 Codex 成员的任务先排队，Claude 成员照常。收件箱提醒一次（「额度用完」，写着多久后重置，以及可以先把它换成 Claude 模型）。同一次用完只提醒一次，你点「知道了」后不会再冒出来。额度恢复后提醒自动关掉，排队的任务开始派发。
+- **崩溃循环**：没有做。lilad 不会自动重启意外退出的成员，所以不会出现循环重启。
+
+**提示词**：PM 段说明了验收卡片、「Rework:」任务、积压时新链要排队，以及 `--budget` 的用法；`skill.md` 同步更新。
+
+**验证**
+- 新增测试：
+  - `message`：卡片和提醒的文字、token 的简写；
+  - `store`：预算和暂停状态的读写；
+  - CLI：`--budget` 的写法，比如 `300k`、`1.5M`。
+  - daemon 6 个：
+    - 验收卡片的证据顺序，以及通过和打回；
+    - 积压时 PM 的新链排队，你派的活和链里面的工作照常；
+    - 长时间没有进展：提醒一次，再进收件箱，空闲后自动消失；
+    - 预算：超了暂停，「继续」后预算翻倍接着走，「取消」后停止；
+    - Codex 额度用完时排队，提醒只出一次，额度恢复后派发。
+- 原来几个测试改成新的卡片格式。工作区全部测试通过，Clippy 零警告。
+
+**已知限制**
+- Claude 的额度：它的会话记录里没有额度信息，所以 Claude 用完时还发现不了。只有 7501 报 error 时，成员才会标红。
+- 预算只在步骤之间检查。一个很长的步骤可能大大超出预算，这种情况靠「长时间没有进展」的提醒来兜底。
+- 积压上限只挡 PM 新开的链。PM 如果把新工作挂到旧链下面，就挡不住。
+- Codex 额度取的是这个项目的会话记录里最新的那条。你在别处用 Codex 更多时，这里会晚一点才知道。（后来改了：装了 magpie 时，改用 magpie 读到的当前登录账号的额度，见 `docs/HANDOFF.md`。）

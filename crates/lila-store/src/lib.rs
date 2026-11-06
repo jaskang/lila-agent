@@ -161,6 +161,10 @@ pub struct Run {
     pub round: u32,
     pub state: RunState,
     pub updated_ms: i64,
+    /// Tokens the run may use; over it, it holds between steps.
+    pub budget: Option<u64>,
+    /// While held: what lilad was about to do next, for when the person lets it go on.
+    pub hold: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +177,8 @@ pub enum RunState {
     /// Failed more than `max_rounds` times; the PM decides.
     Failed,
     Cancelled,
+    /// Over its budget, between two steps: the person decides.
+    Held,
 }
 
 impl RunState {
@@ -183,6 +189,7 @@ impl RunState {
             RunState::Done => "done",
             RunState::Failed => "failed",
             RunState::Cancelled => "cancelled",
+            RunState::Held => "held",
         }
     }
 
@@ -192,12 +199,13 @@ impl RunState {
             "done" => RunState::Done,
             "failed" => RunState::Failed,
             "cancelled" => RunState::Cancelled,
+            "held" => RunState::Held,
             _ => RunState::Running,
         }
     }
 
     pub fn is_open(self) -> bool {
-        matches!(self, RunState::Running | RunState::Checking)
+        matches!(self, RunState::Running | RunState::Checking | RunState::Held)
     }
 }
 
@@ -213,6 +221,8 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("tasks", "run_step", "INTEGER"),
     ("tasks", "verdict", "TEXT"),
     ("members", "session", "TEXT"),
+    ("runs", "budget", "INTEGER"),
+    ("runs", "hold", "TEXT"),
 ];
 
 fn migrate(db: &Connection) -> Result<()> {
@@ -559,10 +569,10 @@ impl Store {
     // ---------- flow runs ----------
 
     /// Starts a run at `anchor`, which becomes its step 0.
-    pub fn start_run(&self, project: &str, anchor: &str, flow: &str, now: i64) -> Result<Run> {
+    pub fn start_run(&self, project: &str, anchor: &str, flow: &str, budget: Option<u64>, now: i64) -> Result<Run> {
         self.db.execute(
-            "INSERT INTO runs (project, anchor, flow, state, created_ms, updated_ms) VALUES (?1, ?2, ?3, 'running', ?4, ?4)",
-            params![project, anchor, flow, now],
+            "INSERT INTO runs (project, anchor, flow, state, created_ms, updated_ms, budget) VALUES (?1, ?2, ?3, 'running', ?4, ?4, ?5)",
+            params![project, anchor, flow, now, budget.map(|b| b as i64)],
         )?;
         self.db.execute("UPDATE tasks SET run = ?2, run_step = 0 WHERE project = ?1 AND id = ?2", params![project, anchor])?;
         Ok(self.run(project, anchor)?.expect("just inserted"))
@@ -576,6 +586,8 @@ impl Store {
             round: r.get::<_, i64>(3)? as u32,
             state: RunState::parse(&r.get::<_, String>(4)?),
             updated_ms: r.get(5)?,
+            budget: r.get::<_, Option<i64>>(6)?.map(|b| b as u64),
+            hold: r.get(7)?,
         })
     }
 
@@ -583,7 +595,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT anchor, flow, step, round, state, updated_ms FROM runs WHERE project = ?1 AND anchor = ?2",
+                "SELECT anchor, flow, step, round, state, updated_ms, budget, hold FROM runs WHERE project = ?1 AND anchor = ?2",
                 params![project, anchor],
                 Self::run_from,
             )
@@ -592,8 +604,17 @@ impl Store {
 
     /// Every run of a project, oldest first.
     pub fn runs(&self, project: &str) -> Result<Vec<Run>> {
-        let mut st = self.db.prepare("SELECT anchor, flow, step, round, state, updated_ms FROM runs WHERE project = ?1 ORDER BY created_ms, rowid")?;
+        let mut st = self.db.prepare("SELECT anchor, flow, step, round, state, updated_ms, budget, hold FROM runs WHERE project = ?1 ORDER BY created_ms, rowid")?;
         Ok(st.query_map([project], Self::run_from)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A run's budget and what it holds for (None: not held).
+    pub fn set_run_hold(&self, project: &str, anchor: &str, budget: Option<u64>, hold: Option<&str>) -> Result<()> {
+        self.db.execute(
+            "UPDATE runs SET budget = ?3, hold = ?4 WHERE project = ?1 AND anchor = ?2",
+            params![project, anchor, budget.map(|b| b as i64), hold],
+        )?;
+        Ok(())
     }
 
     pub fn set_run(&self, project: &str, anchor: &str, step: usize, round: u32, state: RunState, now: i64) -> Result<()> {
@@ -807,7 +828,7 @@ mod tests {
     fn runs_track_their_step_round_and_state() {
         let mut s = store();
         s.create_task("shop", new("engineer", None), 1).unwrap();
-        let run = s.start_run("shop", "T1", "code", 2).unwrap();
+        let run = s.start_run("shop", "T1", "code", Some(300_000), 2).unwrap();
         assert_eq!((run.step, run.round, run.state), (0, 0, RunState::Running));
         assert_eq!(s.task("shop", "T1").unwrap().unwrap().run, Some(("T1".into(), 0)));
         let mut step = new("tester", Some("T1"));
@@ -819,6 +840,11 @@ mod tests {
         assert!(run.state.is_open() && !RunState::Failed.is_open());
         assert_eq!(s.runs("shop").unwrap().len(), 1);
         assert!(s.run("shop", "T2").unwrap().is_none());
+        assert_eq!(run.budget, Some(300_000));
+        s.set_run_hold("shop", "T1", Some(600_000), Some("{\"at\":1}")).unwrap();
+        let run = s.run("shop", "T1").unwrap().unwrap();
+        assert_eq!((run.budget, run.hold.as_deref()), (Some(600_000), Some("{\"at\":1}")));
+        assert!(RunState::Held.is_open());
     }
 
     #[test]

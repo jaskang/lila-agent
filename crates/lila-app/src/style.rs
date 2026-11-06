@@ -128,7 +128,7 @@ pub trait Control: Styled + Sized {
 
 impl<T: Styled> Control for T {}
 
-/// A card: the terminal, each overview section, the status bar.
+/// A card: the sidebar, terminal, each overview section, and status bar.
 pub fn card() -> Div {
     div().rounded(px(R_BLOCK)).bg(block()).border_1().border_color(block_line()).overflow_hidden()
 }
@@ -222,6 +222,7 @@ impl AssetSource for Assets {
             "lila/claude.svg" => Some(include_bytes!("../assets/lila/claude.svg")),
             "lila/prompt.svg" => Some(include_bytes!("../assets/lila/prompt.svg")),
             "lila/branch.svg" => Some(include_bytes!("../assets/lila/branch.svg")),
+            "lila/trash.svg" => Some(include_bytes!("../assets/lila/trash.svg")),
             _ => None,
         };
         match own {

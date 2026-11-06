@@ -688,6 +688,7 @@ impl LilaApp {
                 back: None,
                 on_save: Box::new(|this, cx| this.save_settings(cx)),
                 on_close: Box::new(|this, _| this.settings = None),
+                footer: true,
             },
             cx,
         ))
