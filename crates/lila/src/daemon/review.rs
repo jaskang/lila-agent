@@ -118,10 +118,9 @@ impl<T: Terminals> Daemon<T> {
             let files = self.store.artifacts(pid, &t.id)?;
             lines.push((t.updated_ms, inbox::step_done(t, &files)));
         }
-        let check = self.check_cmd(pid).unwrap_or_default();
         for e in self.store.events(pid, None, 1000)? {
             if e.kind == "check" && !e.detail.starts_with("running") && e.task.as_deref().is_some_and(under) {
-                lines.push((e.at_ms, inbox::step_check(&check, &e.task.unwrap_or_default(), &e.detail)));
+                lines.push((e.at_ms, inbox::check(&e.detail)));
             }
         }
         lines.sort_by_key(|(at, _)| *at);

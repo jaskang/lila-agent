@@ -559,7 +559,7 @@ fn the_person_signs_off_or_sends_work_back() {
     assert_eq!((inbox[0]["kind"].as_str(), inbox[0]["options"].clone()), (Some("review"), json!(["通过"])));
     let card = inbox[0]["text"].as_str().unwrap();
     assert!(card.starts_with("T1「Ship it」做完了：shipped v1\n· T2 engineer：built（文件：src/a.rs）\n"), "{card}");
-    assert!(card.contains("· 检查 `cargo test`（T2）：通过\n· T3 tester：PASS\n  没验证：load"), "evidence in order: {card}");
+    assert!(card.contains("· 检查通过\n· T3 tester：PASS\n  没验证：load"), "evidence in order: {card}");
 
     // Sent back: the comment goes to the PM as a task in the same chain.
     w.status("owner", "idle");

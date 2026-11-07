@@ -40,10 +40,18 @@ pub fn step_done(t: &Task, files: &[String]) -> String {
     s
 }
 
-/// One run of the check command under a review card.
-pub fn step_check(cmd: &str, task: &str, detail: &str) -> String {
-    let result = if detail == "passed" { "通过" } else { detail };
-    format!("检查 `{cmd}`（{task}）：{result}")
+/// One run of the check command, from its event's detail ("passed",
+/// "failed (exit 1)", "did not finish"). The command itself is in the project's
+/// settings; repeating it on every line is noise.
+pub fn check(detail: &str) -> String {
+    match detail {
+        "passed" => "检查通过".to_owned(),
+        "did not finish" => "检查没跑完".to_owned(),
+        _ => match detail.strip_prefix("failed (exit ").and_then(|c| c.strip_suffix(')')) {
+            Some(code) => format!("检查没通过（退出码 {code}）"),
+            None => format!("检查：{detail}"),
+        },
+    }
 }
 
 /// Work for the person is finished: what came of it, then each step's evidence.
@@ -134,8 +142,8 @@ mod tests {
     fn review_cards_list_the_evidence() {
         let mut t = task();
         t.outcome.unverified = vec!["load".into()];
-        let steps = [step_check("cargo test", "T4", "passed"), step_check("cargo test", "T4", "1 failed")];
-        assert_eq!(review(&t, &steps), "T3「Add login」做完了：done it\n  没验证：load\n· 检查 `cargo test`（T4）：通过\n· 检查 `cargo test`（T4）：1 failed");
+        let steps = [check("failed (exit 1)"), check("passed")];
+        assert_eq!(review(&t, &steps), "T3「Add login」做完了：done it\n  没验证：load\n· 检查没通过（退出码 1）\n· 检查通过");
         assert_eq!(step_done(&t, &["a.rs".into(), "b.rs".into()]), "T3 engineer：done it（文件：a.rs、b.rs）\n  没验证：load");
     }
 
