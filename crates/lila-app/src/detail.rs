@@ -319,8 +319,11 @@ impl LilaApp {
                     .when(!events.is_empty(), |d| d.child(block("经过", cx).child({
                         // A thin line down the left, a dot per event; the latest one is blue.
                         let n = events.len();
+                        // The latest summary is already the banner above.
+                        let summary = t["summary"].as_str().unwrap_or_default().to_owned();
                         v_flex().ml_1().pl_4().gap(px(10.)).border_l_1().border_color(gpui::Hsla::from(rgba(0xffffff1a))).children(events.into_iter().enumerate().map(move |(i, e)| {
                             let (line, detail) = event_line(&s(&e, "actor"), &s(&e, "kind"), &s(&e, "detail"));
+                            let detail = detail.filter(|d| *d != summary);
                             h_flex()
                                 .relative()
                                 .gap_2()

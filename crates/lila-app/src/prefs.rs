@@ -442,7 +442,7 @@ impl LilaApp {
                 can_save: true,
                 on_save: Box::new(|this, cx| this.save_prefs(cx)),
                 on_close: Box::new(|this, _| this.prefs = None),
-                footer: page != PrefPage::Usage,
+                footer: page == PrefPage::Roles,
             },
             cx,
         ))
