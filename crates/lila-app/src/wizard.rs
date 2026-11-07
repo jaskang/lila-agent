@@ -225,7 +225,8 @@ impl LilaApp {
         if new {
             rows.push(row("名称", None, div().w(px(280.)).child(Input::new(&title_input).control()), cx));
         }
-        let mut body = vec![group(None, rows, cx)];
+        // What to do comes first: it is the one thing every new project needs.
+        let mut body = vec![group(None, rows, cx), group(None, vec![block("简介", None, Textarea::new(&brief).area(), None, cx)], cx)];
         // An existing project keeps its team.
         if new {
             let team = w
@@ -259,7 +260,6 @@ impl LilaApp {
                 .collect();
             body.push(group(None, team, cx));
         }
-        body.push(group(None, vec![block("简介", None, Textarea::new(&brief).area(), None, cx)], cx));
         crate::dialog::scroll("wizard", body)
     }
 
