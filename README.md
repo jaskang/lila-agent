@@ -4,6 +4,8 @@
 
 每个成员都是官方 CLI（`claude` / `codex`）的交互会话，用你的订阅登录，不需要 API key。
 
+![Lila](docs/images/window.png)
+
 ## 安装
 
 需要 Rust（版本见 `rust-toolchain.toml`）、[herdr-core](https://github.com/herdrdev/herdr-core) 的 `hc`、Zig 0.16（编译 libghostty），以及 `claude` 和/或 `codex`。
