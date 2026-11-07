@@ -26,6 +26,7 @@ const PREVIOUS: &[(&str, &str)] = &[
     ("tester.md", include_str!("../../../defaults/roles/previous/tester.1.md")),
     ("engineer.md", include_str!("../../../defaults/roles/previous/engineer.1.md")),
     ("tester.md", include_str!("../../../defaults/roles/previous/tester.2.md")),
+    ("pm.md", include_str!("../../../defaults/roles/previous/pm.3.md")),
 ];
 
 /// The role every project's PM has: it can't be deleted.
