@@ -632,3 +632,17 @@ runs.worktree                                                                   
 - 截图检查后：任务详情的「经过」改成中文，只留人要看的（谁、做了什么、说了什么），送达到哪个终端、签收、轮数这些 lilad 的记账不显示；验收卡片里不再每行重复检查命令；窗口里的验收卡片只显示结果、决定和没验证的，逐步的证据在任务的「经过」里（`lila inbox` 仍然打印全部）。新建项目的简介放在团队前面。
 - Codex 成员（tester 换成 `codex`，gpt-6-luna、low）：lilad 用 `codex --no-daemon -m … -c developer_instructions=…` 启动，第一次进文件夹要在终端里点「Trust and continue」；之后 tester 收到 `Verify:`，自己 `lila task start` / `done`，给出 PASS，验收后提交。同一轮里 Haiku 的 PM 有一次想自己用 Bash 写文件，被 `--permission-mode manual` 拦下在终端里等批准；拒绝并让它派给 engineer 后照常走完。PM 看小需求会自己选 `quick` 流程（不派 tester）。
 - PM 的提示词加了一条「不自己动手，再小的改动也派出去；等批准的命令就该交出去」（旧版存为 `previous/pm.3.md`，没改过的会自动升级）。再跑一轮 Haiku：PM 直接派给 engineer，检查、tester、验收卡片一次走完。
+
+**每个决定对人、开发者、成员各有什么好处**
+
+| 决定 | UX（人） | DX（开发者） | AX（成员） |
+|---|---|---|---|
+| 「经过」只留谁、做了什么、说了什么 | 一眼读完，不再中英混杂 | 映射集中在 `detail::event_line` 一处 | 事件仍用英文记录，`lila task show` 不变 |
+| 提交事件只记 sha | 「Lila 提交」后面就是 sha | `on_commit_done` 少一段拼接 | `lila task show` 里一眼看到 sha |
+| 检查结果用 `inbox::check` 一句话 | 卡片不再重复整条命令 | 卡片和「经过」共用一个函数 | 退回的 Fix 任务正文仍带完整输出 |
+| 窗口里的验收卡片只显示结果 | 按钮不会被挤出面板 | 不新增状态，只截取已有文本 | `lila inbox` 照旧打印全部证据 |
+| 加载失败的任务关闭面板并报错 | 不再一直转圈 | 少一种挂起状态 | — |
+| 简介放在团队前面 | 最要紧的输入不用滚动 | 只是调换顺序 | PM 收到的简介更常是写过的 |
+| 没得保存的页面不显示保存 | 少两个没用的按钮 | `footer` 只看页面 | — |
+| PM 提示词：再小的改动也派出去 | 改动都走检查和验证 | 有升级路径（`previous/pm.3.md`） | PM 不用猜自己该不该动手 |
+| `lila task new` 每个参数都有说明 | — | `--help` 就是文档 | 成员不用猜 `--to`、`--parent` |
