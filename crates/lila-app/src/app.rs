@@ -403,12 +403,18 @@ impl LilaApp {
         let (paths, project) = (self.paths.clone(), self.project());
         cx.spawn(async move |this, cx| {
             let Some(p) = project else { return };
-            let v = cx.background_executor().spawn(async move { data::act(&paths, &p, "task.show", json!({"id": id}), false) }).await;
+            let asked = id.clone();
+            let v = cx.background_executor().spawn(async move { data::act(&paths, &p, "task.show", json!({"id": asked}), false) }).await;
             let _ = this.update(cx, |this, cx| {
-                if let Ok(v) = v
-                    && this.task.as_deref() == v["id"].as_str()
-                {
-                    this.snap.detail = Some(v);
+                match v {
+                    Ok(v) if this.task.as_deref() == v["id"].as_str() => this.snap.detail = Some(v),
+                    Ok(_) => {}
+                    // Nothing to show: no spinner left turning.
+                    Err(e) if this.task.as_deref() == Some(&id) => {
+                        this.close_task(cx);
+                        this.notice = Some(format!("{e:#}"));
+                    }
+                    Err(_) => {}
                 }
                 cx.notify();
             });
