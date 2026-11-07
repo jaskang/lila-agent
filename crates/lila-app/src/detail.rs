@@ -37,22 +37,44 @@ pub fn state_label(state: &str) -> &'static str {
     }
 }
 
-fn event_label(kind: &str) -> &str {
-    match kind {
-        "created" => "创建",
-        "delivered" => "送达",
-        "started" => "开始",
-        "blocked" => "阻塞",
-        "done" => "完成",
-        "cancelled" => "取消",
-        "requeued" => "退回队列",
-        "edited" => "修改",
-        "nudged" => "提醒",
-        "stalled" => "无回应",
-        "answered" => "回答",
-        "fresh_session" => "新会话",
+/// One line of a task's history, for the person: who, what, and the words that
+/// came with it. lilad's own bookkeeping (terminals, rounds, sign-offs) stays out.
+fn event_line(actor: &str, kind: &str, detail: &str) -> (String, Option<String>) {
+    let who = match actor {
+        "human" => "你",
+        "lilad" => "Lila",
         other => other,
-    }
+    };
+    let (what, said) = match kind {
+        "created" => ("创建", false),
+        "delivered" => ("送达", false),
+        "started" => ("开始", false),
+        "blocked" => ("卡住", true),
+        "done" => ("完成", true),
+        "cancelled" => ("取消", true),
+        "requeued" => ("退回队列", false),
+        "edited" => ("修改", false),
+        "nudged" => ("提醒", false),
+        "stalled" => ("无回应", false),
+        "answered" => ("回答", true),
+        "fresh_session" => ("换新会话", false),
+        "accepted" => ("通过", false),
+        "rejected" => ("打回", true),
+        "committed" => ("提交", !detail.contains(' ')),
+        "commit_failed" => ("提交失败", true),
+        "check" if detail.starts_with("running") => ("开始检查", false),
+        "check" if detail == "passed" => ("检查通过", false),
+        "check" => ("检查没通过", true),
+        "sent_back" => ("返工", false),
+        "flow" => ("开始流程", false),
+        "flow_done" => ("流程结束", false),
+        "flow_failed" => ("流程失败", true),
+        "flow_held" => ("流程暂停", false),
+        "flow_cancelled" => ("流程取消", false),
+        "budget" => ("调整预算", false),
+        other => (other, true),
+    };
+    (format!("{who} {what}"), (said && !detail.is_empty()).then(|| detail.to_owned()))
 }
 
 /// A clickable task id that opens it in the panel.
@@ -299,7 +321,7 @@ impl LilaApp {
                         // A thin line down the left, a dot per event; the latest one is blue.
                         let n = events.len();
                         v_flex().ml_1().pl_4().gap(px(10.)).border_l_1().border_color(gpui::Hsla::from(rgba(0xffffff1a))).children(events.into_iter().enumerate().map(move |(i, e)| {
-                            let detail = s(&e, "detail");
+                            let (line, detail) = event_line(&s(&e, "actor"), &s(&e, "kind"), &s(&e, "detail"));
                             h_flex()
                                 .relative()
                                 .gap_2()
@@ -307,8 +329,8 @@ impl LilaApp {
                                 .text_xs()
                                 .child(div().absolute().left(px(-20.)).top(px(4.)).size(px(7.)).rounded_full().bg(if i + 1 == n { style::blue() } else { gpui::Hsla::from(rgba(0x48484eff)) }))
                                 .child(div().flex_none().text_color(muted()).child(data::clock(e["at_ms"].as_i64().unwrap_or(0))))
-                                .child(div().flex_none().child(format!("{} {}", s(&e, "actor"), event_label(&s(&e, "kind")))))
-                                .when(!detail.is_empty(), |d| d.child(div().flex_1().min_w_0().text_color(muted2()).child(detail)))
+                                .child(div().flex_none().child(line))
+                                .when_some(detail, |d, detail| d.child(div().flex_1().min_w_0().text_color(muted2()).child(detail)))
                         }))
                     })))
                     .when(open, |d| {

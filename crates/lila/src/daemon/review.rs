@@ -95,7 +95,7 @@ impl<T: Terminals> Daemon<T> {
             return;
         }
         let (kind, detail) = match r {
-            CommitResult::Committed(sha) => ("committed", format!("{chain}'s changes are commit {sha}")),
+            CommitResult::Committed(sha) => ("committed", sha.clone()),
             CommitResult::Nothing => ("committed", format!("{chain} changed nothing to commit")),
             CommitResult::NotRepo => ("committed", "the project folder is not a git repository; nothing committed".to_owned()),
             CommitResult::Failed(why) => ("commit_failed", format!("{chain}'s changes could not be committed: {why}")),
@@ -104,7 +104,7 @@ impl<T: Terminals> Daemon<T> {
         if let CommitResult::Failed(why) = r {
             let _ = self.store.add_inbox(pid, "report", None, Some(chain), &inbox::commit_failed(chain, why), &[], now);
         }
-        self.say(format!("{pid}: {detail}"));
+        self.say(format!("{pid}: {chain} {kind} {detail}"));
         self.pump(pid, now);
     }
 
