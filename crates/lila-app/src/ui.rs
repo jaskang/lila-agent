@@ -641,7 +641,11 @@ impl LilaApp {
                     .child(div().flex_1())
                     .when_some(item["task"].as_str().map(String::from), |d, t| d.child(div().text_xs().child(crate::detail::task_link(&t, &format!("inbox-{card_id}"), cx)))),
             )
-            .child(div().text_size(px(13.)).line_height(relative(1.55)).child(s(&item, "text")))
+            .child(div().text_size(px(13.)).line_height(relative(1.55)).child({
+                // A review's step-by-step evidence is the task's history: the card keeps the outcome.
+                let text = s(&item, "text");
+                if review { text.split("\n· ").next().unwrap_or_default().to_owned() } else { text }
+            }))
             .when(!options.is_empty() && !review, |d| {
                 d.child(h_flex().gap(px(6.)).flex_wrap().children(options.into_iter().enumerate().map(|(n, opt)| {
                     let (id, text) = (id.clone(), opt.clone());
