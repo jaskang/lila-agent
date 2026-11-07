@@ -80,12 +80,6 @@ fn run(paths: &lila::paths::Paths, plan: Plan) -> anyhow::Result<String> {
     Ok(v["project"].as_str().unwrap_or_default().to_owned())
 }
 
-/// A long path as its last `n` characters, so the folder's own name shows.
-fn tail(path: &str, n: usize) -> String {
-    let count = path.chars().count();
-    if count <= n { path.to_owned() } else { format!("…{}", path.chars().skip(count - n + 1).collect::<String>()) }
-}
-
 fn is_git(dir: &Path) -> bool {
     dir.ancestors().any(|d| d.join(".git").exists())
 }
@@ -220,7 +214,7 @@ impl LilaApp {
                 .into_any_element();
         };
         let change = Button::new("wizard-pick").outline().small().small_button().label("更换").on_click(cx.listener(|this, _, window, cx| this.wizard_pick_folder(window, cx)));
-        let mut rows = vec![row("文件夹", None, h_flex().gap_3().child(value_text(tail(&crate::data::tilde(&f.dir.to_string_lossy()), 44), cx)).child(change), cx)];
+        let mut rows = vec![row("文件夹", None, h_flex().gap_3().child(value_text(crate::data::tail(&crate::data::tilde(&f.dir.to_string_lossy()), 44), cx)).child(change), cx)];
         let new = f.existing.is_none();
         if new {
             rows.push(row("名称", None, div().w(px(280.)).child(Input::new(&title_input).control()), cx));

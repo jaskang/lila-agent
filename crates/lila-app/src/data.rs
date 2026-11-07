@@ -25,6 +25,12 @@ fn title(cwd: &str) -> Option<String> {
 }
 
 /// `/Users/me/x` as `~/x`.
+/// A long path as its last `n` characters, so the folder's own name shows.
+pub fn tail(path: &str, n: usize) -> String {
+    let count = path.chars().count();
+    if count <= n { path.to_owned() } else { format!("…{}", path.chars().skip(count - n + 1).collect::<String>()) }
+}
+
 pub fn tilde(path: &str) -> String {
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && path.starts_with(&home) => format!("~{}", &path[home.len()..]),

@@ -397,7 +397,7 @@ impl LilaApp {
 
     fn about_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let paths = self.paths().clone();
-        let tilde = |p: std::path::PathBuf| data::tilde(&p.to_string_lossy());
+        let tilde = |p: std::path::PathBuf| data::tail(&data::tilde(&p.to_string_lossy()), 44);
         let daemon = if self.snap.daemon { "运行中" } else { "没有运行" };
         dialog::scroll(
             "prefs-about",
