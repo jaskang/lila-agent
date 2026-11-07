@@ -630,3 +630,4 @@ runs.worktree                                                                   
 - 再跑一轮带 tester（也用 Haiku）：检查通过后 lilad 派出 `Verify:`，tester 看到原话、验收标准和不做什么，给出 PASS，验收卡片按时间列出四步。
 - 检查失败退回（检查命令第一次故意失败）：lilad 给 engineer 建 `Fix:` 任务，正文是检查的输出；engineer 再报完成，第二次检查通过，派出 `Verify:`，验收卡片按顺序列出「检查没通过（退出码 1）」「检查通过」。检查命令和需求矛盾时，PM 会不走流程直接派活，并在「决定」里说明。
 - 截图检查后：任务详情的「经过」改成中文，只留人要看的（谁、做了什么、说了什么），送达到哪个终端、签收、轮数这些 lilad 的记账不显示；验收卡片里不再每行重复检查命令；窗口里的验收卡片只显示结果、决定和没验证的，逐步的证据在任务的「经过」里（`lila inbox` 仍然打印全部）。新建项目的简介放在团队前面。
+- Codex 成员（tester 换成 `codex`，gpt-6-luna、low）：lilad 用 `codex --no-daemon -m … -c developer_instructions=…` 启动，第一次进文件夹要在终端里点「Trust and continue」；之后 tester 收到 `Verify:`，自己 `lila task start` / `done`，给出 PASS，验收后提交。同一轮里 Haiku 的 PM 有一次想自己用 Bash 写文件，被 `--permission-mode manual` 拦下在终端里等批准；拒绝并让它派给 engineer 后照常走完。PM 看小需求会自己选 `quick` 流程（不派 tester）。

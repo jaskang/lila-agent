@@ -176,7 +176,7 @@ macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; ki
 
 都过了测试和截图，但要用鼠标、键盘或真实环境确认：
 
-- **v2 的流程真跑一轮**（2026-11-07 用 Haiku 跑通了 PM → engineer → 检查 → tester 验证 → 验收 → 提交，tester 收到了原话和验收标准；检查失败退回给 engineer 也跑通了，见 architecture §15；还没真跑过 Codex 成员）：先 `cargo install --path crates/lila`、`lila daemon stop`，在设了 `[settings] check = "…"` 的项目里让 PM 做个小需求。要看的是：
+- **v2 的流程真跑一轮**（2026-11-07 用 Haiku 跑通了 PM → engineer → 检查 → tester 验证 → 验收 → 提交，tester 收到了原话和验收标准；检查失败退回给 engineer、Codex 成员当 tester 也跑通了，见 architecture §15）：先 `cargo install --path crates/lila`、`lila daemon stop`，在设了 `[settings] check = "…"` 的项目里让 PM 做个小需求。要看的是：
   - PM 有没有试图跑被拦下的命令；
   - tester 收到的任务里有没有用户原话；
   - 检查失败时是否退回给 engineer；

@@ -100,14 +100,19 @@ enum RolesCmd {
 enum TaskCmd {
     /// Assign a task to a member.
     New {
+        /// The member's id (`lila status` lists them).
         #[arg(long)]
         to: String,
+        /// One line: what is to be done.
         #[arg(long)]
         title: String,
+        /// The details, in Markdown.
         #[arg(long, conflicts_with = "body_file")]
         body: Option<String>,
+        /// The details, read from a file.
         #[arg(long)]
         body_file: Option<std::path::PathBuf>,
+        /// The task this is part of.
         #[arg(long)]
         parent: Option<String>,
         /// Lower runs first (default 0).
