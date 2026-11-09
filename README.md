@@ -8,13 +8,11 @@
 
 ## 安装
 
-需要 Rust（版本见 `rust-toolchain.toml`）、[herdr-core](https://github.com/herdrdev/herdr-core) 的 `hc`、Zig 0.17（编译 libghostty-vt 1.0），以及 `claude` 和/或 `codex`。
+需要 Rust（版本见 `rust-toolchain.toml`）、[herdr-core](https://github.com/herdrdev/herdr-core) 的 `hc`，以及 `claude` 和/或 `codex`。终端用的 libghostty-vt 1.0 在 Apple Silicon 上已经预编译好放在仓库里（`crates/ghostty-sys/libghostty-vt`）；其他平台还要 `git submodule update --init --depth 1` 和 Zig 0.17 现场编译。
 
 ```sh
-git submodule update --init --depth 1
-brew install zig
 cargo install --path crates/lila
-ZIG=$(brew --prefix zig)/bin/zig cargo install --path crates/lila-app
+cargo install --path crates/lila-app
 lila-app
 ```
 
@@ -85,7 +83,6 @@ lila pause / resume / down
 ## 开发
 
 ```sh
-export ZIG=$(brew --prefix zig)/bin/zig
 cargo test --workspace
 cargo clippy --workspace --all-targets
 ```

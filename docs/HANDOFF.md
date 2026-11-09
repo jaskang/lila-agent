@@ -47,10 +47,9 @@ Lila 是一个管理编程 agent 团队的桌面工具。
 
 ```sh
 git clone git@github.com:jaskang/lila-agent.git && cd lila-agent
-git submodule update --init --depth 1 vendor/ghostty
-brew install zig                                  # 0.17.x；Homebrew 的 zig 升到 0.18 后改用 zig@0.17
-export ZIG=$(brew --prefix zig)/bin/zig           # libghostty-vt 1.0（tag vt-1.0.0）要 Zig 0.17
-cargo test --workspace                            # 首次会编译 libghostty，要几分钟；应该是 209 个测试全过
+# Apple Silicon 不用 Zig 和子模块：libghostty-vt 预编译在 crates/ghostty-sys/libghostty-vt。
+# 其他平台：git submodule update --init --depth 1 vendor/ghostty，再装 Zig 0.17（ZIG=…/zig）
+cargo test --workspace                            # 应该是 247 个测试全过
 cargo install --path crates/lila                  # 窗口通过 lila 命令启动 lilad
 cargo run -p lila-app                             # 或者：cargo install --path crates/lila-app
 ```
@@ -74,7 +73,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
   - gpui-kit 的组件源码：`~/.cargo/registry/src/*/gpui-component-0.9.0/src/`；输入框 `InputState` 在 `gpui-base-0.9.0/src/input/`。
   - 图标只有 gpui-kit 打包的那一部分能显示，名单见 `target/debug/build/gpui-kit-assets-*/out/icon_name.rs` 里 `__component_icon_names` 之后的部分（比如没有 `Trash`）。缺的图标放进 `crates/lila-app/assets/lila/`，再在 `style::Assets` 里登记（垃圾桶就是这样加的）。
   - **测试模块里不要 `use super::*`**：会把 `gpui::*` 里的 `test` 宏引进来，盖住标准库的 `#[test]`，报的错是「recursion limit」。
-- 终端渲染：libghostty-vt 1.0（子模块 `vendor/ghostty`，tag `vt-1.0.0`）。注意 `*_get`/`*_set` 的输出是 `void*`，1.0 改了的类型（如 GRAPHEMES_BUF 要 `GhosttyCodepointBuffer`）编译器查不出来，升级时要对照头文件逐个核对。Kitty 图片的位置直接取渲染状态的图片列表（`Vt::placements`，占位符也由库解析）；视图还没有画图片，`placements`/`image_bgra` 目前只有测试在用。终端进程：herdr-core（`hc`）。
+- 终端渲染：libghostty-vt 1.0。macOS arm64 用仓库里的预编译库（`crates/ghostty-sys/libghostty-vt/`：官方 xcframework 取 arm64、去掉调试信息，加头文件；升级跑 `crates/ghostty-sys/update-prebuilt.sh <版本>`，并把子模块切到同一个 tag `vt-<版本>`）。Linux、Windows 还没有预编译库，从子模块 `vendor/ghostty` 用 Zig 0.17 编译。注意 `*_get`/`*_set` 的输出是 `void*`，1.0 改了的类型（如 GRAPHEMES_BUF 要 `GhosttyCodepointBuffer`）编译器查不出来，升级时要对照头文件逐个核对。Kitty 图片的位置直接取渲染状态的图片列表（`Vt::placements`，占位符也由库解析）；视图还没有画图片，`placements`/`image_bgra` 目前只有测试在用。终端进程：herdr-core（`hc`）。
 - 从 herdr-app（Apache-2.0）移植的代码记在 `THIRD-PARTY.md`。
 
 ## 代码地图
