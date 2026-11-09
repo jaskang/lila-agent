@@ -48,8 +48,8 @@ Lila 是一个管理编程 agent 团队的桌面工具。
 ```sh
 git clone git@github.com:jaskang/lila-agent.git && cd lila-agent
 git submodule update --init --depth 1 vendor/ghostty
-brew install zig@0.16                             # keg-only，不在 PATH 上
-export ZIG=$(brew --prefix zig@0.16)/bin/zig      # libghostty 要 Zig 0.16
+brew install zig                                  # 0.17.x；Homebrew 的 zig 升到 0.18 后改用 zig@0.17
+export ZIG=$(brew --prefix zig)/bin/zig           # libghostty-vt 1.0（tag vt-1.0.0）要 Zig 0.17
 cargo test --workspace                            # 首次会编译 libghostty，要几分钟；应该是 209 个测试全过
 cargo install --path crates/lila                  # 窗口通过 lila 命令启动 lilad
 cargo run -p lila-app                             # 或者：cargo install --path crates/lila-app
@@ -74,7 +74,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
   - gpui-kit 的组件源码：`~/.cargo/registry/src/*/gpui-component-0.9.0/src/`；输入框 `InputState` 在 `gpui-base-0.9.0/src/input/`。
   - 图标只有 gpui-kit 打包的那一部分能显示，名单见 `target/debug/build/gpui-kit-assets-*/out/icon_name.rs` 里 `__component_icon_names` 之后的部分（比如没有 `Trash`）。缺的图标放进 `crates/lila-app/assets/lila/`，再在 `style::Assets` 里登记（垃圾桶就是这样加的）。
   - **测试模块里不要 `use super::*`**：会把 `gpui::*` 里的 `test` 宏引进来，盖住标准库的 `#[test]`，报的错是「recursion limit」。
-- 终端渲染：libghostty-vt（子模块 `vendor/ghostty`）。终端进程：herdr-core（`hc`）。
+- 终端渲染：libghostty-vt 1.0（子模块 `vendor/ghostty`，tag `vt-1.0.0`）。注意 `*_get`/`*_set` 的输出是 `void*`，1.0 改了的类型（如 GRAPHEMES_BUF 要 `GhosttyCodepointBuffer`）编译器查不出来，升级时要对照头文件逐个核对。终端进程：herdr-core（`hc`）。
 - 从 herdr-app（Apache-2.0）移植的代码记在 `THIRD-PARTY.md`。
 
 ## 代码地图

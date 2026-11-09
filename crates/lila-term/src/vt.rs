@@ -211,7 +211,7 @@ static KITTY_PLACEHOLDER_DIACRITICS: OnceLock<HashMap<u32, u32>> = OnceLock::new
 fn kitty_virtual_cell(x: u16, y: u16, grid_ref: &GhosttyGridRef) -> Option<KittyVirtualCell> {
     let mut graphemes = vec![0u32; 4];
     let mut len = 0;
-    let mut style = GhosttyStyle { size: std::mem::size_of::<GhosttyStyle>(), ..Default::default() };
+    let mut style = GhosttyStyle::default();
     unsafe {
         let result = ghostty_grid_ref_graphemes(grid_ref, graphemes.as_mut_ptr(), graphemes.len(), &mut len);
         if result == GHOSTTY_OUT_OF_SPACE {
@@ -243,7 +243,7 @@ fn kitty_virtual_cell(x: u16, y: u16, grid_ref: &GhosttyGridRef) -> Option<Kitty
 
 fn kitty_placeholder_color_to_id(color: GhosttyStyleColor) -> u32 {
     unsafe {
-        match color.tag {
+        match GhosttyStyleColorTag::from(color.tag) {
             GHOSTTY_STYLE_COLOR_PALETTE => u32::from(color.value.palette),
             GHOSTTY_STYLE_COLOR_RGB => {
                 let rgb = color.value.rgb;
@@ -389,7 +389,7 @@ const MAX_CLIPBOARD_BYTES: usize = 1 << 20;
 unsafe extern "C" fn on_clipboard_write(_t: GhosttyTerminal, userdata: *mut c_void, request: *const GhosttyClipboardWrite) {
     let shared = unsafe { &mut *(userdata as *mut Shared) };
     let request = unsafe { &*request };
-    if !shared.clipboard_write || request.size < std::mem::size_of::<GhosttyClipboardWrite>() {
+    if !shared.clipboard_write {
         return;
     }
     let slot = match request.location {
@@ -802,7 +802,7 @@ impl Vt {
                         continue;
                     }
                     let mut generation = 0u64;
-                    ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_IMAGE_DATA_GENERATION, &mut generation as *mut _ as *mut c_void);
+                    ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION, &mut generation as *mut _ as *mut c_void);
                     out.push(Placement {
                         image: id,
                         generation,
@@ -884,9 +884,9 @@ impl Vt {
             }
             let (mut image_width, mut image_height, mut generation) = (0u32, 0u32, 0u64);
             unsafe {
-                ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &mut image_width as *mut _ as *mut c_void);
-                ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &mut image_height as *mut _ as *mut c_void);
-                ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_GENERATION, &mut generation as *mut _ as *mut c_void);
+                ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH, &mut image_width as *mut _ as *mut c_void);
+                ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT, &mut image_height as *mut _ as *mut c_void);
+                ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION, &mut generation as *mut _ as *mut c_void);
             }
             if let Some(placement) = kitty_virtual_placement_geometry(run, *spec, image_width, image_height, cell_width, cell_height, generation) {
                 placements.push(placement);
@@ -902,15 +902,14 @@ impl Vt {
             ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &mut g as *mut _ as *mut c_void);
             let img = (!g.is_null()).then(|| ghostty_kitty_graphics_image(g, id)).filter(|i| !i.is_null())?;
             let (mut w, mut h, mut fmt) = (0u32, 0u32, GHOSTTY_KITTY_IMAGE_FORMAT_RGBA);
-            let (mut ptr, mut len): (*const u8, usize) = (std::ptr::null(), 0);
-            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &mut w as *mut _ as *mut c_void);
-            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &mut h as *mut _ as *mut c_void);
-            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &mut fmt as *mut _ as *mut c_void);
-            if ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &mut ptr as *mut _ as *mut c_void) != GHOSTTY_SUCCESS || ptr.is_null() {
+            let mut pixels = GhosttyString::default();
+            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH, &mut w as *mut _ as *mut c_void);
+            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT, &mut h as *mut _ as *mut c_void);
+            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT, &mut fmt as *mut _ as *mut c_void);
+            if ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS, &mut pixels as *mut _ as *mut c_void) != GHOSTTY_SUCCESS || pixels.ptr.is_null() {
                 return None;
             }
-            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &mut len as *mut _ as *mut c_void);
-            let px = std::slice::from_raw_parts(ptr, len);
+            let px = std::slice::from_raw_parts(pixels.ptr, pixels.len);
             let bpp = match fmt {
                 GHOSTTY_KITTY_IMAGE_FORMAT_RGB => 3,
                 GHOSTTY_KITTY_IMAGE_FORMAT_GRAY_ALPHA => 2,
@@ -944,7 +943,7 @@ impl Vt {
     /// Applies the resulting selection; a plain click clears it.
     pub fn select(&mut self, step: Select, col: u16, row: u16, x: f32, y: f32, cell_w: f32, height: f32) {
         unsafe {
-            let mut r = GhosttyGridRef { size: std::mem::size_of::<GhosttyGridRef>(), ..Default::default() };
+            let mut r = GhosttyGridRef::default();
             let mut p = GhosttyPoint { tag: GHOSTTY_POINT_TAG_VIEWPORT, ..Default::default() };
             p.value.coordinate = GhosttyPointCoordinate { x: col.min(self.cols.saturating_sub(1)), y: row.min(self.rows.saturating_sub(1)) as u32 };
             if ghostty_terminal_grid_ref(self.term, p, &mut r) != GHOSTTY_SUCCESS {
@@ -983,7 +982,7 @@ impl Vt {
                 }
                 Select::Release => {}
             }
-            let mut sel = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
+            let mut sel = GhosttySelection::default();
             match ghostty_selection_gesture_event(self.gesture, self.term, e, &mut sel) {
                 GHOSTTY_SUCCESS => {
                     ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel as *const _ as *const c_void);
@@ -999,16 +998,25 @@ impl Vt {
     /// The selected text, if anything is selected.
     pub fn selection_text(&self) -> Option<String> {
         unsafe {
-            let opts = GhosttyTerminalSelectionFormatOptions {
-                size: std::mem::size_of::<GhosttyTerminalSelectionFormatOptions>(),
-                emit: GHOSTTY_FORMATTER_FORMAT_PLAIN,
-                unwrap: true,
-                trim: true,
-                ..Default::default()
-            };
+            let mut sel = GhosttySelection::default();
+            if ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_SELECTION, &mut sel as *mut _ as *mut c_void) != GHOSTTY_SUCCESS {
+                return None;
+            }
+            // What Ghostty copies: plain text, wrapped lines joined, trailing spaces trimmed.
+            let mut f: GhosttyFormatter = std::ptr::null_mut();
+            if ghostty_formatter_terminal_new(std::ptr::null(), &mut f, self.term) != GHOSTTY_SUCCESS {
+                return None;
+            }
+            let (emit, yes) = (GHOSTTY_FORMATTER_FORMAT_PLAIN, true);
+            ghostty_formatter_set(f, GHOSTTY_FORMATTER_OPT_EMIT, &emit as *const _ as *const c_void);
+            ghostty_formatter_set(f, GHOSTTY_FORMATTER_OPT_UNWRAP, &yes as *const _ as *const c_void);
+            ghostty_formatter_set(f, GHOSTTY_FORMATTER_OPT_TRIM, &yes as *const _ as *const c_void);
+            ghostty_formatter_set(f, GHOSTTY_FORMATTER_OPT_SELECTION, &sel as *const _ as *const c_void);
             let mut ptr: *mut u8 = std::ptr::null_mut();
             let mut len = 0usize;
-            if ghostty_terminal_selection_format_alloc(self.term, std::ptr::null(), opts, &mut ptr, &mut len) != GHOSTTY_SUCCESS {
+            let r = ghostty_formatter_format_alloc(f, std::ptr::null(), &mut ptr, &mut len);
+            ghostty_formatter_free(f);
+            if r != GHOSTTY_SUCCESS {
                 return None;
             }
             if ptr.is_null() {
@@ -1021,7 +1029,7 @@ impl Vt {
     }
 
     fn grid_ref(&self, tag: GhosttyPointTag, x: u16, y: u32) -> Option<GhosttyGridRef> {
-        let mut r = GhosttyGridRef { size: std::mem::size_of::<GhosttyGridRef>(), ..Default::default() };
+        let mut r = GhosttyGridRef::default();
         let mut p = GhosttyPoint { tag, ..Default::default() };
         p.value.coordinate = GhosttyPointCoordinate { x, y };
         (unsafe { ghostty_terminal_grid_ref(self.term, p, &mut r) } == GHOSTTY_SUCCESS).then_some(r)
@@ -1271,7 +1279,7 @@ impl Vt {
 
     pub fn scroll_viewport(&mut self, delta: isize) {
         self.placements_cache.get_mut().take();
-        let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_DELTA, ..Default::default() };
+        let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA, ..Default::default() };
         s.value.delta = delta;
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
         self.feed_search();
@@ -1280,7 +1288,7 @@ impl Vt {
     /// Scrolls so `row` (from the scrollback's top) is the first visible row.
     pub fn scroll_to_row(&mut self, row: usize) {
         self.placements_cache.get_mut().take();
-        let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_ROW, ..Default::default() };
+        let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_TERMINAL_SCROLL_VIEWPORT_ROW, ..Default::default() };
         s.value.row = row;
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
         self.feed_search();
@@ -1296,7 +1304,7 @@ impl Vt {
 
     pub fn scroll_to_bottom(&mut self) {
         self.placements_cache.get_mut().take();
-        let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_BOTTOM, ..Default::default() };
+        let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM, ..Default::default() };
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
         self.feed_search();
     }
@@ -1363,8 +1371,8 @@ impl Vt {
     /// select API catches up synchronously, so calling it early could stall UI.
     pub fn search_navigate(&mut self, previous: bool) -> bool {
         let Some(search) = self.search.filter(|_| self.search_active && self.search_progress.complete) else { return false };
-        let option = if previous { GHOSTTY_SEARCH_OPT_SELECT_PREV } else { GHOSTTY_SEARCH_OPT_SELECT_NEXT };
-        if unsafe { ghostty_search_set(search, option, std::ptr::null()) } != GHOSTTY_SUCCESS {
+        let moved = unsafe { if previous { ghostty_search_select_prev(search) } else { ghostty_search_select_next(search) } };
+        if moved != GHOSTTY_SUCCESS {
             return false;
         }
         self.feed_search();
@@ -1397,7 +1405,7 @@ impl Vt {
         let result = unsafe { ghostty_search_get(search, GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES, &mut buffer as *mut _ as *mut c_void) };
         let mut matches = Vec::new();
         if result == GHOSTTY_OUT_OF_SPACE && buffer.len > 0 {
-            matches = std::iter::repeat_with(|| GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() })
+            matches = std::iter::repeat_with(GhosttySelection::default)
                 .take(buffer.len)
                 .collect();
             buffer.ptr = matches.as_mut_ptr();
@@ -1412,7 +1420,7 @@ impl Vt {
             return;
         }
 
-        let mut selected_match = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
+        let mut selected_match = GhosttySelection::default();
         let has_selected_match = unsafe {
             ghostty_search_get(search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &mut selected_match as *mut _ as *mut c_void) == GHOSTTY_SUCCESS
         };
@@ -1456,7 +1464,7 @@ impl Vt {
 
     pub fn scroll_to_top(&mut self) {
         self.placements_cache.get_mut().take();
-        let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_TOP, ..Default::default() };
+        let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_TERMINAL_SCROLL_VIEWPORT_TOP, ..Default::default() };
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
         self.feed_search();
     }
@@ -1579,9 +1587,9 @@ impl Vt {
                 x: if cur.wide_tail { cur.viewport_x.saturating_sub(1) } else { cur.viewport_x },
                 y: cur.viewport_y,
                 shape: match cur.visual_style {
-                    GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR => CursorShape::Bar,
-                    GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE => CursorShape::Underline,
-                    GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW => CursorShape::Hollow,
+                    GHOSTTY_CURSOR_STYLE_BAR => CursorShape::Bar,
+                    GHOSTTY_CURSOR_STYLE_UNDERLINE => CursorShape::Underline,
+                    GHOSTTY_CURSOR_STYLE_BLOCK_HOLLOW => CursorShape::Hollow,
                     _ => CursorShape::Block,
                 },
                 color: if colors.cursor_has_value { colors.cursor.into() } else { fg_default },
@@ -1602,7 +1610,7 @@ impl Vt {
             let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
             ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void);
 
-            let mut style = GhosttyStyle { size: std::mem::size_of::<GhosttyStyle>(), ..Default::default() };
+            let mut style = GhosttyStyle::default();
             ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &mut style as *mut _ as *mut c_void);
 
             let mut fg = GhosttyColorRgb::default();
@@ -1619,7 +1627,7 @@ impl Vt {
                 .then(|| Rgb::from(bg));
 
             let (mut fg, mut bg) = (fg, bg);
-            if style.inverse {
+            if style.has(GHOSTTY_STYLE_FLAG_INVERSE) {
                 let new_fg = bg.unwrap_or(self.theme.bg);
                 bg = Some(fg);
                 fg = new_fg;
@@ -1628,20 +1636,22 @@ impl Vt {
                 bg = Some(self.theme.selection_bg);
             }
             let mut text = String::new();
-            if wide != GHOSTTY_CELL_WIDE_SPACER_TAIL && wide != GHOSTTY_CELL_WIDE_SPACER_HEAD && !style.invisible {
+            if wide != GHOSTTY_CELL_WIDE_SPACER_TAIL && wide != GHOSTTY_CELL_WIDE_SPACER_HEAD && !style.has(GHOSTTY_STYLE_FLAG_INVISIBLE) {
                 let mut len: u32 = 0;
                 ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &mut len as *mut _ as *mut c_void);
                 if len > 0 {
                     let mut cps = vec![0u32; len as usize];
-                    ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, cps.as_mut_ptr() as *mut c_void);
-                    text = cps.into_iter().filter_map(char::from_u32).collect();
+                    let mut buf = GhosttyCodepointBuffer { ptr: cps.as_mut_ptr(), cap: cps.len(), len: 0 };
+                    if ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, &mut buf as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
+                        cps.truncate(buf.len);
+                        text = cps.into_iter().filter_map(char::from_u32).collect();
+                    }
                 }
             }
 
             if text.starts_with('\u{10eeee}') {
                 text.clear();
-                style.underline = 0;
-                style.strikethrough = false;
+                style.flags &= !(GHOSTTY_STYLE_UNDERLINE_MASK | GHOSTTY_STYLE_FLAG_STRIKETHROUGH);
             }
 
             // Contrast adjustment is opt-in; graphics always keep their colors.
@@ -1653,11 +1663,11 @@ impl Vt {
                 text,
                 fg,
                 bg,
-                bold: style.bold,
-                italic: style.italic,
-                faint: style.faint,
-                underline: style.underline != 0,
-                strike: style.strikethrough,
+                bold: style.has(GHOSTTY_STYLE_FLAG_BOLD),
+                italic: style.has(GHOSTTY_STYLE_FLAG_ITALIC),
+                faint: style.has(GHOSTTY_STYLE_FLAG_FAINT),
+                underline: style.underline() != 0,
+                strike: style.has(GHOSTTY_STYLE_FLAG_STRIKETHROUGH),
                 wide: wide == GHOSTTY_CELL_WIDE_WIDE,
             }
         }
@@ -1669,12 +1679,12 @@ impl Vt {
     /// kitty keyboard protocol reports shift+; and Neovim never sees ":".
     pub fn encode_key(&mut self, key: GhosttyKey, mods: GhosttyMods, consumed: GhosttyMods, text: Option<&str>, unshifted: Option<char>) -> Vec<u8> {
         unsafe {
-            ghostty_key_encoder_setopt_from_terminal(self.keys, self.term);
+            ghostty_key_encoder_set_from_terminal(self.keys, self.term);
             #[cfg(target_os = "macos")]
             {
                 // Lila does not offer Option-as-Alt yet: Option types characters.
                 let option = GHOSTTY_OPTION_AS_ALT_FALSE;
-                ghostty_key_encoder_setopt(self.keys, GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT, &option as *const _ as *const c_void);
+                ghostty_key_encoder_set(self.keys, GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT, &option as *const _ as *const c_void);
             }
             let e = self.key_event;
             ghostty_key_event_set_action(e, GHOSTTY_KEY_ACTION_PRESS);
@@ -1684,9 +1694,11 @@ impl Vt {
             ghostty_key_event_set_consumed_mods(e, if printable { consumed } else { 0 });
             match text {
                 Some(t) if printable => {
-                    ghostty_key_event_set_utf8(e, t.as_ptr() as *const _, t.len())
+                    let _ = ghostty_key_event_set_utf8(e, GhosttyString { ptr: t.as_ptr(), len: t.len() });
                 }
-                _ => ghostty_key_event_set_utf8(e, std::ptr::null(), 0),
+                _ => {
+                    let _ = ghostty_key_event_set_utf8(e, GhosttyString::default());
+                }
             }
             ghostty_key_event_set_unshifted_codepoint(e, unshifted.map_or(0, |c| c as u32));
             let mut buf = [0u8; 128];
@@ -1721,7 +1733,7 @@ impl Vt {
         let (cwi, chi) = (cw.round().max(1.0), ch.round().max(1.0));
         let (x, y) = (x / cw.max(1.0) * cwi, y / ch.max(1.0) * chi);
         unsafe {
-            ghostty_mouse_encoder_setopt_from_terminal(self.mouse, self.term);
+            ghostty_mouse_encoder_set_from_terminal(self.mouse, self.term);
             let s = GhosttyMouseEncoderSize {
                 size: std::mem::size_of::<GhosttyMouseEncoderSize>(),
                 screen_width: cols * cwi as u32,
@@ -1730,14 +1742,14 @@ impl Vt {
                 cell_height: chi as u32,
                 ..Default::default()
             };
-            ghostty_mouse_encoder_setopt(self.mouse, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &s as *const _ as *const c_void);
-            ghostty_mouse_encoder_setopt(self.mouse, GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED, &any_pressed as *const _ as *const c_void);
+            ghostty_mouse_encoder_set(self.mouse, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &s as *const _ as *const c_void);
+            ghostty_mouse_encoder_set(self.mouse, GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED, &any_pressed as *const _ as *const c_void);
             let e = self.mouse_event;
             ghostty_mouse_event_set_action(e, action);
             match button {
                 Some(b) => ghostty_mouse_event_set_button(e, b),
                 None => ghostty_mouse_event_clear_button(e),
-            }
+            };
             ghostty_mouse_event_set_mods(e, mods);
             ghostty_mouse_event_set_position(e, GhosttyMousePosition { x, y });
             let mut buf = [0u8; 64];
