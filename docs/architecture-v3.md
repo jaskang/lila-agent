@@ -1,0 +1,376 @@
+# Lila 架构 v3：多 agent 运行时与原生 GUI（草案）
+
+> 2026-11-09 · 用户的决定：**默认用原生 GUI**。Codex 走官方的 `codex app-server`；omp 走 ACP；Claude Code 因为官方对 `-p` 和 SDK 的限制，**内部照旧跑 TUI，由 Lila 代理出一个 GUI**，并且可以在 TUI 和 GUI 之间切换。
+>
+> 一句话结论：**每个成员仍然是一个 hc 终端**，lilad 现有的生命周期、状态和派活机制一律不动。新增两样东西：一套与 agent 无关的**对话事件模型**，以及按运行时实现的**驱动**。Claude 的驱动从 TUI 旁边收集事件。Codex 和 omp 的驱动是 Lila 自己的托管进程 `lila host`，它在 hc 终端里运行，通过官方协议驱动 agent，并像普通程序一样向 hc 报告状态。窗口只认对话事件，所以 GUI 只需要写一份。
+>
+> 本文核对过的版本：Claude Code 2.1.319、codex-cli 0.166.0、omp 18.18.3（都在本机）。
+
+---
+
+## 1. 目标与约束
+
+**目标**
+- 不熟悉 TUI 的人也能看懂、管好每个成员：对话、工具调用、改了什么、卡在哪里、要它做什么决定。
+- 再接一种 agent 时，只需要写一个驱动，不用改 lilad 的调度和窗口。
+
+**不变的约束**
+- lilad 是唯一的写入方。窗口和 CLI 都通过 socket 跟它说话。
+- Claude 和 Codex 走用户自己的订阅，Lila 不碰它们的 token（`docs/HANDOFF.md`）。
+- 成员还是通过 `lila` 命令参与协议（`lila task done …`），由 `LILA_PROJECT` 和 `LILA_MEMBER` 环境变量表明身份。
+- 界面不写说明文字（DESIGN.md）。
+- 优先用成熟的库：ACP 用官方 crate `agent-client-protocol`。
+
+**不做**
+- 不用 `claude -p` 或 Agent SDK 驱动 Claude：订阅政策和计费都有疑问。
+- 不在窗口里直接跑 agent：agent 进程一律由 lilad 通过 hc 管理。
+
+---
+
+## 2. 现状：lilad 怎么驱动成员
+
+| 环节 | 现在的做法 | 代码 |
+|---|---|---|
+| 启动 | 在 hc 里起一个终端，跑官方 CLI；带标签 `lila.project`、`lila.member`，环境变量里有身份 | `daemon/requests.rs::start_session`、`lila_core::runtime::launch` |
+| 派活、发通知 | 把文字**打进终端**再回车；只在空闲时打字（hc 的 `if`） | `Terminals::send`、`Daemon::pump` |
+| 状态 | 程序通过 **OSC 7501** 向 hc 报告 `idle`、`working`、`done`、`blocked`、`error`，hc 推给 lilad | `Daemon::on_event`、`set_status` |
+| 会话、用量、额度 | 事后读 CLI 自己写的记录文件：Claude 的 `<id>.jsonl`；Codex 的 rollout，会话 id 还得靠猜 | `sessions.rs`、`usage.rs`、`watch::watch_quota`、`watch::find_sessions` |
+| 特殊对话框 | 信任目录、登录：成员一直不报状态时出「启动卡住」卡片，由人去终端里处理 | `watch.rs`、`inbox::startup` |
+| 窗口 | 中间显示成员的终端（`lila-term`，基于 libghostty） | `lila-app/src/ui.rs::center` |
+
+这套做法的长处是**和 agent 的种类基本无关**：只要是能在终端里跑、会报 OSC 7501 状态的程序就行。v3 保留这一点。它缺的是**内容**：窗口只能显示终端画面，lilad 也不知道成员在做什么。
+
+---
+
+## 3. 三种运行时怎么接（2026-11-09 实测）
+
+| | Claude Code | Codex | omp |
+|---|---|---|---|
+| 进程 | 官方 TUI（不变） | `codex app-server`，在 stdio 上收发 JSON-RPC | `omp acp`，在 stdio 上跑 ACP |
+| 谁来跑 | hc 终端直接跑 `claude` | hc 终端跑 `lila host codex`，它再起子进程 | hc 终端跑 `lila host omp`，同上 |
+| 对话内容 | 会话记录文件 `~/.claude/projects/<目录>/<id>.jsonl`，边跑边追加，含消息、思考、`tool_use`、`tool_result`、权限决定 | `item/started`、`item/completed`，以及消息、思考、命令输出的增量 | `session/update`：`agent_message_chunk`、`agent_thought_chunk`、`tool_call`、`tool_call_update`、`plan`、`usage_update` |
+| 轮次和状态 | hc 的 OSC 7501；hooks 里的 `UserPromptSubmit`、`Stop`、`StopFailure`、`Notification` | `turn/started`、`turn/completed`、`thread/status/changed` | `session/prompt` 返回时附带 `stopReason` |
+| 权限确认 | hooks 里的 `PermissionRequest`：可以返回 allow 或 deny，默认超时 600 秒 | 服务端请求 `item/commandExecution/requestApproval`、`item/fileChange/requestApproval`、`item/permissions/requestApproval` | `session/request_permission`：执行命令、编辑、删除、移动这几类工具要确认，选项有 allow 或 reject 的一次和总是 |
+| 系统提示词 | `--append-system-prompt-file`（不变） | `thread/start` 的 `developerInstructions` | 待原型验证（`omp` 有 `--append-system-prompt`） |
+| 会话 id | Lila 用 `--session-id` 指定 | `thread/start` 直接返回 `threadId`，不用再猜 rollout | `session/new` 返回 |
+| 续接 | `--resume <id>` | `thread/resume` | `session/load` 或 `session/resume` |
+| 运行中插话 | 工作时也能打字，CLI 会排队 | `turn/steer` | 无；由 Lila 排队，等这一轮结束再发 |
+| 中断 | hc 的 `interrupt` | `turn/interrupt` | `session/cancel` |
+| 换目录（worktree 槽） | 在新目录重启 CLI（不变） | `turn/start` 的 `cwd` 参数，**不用重启** | 在新目录开一个新会话 |
+| token 和上下文 | 读会话记录文件（不变） | `thread/tokenUsage/updated` | `usage_update` |
+| 额度 | hooks：`StopFailure`、`Notification` 的 `quota_*` | `account/rateLimits/updated`、`account/rateLimits/read` | 错误事件 |
+| 登录 | `claude auth login`（不变） | `account/login/start`（ChatGPT 订阅） | omp 自己的登录或 API key |
+| 能切到 TUI | ✅ | ✗ | ✗ |
+
+Claude 的 hooks 只对 Lila 起的会话生效，不动用户自己的配置：通过 `--settings <文件>` 或 `--plugin-dir <目录>` 加载（插件是官方列出的 hook 来源之一）。用哪一种由原型 S1 决定。
+
+---
+
+## 4. 总体结构
+
+```
+lila-app（GPUI）
+   │  socket：现有方法 + conversation.* + 订阅推送
+   ▼
+lilad（唯一写入方）
+   ├─ 调度、任务、请求、收件箱、worktree 槽……（不变）
+   ├─ 对话存储：每个成员的规范化条目（SQLite）
+   └─ 驱动注册表：按 runtime 分派
+        │
+        ├─ ClaudeDriver ──hc──▶ 终端：claude（TUI）
+        │     ├─ 读会话记录文件 → 条目
+        │     └─ hooks：claude 调用 `lila hook` → socket → lilad（权限确认在这里等答复）
+        │
+        └─ HostDriver ──unix socket──▶ 终端：lila host <runtime>
+                                          ├─ 发 OSC 7501 状态 → hc → lilad（沿用现有状态机）
+                                          ├─ codex：子进程 `codex app-server`（JSON-RPC）
+                                          └─ omp：  子进程 `omp acp`（agent-client-protocol crate）
+```
+
+### D1 每个成员仍是一个 hc 终端；Codex 和 omp 由 `lila host` 托管
+
+为什么不让 lilad 直接起 `codex app-server` 子进程：
+- **lilad 重启时成员不能断。** 现在 `lila daemon stop` 时成员照样运行，lilad 回来后通过 hc 重新对上。如果是 lilad 的子进程，stdio 一断，成员就跟着没了。
+- **生命周期不用改。** 起停、标签、`list`、`reconcile`、`kill`、「成员退出」的处理都已经基于 hc，`lila host` 只是换了个被启动的程序。
+- **状态机不用改。** host 自己按照对话事件发 OSC 7501 状态。lilad 现有的空闲才派活、`stall`、`unstick`、`runaway` 检测、「卡住」卡片全都照常工作。
+- **方便排查。** host 的终端会打印一行一条的可读日志，出问题时能直接看到。界面上默认不显示。
+
+host 和 lilad 之间：unix socket（`$LILA_HOME/state/hosts/<project>.<member>.sock`），每行一个 JSON。
+- lilad 发给 host 的是**命令**（§6）。
+- host 发给 lilad 的是**带序号的事件**。host 保留尚未确认的事件；lilad 重连时报告最后收到的序号，host 从那里补发。
+
+### D2 一套与 agent 无关的对话事件模型
+
+新 crate `lila-agent` 定义事件（§5）。三个驱动都把自己的数据**转换**成这套事件，lilad 和窗口只认这一种。形状参照 ACP 的会话更新，因为 ACP 本来就是为渲染 agent 界面设计的。
+
+### D3 lilad 只存规范化后的条目，不存增量
+
+条目（一条消息、一次工具调用）以 id 为键，更新时覆盖原来的记录，并分配一个递增的序号。逐字的增量只放在内存里转发给窗口，不落盘。窗口按「从某个序号之后」增量读取，再加上订阅推送。
+
+### D4 权限确认统一处理：先看角色策略，剩下的才问人
+
+三种运行时的权限请求都转成同一种 `PermissionRequest`。lilad 先按角色的权限规则自动决定（例如 `lila …` 命令一律允许，读文件一律允许），剩下的才变成收件箱卡片，同时显示在对话视图底部。人的回答再沿原路送回去：Claude 是 hook 的返回值，Codex 是服务端请求的响应，omp 是 `request_permission` 的结果。
+
+### D5 Claude 的 TUI/GUI 切换
+
+Claude 成员的 TUI 一直在 hc 里运行。窗口显示 GUI（对话视图）还是 TUI（`lila-term` 终端视图），由标题行上的一个两段式切换控件决定，每个成员单独记住。只有 TUI 能处理的场合（信任目录、登录、`/model` 这类菜单）会提示切过去。
+
+---
+
+## 5. 事件模型（`lila-agent`）
+
+```rust
+/// 驱动 → lilad。顺序就是发生的顺序；host 发出的事件带 seq。
+pub enum AgentEvent {
+    /// 会话 id 一旦知道就报（Claude 是启动时，Codex 是 thread/start 之后，omp 是 session/new 之后）。
+    Session { id: String },
+    /// 只有 host 驱动会发；Claude 的状态仍然来自 hc（§7.1）。
+    Status(Status),
+    TurnStarted { turn: String, origin: Origin },
+    TurnEnded { turn: String, end: TurnEnd },
+    /// 新建或更新一个条目（以 id 为键，整条覆盖）。
+    Item(Item),
+    /// 进行中条目的文字增量：只转发给窗口，不落盘。
+    Delta { item: String, part: Part, text: String },
+    Permission(PermissionRequest),
+    PermissionResolved { id: String, by: Resolver },
+    Usage { input: u64, output: u64, cached: u64, context: Option<u64> },
+    Limits(Vec<Limit>),
+    Notice { level: Level, text: String },
+}
+
+pub enum Status { Idle, Working, Blocked { why: String }, Error { why: String } }
+pub enum TurnEnd { Done, Interrupted, Failed(String), Quota { resets_ms: Option<i64> } }
+pub enum Origin { Person, Lila { task: Option<String> }, Agent }
+
+pub struct Item { pub id: String, pub turn: Option<String>, pub at_ms: i64, pub kind: ItemKind, pub state: ItemState }
+pub enum ItemState { Running, Done, Failed }
+pub enum ItemKind {
+    UserMessage { text: String, origin: Origin },
+    AgentMessage { text: String },          // markdown
+    Thought { text: String },
+    ToolCall { tool: ToolKind, title: String, input: serde_json::Value,
+               output: Option<String>, diffs: Vec<FileDiff>, exit: Option<i32> },
+    Plan { steps: Vec<(String, StepState)> },
+}
+/// 和 ACP 的 ToolKind 一致，窗口按它选图标。
+pub enum ToolKind { Read, Edit, Delete, Move, Search, Execute, Fetch, Think, Other }
+
+pub struct PermissionRequest { pub id: String, pub item: Option<String>, pub tool: ToolKind,
+                               pub title: String, pub detail: String, pub options: Vec<PermOption> }
+pub struct PermOption { pub id: String, pub label: String, pub kind: PermKind }
+pub enum PermKind { AllowOnce, AllowAlways, RejectOnce, RejectAlways }
+
+/// lilad → 驱动。
+pub enum Command {
+    Prompt { text: String, origin: Origin },   // 派活、通知、人在输入框里说的话
+    Steer { text: String },                    // 插进正在进行的这一轮
+    Interrupt,
+    Answer { permission: String, option: String },
+    Cwd(std::path::PathBuf),                   // 换到 worktree 槽
+    Shutdown,
+}
+
+/// 每种运行时的能力。窗口和 lilad 按能力决定行为，而不是按名字判断。
+pub struct Caps {
+    pub tui: bool,              // 能切到终端
+    pub steer: bool,            // 运行中能插话
+    pub cwd_without_restart: bool,
+    pub stream: bool,           // 有逐字增量
+    pub limits: bool,           // 能直接读额度
+}
+```
+
+**派活时的行为**由能力决定：成员空闲时发 `Prompt`；正在工作时，能插话就发 `Steer`，不能就留在 outbox 里，等这一轮结束再发。这和现在通知（notes）的处理方式一样。
+
+---
+
+## 6. 驱动接口（lilad 里）
+
+```rust
+pub trait Driver {
+    fn caps(&self) -> Caps;
+    /// hc 里要跑的程序：claude 的 argv，或 `lila host <runtime> …`。
+    fn launch(&self, member: &Member, session: &Session, cwd: &Path) -> Launch;
+    /// 把命令交给成员：Claude 是 hc 的 send、interrupt 或 hook 的答复；host 是 socket。
+    fn send(&mut self, member: &str, cmd: Command) -> Result<()>;
+}
+```
+
+事件统一进入 lilad 的输入通道（`server.rs` 里的 `Input::Agent { project, member, event }`），和 hc 的事件、socket 请求排在同一个循环里处理。所以 lilad 仍然是单线程写入。
+
+运行时自己的代码按目录分开：
+
+```
+crates/lila-agent/
+  src/model.rs        事件、命令、能力（§5）
+  src/claude/         启动参数（从 lila_core::runtime 移过来）、会话记录解析、hook 载荷解析
+  src/codex/          app-server 客户端：按用到的那部分手写 serde 类型，忽略不认识的字段
+  src/omp/            ACP 客户端（agent-client-protocol crate）
+  src/host.rs         `lila host` 的主循环：起子进程、转换事件、发 OSC 7501、连 lilad 的 socket
+```
+
+- **异步代码只放在 host 进程里**（ACP crate 是异步的）。lilad 保持现在的同步线程模型。
+- **Codex 协议的版本校验：** 有一个测试会用 `codex app-server generate-json-schema` 生成本机版本的协议定义，检查 Lila 用到的方法都还在。在设置页显示支持的 Codex 版本范围。
+
+---
+
+## 7. 三个驱动
+
+### 7.1 ClaudeDriver：TUI 照跑，从旁边拿事件
+
+- **启动：** 现在的参数不变，加上 `--settings <$LILA_HOME/run/<project>.<member>.json>`，里面配置 hooks，或者用 `--plugin-dir`（原型 S1 决定）。hook 的命令都是 `lila hook`：它从 stdin 读事件的 JSON，经 socket 交给 lilad，再把答复写回 stdout。
+- **对话条目：** 读会话记录文件（lilad 已经知道路径），从上次读到的位置继续读。只认 `user`、`assistant`、`tool_use`、`tool_result`、`thinking`，不认识的行跳过。会话记录用 `transcript_path`（hook 的输入里就有）对上。
+- **轮次：** `UserPromptSubmit` 是一轮开始，`Stop` 是正常结束，`StopFailure` 是 API 错误或额度用完。
+- **状态：** 仍然用 hc 的 OSC 7501（不变）。hooks 用来补准确性：`Notification`（`permission_prompt`）表示卡在权限确认。
+- **权限：** `PermissionRequest` hook 会**一直等到** lilad 给出答复。lilad 先按角色策略自动答；剩下的出卡片。人在超时前答了，就返回 allow 或 deny。超时或窗口没开，就返回「不决定」，让 TUI 自己问，卡片上提示切到 TUI 去处理。超时时间取 hook 的配置，比如 590 秒。
+- **派活和插话：** 用 hc 的 send（不变）。Claude 工作时打进去的字会排队，所以 `Steer` 等于工作时直接 send。
+- **逐字显示：** 默认按条更新（会话记录是按条写的）。原型 S1 会验证 `MessageDisplay` hook 能不能拿到正在显示的文字，能的话就用来做逐字显示。
+
+### 7.2 HostDriver + Codex（`lila host codex`）
+
+- **启动：** hc 里跑 `lila host codex --model … --effort … --sandbox …`。host 起子进程 `codex app-server`，先 `initialize`，再用 `account/read` 查登录状态，没登录就报 `Status::Error`，配上「登录」卡片。
+- **会话：** 新建用 `thread/start {cwd, model, developerInstructions: <Lila 的提示词>, approvalPolicy, sandbox}`；续接用 `thread/resume {threadId}`。`threadId` 就是会话 id，不再去猜 rollout，`watch::find_sessions` 对 host 成员不再需要。
+- **命令对应：**
+  - `Prompt` → `turn/start {threadId, input, effort, cwd}`
+  - `Steer` → `turn/steer`
+  - `Interrupt` → `turn/interrupt`
+  - `Cwd` → 下一次 `turn/start` 带上新的 `cwd`，不重启进程
+  - `Answer` → 回复对应的服务端审批请求
+- **事件对应：**
+  - `turn/started` / `turn/completed` → `TurnStarted` / `TurnEnded`
+  - `item/*` → `Item`，增量 → `Delta`
+  - 审批请求 → `Permission`
+  - `thread/tokenUsage/updated` → `Usage`
+  - `account/rateLimits/updated` → `Limits`，替换现在 `watch_quota` 读 rollout 的做法
+- **状态：** host 根据轮次和待处理的审批，算出 idle、working、blocked、error，用 OSC 7501 报给 hc（`app = "lila-codex"`）。
+
+### 7.3 HostDriver + omp（`lila host omp`）
+
+- **启动：** 子进程 `omp acp`，用官方 crate `agent-client-protocol` 作为客户端：`initialize`，再 `session/new {cwd, mcpServers: []}` 或 `session/load`。模型通过 `--model` 或 `session/set_config_option` 设置。系统提示词的注入方式在原型 S3 里确认；实在不行，就把提示词作为第一条消息发出去。
+- **命令对应：**
+  - `Prompt` → `session/prompt`。omp 不能插话，所以运行中收到的 `Steer` 先在 host 里排队，这一轮结束再发。
+  - `Interrupt` → `session/cancel`
+  - `Answer` → `request_permission` 的结果
+  - `Cwd` → 开一个新会话
+- **事件对应：**
+  - `agent_message_chunk` 和 `agent_thought_chunk` → `Delta`，一段完整后合成 `Item`
+  - `tool_call` 和 `tool_call_update` → `Item::ToolCall`；ACP 的 `kind` 直接对应 `ToolKind`
+  - `plan` → `Item::Plan`
+  - `usage_update` → `Usage`
+- **账号：** omp 用的是 API key 还是订阅，要等「是否放开 API key」的决定。放开的话，key 存在钥匙串里，用 omp 的 `--profile` 按账号隔离。
+
+---
+
+## 8. lilad 的改动
+
+| 地方 | 改动 |
+|---|---|
+| `Live` | 增加驱动类型、能力，以及 host 的 socket 连接；`session` 可以直接来自 `AgentEvent::Session` |
+| `Terminals::send` 的调用点 | 改成 `Driver::send(Command::Prompt …)`；Claude 内部仍然用 hc 的 send |
+| `pump` | 「空闲才派活」不变。新增：工作时有插话能力，就把通知作为 `Steer` 发出去 |
+| 状态 | hc 的 OSC 7501 仍然是唯一来源，host 也走这条路。`Notice` 和 `Error` 进收件箱 |
+| worktree 槽 | 有 `cwd_without_restart` 能力的成员换槽时发 `Cwd`，不重启；`switch_plan` 根据能力判断 |
+| 额度 | Codex 改用 `Limits` 事件；Claude 增加 `TurnEnd::Quota`；`codex_paused` 改成按运行时记录 |
+| 用量 | 有 `Usage` 事件的运行时直接累计；Claude 继续读会话记录文件 |
+| 收件箱 | 新增 `permission` 类型（选项来自 `PermOption`），答复之后发 `Command::Answer` |
+| 角色配置 | 增加 `[permissions] allow = […]`（运行时无关的自动允许规则）。Claude 现有的 `tools.allow` 继续作为 CLI 参数 |
+
+---
+
+## 9. 存储与 socket
+
+**表**
+
+```sql
+CREATE TABLE conv_items (
+  project TEXT NOT NULL, member TEXT NOT NULL, session TEXT,
+  seq INTEGER NOT NULL,            -- 每个成员内递增；更新条目时重新分配 seq
+  item TEXT NOT NULL, turn TEXT, kind TEXT NOT NULL, state TEXT NOT NULL,
+  body TEXT NOT NULL,              -- ItemKind 的 JSON
+  at_ms INTEGER NOT NULL,
+  PRIMARY KEY (project, member, item)
+);
+CREATE INDEX conv_items_seq ON conv_items(project, member, seq);
+```
+
+保留时间跟着会话走：会话被清掉时一起删，或者超过 30 天删除。
+
+**socket 方法**
+- `conversation.read {member, after?, limit?}` → 条目、进行中的条目、待处理的权限请求、当前状态、能力
+- `conversation.send {member, text}` → 记成 `UserMessage{origin: Person}`，再根据状态和能力决定发 `Prompt` 还是 `Steer`
+- `conversation.interrupt {member}`
+- 订阅通道（现有的 `subscribe`）新增两种推送：`{"event":"conversation","project","member","seq"}`，以及节流到约每秒 30 次的 `{"event":"delta","member","item","text"}`
+
+---
+
+## 10. 窗口（lila-app）
+
+- **中间区域：** 在侧栏选中成员后，默认显示**对话视图**。标题行是成员名和状态标签；只有能切 TUI 的运行时（Claude）才在右边显示 `GUI | TUI` 两段式切换。
+- **对话视图从上到下：**
+  - Lila 派来的任务：一行显示「T3 标题」，点开看全文。人说的话，按普通消息显示。
+  - 成员的回复：markdown（`TextView`）。思考过程默认折叠，用次要颜色。
+  - 工具调用：按 `ToolKind` 显示图标，加标题和状态。点开看命令输出，或者看 diff。
+  - 计划：清单。
+  - 轮次之间的分隔：显示耗时和 token。
+  - 待处理的权限请求：贴在最底部，和收件箱卡片用同一个组件。
+- **底部输入框：** ⌘↩ 发送。工作中能插话就直接发，否则显示为排队中。
+- **请求面板的「看现场」：** 打开成员的对话视图，并定位到这个任务所在的那一轮。
+- **原则：** 不写说明文字（DESIGN.md）；每个成员的终端视图只在 TUI 模式下创建。
+
+---
+
+## 11. 落地顺序
+
+**P0 原型**（每项是一个用完就扔的小实验，结果记进本文）
+- **S1 Claude：**
+  - 用 `--settings` 还是 `--plugin-dir` 注入只在本会话生效的 hooks；
+  - `PermissionRequest` 能不能停下来等，返回的决定是否生效；
+  - `Stop`、`StopFailure`、`Notification` 的载荷是什么样；
+  - `MessageDisplay` 能不能拿到文字；
+  - 会话记录文件的写入粒度。
+- **S2 Codex：**
+  - 用 ChatGPT 订阅登录的情况下，`codex app-server` 跑通 `thread/start`（含 developerInstructions）、`turn/start`、`turn/steer`；
+  - 执行 `lila …` 命令时的审批流程；
+  - `account/rateLimits/read`。
+- **S3 omp：**
+  - 用 `agent-client-protocol` crate 跑通 `omp acp` 的会话、提示、权限；
+  - 系统提示词能否注入。
+- **S4 host：** `lila host` 发出的 OSC 7501 状态能出现在 `hc get` 里。
+
+**P1 事件模型、存储、对话视图，先接 Claude**（只读会话记录，加输入框）和 TUI/GUI 切换。做完后，现有成员马上就能用 GUI。
+
+**P2 `lila host` 和 Codex 驱动：** Codex 成员从 TUI 改到 app-server；换 worktree 槽不再重启；额度和会话 id 直接从协议拿。
+
+**P3 Claude 的 hooks：** 权限卡片、准确的轮次结束、额度用完时停下来。
+
+**P4 omp 驱动：** 以及 API key 和钥匙串，取决于 §13 的决定。
+
+**P5（可选）把 Lila 的协议做成 MCP 工具：** Claude（`--mcp-config`）、Codex（配置里的 MCP）、omp（`session/new` 的 `mcpServers`）都支持 MCP。这样成员不用再通过 shell 调 `lila`，权限规则也更简单。
+
+每个阶段结束都真跑一轮，按截图打磨（和 v2 一样）。
+
+---
+
+## 12. 风险
+
+| 风险 | 对策 |
+|---|---|
+| Claude 的会话记录文件是内部格式、没有文档 | 解析时宽松处理，不认识的行跳过；按版本保存样本做测试；解析失败时提示切到 TUI |
+| `codex app-server` 在命令行里标着 experimental | 写明支持的最低版本，用协议定义做校验测试，功能按能力开关 |
+| Claude hook 的超时上限（默认 600 秒） | 超时就交还给 TUI 自己问；卡片保留，提示切到 TUI |
+| 状态有多个来源（hc、hooks、协议事件） | 规定优先级：协议事件 > hooks > hc；只有 host 往 hc 报状态，所以对 lilad 来说只有一个来源 |
+| host 崩溃 | 按「成员退出」处理（现有逻辑），任务退回队列 |
+| 增量太频繁 | 只在内存里转发，按约每秒 30 次节流；不落盘 |
+| 用了 omp 就需要 API key | 要等 §13 的决定；key 只放钥匙串，界面标出按量计费的成员 |
+
+---
+
+## 13. 需要你决定的
+
+1. **从哪里开始：**
+   - **建议 P1 先做 Claude 的 GUI。** 不需要 host 这套基础设施，就能把事件模型、存储、对话视图从头到尾跑通，现有成员马上受益。
+   - **另一个选择是先做 Codex。** 它的数据最规整，用来定事件模型最顺；但第一步就要把 host 做出来。
+2. **对话存在 SQLite（建议）** 还是每次从各自的记录文件现读。SQLite 的好处是三种运行时一视同仁，窗口按序号增量读，也和「lilad 是唯一写入方」一致。
+3. **Codex 成员要不要保留一个隐藏的原始日志视图**，就是 host 终端里的那些日志，用来排查问题。建议放在成员菜单里，平时不显示。
+4. **omp 用 API key**（DeepSeek、MiniMax 等）：要不要放开「只用订阅」的原则。

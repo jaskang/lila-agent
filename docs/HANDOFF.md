@@ -4,6 +4,7 @@
 
 先读这份。需要细节时再读：
 - `docs/product-v3.md`：下一阶段的产品方案（请求为中心、多来源、worktree 槽），M1 起按它做。
+- `docs/architecture-v3.md`：多 agent 运行时与原生 GUI 的设计（草案，2026-11-09）。默认 GUI；Codex 走 `codex app-server`，omp 走 ACP，都由 `lila host` 托管在 hc 终端里；Claude 照跑 TUI，Lila 代理出 GUI，可切换。§13 有待决定的事。
 - `docs/architecture-v2.md`：参考四篇文章（README 末尾）重新评估后的架构，分阶段落地。阶段 A–E 已完成，记录在 §10–§14；§15 是第一版上线前的精简。
 - `DESIGN.md`（仓库根目录）：界面规范。第一条规则：不写说明文字，看不懂就改布局。
 - 各阶段的旧记录（m1–m3、spikes、最初的 design.md）和 HTML 原型已经从仓库里去掉，要查就看 git 历史。
