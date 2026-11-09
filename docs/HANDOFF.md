@@ -1,10 +1,10 @@
 # 交接说明（给接手的模型）
 
-更新于 2026-11-07。用户用中文交流，回复也用中文。用户会换一台电脑继续，那台电脑上没有这一台的 Claude 记忆，所以该知道的都写在这里。
+更新于 2026-11-09。用户用中文交流，回复也用中文。用户会换一台电脑继续，那台电脑上没有这一台的 Claude 记忆，所以该知道的都写在这里。
 
 先读这份。需要细节时再读：
 - `docs/product-v3.md`：下一阶段的产品方案（请求为中心、多来源、worktree 槽），M1 起按它做。
-- `docs/architecture-v3.md`：多 agent 运行时与原生 GUI 的设计（草案，2026-11-09）。默认 GUI；Codex 走 `codex app-server`，omp 走 ACP，都由 `lila host` 托管在 hc 终端里；Claude 照跑 TUI，Lila 代理出 GUI，可切换。§13 有待决定的事。
+- `docs/architecture-v3.md`：**正在做的**。多 agent 运行时与原生 GUI。默认 GUI；Codex 走 `codex app-server`，omp 走 ACP，都由 `lila host` 托管在 hc 终端里；Claude 照跑 TUI，Lila 代理出 GUI，可切换。§13 的决定全部按建议（P1 先做 Claude、对话存 SQLite、host 原始日志放菜单、omp 的账号交给 omp）。进度：P0 原型 ✅（§14），P1 Claude 对话视图 ✅（§15），**下一步 P2：`lila host` + Codex app-server**，再 P3（Claude hooks：权限卡片、逐字显示、准确的轮次结束）、P4（omp ACP）。用户的目标是「按建议从 P0 做到完成」。
 - `docs/architecture-v2.md`：参考四篇文章（README 末尾）重新评估后的架构，分阶段落地。阶段 A–E 已完成，记录在 §10–§14；§15 是第一版上线前的精简。
 - `DESIGN.md`（仓库根目录）：界面规范。第一条规则：不写说明文字，看不懂就改布局。
 - 各阶段的旧记录（m1–m3、spikes、最初的 design.md）和 HTML 原型已经从仓库里去掉，要查就看 git 历史。
@@ -203,6 +203,7 @@ macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; ki
 
 ## 待办
 
+- **架构 v3**（`docs/architecture-v3.md`）：见文首。P2 的要点在 §7.2 和 §14 S2（app-server 的实测：一轮进行中再 `turn/start` 会并进当前这一轮，所以运行中用 `turn/steer`；成员会继承用户全局的 `~/.codex/config.toml`，里面的 MCP 服务器可能拖慢第一轮）。
 - **产品方案 v3**（`docs/product-v3.md`，2026-11-09 草案）：主界面改成以请求为中心，来源是手动、GitHub、Asana；M1 先做 worktree 槽和请求列表，不接外部渠道。取代下面这条。
 - **阶段 E 的 worktree**（`docs/architecture-v2.md` §4.8）：第一版没做，改成一条链占目录、验收时提交（§14）。以后要真正并行时再做每条链一个 worktree。
 - PM 自己开的链（终端里提的需求）没有验收卡片，也就不会提交（§14 已知限制）。
