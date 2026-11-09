@@ -2,6 +2,7 @@
 //! Unix socket, terminal facts from herdr-core's event stream; both are
 //! handled one at a time on one thread, so there is no locking.
 
+mod conversation;
 mod flows;
 mod requests;
 mod review;
@@ -28,7 +29,7 @@ use lila_core::route::{self, DoneRoute};
 use lila_core::{Actor, Brief, Outcome, ProjectConfig, SourceSpec, Task, TaskState, Team, Transition, inbox, message, prompt, runtime};
 use lila_store::{NewTask, Run, RunState, SessionRow, Store};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// What the daemon needs from herdr-core. A fake stands in for it in tests.
@@ -133,6 +134,8 @@ pub struct Daemon<T: Terminals> {
     committing: BTreeSet<(String, String)>,
     /// Where the CLIs record their sessions, and the context sizes read from them.
     sources: Sources,
+    /// How far each member's transcript has been read (`conversation`), by (project, member).
+    tails: HashMap<(String, String), conversation::Tail>,
     contexts: Contexts,
     /// Token use per member and window, from the same records (budgets, quotas).
     scanner: Scanner,
@@ -236,6 +239,7 @@ impl<T: Terminals> Daemon<T> {
             commits: Vec::new(),
             committing: BTreeSet::new(),
             sources: Sources::from_env(),
+            tails: HashMap::new(),
             contexts: Contexts::default(),
             scanner: Scanner::default(),
             quota_checked: BTreeMap::new(),
@@ -688,6 +692,7 @@ impl<T: Terminals> Daemon<T> {
                 }
             }
         }
+        self.follow_transcripts();
     }
 }
 

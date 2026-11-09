@@ -117,6 +117,17 @@ CREATE TABLE IF NOT EXISTS session_chains (
     last_ms INTEGER NOT NULL,
     PRIMARY KEY (project, session, chain)
 );
+CREATE TABLE IF NOT EXISTS conv_items (
+    project TEXT NOT NULL,
+    member TEXT NOT NULL,
+    session TEXT NOT NULL,
+    item TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    at_ms INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY (project, member, session, item)
+);
+CREATE INDEX IF NOT EXISTS conv_items_seq ON conv_items (project, member, seq);
 "#;
 
 pub struct Store {
@@ -430,7 +441,7 @@ impl Store {
     /// Forgets a project and everything Lila recorded for it. Its folder is not touched.
     pub fn remove_project(&self, project: &str) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        for table in ["members", "tasks", "task_events", "artifacts", "inbox", "outbox", "runs", "sessions", "session_chains", "external"] {
+        for table in ["members", "tasks", "task_events", "artifacts", "inbox", "outbox", "runs", "sessions", "session_chains", "external", "conv_items"] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [project])?;
         }
         tx.execute("DELETE FROM projects WHERE id = ?1", [project])?;
@@ -528,6 +539,52 @@ impl Store {
     pub fn set_pr(&self, project: &str, task: &str, url: &str) -> Result<()> {
         self.db.execute("UPDATE external SET pr = ?3 WHERE project = ?1 AND task = ?2", params![project, task, url])?;
         Ok(())
+    }
+
+    // ---------- conversations ----------
+
+    /// Stores conversation items of a member's session (`(id, at_ms, body)`). Each
+    /// new or changed one gets the member's next seq, so readers ask for what came
+    /// after the last one they saw; an unchanged one is left alone (read again after
+    /// a restart, it changes nothing). Returns the member's last seq.
+    pub fn put_items(&self, project: &str, member: &str, session: &str, items: &[(String, i64, String)]) -> Result<i64> {
+        let tx = self.db.unchecked_transaction()?;
+        let mut seq: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM conv_items WHERE project = ?1 AND member = ?2", params![project, member], |r| r.get(0))?;
+        for (item, at_ms, body) in items {
+            let old: Option<String> = tx
+                .query_row("SELECT body FROM conv_items WHERE project = ?1 AND member = ?2 AND session = ?3 AND item = ?4", params![project, member, session, item], |r| r.get(0))
+                .optional()?;
+            if old.as_deref() == Some(body.as_str()) {
+                continue;
+            }
+            seq += 1;
+            tx.execute(
+                "INSERT INTO conv_items (project, member, session, item, seq, at_ms, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (project, member, session, item) DO UPDATE SET seq = ?5, at_ms = ?6, body = ?7",
+                params![project, member, session, item, seq, at_ms, body],
+            )?;
+        }
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// A session's items with a seq after `after`, oldest first: `(seq, body)`.
+    /// The latest `limit` when there are more.
+    pub fn items(&self, project: &str, member: &str, session: &str, after: i64, limit: usize) -> Result<Vec<(i64, String)>> {
+        let mut st = self.db.prepare(
+            "SELECT seq, body FROM (SELECT seq, body, at_ms FROM conv_items WHERE project = ?1 AND member = ?2 AND session = ?3 AND seq > ?4
+             ORDER BY at_ms DESC, seq DESC LIMIT ?5) ORDER BY at_ms, seq",
+        )?;
+        let rows = st.query_map(params![project, member, session, after, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The session a member last had items in.
+    pub fn last_conversation(&self, project: &str, member: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row("SELECT session FROM conv_items WHERE project = ?1 AND member = ?2 ORDER BY seq DESC LIMIT 1", params![project, member], |r| r.get(0))
+            .optional()?)
     }
 
     // ---------- sessions ----------
@@ -1108,6 +1165,23 @@ mod tests {
         assert_eq!(out[0].text, "hello");
         s.pop_outbox(out[0].id).unwrap();
         assert!(s.outbox("shop").unwrap().is_empty());
+    }
+
+    #[test]
+    fn conversation_items_update_in_place_and_read_after_a_seq() {
+        let s = store();
+        let it = |id: &str, at: i64, body: &str| (id.to_owned(), at, body.to_owned());
+        assert_eq!(s.put_items("shop", "eng", "s1", &[it("u1", 1, "hi"), it("t1", 2, "running")]).unwrap(), 2);
+        assert_eq!(s.put_items("shop", "eng", "s1", &[it("t1", 2, "done")]).unwrap(), 3);
+        let before = s.total_changes();
+        assert_eq!(s.put_items("shop", "eng", "s1", &[it("u1", 1, "hi"), it("t1", 2, "done")]).unwrap(), 3, "read again: nothing new");
+        assert_eq!(s.total_changes(), before);
+        assert_eq!(s.items("shop", "eng", "s1", 0, 100).unwrap(), vec![(1, "hi".into()), (3, "done".into())]);
+        assert_eq!(s.items("shop", "eng", "s1", 1, 100).unwrap(), vec![(3, "done".into())], "only what changed since seq 1");
+        s.put_items("shop", "eng", "s2", &[it("u9", 9, "new session")]).unwrap();
+        assert_eq!(s.last_conversation("shop", "eng").unwrap().as_deref(), Some("s2"));
+        assert_eq!(s.items("shop", "eng", "s1", 0, 1).unwrap(), vec![(3, "done".into())], "the latest when limited");
+        assert!(s.items("shop", "pm", "s1", 0, 100).unwrap().is_empty());
     }
 
     #[test]

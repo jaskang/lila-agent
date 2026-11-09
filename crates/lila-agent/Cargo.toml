@@ -1,0 +1,11 @@
+[package]
+name = "lila-agent"
+description = "Agent runtimes behind one conversation model: events, items, and each runtime's translation into them."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

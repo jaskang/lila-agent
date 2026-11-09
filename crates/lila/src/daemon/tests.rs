@@ -1953,3 +1953,59 @@ fn a_small_fix_goes_ahead_without_asking_when_the_source_allows() {
     w.ok(Some("owner"), "triage", json!({"id": "T2", "decision": "fix", "size": "l", "why": "a rewrite"}));
     assert_eq!(w.inbox_kinds(), ["triage"]);
 }
+
+// ---------------- conversations (architecture v3) ----------------
+
+#[test]
+fn a_claude_members_transcript_becomes_its_conversation() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    let sid = w.d.projects["shop"].live["owner"].session.clone().expect("Lila picked the session id");
+    let file = crate::sessions::claude_file(&w.d.sources, &w.repo.to_string_lossy(), &sid);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let task = json!({"type": "user", "uuid": "u1", "promptId": "p1", "timestamp": "2026-11-09T08:00:00.000Z", "message": {"content": "<lila task=\"T1\" from=\"human\">\nShip login\n</lila>"}});
+    let call = json!({"type": "assistant", "uuid": "a1", "timestamp": "2026-11-09T08:00:01.000Z", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "lila task start T1"}}]}});
+    let result = json!({"type": "user", "uuid": "u2", "timestamp": "2026-11-09T08:00:02.000Z", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "started"}]}}).to_string();
+    // The CLI is mid-way through writing the result line.
+    std::fs::write(&file, format!("{task}\n{call}\n{}", &result[..20])).unwrap();
+    w.d.process_spool(w.now);
+    let r = w.ok(None, "conversation.read", json!({"member": "owner"}));
+    assert_eq!((r["session"].as_str(), r["caps"]["gui"].as_bool()), (Some(sid.as_str()), Some(true)));
+    let kinds: Vec<(&str, &str)> = r["items"].as_array().unwrap().iter().map(|i| (i["kind"].as_str().unwrap(), i["state"].as_str().unwrap())).collect();
+    assert_eq!(kinds, [("user_message", "done"), ("tool_call", "running")]);
+    assert_eq!((r["items"][0]["from"].as_str(), r["items"][0]["task"].as_str()), (Some("lila"), Some("T1")));
+    let seen = r["seq"].as_i64().unwrap();
+
+    let reply = json!({"type": "assistant", "uuid": "a2", "timestamp": "2026-11-09T08:00:03.000Z", "message": {"content": [{"type": "text", "text": "Started."}]}});
+    let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+    std::io::Write::write_all(&mut f, format!("{}\n{reply}\n", &result[20..]).as_bytes()).unwrap();
+    w.d.process_spool(w.now);
+    let r = w.ok(None, "conversation.read", json!({"member": "owner", "after": seen}));
+    let got: Vec<(&str, &str)> = r["items"].as_array().unwrap().iter().map(|i| (i["id"].as_str().unwrap(), i["state"].as_str().unwrap())).collect();
+    assert_eq!(got, [("t1", "done"), ("a2", "done")], "only what changed: the call finished, then the reply");
+
+    // Read again after a restart: nothing changes, nothing is announced.
+    let before = w.d.store.total_changes();
+    w.d.tails.clear();
+    w.d.process_spool(w.now);
+    assert_eq!(w.d.store.total_changes(), before);
+}
+
+#[test]
+fn the_person_writes_to_a_member_unless_it_waits_on_a_dialog() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    w.ok(None, "conversation.send", json!({"member": "engineer", "text": "  what are you on?  "}));
+    assert_eq!(w.sends_to("engineer").last().map(String::as_str), Some("what are you on?"));
+    w.status("engineer", "blocked");
+    let err = w.call(None, "conversation.send", json!({"member": "engineer", "text": "yes"})).unwrap_err();
+    assert!(err.to_string().contains("waiting on its terminal"), "{err:#}");
+    assert!(w.call(None, "conversation.send", json!({"member": "engineer", "text": "  "})).is_err());
+    // Codex keeps its terminal for now: no conversation is drawn for it.
+    let tester = w.ok(None, "conversation.read", json!({"member": "tester"}));
+    assert_eq!(tester["caps"]["gui"], false);
+    let status = w.ok(None, "status", json!({}));
+    assert_eq!(status["members"].as_array().unwrap().iter().find(|m| m["id"] == "owner").unwrap()["caps"]["tui"], true);
+}

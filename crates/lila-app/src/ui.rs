@@ -415,6 +415,7 @@ impl LilaApp {
                             .tooltip(move |window, cx| gpui::component::tooltip::Tooltip::new(spec.clone()).build(window, cx)),
                     )
                     .child(style::status_pill(&s(m, "status"), cx))
+                    .when(m["caps"]["gui"] == true && m["caps"]["tui"] == true, |d| d.child(self.view_switch(m, cx)))
                     .when(m["stale"] == true, |d| {
                         let id = id.clone();
                         d.child(Button::new("restart-member").small().small_button().outline().rounded_full().text_color(style::yellow()).icon(IconName::RefreshCw).label("重启").tooltip("设置改过了：用新设置重启，当前对话会丢失").on_click(cx.listener(move |this, _, _, cx| {
@@ -476,7 +477,10 @@ impl LilaApp {
         let address = member.as_ref().map(|m| s(m, "terminal")).filter(|a| !a.is_empty());
         let mut terminal_view = None;
         let empty = || v_flex().flex_1().items_center().justify_center();
+        // Shown as its conversation (the default where Lila can draw one), else its terminal.
+        let gui = member.as_ref().filter(|m| self.shows_gui(m)).cloned();
         let body: AnyElement = match (address, &self.core_error) {
+            _ if gui.is_some() => self.conversation_view(gui.as_ref().unwrap(), window, cx),
             (_, Some(e)) => placeholder(e.clone(), cx).into_any_element(),
             (Some(addr), None) => match self.terminal(&addr, window, cx) {
                 Some(view) => {

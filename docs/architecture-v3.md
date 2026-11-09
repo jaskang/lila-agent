@@ -407,3 +407,22 @@ CREATE INDEX conv_items_seq ON conv_items(project, member, seq);
 - `session/new` 返回 `sessionId` 和 `configOptions`：`mode`（default、plan）以及 `model`，可选的模型就是 omp 能用的全部模型（本机经 magpie 管理，比如 `magpie/codex/gpt-6.1-sol`、`magpie/claude/…`）。
 - `session/request_permission` 带 `toolCall`（`title`、`kind: "execute"`、`rawInput.command`）和标准的四个选项；回复 `{"outcome":{"outcome":"selected","optionId":…}}`。
 - 更新：`agent_message_chunk`（带 `messageId`）、`tool_call`、`tool_call_update`（从 pending 到 in_progress 再到 completed，`rawOutput.content`）、`usage_update`（`size`、`used`、`cost`）、`available_commands_update`、`session_info_update`。`session/prompt` 返回 `stopReason` 和 `usage`。
+
+## 15. P1 记录：Claude 的对话视图（2026-11-09）
+
+**做了什么**
+- 新 crate `lila-agent`：`model.rs`（条目：用户消息（来自你或 Lila、带任务号）、成员消息、思考、工具调用（种类、标题、输出、diff）；`Caps`），`claude.rs`（会话记录解析：逐行读，工具调用先是 running，结果回来改成 done/failed 并带上输出和 `structuredPatch` 变成的 diff；跳过 `isMeta`、`isSidechain`、不认识的行；空的 thinking 不显示）。
+- 存储：`conv_items(project, member, session, item, seq, at_ms, body)`，按成员递增的 seq；内容没变的条目不改（lilad 重启后重读不会产生变化，也不会让窗口白刷新）。
+- lilad：`daemon/conversation.rs`。spool 那一拍（250ms）跟读运行中 Claude 成员的会话记录（从上次的偏移读，半行留到下次）；`conversation.read {member, after, session}`、`conversation.send {member, text}`（打进终端；成员卡在对话框时拒绝）；`status` 的成员带 `caps`。
+- 窗口：选中成员默认显示对话视图；标题行的对话/终端两段切换（按成员记在 `app-views.json`）；输入框 ⌘↩ 发送。规范写进 DESIGN.md 的 Conversation。
+
+**真跑**（空项目，Haiku）
+- engineer 做完一个小任务：对话里是「T1 Create hello.txt」、两次 Bash 调用、markdown 的回复；点 T1 在右边推进这个任务。
+- 通过 socket 发「hello.txt 里是什么？」：记成「你说的」，成员的回答跟着出现。
+- 切到终端：显示 Claude Code 的 TUI 和搜索按钮；切回对话。
+
+**发现并修好的**
+- Lila 投递的任务在会话记录里被包在 `<pasted_content id="…">…</pasted_content id="…">` 里（hc 用粘贴打字），开头不是 `<lila`，认不出是 Lila 派的：解析时先剥掉粘贴外壳。
+- markdown 的行内代码默认用 accent（亮蓝底）太抢眼：改成 Fill 底、正文色。
+
+**留到 P3**：逐字显示（`MessageDisplay` hook）、权限卡片、轮次的准确结束。

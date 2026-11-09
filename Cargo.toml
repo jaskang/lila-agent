@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lila-core", "crates/lila-store", "crates/hc-client", "crates/lila", "crates/ghostty-sys", "crates/lila-term", "crates/lila-app"]
+members = ["crates/lila-core", "crates/lila-agent", "crates/lila-store", "crates/hc-client", "crates/lila", "crates/ghostty-sys", "crates/lila-term", "crates/lila-app"]
 resolver = "3"
 
 [workspace.package]

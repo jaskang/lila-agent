@@ -19,6 +19,8 @@ impl<T: Terminals> Daemon<T> {
             "status" => self.status(&caller),
             "request.list" => self.request_list(&caller, params),
             "request.show" => self.request_show(&caller, params),
+            "conversation.read" => self.conversation_read(&caller, params),
+            "conversation.send" => self.conversation_send(&caller, params),
             "triage" => self.triage(&caller, params, now),
             "draft" => self.draft(&caller, params, now),
             "task.new" => self.task_new(&caller, params, now),
@@ -431,6 +433,7 @@ impl<T: Terminals> Daemon<T> {
                     "id": m.id, "role": m.role.file.name, "runtime": m.role.file.runtime.to_string(), "model": m.role.file.model,
                     "owner": m.is_owner, "terminal": live.terminal, "status": live.status.as_str(), "kind": live.kind, "msg": live.msg,
                     "task": current, "queued": queued, "stale": stale, "effort": m.role.file.effort,
+                    "caps": conversation::caps(m.role.file.runtime),
                     "context": contexts.get(&m.id).copied().flatten(),
                     "context_limit": if m.is_owner { proj.team.settings.pm_refresh_tokens } else { proj.team.settings.fresh_after_tokens },
                 })

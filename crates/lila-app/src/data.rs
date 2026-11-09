@@ -56,6 +56,8 @@ pub struct Snapshot {
     pub requests: Vec<Value>,
     /// `request.show` of the selected request: its tasks, history, inbox items.
     pub request: Option<Value>,
+    /// `conversation.read` of the shown member, when it is shown as its conversation.
+    pub conversation: Option<Value>,
     pub error: Option<String>,
 }
 
@@ -69,7 +71,7 @@ fn projects_from_db(paths: &Paths) -> anyhow::Result<Vec<Project>> {
     Ok(store.projects()?.into_iter().map(|p| Project { title: title(&p.cwd), missing: !std::path::Path::new(&p.cwd).join(".lila/project.toml").exists(), id: p.id, cwd: p.cwd }).collect())
 }
 
-pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>, request: Option<&str>) -> Snapshot {
+pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>, request: Option<&str>, conv: Option<&crate::conversation::ConvWant>) -> Snapshot {
     let mut snap = Snapshot { daemon: lila::client::is_running(paths), ..Default::default() };
     match projects_from_db(paths) {
         Ok(p) => snap.projects = p,
@@ -105,6 +107,9 @@ pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>, request:
     }
     if let Some(id) = task {
         snap.detail = call("task.show", json!({"id": id})).ok();
+    }
+    if let Some(c) = conv {
+        snap.conversation = call("conversation.read", json!({"member": c.member, "session": c.session, "after": c.after})).ok();
     }
     snap
 }
@@ -167,6 +172,22 @@ fn last_file(paths: &Paths) -> std::path::PathBuf {
 pub fn load_last(paths: &Paths) -> Option<String> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(last_file(paths)).ok()?).ok()?;
     v["selected"].as_str().map(String::from)
+}
+
+fn views_file(paths: &Paths) -> std::path::PathBuf {
+    paths.state.join("app-views.json")
+}
+
+/// Members shown as their terminal rather than their conversation ("project/member").
+pub fn load_views(paths: &Paths) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(views_file(paths)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["tui"].as_array().cloned()).into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect()
+}
+
+pub fn save_views(paths: &Paths, tui: &std::collections::HashSet<String>) {
+    let mut list: Vec<&String> = tui.iter().collect();
+    list.sort();
+    let _ = std::fs::create_dir_all(&paths.state);
+    let _ = std::fs::write(views_file(paths), json!({ "tui": list }).to_string());
 }
 
 pub fn save_last(paths: &Paths, selected: Option<&str>) {

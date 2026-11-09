@@ -3,6 +3,7 @@
 
 mod app;
 mod compose;
+mod conversation;
 mod data;
 mod detail;
 mod dialog;

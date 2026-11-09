@@ -80,6 +80,14 @@ pub struct LilaApp {
     pub removing: Option<data::Project>,
     /// The new-task form, while open.
     pub draft: Option<crate::compose::Draft>,
+    /// Members shown as their terminal instead of their conversation ("project/member").
+    pub tui: std::collections::HashSet<String>,
+    /// The shown member's conversation, as far as it was read.
+    pub conv: Option<crate::conversation::Conv>,
+    /// Tool calls opened to show their output.
+    pub conv_open: std::collections::HashSet<String>,
+    pub conv_scroll: ScrollHandle,
+    pub conv_input: Option<Entity<gpui::component::input::TextareaState>>,
     /// The box a project without requests opens with: a first request for the PM.
     pub ask: Option<Entity<gpui::component::input::TextareaState>>,
     /// A queued task being rewritten in the detail panel.
@@ -117,8 +125,8 @@ impl LilaApp {
         });
         let poll = cx.spawn_in(window, async move |this, cx| {
             loop {
-                let Ok((paths, selected, task, request)) = this.update(cx, |this, _| (this.paths.clone(), this.selected.clone(), this.task.clone(), this.request.clone())) else { return };
-                let snap = cx.background_executor().spawn(async move { data::fetch(&paths, selected.as_deref(), task.as_deref(), request.as_deref()) }).await;
+                let Ok((paths, selected, task, request, conv)) = this.update(cx, |this, _| (this.paths.clone(), this.selected.clone(), this.task.clone(), this.request.clone(), this.conv_want())) else { return };
+                let snap = cx.background_executor().spawn(async move { data::fetch(&paths, selected.as_deref(), task.as_deref(), request.as_deref(), conv.as_ref()) }).await;
                 if std::env::var_os("LILA_APP_DEBUG").is_some() {
                     eprintln!("[lila-app] {} refreshed {}: {} tasks", data::clock_ms(), snap.project.as_deref().unwrap_or("-"), snap.tasks.len());
                 }
@@ -154,7 +162,8 @@ impl LilaApp {
             });
         })
         .detach();
-        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, request: None, active: true, away_since: None, recap: None, recap_only: false, needs_seen: HashMap::new(), core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, task_back: Vec::new(), append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, ask: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
+        let tui = data::load_views(&paths);
+        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, request: None, active: true, away_since: None, recap: None, recap_only: false, needs_seen: HashMap::new(), core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, task_back: Vec::new(), append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, tui, conv: None, conv_open: Default::default(), conv_scroll: ScrollHandle::new(), conv_input: None, ask: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
         app.start_usage(window, cx);
         cx.observe_window_activation(window, |this, window, cx| this.activated(window.is_window_active(), cx)).detach();
         app
@@ -235,6 +244,9 @@ impl LilaApp {
         let shows = |v: &Option<Value>, id: Option<&str>| v.as_ref().and_then(|r| r["request"]["id"].as_str()) == id;
         if !shows(&snap.request, self.request.as_deref()) {
             snap.request = self.snap.request.take().filter(|r| shows(&Some(r.clone()), self.request.as_deref()));
+        }
+        if let Some(c) = snap.conversation.take() {
+            self.take_conv(c);
         }
         self.snap = snap;
         self.keep_a_request();
