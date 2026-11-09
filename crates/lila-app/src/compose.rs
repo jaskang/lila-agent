@@ -53,9 +53,11 @@ impl LilaApp {
         }
         let body = d.body.read(cx).value().to_string();
         let params = json!({"to": to, "title": title, "body": body, "parent": d.parent});
-        self.request("task.new", params, cx, |this, v, cx| {
+        let root = d.parent.is_none();
+        self.request("task.new", params, cx, move |this, v, cx| {
             this.draft = None;
-            this.show_task(s(&v, "id"), cx);
+            // A new request shows as one; a subtask is pushed over the task it is under.
+            if root { this.select_request(s(&v, "id"), cx) } else { this.show_task(s(&v, "id"), cx) }
         });
     }
 

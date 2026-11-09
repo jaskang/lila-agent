@@ -67,8 +67,10 @@ pub struct LilaApp {
     pub right_open: bool,
     /// A press on a top bar that becomes a window drag once the mouse moves.
     pub drag_armed: bool,
-    /// The task open in the detail panel.
+    /// The task open in the side panel, pushed over its request.
     pub task: Option<String>,
+    /// The tasks opened before it, the latest last: back goes to them, then to the request.
+    pub task_back: Vec<String>,
     append: Option<Entity<InputState>>,
     /// The task whose "cancel" was pressed once (press again to confirm).
     pub confirm_cancel: Option<String>,
@@ -150,7 +152,7 @@ impl LilaApp {
             });
         })
         .detach();
-        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, request: None, active: true, away_since: None, recap: None, recap_only: false, needs_seen: HashMap::new(), core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
+        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, request: None, active: true, away_since: None, recap: None, recap_only: false, needs_seen: HashMap::new(), core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, task_back: Vec::new(), append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
         app.start_usage(window, cx);
         cx.observe_window_activation(window, |this, window, cx| this.activated(window.is_window_active(), cx)).detach();
         app
@@ -313,6 +315,10 @@ impl LilaApp {
             self.request = Some(id);
             self.snap.request = None;
             self.refresh_now();
+        }
+        // The panel shows the request itself, not a task pushed over the last one.
+        if self.task.is_some() {
+            self.close_task(cx);
         }
         self.right_open = true;
         cx.notify();
@@ -497,9 +503,26 @@ impl LilaApp {
         .detach();
     }
 
-    /// Shows a task in the detail panel; its details load with the next poll (and now).
+    /// Pushes a task over the side panel; back returns to what was there.
     pub fn show_task(&mut self, id: String, cx: &mut Context<Self>) {
+        if let Some(prev) = self.task.clone().filter(|p| *p != id) {
+            self.task_back.push(prev);
+        }
+        self.open_task(id, cx);
+    }
+
+    /// One step back: the task opened before this one, else the request.
+    pub fn back_task(&mut self, cx: &mut Context<Self>) {
+        match self.task_back.pop() {
+            Some(prev) => self.open_task(prev, cx),
+            None => self.close_task(cx),
+        }
+    }
+
+    /// Shows a task in the side panel; its details load with the next poll (and now).
+    fn open_task(&mut self, id: String, cx: &mut Context<Self>) {
         self.draft = None;
+        self.right_open = true;
         if self.task.as_deref() != Some(&id) {
             self.snap.detail = None;
             self.confirm_cancel = None;
@@ -531,6 +554,7 @@ impl LilaApp {
 
     pub fn close_task(&mut self, cx: &mut Context<Self>) {
         self.task = None;
+        self.task_back.clear();
         self.snap.detail = None;
         self.confirm_cancel = None;
         self.rewrite = None;
@@ -576,8 +600,6 @@ impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let compose = self.compose_panel(cx);
         let dialog = self.settings_dialog(cx).or_else(|| self.prefs_dialog(cx)).or_else(|| self.wizard_dialog(cx)).or_else(|| self.remove_dialog(cx));
-        let detail = if compose.is_some() { None } else { self.task.as_ref().and(self.snap.detail.clone()) };
-        let loading = compose.is_none() && self.task.is_some() && detail.is_none();
         let overlay = |d: Div| crate::ui::drawer_frame(d, 600.);
         let pad = px(crate::style::GAP);
         if window.focused(cx).is_none() {
@@ -618,8 +640,6 @@ impl Render for LilaApp {
                 ),
             )
             .children(compose.map(|c| overlay(div()).child(c)))
-            .when_some(detail, |d, t| d.child(self.detail_panel(t, window, cx)))
-            .when(loading, |d| d.child(overlay(div()).flex().items_center().justify_center().child(gpui::component::spinner::Spinner::new().color(crate::style::muted()))))
             .children(dialog)
     }
 }
@@ -659,9 +679,14 @@ impl LilaApp {
             cx.stop_propagation();
             return;
         }
-        if k.key == "escape" && (self.task.is_some() || self.draft.is_some()) {
+        if k.key == "escape" && self.draft.is_some() {
             self.draft = None;
-            self.close_task(cx);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if k.key == "escape" && self.task.is_some() {
+            self.back_task(cx);
             cx.stop_propagation();
             return;
         }

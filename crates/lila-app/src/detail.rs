@@ -252,33 +252,57 @@ impl LilaApp {
         let rewrite = self.rewrite_form(&id, cx);
         let rewriting = rewrite.is_some();
 
-        crate::ui::drawer_frame(v_flex(), 600.)
-            .id("task-detail")
+        // Where back goes: the task opened before, else the request.
+        let back = match self.task_back.last() {
+            Some(prev) => prev.clone(),
+            None => self.snap.request.as_ref().map(|v| format!("{} {}", s(&v["request"], "id"), s(&v["request"], "title"))).unwrap_or_else(|| "请求".to_owned()),
+        };
+        style::card()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
             .text_color(style::fg())
             .child(
                 h_flex()
-                    .h(px(48.))
-                    .pl(px(18.))
-                    .pr(px(10.))
+                    .h(px(40.))
+                    .px(px(10.))
                     .gap_2()
                     .flex_none()
                     .border_b_1()
                     .border_color(style::divider())
+                    .child(
+                        h_flex()
+                            .id("detail-back")
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .px_1()
+                            .py(px(3.))
+                            .rounded(px(style::R_CTL))
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(muted())
+                            .hover(|d| d.bg(style::hover()).text_color(style::fg()))
+                            .child(gpui::component::Icon::new(IconName::ChevronLeft).size(px(14.)).flex_none())
+                            .child(div().min_w_0().truncate().child(back))
+                            .tooltip(|window, cx| gpui::component::tooltip::Tooltip::new("返回 (Esc)").build(window, cx))
+                            .on_click(cx.listener(|this, _, _, cx| this.back_task(cx))),
+                    )
                     .child(state_tag(&state, state_label(&state)))
-                    .child(div().font_semibold().child(id.clone()))
-                    .child(div().flex_1())
-                    .child(Button::new("detail-close").ghost().xsmall().icon(IconName::Close).tooltip("关闭 (Esc)").on_click(cx.listener(|this, _, _, cx| this.close_task(cx)))),
+                    .child(div().text_xs().font_semibold().child(id.clone())),
             )
             .child(
                 v_flex()
+                    .id("task-detail")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scrollbar()
-                    .px_5()
-                    .pt_5()
-                    .pb_6()
-                    .gap_5()
-                    .child(v_flex().gap(px(6.)).child(div().text_size(px(19.)).font_semibold().line_height(relative(1.3)).child(s(&t, "title"))).child(meta))
+                    .px_4()
+                    .pt_4()
+                    .pb_5()
+                    .gap_4()
+                    .child(v_flex().gap(px(6.)).child(div().text_size(px(15.)).font_semibold().line_height(relative(1.35)).child(s(&t, "title"))).child(meta))
                     .child(actions)
                     .when_some(outcome, |d, (accent, text)| {
                         d.child(div().px_3().py(px(10.)).rounded(px(8.)).bg(accent.opacity(0.12)).text_color(style::tint(accent, 0.4)).text_size(px(13.)).child(text))

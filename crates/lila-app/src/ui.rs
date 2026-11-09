@@ -533,7 +533,14 @@ impl LilaApp {
             let id = s(i, "id");
             self.answers.entry(id).or_insert_with(|| cx.new(|cx| gpui::component::input::InputState::new(window, cx).placeholder(placeholder)));
         }
-        let panel = self.request_panel(cx);
+        // A task pushed over the request, else the request.
+        let panel = match self.task.is_some() {
+            true => Some(match self.snap.detail.clone() {
+                Some(t) => self.detail_panel(t, window, cx).into_any_element(),
+                None => style::card().flex_1().flex().items_center().justify_center().child(gpui::component::spinner::Spinner::new().color(muted())).into_any_element(),
+            }),
+            false => self.request_panel(cx),
+        };
         v_flex()
             .size_full()
             .pl(px(3.))
