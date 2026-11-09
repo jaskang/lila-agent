@@ -8,6 +8,7 @@ pub mod flow;
 pub mod inbox;
 pub mod message;
 pub mod prompt;
+pub mod request;
 pub mod route;
 pub mod runtime;
 pub mod task;

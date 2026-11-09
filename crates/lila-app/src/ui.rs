@@ -1,7 +1,7 @@
 //! How the window looks: a graphite glass window with three cards. The
-//! sidebar holds the projects, then the team as a tree under the PM; the
-//! center card is a header row and the shown member's terminal; the overview
-//! holds what needs you, the task board and activity.
+//! sidebar holds the projects, then the team as a tree under the PM (the
+//! person's assistant); the center card is a header row and the requests, or
+//! the chosen member's terminal; the right card is the selected request (`requests`).
 
 use crate::app::LilaApp;
 use crate::data;
@@ -78,19 +78,6 @@ pub fn avatar(name: &str, size: f32, _cx: &App) -> Div {
 /// A section heading in the sidebar (项目, 成员).
 fn label(text: impl Into<SharedString>) -> Div {
     div().text_xs().font_semibold().text_color(muted()).child(text.into())
-}
-
-/// A card's title row: small title, count, then actions on the right.
-fn card_head(title: &'static str, count: usize) -> Div {
-    h_flex()
-        .h(px(42.))
-        .flex_none()
-        .pl_4()
-        .pr_3()
-        .gap(px(6.))
-        .child(div().text_size(px(13.)).font_semibold().text_color(gpui::Hsla::from(rgba(0xebebf5cc))).child(title))
-        .when(count > 0, |d| d.child(div().text_xs().text_color(muted2()).child(count.to_string())))
-        .child(div().flex_1())
 }
 
 /// A sidebar row: a soft highlight when chosen or hovered.
@@ -202,7 +189,7 @@ impl LilaApp {
                     .child(
                         h_flex()
                             .gap(px(6.))
-                            .child(div().text_size(px(13.)).font_medium().child(id.clone()))
+                            .child(div().text_size(px(13.)).font_medium().child(if m["owner"] == true { "助理".to_owned() } else { id.clone() }))
                             .when(stale, |d| d.child(dot(style::yellow())))
                             .when(queued > 0, |d| d.child(div().text_xs().text_color(muted2()).child(format!("+{queued}")))),
                     )
@@ -386,6 +373,8 @@ impl LilaApp {
         let (open, inbox) = (self.right_open, self.snap.inbox.len());
         let project = self.project();
         let paused = self.snap.status.as_ref().is_some_and(|s| s["paused"] == true);
+        // A team that is not running, with requests to show: started from here.
+        let running_none = self.snap.status.is_some() && !self.team_running() && !self.snap.requests.is_empty();
         let tool = |id: &'static str, icon: IconName, tip: &'static str| Button::new(id).ghost().xsmall().icon(icon).tooltip(tip);
         drag_bar(h_flex().id("project-bar"), cx)
             .h(px(BAR))
@@ -396,9 +385,21 @@ impl LilaApp {
             .when(project.is_some(), |d| d.border_b_1().border_color(style::divider()))
             .whitespace_nowrap()
             .when_some(project, |d, p| {
-                d.child(avatar(&p.id, 20., cx))
-                    .child(div().flex_none().max_w(px(220.)).truncate().text_size(px(15.)).font_semibold().child(p.label()))
-                    .when(paused, |d| d.child(style::tag(style::yellow(), "已暂停")))
+                // In a terminal, the project's name leads back to the requests.
+                let back = self.member.is_some();
+                d.child(
+                    h_flex()
+                        .id("project-name")
+                        .gap_2()
+                        .when(back, |d| d.cursor_pointer().child(Icon::new(IconName::ChevronLeft).size(px(14.)).text_color(muted())).tooltip(|window, cx| gpui::component::tooltip::Tooltip::new("请求 (⌘[)").build(window, cx)))
+                        .child(avatar(&p.id, 20., cx))
+                        .child(div().flex_none().max_w(px(220.)).truncate().text_size(px(15.)).font_semibold().child(p.label()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.member = None;
+                            cx.notify();
+                        })),
+                )
+                .when(paused, |d| d.child(style::tag(style::yellow(), "已暂停")))
             })
             .when_some(member, |d, m| {
                 let id = s(m, "id");
@@ -410,7 +411,7 @@ impl LilaApp {
                             .gap_2()
                             .min_w_0()
                             .child(style::cli_tile(&s(m, "runtime"), 20.))
-                            .child(div().text_size(px(13.)).font_medium().child(id.clone()))
+                            .child(div().text_size(px(13.)).font_medium().child(if m["owner"] == true { "助理".to_owned() } else { id.clone() }))
                             .tooltip(move |window, cx| gpui::component::tooltip::Tooltip::new(spec.clone()).build(window, cx)),
                     )
                     .child(style::status_pill(&s(m, "status"), cx))
@@ -422,6 +423,9 @@ impl LilaApp {
                     })
             })
             .child(div().flex_1())
+            .when(member.is_none() && running_none, |d| {
+                d.child(Button::new("start-team").small().small_button().primary().icon(IconName::Play).label("启动团队").on_click(cx.listener(|this, _, _, cx| this.act("project.up", json!({}), true, cx))))
+            })
             .when_some(member, |d, m| {
                 let id = s(m, "id");
                 d.when_some(m["context"].as_u64().zip(m["context_limit"].as_u64()), |d, (n, limit)| d.child(context_chip(n, limit)))
@@ -448,6 +452,7 @@ impl LilaApp {
                     view.update(cx, |view, cx| view.open_search(window, cx));
                 }))
             })
+            .when(self.project().is_some() && self.member.is_none(), |d| d.child(tool("bar-new", IconName::Plus, "新需求 (⌘N)").on_click(cx.listener(|this, _, window, cx| this.compose(None, None, window, cx)))))
             .when(self.project().is_some(), |d| d.child(tool("bar-settings", IconName::Settings2, "项目设置 (⇧⌘,)").on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))))
             .when(self.project().is_some(), |d| d.child(
                 div().relative().child(
@@ -482,6 +487,8 @@ impl LilaApp {
             },
             (None, None) if self.snap.projects.is_empty() => empty().child(Button::new("new-project-big").primary().icon(IconName::Plus).label("新建项目").on_click(cx.listener(|this, _, window, cx| this.new_project(window, cx)))).into_any_element(),
             (None, None) if self.project().is_none() => empty().into_any_element(),
+            (None, None) if self.member.is_none() && !self.snap.requests.is_empty() => self.request_list(cx),
+            (None, None) if self.member.is_none() && self.team_running() => empty().into_any_element(),
             (None, None) => empty().child(Button::new("start-big").primary().icon(IconName::Play).label("启动团队").on_click(cx.listener(|this, _, _, cx| this.act("project.up", json!({}), true, cx)))).into_any_element(),
         };
         let header = self.header(member.as_ref(), terminal_view, cx).into_any_element();
@@ -525,92 +532,22 @@ impl LilaApp {
             let id = s(i, "id");
             self.answers.entry(id).or_insert_with(|| cx.new(|cx| gpui::component::input::InputState::new(window, cx).placeholder(placeholder)));
         }
-        let inbox = self.snap.inbox.len();
-        let open_tasks = self.snap.tasks.iter().filter(|t| !matches!(t["state"].as_str(), Some("done" | "cancelled"))).count();
-        let inbox_el = self.inbox_list(cx).into_any_element();
-        let tasks_el = self.task_board(cx).into_any_element();
-        let has_project = self.project().is_some();
+        let panel = self.request_panel(cx);
         v_flex()
             .size_full()
             .pl(px(3.))
             .gap(px(style::GAP))
             .when_some(self.snap.error.clone(), |d, n| d.child(div().p_2().rounded(px(10.)).bg(style::yellow().opacity(0.15)).text_xs().child(n)))
-            .when(inbox > 0, |d| d.child(card().flex_none().max_h(relative(0.45)).flex().flex_col().child(card_head("需要你", inbox)).child(inbox_el)))
-            .child(
-                card()
-                    .flex_1()
-                    .min_h(px(170.))
-                    .flex()
-                    .flex_col()
-                    .child(card_head("任务", open_tasks).when(has_project, |d| d.child(style::link("task-new", "新建", true).text_size(px(13.)).on_click(cx.listener(|this, _, window, cx| this.compose(None, None, window, cx))))))
-                    .child(tasks_el),
-            )
+            .children(panel)
     }
 
-    fn inbox_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.snap.inbox.clone();
-        let cards: Vec<AnyElement> = items.into_iter().enumerate().map(|(n, item)| self.inbox_card(item, n > 0, cx).into_any_element()).collect();
-        v_flex().id("inbox-list").min_h_0().overflow_y_scrollbar().children(cards)
-    }
-
-    fn task_board(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tasks = self.snap.tasks.clone();
-        // Open flow runs by their first task: where each is now.
-        let runs: Vec<Value> = self.snap.status.as_ref().and_then(|v| v["runs"].as_array().cloned()).unwrap_or_default();
-        let flow_now = |t: &Value| -> Option<String> {
-            let anchor = t["run"].as_str()?;
-            let r = runs.iter().find(|r| r["anchor"] == anchor)?;
-            let round = r["round"].as_u64().unwrap_or(0);
-            Some(format!("{}{}", crate::detail::step_label(r["step"].as_str()?), if round > 0 { format!(" · 返工 {round} 次") } else { String::new() }))
-        };
-        let group = |title: &'static str, states: &[&str], limit: usize| {
-            let rows: Vec<Value> = tasks.iter().rev().filter(|t| states.contains(&t["state"].as_str().unwrap_or(""))).take(limit).cloned().collect();
-            (title, rows)
-        };
-        let groups = [group("进行中", &["delivered", "in_progress"], 30), group("阻塞", &["blocked"], 30), group("排队", &["queued"], 30), group("最近完成", &["done"], 10)];
-        let sublabel = |t: String| div().text_size(px(11.)).font_semibold().text_color(muted2()).child(t);
-        v_flex()
-            .id("task-board")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scrollbar()
-            .px_2()
-            .pb(px(10.))
-            .gap_3()
-            .children(groups.into_iter().filter(|(_, rows)| !rows.is_empty()).map(|(title, rows)| {
-                v_flex()
-                    .gap(px(2.))
-                    .child(div().px_2().pt(px(2.)).pb_1().child(sublabel(title.into())))
-                    .children(rows.into_iter().map(|t| {
-                        let state = s(&t, "state");
-                        let id = s(&t, "id");
-                        let open = id.clone();
-                        let active = self.task.as_deref() == Some(id.as_str());
-                        let step = if state == "done" { None } else { flow_now(&t) };
-                        let place = step.unwrap_or_else(|| s(&t, "to"));
-                        h_flex()
-                            .id(SharedString::from(format!("board-{id}")))
-                            .h(px(32.))
-                            .px_2()
-                            .gap(px(10.))
-                            .rounded(px(style::R_CTL))
-                            .cursor_pointer()
-                            .when(active, |d| d.bg(style::accent()))
-                            .when(!active, |d| d.hover(|d| d.bg(style::hover())))
-                            .on_click(cx.listener(move |this, _, _, cx| this.show_task(open.clone(), cx)))
-                            .child(crate::detail::state_tag(&state, id.clone()))
-                            .child(div().flex_1().min_w_0().text_size(px(13.)).truncate().child(s(&t, "title")))
-                            .child(div().flex_none().max_w(px(120.)).truncate().text_xs().text_color(muted2()).child(place))
-                    }))
-            }))
-    }
-
-    fn inbox_card(&mut self, item: Value, divided: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn inbox_card(&mut self, item: Value, divided: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let id = s(&item, "id");
         let kind = s(&item, "kind");
         let member = item["member"].as_str().map(String::from);
         let (icon, accent, label_text) = match kind.as_str() {
-            "question" => (IconName::CircleAlert, style::yellow(), "PM 在问你"),
+            "question" => (IconName::CircleAlert, style::yellow(), "助理在问你"),
+            "merge" => (IconName::TriangleAlert, style::red(), "合并没成功"),
             "terminal" => (IconName::SquareTerminal, style::red(), "终端在等你"),
             "startup" => (IconName::TriangleAlert, style::red(), "启动卡住"),
             "stalled" => (IconName::TriangleAlert, style::yellow(), "没有回应"),
@@ -642,9 +579,10 @@ impl LilaApp {
                     .when_some(item["task"].as_str().map(String::from), |d, t| d.child(div().text_xs().child(crate::detail::task_link(&t, &format!("inbox-{card_id}"), cx)))),
             )
             .child(div().text_size(px(13.)).line_height(relative(1.55)).child({
-                // A review's step-by-step evidence is the task's history: the card keeps the outcome.
+                // A review keeps its outcome: the decisions, the unchecked points and each
+                // step's evidence are in the request's panel below it.
                 let text = s(&item, "text");
-                if review { text.split("\n· ").next().unwrap_or_default().to_owned() } else { text }
+                if review { text.lines().next().unwrap_or_default().to_owned() } else { text }
             }))
             .when(!options.is_empty() && !review, |d| {
                 d.child(h_flex().gap(px(6.)).flex_wrap().children(options.into_iter().enumerate().map(|(n, opt)| {

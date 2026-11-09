@@ -52,6 +52,10 @@ pub struct Snapshot {
     pub inbox: Vec<Value>,
     /// `task.show` of the open task: body, children, events, files.
     pub detail: Option<Value>,
+    /// `request.list`: every request and whose move it is, in the window's order.
+    pub requests: Vec<Value>,
+    /// `request.show` of the selected request: its tasks, history, inbox items.
+    pub request: Option<Value>,
     pub error: Option<String>,
 }
 
@@ -65,7 +69,7 @@ fn projects_from_db(paths: &Paths) -> anyhow::Result<Vec<Project>> {
     Ok(store.projects()?.into_iter().map(|p| Project { title: title(&p.cwd), missing: !std::path::Path::new(&p.cwd).join(".lila/project.toml").exists(), id: p.id, cwd: p.cwd }).collect())
 }
 
-pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>) -> Snapshot {
+pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>, request: Option<&str>) -> Snapshot {
     let mut snap = Snapshot { daemon: lila::client::is_running(paths), ..Default::default() };
     match projects_from_db(paths) {
         Ok(p) => snap.projects = p,
@@ -94,10 +98,24 @@ pub fn fetch(paths: &Paths, selected: Option<&str>, task: Option<&str>) -> Snaps
     }
     snap.tasks = call("task.ls", json!({"all": true})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
     snap.inbox = call("inbox", json!({})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    snap.requests = call("request.list", json!({})).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    // An inbox item's id names no request: it is shown from `inbox`.
+    if let Some(id) = request.filter(|id| snap.requests.iter().any(|r| r["id"] == *id)) {
+        snap.request = call("request.show", json!({"id": id})).ok();
+    }
     if let Some(id) = task {
         snap.detail = call("task.show", json!({"id": id})).ok();
     }
     snap
+}
+
+/// A macOS notification, through the system's own `osascript`.
+pub fn notify(title: &str, body: &str) {
+    let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let script = format!("display notification {} with title \"Lila\" subtitle {}", quote(body), quote(title));
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("osascript").arg("-e").arg(script).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    });
 }
 
 /// Opens a file (relative paths from the project folder) with the system's default app.

@@ -22,6 +22,17 @@ pub fn claude_file(src: &Sources, cwd: &str, id: &str) -> PathBuf {
     src.claude.join("projects").join(claude_folder(cwd)).join(format!("{id}.jsonl"))
 }
 
+/// Whether a session's record (`file`) was made in `cwd`: a session goes on
+/// only in the folder it started in (Claude Code looks for it by folder).
+pub fn recorded_in(file: &str, runtime: &str, cwd: &str) -> bool {
+    let path = Path::new(file);
+    if runtime == "codex" {
+        let head = read_head(path, 64 * 1024);
+        return head.lines().next().and_then(|l| serde_json::from_str::<Value>(l).ok()).is_some_and(|v| v["payload"]["cwd"].as_str() == Some(cwd));
+    }
+    path.parent().and_then(|d| d.file_name()).is_some_and(|d| d.to_string_lossy() == crate::usage::claude_folder(cwd))
+}
+
 /// The Codex rollout of `member`'s session in `cwd` started at or after `after_ms`:
 /// its id and file. The newest such one wins.
 pub fn find_codex(src: &Sources, project: &str, member: &str, cwd: &str, after_ms: i64) -> Option<(String, PathBuf)> {

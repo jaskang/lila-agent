@@ -1536,3 +1536,215 @@ fn a_removed_project_is_stopped_and_forgotten() {
     w.up();
     assert!(w.d.store.tasks("shop").unwrap().is_empty());
 }
+
+// ---------------- worktree slots ----------------
+
+/// A project that is a git repository with a commit: chains work in worktree slots.
+fn git_world(settings: &str) -> World {
+    let mut w = world_with(&manual(&format!("fresh_session = false\n{settings}")));
+    // Members' programs, and git.
+    w.d.path_env = format!("{}:{}", w.d.path_env, std::env::var("PATH").unwrap_or_default());
+    crate::worktree::tests::repo(&w.repo);
+    w.up();
+    w.all_idle();
+    w
+}
+
+impl World {
+    fn slot(&self, n: usize) -> PathBuf {
+        self.d.paths.worktrees("shop").join(n.to_string())
+    }
+
+    /// The folder a member's CLI was last started in.
+    fn started_in(&self, member: &str) -> String {
+        let t = self.terminal(member);
+        let i: usize = t.trim_start_matches('t').parse().unwrap();
+        self.d.term.runs[i - 1]["cwd"].as_str().unwrap().to_owned()
+    }
+
+    /// Makes the commits lilad asked for, for real, and hands the results back.
+    fn make_commits(&mut self) -> Vec<CommitResult> {
+        let jobs = self.d.take_commits();
+        jobs.iter()
+            .map(|j| {
+                let r = crate::commit::run(j);
+                self.now += 1000;
+                self.d.on_commit_done("shop", &j.chain, &r, self.now);
+                r
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn chains_work_side_by_side_in_worktrees_and_land_as_one_commit_each() {
+    let mut w = git_world("");
+    let sh = |dir: &Path, args: &[&str]| crate::worktree::tests::sh(dir, args);
+    w.ok(None, "task.new", json!({"to": "architect", "title": "Plan A"}));
+    w.ok(None, "task.new", json!({"to": "engineer", "title": "Build B"}));
+    // Each chain took a worktree; its member starts again there.
+    assert_eq!(w.started_in("architect"), w.slot(1).to_string_lossy());
+    assert_eq!(w.started_in("engineer"), w.slot(2).to_string_lossy());
+    let arch = &w.d.term.runs[w.d.term.runs.len() - 2];
+    assert_eq!(arch["env"]["LILA_ROOT"], w.slot(1).to_string_lossy().as_ref());
+    assert_eq!(sh(&w.slot(1), &["symbolic-ref", "--short", "HEAD"]), "lila/T1");
+    // Every worktree is taken: a third chain waits, even for an idle member.
+    let held = w.ok(None, "task.new", json!({"to": "tester", "title": "Check C"}));
+    assert!(held["held"].as_str().unwrap().contains("every worktree is taken (chains T1, T2)"), "{held}");
+    let status = w.ok(None, "status", json!({}));
+    assert_eq!((status["held_for_worktree"].as_u64(), status["worktrees"][1]["chain"].as_str()), (Some(1), Some("T2")));
+
+    w.status("architect", "idle");
+    w.status("engineer", "idle");
+    assert_eq!((w.state("T1"), w.state("T2")), (TaskState::Delivered, TaskState::Delivered));
+    assert!(w.slot(1).join(".lila/tasks/T1.md").exists(), "the task file is where the member reads it");
+    // They work at once without seeing each other's files; the person's folder is untouched.
+    std::fs::write(w.slot(1).join("plan.md"), "plan\n").unwrap();
+    std::fs::write(w.slot(2).join("b.rs"), "fn b() {}\n").unwrap();
+    assert!(!w.slot(2).join("plan.md").exists() && !w.repo.join("plan.md").exists());
+
+    w.ok(Some("architect"), "task.done", json!({"id": "T1", "summary": "planned"}));
+    w.status("architect", "idle");
+    let q = w.ok(None, "inbox", json!({}))[0]["id"].as_str().unwrap().to_owned();
+    w.ok(None, "answer", json!({"id": q, "text": "通过"}));
+    let jobs = w.d.commits.clone();
+    assert_eq!((jobs[0].cwd.clone(), jobs[0].merge_into.clone()), (w.slot(1), Some(w.repo.clone())));
+    let CommitResult::Committed(sha) = &w.make_commits()[0] else { panic!("not committed") };
+    // One commit on the project's branch; the slot is free and goes to the waiting chain.
+    assert_eq!(&sh(&w.repo, &["rev-parse", "--short", "HEAD"]), sha);
+    assert_eq!(sh(&w.repo, &["log", "-1", "--format=%s"]), "Plan A");
+    assert!(w.repo.join("plan.md").exists());
+    assert_eq!(sh(&w.repo, &["branch", "--list", "lila/T1"]), "");
+    assert_eq!(sh(&w.slot(1), &["symbolic-ref", "--short", "HEAD"]), "lila/T3");
+    assert_eq!(w.started_in("tester"), w.slot(1).to_string_lossy());
+    assert!(w.slot(1).join("plan.md").exists(), "a new chain starts from what was accepted");
+}
+
+#[test]
+fn work_the_pm_started_comes_to_the_person_and_cancelled_work_is_kept() {
+    let mut w = git_world("");
+    let sh = |dir: &Path, args: &[&str]| crate::worktree::tests::sh(dir, args);
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Tidy logs"}));
+    w.ok(Some("owner"), "task.new", json!({"to": "architect", "title": "Try an idea"}));
+    w.status("engineer", "idle");
+    w.status("architect", "idle");
+    std::fs::write(w.slot(1).join("log.rs"), "// tidy\n").unwrap();
+    std::fs::write(w.slot(2).join("idea.md"), "maybe\n").unwrap();
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "tidied"}));
+    w.ok(Some("owner"), "task.cancel", json!({"id": "T2", "reason": "not now"}));
+    w.now += 5000;
+    w.d.tick(w.now);
+    // The PM's chain changed code: the person sees it before it lands.
+    let inbox = w.ok(None, "inbox", json!({}));
+    assert_eq!((inbox[0]["kind"].as_str(), inbox[0]["task"].as_str()), (Some("review"), Some("T1")));
+    // The cancelled chain's work is on its branch; its worktree is free.
+    assert_eq!(sh(&w.repo, &["log", "-1", "--format=%s", "lila/T2"]), "Lila: T2 as it was when cancelled");
+    assert_eq!(w.d.projects["shop"].slots[1].chain, None);
+    w.ok(None, "answer", json!({"id": inbox[0]["id"]}));
+    assert!(matches!(w.make_commits()[0], CommitResult::Committed(_)));
+    assert!(w.repo.join("log.rs").exists() && !w.repo.join("idea.md").exists());
+    assert!(w.d.projects["shop"].slots.iter().all(|s| s.chain.is_none()));
+    // A chain that changed nothing just frees its worktree.
+    w.ok(None, "task.new", json!({"to": "architect", "title": "Look around"}));
+    w.status("architect", "idle");
+    w.ok(Some("architect"), "task.done", json!({"id": "T3", "summary": "nothing to change"}));
+    let q = w.ok(None, "inbox", json!({}))[0]["id"].as_str().unwrap().to_owned();
+    w.ok(None, "answer", json!({"id": q}));
+    assert_eq!(w.make_commits(), [CommitResult::Nothing]);
+    assert!(w.d.projects["shop"].slots.iter().all(|s| s.chain.is_none()));
+}
+
+#[test]
+fn accepted_work_that_conflicts_goes_to_the_pm_and_comes_back() {
+    let mut w = git_world("");
+    w.ok(None, "task.new", json!({"to": "architect", "title": "A"}));
+    w.ok(None, "task.new", json!({"to": "engineer", "title": "B"}));
+    w.status("architect", "idle");
+    w.status("engineer", "idle");
+    std::fs::write(w.slot(1).join("a.txt"), "from A\n").unwrap();
+    std::fs::write(w.slot(2).join("a.txt"), "from B\n").unwrap();
+    for (member, id) in [("architect", "T1"), ("engineer", "T2")] {
+        w.ok(Some(member), "task.done", json!({"id": id, "summary": "changed a"}));
+        w.status(member, "idle");
+    }
+    let cards: Vec<String> = w.ok(None, "inbox", json!({})).as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_owned()).collect();
+    w.ok(None, "answer", json!({"id": cards[0]}));
+    w.make_commits();
+    w.ok(None, "answer", json!({"id": cards[1]}));
+    assert_eq!(w.make_commits(), [CommitResult::Conflict(vec!["a.txt".into()])]);
+    let inbox = w.ok(None, "inbox", json!({}));
+    assert_eq!((inbox[0]["kind"].as_str(), inbox[0]["options"].clone()), (Some("merge"), json!(["交给助理", "重试"])));
+    assert!(inbox[0]["text"].as_str().unwrap().contains("a.txt"), "{inbox}");
+    assert_eq!(w.d.projects["shop"].slots[1].chain.as_deref(), Some("T2"), "the worktree keeps the work");
+    // Handed to the PM: a task in the same chain, which the person accepts again.
+    w.ok(None, "answer", json!({"id": inbox[0]["id"], "text": "交给助理"}));
+    let task = w.task("T3");
+    assert_eq!((task.to.as_str(), task.parent.as_deref()), ("owner", Some("T2")));
+    assert!(task.body.contains("conflicts with main in: a.txt"), "{}", task.body);
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Rebase B", "parent": "T3"}));
+    assert_eq!(w.state("T4"), TaskState::Delivered, "the engineer is still in B's worktree");
+    let sh = |dir: &Path, args: &[&str]| crate::worktree::tests::sh(dir, args);
+    // The engineer rebases and resolves.
+    let _ = crate::worktree::git(&w.slot(2), &w.d.path_env, &["rebase", "main"]);
+    std::fs::write(w.slot(2).join("a.txt"), "from A and B\n").unwrap();
+    sh(&w.slot(2), &["add", "a.txt"]);
+    let _ = std::process::Command::new("git").args(["rebase", "--continue"]).env("GIT_EDITOR", "true").current_dir(w.slot(2)).output();
+    w.ok(Some("engineer"), "task.done", json!({"id": "T4", "summary": "rebased"}));
+    w.ok(Some("owner"), "task.done", json!({"id": "T3", "summary": "resolved"}));
+    let card = w.ok(None, "inbox", json!({}))[0].clone();
+    assert_eq!((card["kind"].as_str(), card["task"].as_str()), (Some("review"), Some("T3")));
+    w.ok(None, "answer", json!({"id": card["id"]}));
+    assert!(matches!(w.make_commits()[0], CommitResult::Committed(_)));
+    assert_eq!(std::fs::read_to_string(w.repo.join("a.txt")).unwrap(), "from A and B\n");
+    assert_eq!(sh(&w.repo, &["log", "--format=%s"]), "B\nA\nfirst");
+}
+
+#[test]
+fn without_git_chains_share_the_folder() {
+    let mut w = world_with(&manual("fresh_session = false\n"));
+    w.d.path_env = format!("{}:{}", w.d.path_env, std::env::var("PATH").unwrap_or_default());
+    w.up();
+    assert!(w.d.projects["shop"].slots.is_empty());
+    assert!(w.ok(None, "status", json!({}))["worktrees"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn requests_say_whose_move_it_is() {
+    let mut w = git_world("");
+    w.ok(None, "task.new", json!({"to": "architect", "title": "Plan A"}));
+    w.ok(None, "task.new", json!({"to": "engineer", "title": "Build B"}));
+    w.ok(None, "task.new", json!({"to": "tester", "title": "Check C"}));
+    w.status("architect", "idle");
+    w.ok(Some("architect"), "task.done", json!({"id": "T1", "summary": "planned"}));
+    let list = w.ok(None, "request.list", json!({}));
+    let row = |id: &str| list.as_array().unwrap().iter().find(|r| r["id"] == id).cloned().unwrap();
+    assert_eq!(list.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect::<Vec<_>>(), ["T1", "T2", "T3"]);
+    assert_eq!((row("T1")["group"].as_str(), row("T1")["doing"]["inbox"].as_str(), row("T1")["slot"].as_u64()), (Some("needs_you"), Some("review"), Some(1)));
+    // Its member starts again in the chain's worktree; once ready, it has it.
+    assert_eq!((row("T2")["group"].as_str(), row("T2")["doing"]["hold"].as_str()), (Some("queued"), Some("starting")));
+    w.status("engineer", "idle");
+    let list = w.ok(None, "request.list", json!({}));
+    let t2 = list.as_array().unwrap().iter().find(|r| r["id"] == "T2").unwrap();
+    assert_eq!((t2["group"].as_str(), t2["doing"]["member"].as_str()), (Some("working"), Some("engineer")));
+    assert_eq!((row("T3")["group"].as_str(), row("T3")["doing"]["hold"].as_str()), (Some("queued"), Some("worktree")));
+}
+
+#[test]
+fn a_request_shows_its_chain_its_history_and_what_waits_for_the_person() {
+    let mut w = git_world("");
+    w.ok(None, "task.new", json!({"to": "architect", "title": "Plan A"}));
+    w.status("architect", "idle");
+    w.ok(Some("architect"), "task.new", json!({"to": "engineer", "title": "Sketch", "parent": "T1"}));
+    w.status("engineer", "idle");
+    w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "sketched", "decisions": ["kept the old API"]}));
+    w.ok(Some("architect"), "task.done", json!({"id": "T1", "summary": "planned"}));
+    let v = w.ok(None, "request.show", json!({"id": "t1"}));
+    assert_eq!((v["request"]["group"].as_str(), v["request"]["decisions"].as_u64()), (Some("needs_you"), Some(1)));
+    assert_eq!(v["tasks"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect::<Vec<_>>(), ["T1", "T2"]);
+    assert_eq!(v["inbox"][0]["kind"], "review");
+    let kinds: Vec<&str> = v["events"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert!(kinds.contains(&"worktree") && kinds.iter().filter(|k| **k == "done").count() == 2, "{kinds:?}");
+    let at: Vec<i64> = v["events"].as_array().unwrap().iter().map(|e| e["at_ms"].as_i64().unwrap()).collect();
+    assert!(at.windows(2).all(|p| p[0] <= p[1]), "one timeline, in order");
+    assert!(w.call(None, "request.show", json!({"id": "T9"})).is_err());
+}

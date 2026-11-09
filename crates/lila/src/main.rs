@@ -43,6 +43,12 @@ enum Cmd {
     Down,
     /// Who is doing what.
     Status,
+    /// Every request and whose move it is: what needs you, what is moving, what waits.
+    Requests {
+        /// How many finished ones to show.
+        #[arg(short = 'n', default_value_t = 10)]
+        done: u64,
+    },
     /// Create, update and inspect tasks.
     Task {
         #[command(subcommand)]
@@ -264,6 +270,7 @@ fn run() -> Result<()> {
         }
         Cmd::Down => out(call("project.down", json!({}))?, &|v| format!("stopped: {}", list(&v["stopped"]))),
         Cmd::Status => out(call("status", json!({}))?, &fmt_status),
+        Cmd::Requests { done } => out(call("request.list", json!({"done_limit": done}))?, &fmt_requests),
         Cmd::Task { cmd } => task(cmd, &call, &out)?,
         Cmd::Ask { question, options, task } => {
             out(call("ask", json!({"question": question, "options": options, "task": task}))?, &|v| format!("asked as {}. {}", v["id"].as_str().unwrap_or("?"), v["note"].as_str().unwrap_or("")))
@@ -431,7 +438,10 @@ fn usage(days: Option<u64>, as_json: bool) -> Result<()> {
     let name = lila_core::ProjectConfig::parse(&text).map_err(anyhow::Error::msg)?.name;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
     let since = days.map(|d| now - d as i64 * 86_400_000);
-    let u = Scanner::default().usage(&Sources::from_env(), &name, &root.to_string_lossy(), since);
+    // Members also work in the project's worktree slots.
+    let slots = lila::worktree::existing(&lila::paths::Paths::from_env().worktrees(&name));
+    let cwds: Vec<String> = std::iter::once(root).chain(slots).map(|p| p.to_string_lossy().to_string()).collect();
+    let u = Scanner::default().usage(&Sources::from_env(), &name, &cwds, since);
     if as_json {
         let members: Vec<Value> = u
             .members
@@ -536,6 +546,15 @@ fn fmt_status(v: &Value) -> String {
         let open: Vec<&str> = v["open_chains"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
         s.push_str(&format!("  {folder} task(s) wait for the project folder: chain {} has it until the person signs it off\n", open.join(", ")));
     }
+    let slots = v["worktrees"].as_array().cloned().unwrap_or_default();
+    if !slots.is_empty() {
+        let each: Vec<String> = slots.iter().map(|w| format!("{} {}", w["slot"], w["chain"].as_str().unwrap_or("free"))).collect();
+        s.push_str(&format!("  worktrees: {}\n", each.join(", ")));
+    }
+    let worktree = v["held_for_worktree"].as_u64().unwrap_or(0);
+    if worktree > 0 {
+        s.push_str(&format!("  {worktree} new chain(s) wait for a free worktree\n"));
+    }
     if v["codex_paused_until"].is_i64() {
         s.push_str("  Codex's usage limit is used up: its members get no work until it resets\n");
     }
@@ -546,6 +565,36 @@ fn fmt_status(v: &Value) -> String {
         s.push_str(&format!(", {inbox} item(s) need the person (`lila inbox`)"));
     }
     s
+}
+
+fn fmt_requests(v: &Value) -> String {
+    let items = v.as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        return "no requests yet".into();
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let mut s = String::new();
+    let mut group = "";
+    for r in &items {
+        let g = r["group"].as_str().unwrap_or("");
+        if g != group {
+            group = g;
+            s.push_str(&format!("{}{}\n", if s.is_empty() { "" } else { "\n" }, g.replace('_', " ")));
+        }
+        let d = &r["doing"];
+        let doing = match d["kind"].as_str().unwrap_or("") {
+            "you" => format!("your move: {}", d["inbox"].as_str().unwrap_or("")),
+            "member" => format!("{} on {} ({})", d["member"].as_str().unwrap_or(""), d["task"].as_str().unwrap_or(""), d["state"].as_str().unwrap_or("")),
+            "check" => "check running".to_owned(),
+            "commit" => "committing".to_owned(),
+            "wait" => format!("waits: {}", d["hold"].as_str().unwrap_or("")),
+            other => other.to_owned(),
+        };
+        let mins = (now - r["since_ms"].as_i64().unwrap_or(now)).max(0) / 60_000;
+        let slot = r["slot"].as_u64().map(|n| format!(" · worktree {n}")).unwrap_or_default();
+        s.push_str(&format!("  {:<5} {} · {doing} · {mins} min{slot}\n", r["id"].as_str().unwrap_or(""), r["title"].as_str().unwrap_or("")));
+    }
+    s.trim_end().to_owned()
 }
 
 fn fmt_inbox(v: &Value) -> String {

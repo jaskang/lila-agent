@@ -93,9 +93,12 @@ The PM has no tools to edit files or run builds: it plans and delegates.
 When work for the person is finished, they get a review card with each step's
 evidence. If they send it back, their comment comes as a `Rework:` task. While
 several results wait for review, a new chain the PM starts waits too.
-Members share one project folder: while one chain has work in it (until the
-person accepts it), other chains wait (`max_chains`). Accepting a chain
-commits what changed in the folder as one commit (`commit_on_accept`).
+In a git repository, each chain works in its own worktree of the project
+(`parallel`, default 2, outside the project folder); members working on it run
+there. Accepting a chain makes its work one commit on the project folder's
+branch. When every worktree is taken, a new chain waits. Without git, members
+share the project folder and one chain has it until the person accepts it
+(`max_chains`); accepting commits what changed (`commit_on_accept`).
 `--budget 300k` on `lila task new` caps a flow's tokens: over it, the flow
 waits for the person before its next step.
 

@@ -7,6 +7,7 @@ mod requests;
 mod review;
 mod server;
 mod session;
+mod slots;
 mod watch;
 
 pub use server::serve;
@@ -88,11 +89,13 @@ struct Live {
     session: Option<String>,
     /// When it last started working (a turn began).
     busy_since: i64,
+    /// The folder its CLI runs in: the project folder or a chain's worktree.
+    cwd: Option<PathBuf>,
 }
 
 impl Default for Live {
     fn default() -> Self {
-        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None, chain: None, session: None, busy_since: 0 }
+        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None, chain: None, session: None, busy_since: 0, cwd: None }
     }
 }
 
@@ -100,6 +103,10 @@ struct Proj {
     cwd: PathBuf,
     team: Team,
     live: BTreeMap<String, Live>,
+    /// Worktree slots chains work in (`slots`); none: chains share `cwd`.
+    slots: Vec<slots::Slot>,
+    /// The repository has a commit for slots to start from (checked until it does).
+    based: bool,
 }
 
 pub struct Daemon<T: Terminals> {
@@ -134,6 +141,12 @@ pub struct Daemon<T: Terminals> {
     quota_told: BTreeMap<String, i64>,
     /// magpie's command line, when it is installed (set by `serve`; tests leave it out).
     pub magpie: Option<PathBuf>,
+    /// Chains whose worktree could not be prepared, and when: tried again a minute later.
+    slot_failed: BTreeMap<(String, String), i64>,
+    /// The files a chain's accepted commit conflicted in, for the PM's task to resolve them.
+    conflicts: BTreeMap<(String, String), Vec<String>>,
+    /// The accepted task each commit under way is for (its summary is the commit's).
+    commit_task: BTreeMap<(String, String), String>,
 }
 
 /// How a member gets work from another chain than its session's.
@@ -217,6 +230,9 @@ impl<T: Terminals> Daemon<T> {
             codex_paused: BTreeMap::new(),
             quota_told: BTreeMap::new(),
             magpie: None,
+            slot_failed: BTreeMap::new(),
+            conflicts: BTreeMap::new(),
+            commit_task: BTreeMap::new(),
         };
         let rows = d.store.projects().unwrap_or_default();
         for p in rows {
@@ -285,7 +301,8 @@ impl<T: Terminals> Daemon<T> {
                 terminals.entry(t.to).or_default();
             }
         }
-        self.projects.insert(id.to_owned(), Proj { cwd: cwd.to_path_buf(), team, live });
+        let slots = self.read_slots(id, cwd, &team);
+        self.projects.insert(id.to_owned(), Proj { cwd: cwd.to_path_buf(), team, live, slots, based: false });
         let removed: Vec<String> = terminals.keys().cloned().collect();
         for (mid, terminal) in terminals {
             self.member_removed(id, &mid, terminal, now);
@@ -310,6 +327,9 @@ impl<T: Terminals> Daemon<T> {
         let Some(live) = self.projects.get_mut(pid).and_then(|p| p.live.get_mut(mid)) else { return };
         let (pid, mid) = (pid.to_owned(), mid.to_owned());
         if rec["state"] == "live" {
+            if let Some(c) = rec["cwd"].as_str() {
+                live.cwd = Some(PathBuf::from(c));
+            }
             if live.terminal.as_deref() != Some(addr) {
                 live.terminal = Some(addr.to_owned());
                 live.started_ms.get_or_insert(now);
@@ -487,6 +507,8 @@ impl<T: Terminals> Daemon<T> {
             return;
         }
         let tasks = self.store.tasks(pid).unwrap_or_default();
+        // Chains without a place to work wait: a free worktree, or the shared folder.
+        let folder = if self.uses_slots(pid) { self.held_for_slots(pid, &tasks, now) } else { self.held_for_folder(pid, &tasks) };
         let proj = &self.projects[pid];
         let views: Vec<MemberView> = proj
             .team
@@ -504,7 +526,6 @@ impl<T: Terminals> Daemon<T> {
             })
             .collect();
         let codex_until = self.codex_paused.get(pid).copied().filter(|t| *t > now);
-        let folder = self.held_for_folder(pid, &tasks);
         let queued: Vec<QueuedTask> = tasks
             .iter()
             .filter(|(t, _)| t.state == TaskState::Queued)
@@ -520,9 +541,13 @@ impl<T: Terminals> Daemon<T> {
             let ancestors = self.store.ancestors(pid, &tid).unwrap_or_default();
             let chain = ancestors.last().map(|t| t.id.clone()).unwrap_or_else(|| tid.clone());
             let proj = &self.projects[pid];
-            let fresh = proj.team.settings.fresh_session && proj.team.member(&mid).is_some_and(|m| !m.is_owner);
-            if fresh && live.chain.as_ref().is_some_and(|c| *c != chain) {
-                let plan = self.switch_plan(pid, &mid, &live, &chain);
+            let not_owner = proj.team.member(&mid).is_some_and(|m| !m.is_owner);
+            let fresh = proj.team.settings.fresh_session && not_owner;
+            // Work in another folder (a chain's worktree) needs its CLI started there.
+            let dir = self.member_dir(pid, &mid, Some(&chain));
+            let moved = not_owner && *live.cwd.as_ref().unwrap_or(&proj.cwd) != dir;
+            if moved || (fresh && live.chain.as_ref().is_some_and(|c| *c != chain)) {
+                let plan = self.switch_plan(pid, &mid, &live, &chain, &dir, moved);
                 if plan != Switch::Keep {
                     // A note just typed would be lost with the session: wait until it is read.
                     if !noted.contains(&mid) {
@@ -535,6 +560,14 @@ impl<T: Terminals> Daemon<T> {
             // and every "done when" and "out of scope" set on the way down.
             let origin = chain_brief(&ancestors);
             let origin = origin.as_ref().map(|(ids, file, brief)| message::ChainBrief { id: ids, file, brief });
+            if dir != self.projects[pid].cwd {
+                // The task's file and its chain's, where the member reads them.
+                for t in std::iter::once(&task).chain(ancestors.iter()) {
+                    if let Err(e) = write_task_file(&dir, t) {
+                        self.say(format!("{pid}: task file {} in {}: {e:#}", t.id, dir.display()));
+                    }
+                }
+            }
             let hint = self.step_hint(pid, &task);
             let text = message::task_delivery(&task, &task_file_rel(&task.id), origin, hint.as_ref());
             // Type only if it is still idle. hc's `if` knows `idle` and `working`
@@ -605,7 +638,8 @@ pub fn spool_dir(root: &Path) -> PathBuf {
 impl<T: Terminals> Daemon<T> {
     /// Answers every pending spool request in every project.
     pub fn process_spool(&mut self, now: i64) {
-        let roots: Vec<PathBuf> = self.projects.values().map(|p| p.cwd.clone()).collect();
+        let pids: Vec<String> = self.projects.keys().cloned().collect();
+        let roots: Vec<PathBuf> = pids.iter().flat_map(|p| self.dirs(p)).collect();
         for root in roots {
             let dir = spool_dir(&root);
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };

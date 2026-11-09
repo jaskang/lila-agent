@@ -119,11 +119,14 @@ impl<T: Terminals> Daemon<T> {
         if !self.checking.insert((pid.to_owned(), anchor.to_owned())) {
             return;
         }
+        // In the chain's worktree, where its work is.
+        let chain = self.store.ancestors(pid, anchor).unwrap_or_default().last().map(|t| t.id.clone()).unwrap_or_else(|| anchor.to_owned());
+        let cwd = self.chain_dir(pid, &chain);
         let p = &self.projects[pid];
         self.checks.push(CheckJob {
             project: pid.to_owned(),
             anchor: anchor.to_owned(),
-            cwd: p.cwd.clone(),
+            cwd,
             cmd,
             timeout: std::time::Duration::from_secs(p.team.settings.check_timeout_secs.max(1)),
             path_env: self.path_env.clone(),

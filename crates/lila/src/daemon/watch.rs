@@ -48,7 +48,7 @@ impl<T: Terminals> Daemon<T> {
             return;
         }
         self.quota_checked.insert(pid.to_owned(), now);
-        let cwd = self.projects[pid].cwd.to_string_lossy().to_string();
+        let cwds = self.dir_strings(pid);
         // magpie reads the account Codex is signed in to now; a session record may be
         // an earlier account's (one magpie switched away from), which would hold
         // Codex's members back until that account resets.
@@ -57,7 +57,7 @@ impl<T: Terminals> Daemon<T> {
             Some(m) => m.usage.windows.iter().filter(|w| w.used_percent >= 100.0 && w.resets_ms > now).map(|w| w.resets_ms).max(),
             None => {
                 let src = self.live_sources();
-                let usage = self.scanner.usage(&src, pid, &cwd, Some(now));
+                let usage = self.scanner.usage(&src, pid, &cwds, Some(now));
                 usage.codex_limits.iter().filter(|l| l.used_percent >= 100.0 && l.resets_at_ms > now).map(|l| l.resets_at_ms).max()
             }
         };
@@ -83,15 +83,15 @@ impl<T: Terminals> Daemon<T> {
     /// Codex picks its own session id: look for the rollout of members that
     /// started without one known, for the first half hour.
     pub(super) fn find_sessions(&mut self, pid: &str, now: i64) {
-        let cwd = self.projects[pid].cwd.to_string_lossy().to_string();
+        let project = self.projects[pid].cwd.clone();
         let team = &self.projects[pid].team;
-        let missing: Vec<(String, i64, Option<String>)> = self.projects[pid]
+        let missing: Vec<(String, i64, Option<String>, String)> = self.projects[pid]
             .live
             .iter()
             .filter(|(m, l)| l.terminal.is_some() && l.session.is_none() && team.member(m).is_some_and(|x| x.role.file.runtime == lila_core::Runtime::Codex))
-            .filter_map(|(m, l)| l.started_ms.filter(|s| now - s < 30 * 60_000).map(|s| (m.clone(), s, l.chain.clone())))
+            .filter_map(|(m, l)| l.started_ms.filter(|s| now - s < 30 * 60_000).map(|s| (m.clone(), s, l.chain.clone(), l.cwd.as_ref().unwrap_or(&project).to_string_lossy().to_string())))
             .collect();
-        for (mid, started, chain) in missing {
+        for (mid, started, chain, cwd) in missing {
             let Some((id, file)) = sessions::find_codex(&self.live_sources(), pid, &mid, &cwd, started) else { continue };
             let row = SessionRow { id: id.clone(), member: mid.clone(), runtime: "codex".into(), file: Some(file.to_string_lossy().to_string()), started_ms: started };
             if self.store.add_session(pid, &row).is_ok() {
@@ -133,6 +133,7 @@ impl<T: Terminals> Daemon<T> {
             self.maybe_refresh_pm(pid, now);
             self.watch_runaways(pid, now);
             self.watch_quota(pid, now);
+            self.tend_slots(pid, now);
         }
         for pid in pids {
             let settings = self.projects[&pid].team.settings.clone();

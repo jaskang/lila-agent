@@ -72,6 +72,11 @@ impl Paths {
         Ok(tmp)
     }
 
+    /// A project's worktree slots (`worktree`): `<data>/worktrees/<project>/<n>`.
+    pub fn worktrees(&self, project: &str) -> PathBuf {
+        self.data.join("worktrees").join(project)
+    }
+
     pub fn prompts(&self, project: &str) -> PathBuf {
         self.state.join("prompts").join(project)
     }

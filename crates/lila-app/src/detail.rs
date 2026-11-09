@@ -39,12 +39,16 @@ pub fn state_label(state: &str) -> &'static str {
 
 /// One line of a task's history, for the person: who, what, and the words that
 /// came with it. lilad's own bookkeeping (terminals, rounds, sign-offs) stays out.
-fn event_line(actor: &str, kind: &str, detail: &str) -> (String, Option<String>) {
+pub fn event_line(actor: &str, kind: &str, detail: &str) -> (String, Option<String>) {
     let who = match actor {
         "human" => "你",
         "lilad" => "Lila",
         other => other,
     };
+    // A worktree freed or held is Lila's bookkeeping; taking one is when the work started.
+    if kind == "worktree" && !detail.contains(" works in ") {
+        return (format!("{who} 收尾"), None);
+    }
     let (what, said) = match kind {
         "created" => ("创建", false),
         "delivered" => ("送达", false),
@@ -71,6 +75,9 @@ fn event_line(actor: &str, kind: &str, detail: &str) -> (String, Option<String>)
         "flow_held" => ("流程暂停", false),
         "flow_cancelled" => ("流程取消", false),
         "budget" => ("调整预算", false),
+        "worktree" => ("安排工作区", false),
+        "resolve" => ("交给助理解决冲突", false),
+        "resumed_session" => ("续接会话", false),
         other => (other, true),
     };
     (format!("{who} {what}"), (said && !detail.is_empty()).then(|| detail.to_owned()))

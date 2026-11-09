@@ -243,6 +243,21 @@ pub fn commit_message(task: &Task) -> String {
 }
 
 /// A member working a long time without telling Lila anything.
+/// The person accepted work whose commit conflicts with the project's branch: the PM has it resolved.
+pub fn resolve_conflicts(task: &Task, chain: &str, target: &str, files: &[String], comment: Option<&str>) -> String {
+    let files = if files.is_empty() { "files git did not name".to_owned() } else { files.join(", ") };
+    let mut s = format!(
+        "The person accepted {} \"{}\", but its commit (branch lila/{chain}) conflicts with {target} in: {files}. \
+         Assign the member who did the work to rebase it onto {target} in the chain's worktree (`git rebase {target}`, \
+         resolve, keep both sides' intent) under this task, then finish this task. Lila asks the person to accept again.",
+        task.id, task.title
+    );
+    if let Some(c) = comment.filter(|c| !c.trim().is_empty()) {
+        s.push_str(&format!("\n\nThe person added: {}", c.trim()));
+    }
+    s
+}
+
 pub fn runaway(task: &Task, minutes: u64) -> String {
     note(
         &task.id,

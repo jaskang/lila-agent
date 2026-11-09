@@ -17,6 +17,8 @@ impl<T: Terminals> Daemon<T> {
             "member.restart" => self.member_restart(&caller, params, now),
             "projects" => Ok(json!(self.projects.iter().map(|(id, p)| json!({"id": id, "cwd": p.cwd})).collect::<Vec<_>>())),
             "status" => self.status(&caller),
+            "request.list" => self.request_list(&caller, params),
+            "request.show" => self.request_show(&caller, params),
             "task.new" => self.task_new(&caller, params, now),
             "task.start" => self.task_move(&caller, params, Transition::Start, now),
             "task.done" => self.task_move(&caller, params, Transition::Done, now),
@@ -91,7 +93,8 @@ impl<T: Terminals> Daemon<T> {
         // A project may have been absent from the database when the event
         // snapshot arrived. Recover its existing team before starting anyone.
         for rec in self.term.list(&pid)? {
-            if rec["state"] != "live" || rec["labels"]["lila.project"] != pid || rec["cwd"] != root_s {
+            let ours = self.dir_strings(&pid);
+            if rec["state"] != "live" || rec["labels"]["lila.project"] != pid || !rec["cwd"].as_str().is_some_and(|c| ours.iter().any(|o| o == c)) {
                 continue;
             }
             let (Some(mid), Some(addr)) = (s(&rec["labels"], "lila.member"), s(&rec, "address")) else { continue };
@@ -137,18 +140,20 @@ impl<T: Terminals> Daemon<T> {
     }
 
     pub(super) fn start_member(&mut self, pid: &str, mid: &str, now: i64) -> Result<String> {
-        self.start_session(pid, mid, runtime::Session::New(None), now)
+        let dir = self.home_dir(pid, mid);
+        self.start_session(pid, mid, runtime::Session::New(None), &dir, now)
     }
 
-    /// Starts a member's CLI in a new session or an earlier one (`Session::Resume`).
-    pub(super) fn start_session(&mut self, pid: &str, mid: &str, session: runtime::Session, now: i64) -> Result<String> {
+    /// Starts a member's CLI in `dir` (the project folder or a chain's worktree),
+    /// in a new session or an earlier one (`Session::Resume`).
+    pub(super) fn start_session(&mut self, pid: &str, mid: &str, session: runtime::Session, dir: &Path, now: i64) -> Result<String> {
         let proj = &self.projects[pid];
         let member = proj.team.member(mid).expect("member").clone();
-        let cwd = proj.cwd.to_string_lossy().to_string();
+        let cwd = dir.to_string_lossy().to_string();
         let text = prompt::render(&proj.team, &member, &cwd);
-        let dir = self.paths.prompts(pid);
-        std::fs::create_dir_all(&dir)?;
-        let prompt_path = dir.join(format!("{mid}.md"));
+        let prompts = self.paths.prompts(pid);
+        std::fs::create_dir_all(&prompts)?;
+        let prompt_path = prompts.join(format!("{mid}.md"));
         std::fs::write(&prompt_path, &text)?;
 
         let rt = member.role.file.runtime;
@@ -198,6 +203,7 @@ impl<T: Terminals> Daemon<T> {
             session: known,
             chain,
             busy_since: now,
+            cwd: Some(dir.to_path_buf()),
             ..Live::default()
         };
         self.live_version += 1;
@@ -449,11 +455,127 @@ impl<T: Terminals> Daemon<T> {
         let held = tasks.iter().filter(|(t, _)| t.state == TaskState::Queued && self.held_for_review(&pid, t)).count();
         let codex_until = self.codex_paused.get(&pid).copied();
         let plain: Vec<Task> = tasks.iter().map(|(t, _)| t.clone()).collect();
+        let (held_folder, held_worktree) = if self.uses_slots(&pid) {
+            let proj = &self.projects[&pid];
+            let started: BTreeSet<String> =
+                plain.iter().filter(|t| t.to != proj.team.owner && t.state != TaskState::Queued).map(|t| route::ancestors(&plain, &t.id).last().map_or(t.id.clone(), |r| r.id.clone())).collect();
+            let waiting = plain
+                .iter()
+                .filter(|t| t.state == TaskState::Queued && t.to != proj.team.owner)
+                .map(|t| route::ancestors(&plain, &t.id).last().map_or(t.id.clone(), |r| r.id.clone()))
+                .filter(|c| !started.contains(c) && self.slot_of(&pid, c).is_none())
+                .count();
+            (0, waiting)
+        } else {
+            (self.held_for_folder(&pid, &tasks).len(), 0)
+        };
+        let proj = &self.projects[&pid];
         Ok(json!({
             "project": pid, "cwd": proj.cwd, "paused": paused, "members": members, "open_tasks": open, "inbox": inbox, "runs": runs,
             "held_for_review": held, "unreviewed": self.unreviewed(&pid), "codex_paused_until": codex_until,
-            "open_chains": self.open_chains(&pid, &plain), "held_for_folder": self.held_for_folder(&pid, &tasks).len(),
+            "open_chains": self.open_chains(&pid, &plain), "held_for_folder": held_folder,
+            "worktrees": self.slots_json(&pid), "held_for_worktree": held_worktree,
         }))
+    }
+
+    /// Every request (chain) and whose move it is (`lila_core::request`): the
+    /// window's list and `lila requests`. Finished ones: the latest `done_limit` (30).
+    pub(super) fn request_list(&mut self, caller: &Value, params: &Value) -> Result<Value> {
+        use lila_core::request::Group;
+        let (pid, _) = self.who(caller)?;
+        let limit = params.get("done_limit").and_then(Value::as_u64).unwrap_or(30) as usize;
+        let mut finished = 0;
+        let list: Vec<lila_core::request::Request> = self
+            .requests_of(&pid)?
+            .into_iter()
+            .filter(|r| {
+                let done = matches!(r.group, Group::Delivered | Group::Dropped);
+                finished += usize::from(done);
+                !done || finished <= limit
+            })
+            .collect();
+        Ok(serde_json::to_value(list)?)
+    }
+
+    /// One request for the window's panel: the request, every task in its chain
+    /// (oldest first), their history as one timeline, and the open inbox items about it.
+    pub(super) fn request_show(&mut self, caller: &Value, params: &Value) -> Result<Value> {
+        let (pid, _) = self.who(caller)?;
+        let id = req(params, "id")?.to_ascii_uppercase();
+        let list = self.requests_of(&pid)?;
+        let r = list.into_iter().find(|r| r.id == id).ok_or_else(|| anyhow!("no request {id}"))?;
+        let tasks: Vec<Task> = self.store.tasks(&pid)?.into_iter().map(|(t, _)| t).collect();
+        let chain: Vec<&Task> = tasks.iter().filter(|t| t.id == id || route::ancestors(&tasks, &t.id).iter().any(|a| a.id == id)).collect();
+        let mut events = Vec::new();
+        for t in &chain {
+            for e in self.store.events(&pid, Some(&t.id), 200)? {
+                events.push(json!({"at_ms": e.at_ms, "task": e.task, "actor": e.actor, "kind": e.kind, "detail": e.detail}));
+            }
+        }
+        events.sort_by_key(|e| e["at_ms"].as_i64().unwrap_or(0));
+        let items: Vec<Value> = self.store.inbox(&pid, false)?.iter().filter(|i| r.inbox.contains(&i.id)).map(inbox_json).collect();
+        let tasks: Vec<Value> = chain
+            .iter()
+            .map(|t| {
+                let mut v = task_json(t);
+                v["artifacts"] = json!(self.store.artifacts(&pid, &t.id).unwrap_or_default());
+                v
+            })
+            .collect();
+        Ok(json!({"request": r, "tasks": tasks, "events": events, "inbox": items}))
+    }
+
+    /// Every request of a project (`lila_core::request`).
+    fn requests_of(&mut self, pid: &str) -> Result<Vec<lila_core::request::Request>> {
+        use lila_core::request::{self, Facts, Hold, InboxFact, RunFact};
+        let pid = pid.to_owned();
+        let with_meta = self.store.tasks(&pid)?;
+        let tasks: Vec<Task> = with_meta.iter().map(|(t, _)| t.clone()).collect();
+        let slotted = self.uses_slots(&pid);
+        let proj = &self.projects[&pid];
+        let owner = proj.team.owner.clone();
+        let active = |m: &str| tasks.iter().filter(|t| t.to == m && matches!(t.state, TaskState::Delivered | TaskState::InProgress | TaskState::Blocked)).max_by_key(|t| t.updated_ms).map(|t| t.id.clone());
+        // An item about a member is about the task it holds.
+        let inbox: Vec<InboxFact> = self
+            .store
+            .inbox(&pid, false)?
+            .into_iter()
+            .map(|i| {
+                let task = i.task.clone().or_else(|| i.member.as_deref().and_then(active));
+                InboxFact { id: i.id, kind: i.kind, task, created_ms: i.created_ms }
+            })
+            .collect();
+        let runs: Vec<RunFact> = self.store.runs(&pid)?.into_iter().filter(|r| r.state.is_open()).map(|r| RunFact { anchor: r.anchor, checking: r.state == RunState::Checking, updated_ms: r.updated_ms }).collect();
+        let committing: Vec<String> = self.committing.iter().filter(|(p, _)| *p == pid).map(|(_, c)| c.clone()).collect();
+        let root = |id: &str| route::ancestors(&tasks, id).last().map(|t| t.id.clone()).unwrap_or_else(|| id.to_owned());
+        let started: BTreeSet<String> = tasks.iter().filter(|t| t.to != owner && t.state != TaskState::Queued).map(|t| root(&t.id)).collect();
+        let folder = if slotted { BTreeSet::new() } else { self.held_for_folder(&pid, &with_meta) };
+        let codex_until = self.codex_paused.get(&pid).copied();
+        let parallel = proj.team.settings.parallel as usize;
+        let full = proj.slots.iter().take(parallel).all(|s| s.chain.is_some());
+        let mut held = BTreeMap::new();
+        for t in tasks.iter().filter(|t| t.state == TaskState::Queued) {
+            let chain = root(&t.id);
+            let why = if self.held_for_review(&pid, t) {
+                Hold::Review
+            } else if slotted && full && t.to != owner && self.slot_of(&pid, &chain).is_none() && !started.contains(&chain) {
+                Hold::Worktree
+            } else if folder.contains(&t.id) {
+                Hold::Folder
+            } else if codex_until.is_some() && proj.team.member(&t.to).is_some_and(|m| m.role.file.runtime == lila_core::Runtime::Codex) {
+                Hold::Quota
+            } else if proj.live.get(&t.to).is_none_or(|l| l.terminal.is_none()) {
+                Hold::Stopped
+            } else if proj.live.get(&t.to).is_some_and(|l| !l.reported) {
+                Hold::Starting
+            } else {
+                Hold::Member
+            };
+            held.insert(t.id.clone(), why);
+        }
+        let slots: BTreeMap<String, usize> = proj.slots.iter().enumerate().filter_map(|(i, s)| s.chain.clone().map(|c| (c, i + 1))).collect();
+        let facts = Facts { tasks: &tasks, owner: &owner, inbox: &inbox, runs: &runs, committing: &committing, held: &held, slots: &slots };
+        Ok(request::requests(&facts))
     }
 
     pub(super) fn create_task(&mut self, pid: &str, new: NewTask, now: i64) -> Result<Task> {
@@ -531,7 +653,10 @@ impl<T: Terminals> Daemon<T> {
         let mut v = task_json(&task);
         if task.state == TaskState::Queued && self.held_for_review(&pid, &task) {
             v["held"] = json!(format!("{} results wait for the person's review; new work starts once they look at them", self.unreviewed(&pid)));
-        } else if task.state == TaskState::Queued && self.held_for_folder(&pid, &self.store.tasks(&pid)?).contains(&task.id) {
+        } else if task.state == TaskState::Queued && self.uses_slots(&pid) && self.slot_of(&pid, &self.store.ancestors(&pid, &task.id)?.last().map(|t| t.id.clone()).unwrap_or_else(|| task.id.clone())).is_none() && task.to != self.projects[&pid].team.owner {
+            let held: Vec<String> = self.projects[&pid].slots.iter().filter_map(|s| s.chain.clone()).collect();
+            v["held"] = json!(format!("every worktree is taken (chains {}) until the person signs one off; this chain starts in the first one free", held.join(", ")));
+        } else if task.state == TaskState::Queued && !self.uses_slots(&pid) && self.held_for_folder(&pid, &self.store.tasks(&pid)?).contains(&task.id) {
             let open: Vec<String> = self.open_chains(&pid, &self.store.tasks(&pid)?.into_iter().map(|(t, _)| t).collect::<Vec<_>>()).into_iter().collect();
             v["held"] = json!(format!(
                 "the project folder holds chain {} until the person signs it off; this chain starts after that",
@@ -733,6 +858,11 @@ impl<T: Terminals> Daemon<T> {
         self.store.set_task_text(&pid, &task.id, &new_title, &new_body, now)?;
         let updated = self.store.task(&pid, &task.id)?.expect("exists");
         write_task_file(&self.projects[&pid].cwd, &updated)?;
+        let chain = self.store.ancestors(&pid, &updated.id)?.last().map(|t| t.id.clone()).unwrap_or_else(|| updated.id.clone());
+        let dir = self.chain_dir(&pid, &chain);
+        if dir != self.projects[&pid].cwd {
+            write_task_file(&dir, &updated)?;
+        }
         let detail = append.map(|a| format!("appended: {a}")).unwrap_or_else(|| "rewrote the task".into());
         self.store.event(&pid, Some(&task.id), actor.as_str(), "edited", &detail, now)?;
         if delivered && let Some(a) = append {
@@ -833,6 +963,7 @@ impl<T: Terminals> Daemon<T> {
                 self.store.push_outbox(&pid, &to, &message::answer(&item.id, &item.text, text), now)?;
             }
             "review" => self.review_answer(&pid, &item, text, now)?,
+            "merge" => self.merge_answer(&pid, &item, text, now)?,
             "budget" => self.budget_answer(&pid, &item, text, now)?,
             _ => {}
         }

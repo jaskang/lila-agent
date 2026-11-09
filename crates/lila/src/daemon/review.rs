@@ -1,4 +1,4 @@
-//! The person's side: review cards, one chain in the folder at a time, the commit on accept, budgets.
+//! The person's side: review cards, one chain in the folder at a time (without worktrees), the commit on accept, budgets.
 
 use super::*;
 
@@ -27,11 +27,7 @@ impl<T: Terminals> Daemon<T> {
         let owner = &self.projects[pid].team.owner;
         let root = |id: &str| route::ancestors(tasks, id).last().map(|t| t.id.clone()).unwrap_or_else(|| id.to_owned());
         let started: BTreeSet<String> = tasks.iter().filter(|t| t.to != *owner && t.state != TaskState::Queued).map(|t| root(&t.id)).collect();
-        let mut busy: BTreeSet<String> = tasks.iter().filter(|t| !matches!(t.state, TaskState::Done | TaskState::Cancelled)).map(|t| root(&t.id)).collect();
-        busy.extend(self.store.runs(pid).unwrap_or_default().into_iter().filter(|r| r.state.is_open()).map(|r| root(&r.anchor)));
-        busy.extend(self.store.inbox(pid, false).unwrap_or_default().into_iter().filter(|i| i.kind == "review").filter_map(|i| i.task).map(|t| root(&t)));
-        busy.extend(self.committing.iter().filter(|(p, _)| p == pid).map(|(_, c)| c.clone()));
-        started.intersection(&busy).cloned().collect()
+        started.intersection(&self.busy_chains(pid, tasks)).cloned().collect()
     }
 
     /// Queued tasks that wait for the folder: members share one, so at most
@@ -66,9 +62,6 @@ impl<T: Terminals> Daemon<T> {
     /// The person accepted `id`: its chain's changes become one commit (`commit_on_accept`).
     pub(super) fn queue_commit(&mut self, pid: &str, id: &str) {
         let p = &self.projects[pid];
-        if !p.team.settings.commit_on_accept {
-            return;
-        }
         let tasks: Vec<Task> = self.store.tasks(pid).unwrap_or_default().into_iter().map(|(t, _)| t).collect();
         let Some(task) = tasks.iter().find(|t| t.id == id) else { return };
         // The chain's title and the person's words; what came of it from the accepted task (a rework's).
@@ -77,10 +70,18 @@ impl<T: Terminals> Daemon<T> {
         what.summary = task.summary.clone();
         what.outcome = task.outcome.clone();
         let chain = what.id.clone();
+        // From a worktree it always goes: that is how the work reaches the project folder.
+        let slot = self.slot_of(pid, &chain).map(|i| p.slots[i].path.clone());
+        if slot.is_none() && !p.team.settings.commit_on_accept {
+            return;
+        }
         if !self.committing.insert((pid.to_owned(), chain.clone())) {
             return;
         }
-        self.commits.push(CommitJob { project: pid.to_owned(), chain, cwd: p.cwd.clone(), message: message::commit_message(&what), path_env: self.path_env.clone() });
+        self.commit_task.insert((pid.to_owned(), chain.clone()), id.to_owned());
+        let merge_into = slot.is_some().then(|| p.cwd.clone());
+        let cwd = slot.unwrap_or_else(|| p.cwd.clone());
+        self.commits.push(CommitJob { project: pid.to_owned(), chain, cwd, message: message::commit_message(&what), path_env: self.path_env.clone(), merge_into });
     }
 
     /// Commits to make now; each result comes back through `on_commit_done`.
@@ -91,6 +92,7 @@ impl<T: Terminals> Daemon<T> {
     /// A chain's commit is made (or not): the folder is free for the next chain.
     pub fn on_commit_done(&mut self, pid: &str, chain: &str, r: &CommitResult, now: i64) {
         self.committing.remove(&(pid.to_owned(), chain.to_owned()));
+        let task = self.commit_task.remove(&(pid.to_owned(), chain.to_owned())).unwrap_or_else(|| chain.to_owned());
         if !self.projects.contains_key(pid) {
             return;
         }
@@ -99,9 +101,13 @@ impl<T: Terminals> Daemon<T> {
             CommitResult::Nothing => ("committed", format!("{chain} changed nothing to commit")),
             CommitResult::NotRepo => ("committed", "the project folder is not a git repository; nothing committed".to_owned()),
             CommitResult::Failed(why) => ("commit_failed", format!("{chain}'s changes could not be committed: {why}")),
+            CommitResult::Conflict(files) => ("commit_failed", format!("{chain}'s commit conflicts with the project's branch in {}", files.join(", "))),
+            CommitResult::NotMerged(why) => ("commit_failed", format!("{chain} is committed on its branch, but the project folder did not move to it: {why}")),
         };
         let _ = self.store.event(pid, Some(chain), LILAD, kind, &detail, now);
-        if let CommitResult::Failed(why) = r {
+        if let Some(i) = self.slot_of(pid, chain) {
+            self.slot_commit_done(pid, i, chain, &task, r, now);
+        } else if let CommitResult::Failed(why) = r {
             let _ = self.store.add_inbox(pid, "report", None, Some(chain), &inbox::commit_failed(chain, why), &[], now);
         }
         self.say(format!("{pid}: {chain} {kind} {detail}"));
@@ -162,7 +168,7 @@ impl<T: Terminals> Daemon<T> {
 
     /// Tokens a run's step tasks used: each member's use while it held its task.
     pub(super) fn run_tokens(&mut self, pid: &str, run: &Run, now: i64) -> u64 {
-        let cwd = self.projects[pid].cwd.to_string_lossy().to_string();
+        let cwds = self.dir_strings(pid);
         let tasks: Vec<Task> = self.store.tasks(pid).unwrap_or_default().into_iter().map(|(t, _)| t).filter(|t| t.run.as_ref().is_some_and(|(a, _)| *a == run.anchor)).collect();
         let mut spent = 0;
         let src = self.live_sources();
@@ -170,7 +176,7 @@ impl<T: Terminals> Daemon<T> {
             let events = self.store.events(pid, Some(&t.id), 200).unwrap_or_default();
             let Some(from) = events.iter().filter(|e| e.kind == "delivered").map(|e| e.at_ms).min() else { continue };
             let to = events.iter().filter(|e| matches!(e.kind.as_str(), "done" | "cancelled")).map(|e| e.at_ms).max().unwrap_or(now);
-            spent += self.scanner.tokens_between(&src, pid, &cwd, &t.to, from, to);
+            spent += self.scanner.tokens_between(&src, pid, &cwds, &t.to, from, to);
         }
         spent
     }

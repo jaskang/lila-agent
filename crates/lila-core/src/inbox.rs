@@ -97,6 +97,25 @@ pub fn commit_failed(chain: &str, why: &str) -> String {
     format!("验收后没能提交 {chain} 的改动，改动还在项目文件夹里，需要你自己提交。git：{why}")
 }
 
+pub fn worktree_failed(chain: &str, why: &str) -> String {
+    format!("没能给 {chain} 准备 worktree，它先排着，一分钟后再试。git：{why}")
+}
+
+/// The accepted work is a commit on its branch, but does not apply on the project's branch.
+pub fn merge_conflict(chain: &str, files: &[String]) -> String {
+    let files = if files.is_empty() { "（git 没说是哪些文件）".to_owned() } else { files.join("、") };
+    format!("{chain} 的改动已经提交到分支 lila/{chain}，但和项目当前的分支有冲突：{files}。「交给助理」让团队解决后再给你验收；你自己解决了就点「重试」。")
+}
+
+/// The project folder could not move to the accepted commit: the person's own changes are in the way.
+pub fn not_merged(chain: &str, why: &str) -> String {
+    format!("{chain} 的改动已经提交到分支 lila/{chain}，但项目文件夹没能更新，多半是你在里面的改动挡住了。处理好后点「重试」。git：{why}")
+}
+
+pub fn slot_commit_failed(chain: &str, dir: &str, why: &str) -> String {
+    format!("验收后没能提交 {chain} 的改动，改动还在它的 worktree（{dir}）里。处理好后点「重试」。git：{why}")
+}
+
 pub fn runaway(member: &str, task: &Task, minutes: u64) -> String {
     format!("{member} 在{}上做了 {minutes} 分钟没有调用 lila，提醒过也没有。可能在打转，看看它的终端。", named(task))
 }

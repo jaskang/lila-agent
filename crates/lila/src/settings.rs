@@ -353,7 +353,8 @@ pub fn save(root: &Path, roles_dir: &Path, s: &ProjectSettings) -> Result<()> {
 
     // [settings]: keys already written are kept up to date; others only when not the default.
     let defaults = Settings::default();
-    let numbers: [(&str, i64, i64); 4] = [
+    let numbers: [(&str, i64, i64); 5] = [
+        ("parallel", s.settings.parallel.into(), defaults.parallel.into()),
         ("stall_minutes", s.settings.stall_minutes as i64, defaults.stall_minutes as i64),
         ("startup_timeout_secs", s.settings.startup_timeout_secs as i64, defaults.startup_timeout_secs as i64),
         ("max_chain_depth", s.settings.max_chain_depth.into(), defaults.max_chain_depth.into()),

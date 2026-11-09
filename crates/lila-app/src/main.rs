@@ -7,6 +7,7 @@ mod data;
 mod detail;
 mod dialog;
 mod prefs;
+mod requests;
 mod settings;
 mod tree;
 mod style;
@@ -53,6 +54,31 @@ fn main() {
                             let _ = cx.update(|_, cx| view.update(cx, |v, cx| v.show_task(task, cx)));
                         })
                         .detach();
+                }
+                // As if back after being away since this many minutes ago (`LILA_APP_AWAY=360`).
+                if let Ok(m) = std::env::var("LILA_APP_AWAY").map(|m| m.parse::<i64>().unwrap_or(60)) {
+                    view.update(cx, |v, _| v.recap = Some(data::now_ms() - m * 60_000));
+                }
+                // Select this request (`LILA_APP_REQUEST=T3`) or show a member's terminal (`LILA_APP_MEMBER=pm`).
+                for (var, member) in [("LILA_APP_REQUEST", false), ("LILA_APP_MEMBER", true)] {
+                    if let Ok(id) = std::env::var(var) {
+                        let view = view.clone();
+                        window
+                            .spawn(cx, async move |cx| {
+                                cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                                let _ = cx.update(|_, cx| {
+                                    view.update(cx, |v, cx| {
+                                        if member {
+                                            v.member = Some(id);
+                                            cx.notify();
+                                        } else {
+                                            v.select_request(id, cx);
+                                        }
+                                    })
+                                });
+                            })
+                            .detach();
+                    }
                 }
                 // Switch through these projects (comma-separated), one every 3 s.
                 if let Ok(list) = std::env::var("LILA_APP_SWITCH") {

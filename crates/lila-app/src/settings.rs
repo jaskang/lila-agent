@@ -50,6 +50,7 @@ impl Page {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// The rest of `[settings]` (startup timeout, chain depth…) is edited in the file.
 enum Rule {
+    Parallel,
     StallMinutes,
     MaxRounds,
 }
@@ -57,6 +58,7 @@ enum Rule {
 impl Rule {
     fn get(self, s: &Settings) -> i64 {
         match self {
+            Rule::Parallel => s.parallel.into(),
             Rule::StallMinutes => s.stall_minutes as i64,
             Rule::MaxRounds => s.max_rounds.into(),
         }
@@ -66,6 +68,7 @@ impl Rule {
         let (lo, hi) = self.range();
         let v = v.clamp(lo, hi);
         match self {
+            Rule::Parallel => s.parallel = v as u32,
             Rule::StallMinutes => s.stall_minutes = v as u64,
             Rule::MaxRounds => s.max_rounds = v as u32,
         }
@@ -73,6 +76,8 @@ impl Rule {
 
     fn range(self) -> (i64, i64) {
         match self {
+            // 0 (chains share the folder) is for the file: a project that is not a git repository shares it anyway.
+            Rule::Parallel => (1, 6),
             Rule::StallMinutes => (1, 120),
             Rule::MaxRounds => (1, 20),
         }
@@ -81,6 +86,7 @@ impl Rule {
     /// Title, unit.
     fn text(self) -> (&'static str, &'static str) {
         match self {
+            Rule::Parallel => ("同时进行", "件"),
             Rule::StallMinutes => ("无回应提醒", "分钟"),
             Rule::MaxRounds => ("返工上限", "轮"),
         }
@@ -316,7 +322,7 @@ impl LilaApp {
         let Some(f) = self.settings.as_ref() else { return div().into_any_element() };
         let (title, check, cwd) = (f.title.clone(), f.check.clone(), data::tilde(&f.project.cwd));
         let now = f.value.settings.clone();
-        let rules: Vec<AnyElement> = [Rule::StallMinutes, Rule::MaxRounds].into_iter().map(|r| self.rule_row(r, &now, cx)).collect();
+        let rules: Vec<AnyElement> = [Rule::Parallel, Rule::StallMinutes, Rule::MaxRounds].into_iter().map(|r| self.rule_row(r, &now, cx)).collect();
         let fresh = now.fresh_session;
         let fresh_row = row(
             "换任务时开新会话",

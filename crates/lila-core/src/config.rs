@@ -191,12 +191,17 @@ pub struct Settings {
     /// Results waiting for the person's review beyond which new work the PM
     /// starts waits too: more output than anyone can check (0: no limit).
     pub max_unreviewed: u32,
-    /// Chains that may have work in the project folder at once: from the first
-    /// task a member (not the PM) gets until the person signs the chain off.
-    /// Members share one folder, so 1 keeps each chain's changes apart (0: no limit).
+    /// Chains that may work at once, each in its own worktree of the project
+    /// (outside it, reused chain after chain), when the project folder is the top
+    /// of a git repository with a commit. 0: no worktrees; chains share the folder (`max_chains`).
+    pub parallel: u32,
+    /// Without worktrees: chains that may have work in the project folder at once,
+    /// from the first task a member (not the PM) gets until the person signs the
+    /// chain off. Members share the folder, so 1 keeps each chain's changes apart (0: no limit).
     pub max_chains: u32,
     /// When the person accepts a chain's result, lilad commits what changed in
-    /// the project folder (a git repository) as one commit.
+    /// the project folder (a git repository) as one commit. With worktrees
+    /// (`parallel`) it always does: that is how the work reaches the project folder.
     pub commit_on_accept: bool,
 }
 
@@ -217,6 +222,7 @@ impl Default for Settings {
             pm_refresh_idle_minutes: 10,
             runaway_minutes: 30,
             max_unreviewed: 3,
+            parallel: 2,
             max_chains: 1,
             commit_on_accept: true,
         }

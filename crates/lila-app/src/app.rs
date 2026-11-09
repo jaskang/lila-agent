@@ -1,5 +1,6 @@
-//! The main window: team on the left, a member's terminal in the middle,
-//! what needs you, the task board and recent activity on the right.
+//! The main window: projects and the team on the left; the requests in the
+//! middle (or a member's terminal, to look at the work itself); the selected
+//! request on the right, with what it needs from the person.
 
 use crate::data::{self, Project, Snapshot};
 use crate::ui::s;
@@ -13,6 +14,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Away this long, the window says what happened meanwhile.
+const AWAY_MS: i64 = 10 * 60_000;
 
 pub struct LilaApp {
     paths: Paths,
@@ -39,8 +43,20 @@ pub struct LilaApp {
     pub dialog_offset: Point<Pixels>,
     /// While dragging a dialog: where the press was and the offset then.
     pub dialog_drag: Option<(Point<Pixels>, Point<Pixels>)>,
-    /// The member whose terminal fills the middle; `None` is the owner.
+    /// The member whose terminal fills the middle; `None`: the requests do.
     pub member: Option<String>,
+    /// The request on the right (a root task's id), or an inbox item about no request.
+    pub request: Option<String>,
+    /// The window is in front: notifications go out only while it is not.
+    active: bool,
+    /// When the window went to the back.
+    away_since: Option<i64>,
+    /// Back after a while: the list leads with what happened since then.
+    pub recap: Option<i64>,
+    /// The list shows only what changed while the person was away.
+    pub recap_only: bool,
+    /// Per project, the inbox items that needed the person at the last look: only new ones notify.
+    needs_seen: HashMap<String, std::collections::HashSet<String>>,
     core: Option<Arc<Core>>,
     pub core_error: Option<String>,
     terminals: HashMap<String, Entity<TerminalView>>,
@@ -97,8 +113,8 @@ impl LilaApp {
         });
         let poll = cx.spawn_in(window, async move |this, cx| {
             loop {
-                let Ok((paths, selected, task)) = this.update(cx, |this, _| (this.paths.clone(), this.selected.clone(), this.task.clone())) else { return };
-                let snap = cx.background_executor().spawn(async move { data::fetch(&paths, selected.as_deref(), task.as_deref()) }).await;
+                let Ok((paths, selected, task, request)) = this.update(cx, |this, _| (this.paths.clone(), this.selected.clone(), this.task.clone(), this.request.clone())) else { return };
+                let snap = cx.background_executor().spawn(async move { data::fetch(&paths, selected.as_deref(), task.as_deref(), request.as_deref()) }).await;
                 if std::env::var_os("LILA_APP_DEBUG").is_some() {
                     eprintln!("[lila-app] {} refreshed {}: {} tasks", data::clock_ms(), snap.project.as_deref().unwrap_or("-"), snap.tasks.len());
                 }
@@ -134,8 +150,9 @@ impl LilaApp {
             });
         })
         .detach();
-        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
+        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, request: None, active: true, away_since: None, recap: None, recap_only: false, needs_seen: HashMap::new(), core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
         app.start_usage(window, cx);
+        cx.observe_window_activation(window, |this, window, cx| this.activated(window.is_window_active(), cx)).detach();
         app
     }
 
@@ -211,10 +228,93 @@ impl LilaApp {
         if snap.detail.as_ref().and_then(|d| d["id"].as_str()) != self.task.as_deref() {
             snap.detail = self.snap.detail.take().filter(|d| d["id"].as_str() == self.task.as_deref());
         }
+        let shows = |v: &Option<Value>, id: Option<&str>| v.as_ref().and_then(|r| r["request"]["id"].as_str()) == id;
+        if !shows(&snap.request, self.request.as_deref()) {
+            snap.request = self.snap.request.take().filter(|r| shows(&Some(r.clone()), self.request.as_deref()));
+        }
         self.snap = snap;
+        self.keep_a_request();
+        self.notify_needs();
         if let Some(id) = self.selected.clone() {
             self.restore_config(&id, cx);
         }
+        cx.notify();
+    }
+
+    /// The window came to the front or went to the back. Back after `AWAY_MS`:
+    /// the list leads with what happened meanwhile.
+    fn activated(&mut self, active: bool, cx: &mut Context<Self>) {
+        let now = data::now_ms();
+        if !active {
+            self.away_since.get_or_insert(now);
+        } else if let Some(since) = self.away_since.take()
+            && now - since >= AWAY_MS
+        {
+            self.recap = Some(since);
+            self.recap_only = false;
+        }
+        self.active = active;
+        cx.notify();
+    }
+
+    /// A system notification for each new thing that needs the person, while
+    /// the window is not in front. The first look at a project only takes note.
+    fn notify_needs(&mut self) {
+        let Some(pid) = self.snap.project.clone().filter(|_| self.snap.status.is_some()) else { return };
+        let now: std::collections::HashSet<String> = self.snap.inbox.iter().filter(|i| i["kind"] != "report").map(|i| crate::ui::s(i, "id")).collect();
+        let fresh: Vec<String> = match self.needs_seen.get(&pid) {
+            Some(seen) if !self.active => now.iter().filter(|id| !seen.contains(*id)).cloned().collect(),
+            _ => Vec::new(),
+        };
+        self.needs_seen.insert(pid.clone(), now);
+        let project = self.project().map(|p| p.label()).unwrap_or(pid);
+        for id in fresh {
+            let Some(item) = self.snap.inbox.iter().find(|i| i["id"] == id.as_str()) else { continue };
+            let words = crate::requests::inbox_words(item["kind"].as_str().unwrap_or(""));
+            let request = self.snap.requests.iter().find(|r| r["inbox"].as_array().is_some_and(|a| a.iter().any(|x| x == id.as_str())));
+            let body = match request {
+                Some(r) => format!("{} {}：{words}", crate::ui::s(r, "id"), crate::ui::s(r, "title")),
+                None => crate::ui::s(item, "text").lines().next().unwrap_or(words).to_owned(),
+            };
+            data::notify(&project, &body);
+        }
+    }
+
+    /// Inbox items about no request (Codex's quota, a member that left): the
+    /// list shows them with the requests that need the person.
+    pub fn loose_inbox(&self) -> Vec<Value> {
+        let claimed: Vec<&str> = self.snap.requests.iter().flat_map(|r| r["inbox"].as_array().into_iter().flatten().filter_map(|i| i.as_str())).collect();
+        self.snap.inbox.iter().filter(|i| !claimed.contains(&i["id"].as_str().unwrap_or(""))).cloned().collect()
+    }
+
+    /// Something is always on the right while there is anything: the selected
+    /// request while it exists, else what needs the person first, else the first request.
+    fn keep_a_request(&mut self) {
+        if self.snap.status.is_none() {
+            return;
+        }
+        let loose = self.loose_inbox();
+        let exists = |id: &str| self.snap.requests.iter().any(|r| r["id"] == id) || loose.iter().any(|i| i["id"] == id);
+        if self.request.as_deref().is_some_and(exists) {
+            return;
+        }
+        let needs = self.snap.requests.iter().find(|r| r["group"] == "needs_you").map(|r| crate::ui::s(r, "id"));
+        let pick = needs.or_else(|| loose.first().map(|i| crate::ui::s(i, "id"))).or_else(|| self.snap.requests.first().map(|r| crate::ui::s(r, "id")));
+        if pick != self.request {
+            self.request = pick;
+            self.snap.request = None;
+            self.refresh_now();
+        }
+    }
+
+    /// Shows a request (or a loose inbox item) on the right.
+    pub fn select_request(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.request.as_deref() != Some(&id) {
+            self.request = Some(id);
+            self.snap.request = None;
+            self.refresh_now();
+        }
+        self.right_open = true;
         cx.notify();
     }
 
@@ -233,6 +333,7 @@ impl LilaApp {
             Some(next) => self.select_project(next, cx),
             None => {
                 self.member = None;
+                self.request = None;
                 self.close_task(cx);
                 self.draft = None;
                 self.settings = None;
@@ -278,6 +379,7 @@ impl LilaApp {
         }
         self.settings = None;
         self.member = None;
+        self.request = None;
         self.close_task(cx);
         self.draft = None;
         let cached = self.cache.get(&id).cloned().unwrap_or_else(|| Snapshot { project: Some(id.clone()), ..Default::default() });
@@ -325,11 +427,15 @@ impl LilaApp {
         self.snap.status.as_ref().and_then(|s| s["members"].as_array().cloned()).unwrap_or_default()
     }
 
-    /// The member shown in the middle: the chosen one, else the owner.
+    /// The member whose terminal is in the middle, if one was chosen.
     pub fn shown_member(&self) -> Option<Value> {
         let members = self.members();
-        let chosen = self.member.as_ref().and_then(|id| members.iter().find(|m| m["id"] == id.as_str()).cloned());
-        chosen.or_else(|| members.iter().find(|m| m["owner"] == true).cloned())
+        self.member.as_ref().and_then(|id| members.iter().find(|m| m["id"] == id.as_str()).cloned())
+    }
+
+    /// The team has a running member.
+    pub fn team_running(&self) -> bool {
+        self.members().iter().any(|m| m["terminal"].is_string())
     }
 
     /// Runs one request off the UI thread, then refreshes.
@@ -575,6 +681,11 @@ impl LilaApp {
             "," => self.open_prefs(crate::prefs::PrefPage::Roles, window, cx),
             "i" => {
                 self.right_open = !self.right_open;
+                cx.notify();
+            }
+            // Back from a terminal to the requests.
+            "0" | "[" if self.member.is_some() => {
+                self.member = None;
                 cx.notify();
             }
             d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() && d != "0" => {

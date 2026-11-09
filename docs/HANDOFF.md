@@ -3,6 +3,7 @@
 更新于 2026-11-07。用户用中文交流，回复也用中文。用户会换一台电脑继续，那台电脑上没有这一台的 Claude 记忆，所以该知道的都写在这里。
 
 先读这份。需要细节时再读：
+- `docs/product-v3.md`：下一阶段的产品方案（请求为中心、多来源、worktree 槽），M1 起按它做。
 - `docs/architecture-v2.md`：参考四篇文章（README 末尾）重新评估后的架构，分阶段落地。阶段 A–E 已完成，记录在 §10–§14；§15 是第一版上线前的精简。
 - `DESIGN.md`（仓库根目录）：界面规范。第一条规则：不写说明文字，看不懂就改布局。
 - 各阶段的旧记录（m1–m3、spikes、最初的 design.md）和 HTML 原型已经从仓库里去掉，要查就看 git 历史。
@@ -86,6 +87,8 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | `lila` | CLI 和 lilad，详见下面几行 |
 | ↳ `daemon/` | lilad。`mod.rs`：状态、herdr-core 的事件、pump（投递和通知）、spool。`requests.rs`：`Daemon::handle` 和每个请求。`flows.rs`：流程推进、检查命令。`session.rs`：换链时的会话、PM 摘要。`review.rs`：验收卡片、一条链占目录、验收时提交、预算。`watch.rs`：Watchdog 和 `tick`。`server.rs`：socket、事件流和后台线程。`tests.rs` 用 Fake 终端，CLI 的会话记录目录指向临时目录 |
 | ↳ `check.rs` | 后台跑流程的检查命令（进程组、超时） |
+| ↳ `worktree.rs`、`commit.rs` | worktree 槽的 git 命令（占槽、放槽、取消时保留）；验收时提交，从槽里合成一个提交、rebase、快进合并（`docs/product-v3.md` §7.1） |
+| ↳ `daemon/slots.rs` | 哪条链在哪个槽、排队占槽、链结束后放槽或给验收卡片、合并失败的 `merge` 条目 |
 | ↳ `sessions.rs` | Claude 会话记录的位置、找 Codex 的会话、读上下文大小 |
 | ↳ `accounts.rs` | 订阅账号（`accounts.toml`）、成员用哪个账号、读每个账号的额度 |
 | ↳ `signin.rs` | 添加账号时在浏览器里登录（后台运行 CLI 自己的登录） |
@@ -93,7 +96,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | ↳ `usage.rs` | 按成员统计 token（读两个 CLI 的会话记录）、时间解析 |
 | ↳ 其他 | `settings.rs`（项目设置读写，用 toml_edit 保留注释）、`roles.rs`（角色和默认角色升级）、`init.rs`、`client.rs`、`paths.rs`、`skill.md`（给 agent 的协议说明） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app） |
-| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、窗口自己的焦点。`ui.rs`：侧栏卡片、中间卡片（标题行、终端）、概览（需要你 / 任务）、收件箱卡片（含验收、预算）。`style.rs`：配色和小部件。`tree.rs`：成员树动画。`data.rs`：拉数据、本地时间。`dialog.rs`：对话框外壳（`footer: false` 不显示保存栏）。`settings.rs`：项目设置。`prefs.rs`：全局设置（角色 / 用量 / 关于）。`usage.rs`：用量页（账号、浏览器登录、magpie）。`wizard.rs`（新建项目）、`detail.rs`（任务详情）、`compose.rs`（新建任务）、`build.rs`。 |
+| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、窗口自己的焦点、选中的请求、离开期间和通知。`ui.rs`：侧栏卡片、中间卡片（标题行、终端）、收件箱卡片（含验收、预算、合并）。`requests.rs`：请求列表和右边的请求详情。`style.rs`：配色和小部件。`tree.rs`：成员树动画。`data.rs`：拉数据、本地时间。`dialog.rs`：对话框外壳（`footer: false` 不显示保存栏）。`settings.rs`：项目设置。`prefs.rs`：全局设置（角色 / 用量 / 关于）。`usage.rs`：用量页（账号、浏览器登录、magpie）。`wizard.rs`（新建项目）、`detail.rs`（任务详情）、`compose.rs`（新建任务）、`build.rs`。 |
 
 ## 关键机制（v2 之后）
 
@@ -140,10 +143,11 @@ cargo run -p lila-app                             # 或者：cargo install --pat
   - 石墨色毛玻璃窗口，内边距 8，卡片之间的缝是 8，也是拖动改宽度的把手。
   - 12px 圆角卡片，靠填充色区分层次。左、中、右三栏都是卡片，侧栏卡片的第一行是红绿灯、「Lila」和设置按钮。
   - 字号：正文 13、次要 12、说明 11。
-- **布局**：
-  - 侧栏是项目列表，加上两层的成员树（PM 在根上）。暂停派发在项目右键菜单里。
-  - 中间一张卡片：一行标题（项目 › 成员、状态胶囊、上下文、整理上下文、搜索、项目设置、面板开关）和终端。成员没在运行时只有一个「启动团队」按钮。没有状态栏，也没有标签页。
-  - 右边：「需要你」（有事时才出现）和任务（一行一个）。没有动态卡片。
+- **布局**（2026-11-09 起以请求为中心，`docs/product-v3.md` §7.3）：
+  - 侧栏是项目列表，加上两层的成员树（PM 在根上，界面上叫「助理」）。暂停派发在项目右键菜单里。
+  - 中间一张卡片：一行标题和请求列表（`requests.rs`，按「下一步该谁动」分组）。点成员时换成它的终端，标题行是项目 › 成员、状态胶囊、上下文、整理上下文、搜索、项目设置、面板开关；点项目名或 ⌘[ 回到列表。
+  - 右边：选中的请求（要你处理的卡片、决定、没验证、步骤、经过）。
+  - 离开超过 10 分钟回来，列表顶部有一行回顾；窗口在后面时新的「需要你」发系统通知。
 - **收件箱卡片**：PM 在问你、终端在等你、等你验收（通过 / 写意见打回）、超出预算（继续 / 取消）、额度用完、可能在打转等。文字来自 `lila_core::inbox`（中文）；给成员的消息在 `lila_core::message`（英文，协议）。
 - **设置**：
   - 全局设置（⌘,）：角色、用量、关于。
@@ -160,6 +164,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 - `LILA_APP_KEYS="cmd-, cmd-i"`：启动后按这些键，经过窗口自己的按键分发，用来验证快捷键。
 - `LILA_APP_PREFS=roles|usage|about`、`LILA_APP_SETTINGS=general|members`（加 `LILA_APP_SETTINGS_ADD=<角色>`）。
 - `LILA_APP_SIGNIN=claude:<名称>`：直接开始添加账号；`LILA_APP_NO_OPEN=1` 不打开浏览器。截完图要 `pkill -f "claude auth login"`。
+- `LILA_APP_REQUEST=T3`（选中请求）、`LILA_APP_MEMBER=pm`（中间显示终端）、`LILA_APP_AWAY=360`（像离开了 6 小时回来）。
 - `LILA_APP_FAKE_STATUS=designer:working,tester:blocked`、`LILA_APP_OPEN_TASK=T5`、`LILA_APP_COMPOSE=<成员>`、`LILA_APP_NEW=<文件夹>`（空：还没选文件夹）、`LILA_APP_SWITCH=a,b`、`LILA_APP_GUTTERS=1`、`LILA_APP_DEBUG=1`。
 
 截图用临时的 `LILA_HOME`，不碰用户的真实数据：
@@ -196,6 +201,7 @@ macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; ki
 
 ## 待办
 
+- **产品方案 v3**（`docs/product-v3.md`，2026-11-09 草案）：主界面改成以请求为中心，来源是手动、GitHub、Asana；M1 先做 worktree 槽和请求列表，不接外部渠道。取代下面这条。
 - **阶段 E 的 worktree**（`docs/architecture-v2.md` §4.8）：第一版没做，改成一条链占目录、验收时提交（§14）。以后要真正并行时再做每条链一个 worktree。
 - PM 自己开的链（终端里提的需求）没有验收卡片，也就不会提交（§14 已知限制）。
 - **2026-11-07 的精简**见 `docs/architecture-v2.md` §15。

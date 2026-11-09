@@ -2,7 +2,8 @@
 //! machine: Claude Code's `~/.claude/projects/<folder>/<session>.jsonl` and
 //! Codex's `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 //!
-//! Members share one folder, so the folder doesn't say whose a session is.
+//! Members share folders (the project's and its worktrees), so the folder
+//! doesn't say whose a session is.
 //! Its system prompt does: both CLIs record it, and Lila's says
 //! "Project: <id>, working directory: <cwd>" then "You are `<member>`"
 //! (see `lila_core::prompt::render`). Sessions without it are the person's own.
@@ -245,8 +246,8 @@ fn jsonl_under(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 #[derive(Default)]
 pub struct Scanner {
     files: HashMap<PathBuf, (u64, std::time::SystemTime, FileUsage)>,
-    /// Rollouts in another folder, by path (their first line is all that was read).
-    elsewhere: HashMap<PathBuf, (u64, std::time::SystemTime)>,
+    /// The folder each Codex rollout was started in, by path (from its first line).
+    elsewhere: HashMap<PathBuf, ((u64, std::time::SystemTime), Option<String>)>,
 }
 
 impl Scanner {
@@ -264,10 +265,20 @@ impl Scanner {
         &self.files[p].2
     }
 
-    /// Every session of `project` (in `cwd`) Lila started.
-    fn sessions(&mut self, src: &Sources, project: &str, cwd: &str) -> Vec<FileUsage> {
+    /// Every session of `project` Lila started, in any of its folders (the
+    /// project folder and its worktree slots).
+    fn sessions(&mut self, src: &Sources, project: &str, cwds: &[String]) -> Vec<FileUsage> {
         let mut out = Vec::new();
-        // Claude Code: the folder's own directory; a session's subagents sit in `<session>/subagents/`.
+        for cwd in cwds {
+            self.claude_sessions(src, cwd, &mut out);
+        }
+        self.codex_sessions(src, cwds, &mut out);
+        out.retain(|f| f.who.as_ref().is_some_and(|(p, _)| p == project));
+        out
+    }
+
+    /// Claude Code: the folder's own directory; a session's subagents sit in `<session>/subagents/`.
+    fn claude_sessions(&mut self, src: &Sources, cwd: &str, out: &mut Vec<FileUsage>) {
         let dir = src.claude.join("projects").join(claude_folder(cwd));
         let mut files = Vec::new();
         jsonl_under(&dir, &mut files, 2);
@@ -292,32 +303,36 @@ impl Scanner {
             f.who = Some(who);
             out.push(f);
         }
-        // Codex: every rollout; only the first line says the folder.
+    }
+
+    /// Codex: every rollout; only the first line says the folder.
+    fn codex_sessions(&mut self, src: &Sources, cwds: &[String], out: &mut Vec<FileUsage>) {
         let mut files = Vec::new();
         jsonl_under(&src.codex.join("sessions"), &mut files, 4);
         for p in files {
             let Some(stamp) = Self::stamp(&p) else { continue };
-            if self.elsewhere.get(&p) == Some(&stamp) {
-                continue;
-            }
-            if !self.files.contains_key(&p) {
-                use std::io::BufRead;
-                let first = std::fs::File::open(&p).ok().and_then(|f| std::io::BufReader::new(f).lines().next()).and_then(|l| l.ok()).unwrap_or_default();
-                if codex_cwd(&first).as_deref() != Some(cwd) {
-                    self.elsewhere.insert(p, stamp);
-                    continue;
+            // The folder a rollout is in, read once per version of the file.
+            let cwd = match self.elsewhere.get(&p) {
+                Some((at, cwd)) if *at == stamp => cwd.clone(),
+                _ => {
+                    use std::io::BufRead;
+                    let first = std::fs::File::open(&p).ok().and_then(|f| std::io::BufReader::new(f).lines().next()).and_then(|l| l.ok()).unwrap_or_default();
+                    let cwd = codex_cwd(&first);
+                    self.elsewhere.insert(p.clone(), (stamp, cwd.clone()));
+                    cwd
                 }
+            };
+            if !cwd.is_some_and(|c| cwds.contains(&c)) {
+                continue;
             }
             out.push(self.read(&p, stamp, read_codex).clone());
         }
-        out.retain(|f| f.who.as_ref().is_some_and(|(p, _)| p == project));
-        out
     }
 
     /// Use per member since `since_ms` (`None`: all of it), most first.
     /// Tokens (all kinds) `member` used between `from_ms` and `to_ms`.
-    pub fn tokens_between(&mut self, src: &Sources, project: &str, cwd: &str, member: &str, from_ms: i64, to_ms: i64) -> u64 {
-        self.sessions(src, project, cwd)
+    pub fn tokens_between(&mut self, src: &Sources, project: &str, cwds: &[String], member: &str, from_ms: i64, to_ms: i64) -> u64 {
+        self.sessions(src, project, cwds)
             .iter()
             .filter(|f| f.who.as_ref().is_some_and(|(p, m)| p == project && m == member))
             .flat_map(|f| f.entries.iter())
@@ -326,8 +341,8 @@ impl Scanner {
             .sum()
     }
 
-    pub fn usage(&mut self, src: &Sources, project: &str, cwd: &str, since_ms: Option<i64>) -> Usage {
-        let sessions = self.sessions(src, project, cwd);
+    pub fn usage(&mut self, src: &Sources, project: &str, cwds: &[String], since_ms: Option<i64>) -> Usage {
+        let sessions = self.sessions(src, project, cwds);
         let mut members: BTreeMap<String, MemberUsage> = BTreeMap::new();
         let mut total = Tokens::default();
         let mut limits: Vec<Limit> = Vec::new();
@@ -471,7 +486,8 @@ mod tests {
         std::fs::write(roll.join("rollout-2.jsonl"), codex("/elsewhere")).unwrap();
 
         let mut s = Scanner::default();
-        let all = s.usage(&src, "shop", cwd, None);
+        let cwds = [cwd.to_owned()];
+        let all = s.usage(&src, "shop", &cwds, None);
         let by = |u: &Usage, m: &str| u.members.iter().find(|x| x.member == m).map(|x| x.tokens.output);
         assert_eq!(all.members.len(), 3, "{:?}", all.members);
         assert_eq!(by(&all, "engineer"), Some(35));
@@ -480,11 +496,11 @@ mod tests {
         assert_eq!(all.members[0].member, "engineer", "most first");
         assert_eq!(all.members[0].sessions, 2, "the subagent file counts as its own");
 
-        let today = s.usage(&src, "shop", cwd, parse_time("2026-11-05T00:00:00Z"));
+        let today = s.usage(&src, "shop", &cwds, parse_time("2026-11-05T00:00:00Z"));
         assert_eq!(by(&today, "engineer"), Some(25));
 
         // A file that grows is read again.
         std::fs::write(dir.join("s2.jsonl"), session("pm", &[claude_reply("d", "2026-11-05T10:00:00Z", 1), claude_reply("f", "2026-11-05T13:00:00Z", 4)])).unwrap();
-        assert_eq!(by(&s.usage(&src, "shop", cwd, None), "pm"), Some(5));
+        assert_eq!(by(&s.usage(&src, "shop", &cwds, None), "pm"), Some(5));
     }
 }

@@ -3,15 +3,20 @@
 use super::*;
 
 impl<T: Terminals> Daemon<T> {
-    /// How `mid` (its session on another chain) takes work from `chain`: back to
-    /// the session that did this chain before, the same session while its
-    /// context is small (`fresh_after_tokens`), else a new one.
-    pub(super) fn switch_plan(&mut self, pid: &str, mid: &str, live: &Live, chain: &str) -> Switch {
+    /// How `mid` (its session on another chain, or in another folder) takes
+    /// work from `chain` in `dir`: back to the session that did this chain
+    /// before (in that folder), the same session while its context is small
+    /// (`fresh_after_tokens`) and it stays in its folder, else a new one.
+    pub(super) fn switch_plan(&mut self, pid: &str, mid: &str, live: &Live, chain: &str, dir: &Path, moved: bool) -> Switch {
+        let dir_s = dir.to_string_lossy();
         if let Ok(Some(s)) = self.store.session_for_chain(pid, mid, chain)
             && live.session.as_ref() != Some(&s.id)
-            && s.file.as_deref().is_some_and(|f| Path::new(f).exists())
+            && s.file.as_deref().is_some_and(|f| Path::new(f).exists() && (!moved || sessions::recorded_in(f, &s.runtime, &dir_s)))
         {
             return Switch::Resume(s.id);
+        }
+        if moved {
+            return Switch::Fresh;
         }
         let limit = self.projects[pid].team.settings.fresh_after_tokens;
         match self.context_of(pid, live.session.as_deref()) {
@@ -40,7 +45,9 @@ impl<T: Terminals> Daemon<T> {
             _ => (runtime::Session::New(None), "fresh_session", format!("{mid} starts a new session for {tid}")),
         };
         let _ = self.store.event(pid, Some(tid), "lilad", kind, &what, now);
-        if let Err(e) = self.start_session(pid, mid, session, now) {
+        let chain = self.store.ancestors(pid, tid).unwrap_or_default().last().map(|t| t.id.clone()).unwrap_or_else(|| tid.to_owned());
+        let dir = self.member_dir(pid, mid, Some(&chain));
+        if let Err(e) = self.start_session(pid, mid, session, &dir, now) {
             self.say(format!("{pid}: {mid} could not be started again for {tid}: {e:#}"));
             let _ = self.store.add_inbox(pid, "lost", Some(mid), None, &inbox::restart_failed(mid, &format!("{e:#}")), &[], now);
         }
