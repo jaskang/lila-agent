@@ -62,6 +62,7 @@ pub fn event_line(actor: &str, kind: &str, detail: &str) -> (String, Option<Stri
         "stalled" => ("无回应", false),
         "answered" => ("回答", true),
         "fresh_session" => ("换新会话", false),
+        "lingered" => ("重启了做完还没停的成员", false),
         "accepted" => ("通过", false),
         "rejected" => ("打回", true),
         "committed" => ("提交", !detail.contains(' ')),

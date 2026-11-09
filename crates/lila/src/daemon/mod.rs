@@ -147,6 +147,8 @@ pub struct Daemon<T: Terminals> {
     conflicts: BTreeMap<(String, String), Vec<String>>,
     /// The accepted task each commit under way is for (its summary is the commit's).
     commit_task: BTreeMap<(String, String), String>,
+    /// Projects with a commit running: the next one waits for it.
+    merging: BTreeSet<String>,
 }
 
 /// How a member gets work from another chain than its session's.
@@ -233,6 +235,7 @@ impl<T: Terminals> Daemon<T> {
             slot_failed: BTreeMap::new(),
             conflicts: BTreeMap::new(),
             commit_task: BTreeMap::new(),
+            merging: BTreeSet::new(),
         };
         let rows = d.store.projects().unwrap_or_default();
         for p in rows {

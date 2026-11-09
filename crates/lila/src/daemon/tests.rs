@@ -1748,3 +1748,51 @@ fn a_request_shows_its_chain_its_history_and_what_waits_for_the_person() {
     assert!(at.windows(2).all(|p| p[0] <= p[1]), "one timeline, in order");
     assert!(w.call(None, "request.show", json!({"id": "T9"})).is_err());
 }
+
+#[test]
+fn two_accepted_at_once_land_one_after_the_other() {
+    let mut w = git_world("");
+    w.ok(None, "task.new", json!({"to": "architect", "title": "A"}));
+    w.ok(None, "task.new", json!({"to": "engineer", "title": "B"}));
+    w.status("architect", "idle");
+    w.status("engineer", "idle");
+    std::fs::write(w.slot(1).join("a.md"), "a\n").unwrap();
+    std::fs::write(w.slot(2).join("b.md"), "b\n").unwrap();
+    for (member, id) in [("architect", "T1"), ("engineer", "T2")] {
+        w.ok(Some(member), "task.done", json!({"id": id, "summary": "done"}));
+    }
+    for q in ["Q1", "Q2"] {
+        w.ok(None, "answer", json!({"id": q}));
+    }
+    // The second waits for the first, then rebases onto it: no merge item.
+    assert_eq!(w.d.commits.len(), 2);
+    let first = w.d.take_commits();
+    assert_eq!((first.len(), w.d.take_commits().len()), (1, 0));
+    let r = crate::commit::run(&first[0]);
+    w.d.on_commit_done("shop", &first[0].chain, &r, w.now);
+    assert!(matches!(w.make_commits()[..], [CommitResult::Committed(_)]));
+    assert!(w.inbox_kinds().is_empty(), "{:?}", w.inbox_kinds());
+    assert_eq!(crate::worktree::tests::sh(&w.repo, &["log", "--format=%s"]), "B\nA\nfirst");
+}
+
+#[test]
+fn a_member_still_working_after_its_task_is_done_starts_again_for_the_next() {
+    let mut w = world_with(&manual("fresh_session = false\nmax_chains = 0\n"));
+    w.up();
+    w.all_idle();
+    w.ok(None, "task.new", json!({"to": "engineer", "title": "One"}));
+    w.status("engineer", "working");
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "done"}));
+    w.ok(None, "task.new", json!({"to": "engineer", "title": "Two"}));
+    assert_eq!(w.state("T2"), TaskState::Queued, "its turn goes on");
+    let old = w.terminal("engineer");
+    w.now += 60_000;
+    w.d.tick(w.now);
+    assert_eq!(w.terminal("engineer"), old, "not yet");
+    w.now += 70_000;
+    w.d.tick(w.now);
+    assert!(w.d.term.kills.contains(&old));
+    assert_ne!(w.terminal("engineer"), old);
+    w.status("engineer", "idle");
+    assert_eq!(w.state("T2"), TaskState::Delivered);
+}

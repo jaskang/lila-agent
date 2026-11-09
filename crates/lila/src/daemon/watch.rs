@@ -2,8 +2,38 @@
 
 use super::*;
 
+/// How long a member may go on working after its task is done while work waits for it.
+const LINGER_MS: i64 = 120_000;
+
 impl<T: Terminals> Daemon<T> {
     // ---------------- the watchdog ----------------
+
+    /// A member whose task is done but whose turn goes on (Codex sometimes keeps
+    /// "working" for minutes after `lila task done`), while work waits for it:
+    /// after `LINGER_MS` it starts again where its next task is. Its work was
+    /// reported; what is left of the turn is nobody's.
+    pub(super) fn unstick(&mut self, pid: &str, now: i64) {
+        let tasks = self.store.tasks(pid).unwrap_or_default();
+        let lingering: Vec<String> = self.projects[pid]
+            .live
+            .iter()
+            .filter(|(m, l)| l.status == AgentStatus::Working && l.terminal.is_some() && self.projects[pid].team.member(m).is_some_and(|x| !x.is_owner))
+            .filter(|(m, l)| {
+                let holds = tasks.iter().any(|(t, _)| t.to == **m && matches!(t.state, TaskState::Delivered | TaskState::InProgress | TaskState::Blocked));
+                let finished = tasks.iter().filter(|(t, _)| t.to == **m && t.state == TaskState::Done).map(|(t, _)| t.updated_ms).max();
+                let waiting = tasks.iter().any(|(t, _)| t.to == **m && t.state == TaskState::Queued);
+                !holds && waiting && finished.is_some_and(|f| f >= l.busy_since && now - f >= LINGER_MS)
+            })
+            .map(|(m, _)| m.clone())
+            .collect();
+        for mid in lingering {
+            let Some((next, _)) = tasks.iter().filter(|(t, _)| t.to == mid && t.state == TaskState::Queued).min_by_key(|(_, m)| m.seq) else { continue };
+            let next = next.id.clone();
+            let _ = self.store.event(pid, Some(&next), LILAD, "lingered", &format!("{mid} kept working {} s after its task was done; it starts again for {next}", LINGER_MS / 1000), now);
+            self.say(format!("{pid}: {mid} lingered after its task; starting again for {next}"));
+            self.new_session(pid, &mid, &next, Switch::Fresh, now);
+        }
+    }
 
     /// A member working `runaway_minutes` without a `lila` call is reminded once;
     /// if it still says nothing, the person hears. Busy is not progress.
@@ -134,6 +164,7 @@ impl<T: Terminals> Daemon<T> {
             self.watch_runaways(pid, now);
             self.watch_quota(pid, now);
             self.tend_slots(pid, now);
+            self.unstick(pid, now);
         }
         for pid in pids {
             let settings = self.projects[&pid].team.settings.clone();

@@ -92,17 +92,24 @@ pub fn run(job: &CommitJob) -> CommitResult {
         o => return failed("git commit", o),
     }
     if let Some((main, t)) = target {
-        if !git(&["rebase", "-q", &t]).is_ok_and(|o| o.status.success()) {
-            let files = crate::worktree::out(&job.cwd, &job.path_env, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
-            let _ = git(&["rebase", "--abort"]);
-            return CommitResult::Conflict(files.lines().map(String::from).collect());
-        }
         let branch = match crate::worktree::out(&job.cwd, &job.path_env, &["symbolic-ref", "-q", "--short", "HEAD"]) {
             Ok(b) => b,
             Err(e) => return CommitResult::Failed(e.to_string()),
         };
-        if let Err(e) = crate::worktree::out(main, &job.path_env, &["merge", "-q", "--ff-only", &branch]) {
-            return CommitResult::NotMerged(e.to_string());
+        // The project's branch may move between the rebase and the merge (the
+        // person committed): rebase again, a few times.
+        let mut tries = 0;
+        loop {
+            if !git(&["rebase", "-q", &t]).is_ok_and(|o| o.status.success()) {
+                let files = crate::worktree::out(&job.cwd, &job.path_env, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+                let _ = git(&["rebase", "--abort"]);
+                return CommitResult::Conflict(files.lines().map(String::from).collect());
+            }
+            match crate::worktree::out(main, &job.path_env, &["merge", "-q", "--ff-only", &branch]) {
+                Ok(_) => break,
+                Err(e) if tries < 3 && e.to_string().contains("Not possible to fast-forward") => tries += 1,
+                Err(e) => return CommitResult::NotMerged(e.to_string()),
+            }
         }
     }
     match git(&["rev-parse", "--short", "HEAD"]) {

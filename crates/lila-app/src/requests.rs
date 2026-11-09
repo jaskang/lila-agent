@@ -272,7 +272,21 @@ impl LilaApp {
         let group = s(&r, "group");
         let tasks: Vec<Value> = v["tasks"].as_array().cloned().unwrap_or_default();
         let items: Vec<Value> = v["inbox"].as_array().cloned().unwrap_or_default();
-        let events: Vec<Value> = v["events"].as_array().cloned().unwrap_or_default();
+        // Who did what and said what; Lila's own bookkeeping (deliveries, sessions,
+        // worktrees, the tasks it opens for a flow's steps) stays in `lila log`.
+        let events: Vec<Value> = v["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| {
+                let (actor, kind, detail) = (e["actor"].as_str().unwrap_or(""), e["kind"].as_str().unwrap_or(""), e["detail"].as_str().unwrap_or(""));
+                let bookkeeping = matches!(kind, "delivered" | "fresh_session" | "resumed_session" | "worktree" | "flow" | "member_started" | "member_gone" | "edited" | "answered")
+                    || (kind == "created" && actor == "lilad")
+                    || (kind == "check" && detail.starts_with("running"));
+                !bookkeeping
+            })
+            .cloned()
+            .collect();
         let collect = |key: &str| -> Vec<String> { tasks.iter().flat_map(|t| t[key].as_array().cloned().unwrap_or_default()).filter_map(|x| x.as_str().map(String::from)).collect() };
         let (decisions, unverified) = (collect("decisions"), collect("unverified"));
         let from = if r["from"] == "human" { "你提的".to_owned() } else { format!("{}开的", who(r["from"].as_str().unwrap_or(""), &owner)) };

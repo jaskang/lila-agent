@@ -85,13 +85,26 @@ impl<T: Terminals> Daemon<T> {
     }
 
     /// Commits to make now; each result comes back through `on_commit_done`.
+    /// One per project at a time: two accepted chains merging at once would each
+    /// rebase onto the branch before the other lands on it.
     pub fn take_commits(&mut self) -> Vec<CommitJob> {
-        std::mem::take(&mut self.commits)
+        let mut out = Vec::new();
+        let mut left = Vec::new();
+        for job in std::mem::take(&mut self.commits) {
+            if self.merging.insert(job.project.clone()) {
+                out.push(job);
+            } else {
+                left.push(job);
+            }
+        }
+        self.commits = left;
+        out
     }
 
     /// A chain's commit is made (or not): the folder is free for the next chain.
     pub fn on_commit_done(&mut self, pid: &str, chain: &str, r: &CommitResult, now: i64) {
         self.committing.remove(&(pid.to_owned(), chain.to_owned()));
+        self.merging.remove(pid);
         let task = self.commit_task.remove(&(pid.to_owned(), chain.to_owned())).unwrap_or_else(|| chain.to_owned());
         if !self.projects.contains_key(pid) {
             return;
