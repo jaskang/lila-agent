@@ -23,6 +23,8 @@ pub struct Conv {
     pub session: Option<String>,
     pub seq: i64,
     pub items: Vec<Value>,
+    /// The reply being written now, before it is an item (Claude Code's `MessageDisplay`).
+    pub writing: Option<String>,
 }
 
 impl Conv {
@@ -42,6 +44,7 @@ impl Conv {
             }
         }
         self.seq = self.seq.max(v["seq"].as_i64().unwrap_or(0));
+        self.writing = v["writing"].as_str().map(String::from);
     }
 }
 
@@ -117,17 +120,17 @@ impl LilaApp {
             let h = &self.conv_scroll;
             h.max_offset().y - (-h.offset().y) < px(48.)
         };
-        let before = self.conv.as_ref().map(|c| (c.items.len(), c.seq));
+        let before = self.conv.as_ref().map(|c| (c.items.len(), c.seq, c.writing.as_ref().map(String::len)));
         match &mut self.conv {
             Some(c) if c.project == project && c.member == member => c.merge(&v),
             _ => {
-                let mut c = Conv { project, member, session: None, seq: 0, items: Vec::new() };
+                let mut c = Conv { project, member, session: None, seq: 0, items: Vec::new(), writing: None };
                 c.merge(&v);
                 self.conv = Some(c);
                 self.conv_open.clear();
             }
         }
-        let after = self.conv.as_ref().map(|c| (c.items.len(), c.seq));
+        let after = self.conv.as_ref().map(|c| (c.items.len(), c.seq, c.writing.as_ref().map(String::len)));
         if before.is_none() || (at_end && before != after) {
             self.conv_scroll.scroll_to_bottom();
         }
@@ -152,7 +155,25 @@ impl LilaApp {
         let member = s(m, "id");
         let input = self.conv_input(window, cx);
         let items: Vec<Value> = self.conv.as_ref().filter(|c| c.member == member).map(|c| c.items.clone()).unwrap_or_default();
-        let rows: Vec<AnyElement> = items.iter().filter_map(|i| self.item_row(i, cx)).collect();
+        let mut rows: Vec<AnyElement> = items.iter().filter_map(|i| self.item_row(i, cx)).collect();
+        // The reply as it is written: muted, until it is in the record.
+        if let Some(text) = self.conv.as_ref().filter(|c| c.member == member).and_then(|c| c.writing.clone()) {
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_start()
+                    .child(div().pt(px(3.)).child(Spinner::new().xsmall().color(style::blue())))
+                    .child(div().flex_1().min_w_0().text_size(px(13.)).text_color(muted()).child(text))
+                    .into_any_element(),
+            );
+        }
+        // What the member waits on from the person (a permission), right under the conversation.
+        let waiting: Vec<Value> = self.snap.inbox.iter().filter(|i| i["member"] == member.as_str() && i["kind"] == "permission").cloned().collect();
+        for item in waiting {
+            let card = self.inbox_card(item, false, cx).into_any_element();
+            rows.push(div().w_full().px_1().rounded(px(style::R_BLOCK)).border_1().border_color(style::yellow().opacity(0.35)).bg(style::yellow().opacity(0.06)).child(card).into_any_element());
+        }
         let to = member.clone();
         v_flex()
             .flex_1()

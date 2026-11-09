@@ -656,7 +656,8 @@ impl LilaApp {
                         }),
                 )
             })
-            .when(!matches!(kind.as_str(), "question" | "review" | "budget" | "triage" | "draft"), |d| {
+            // A permission is answered by its options only: dismissing it would mean different things per runtime.
+            .when(!matches!(kind.as_str(), "question" | "review" | "budget" | "triage" | "draft" | "permission"), |d| {
                 let open = member.clone().filter(|_| matches!(kind.as_str(), "terminal" | "startup" | "stalled" | "runaway"));
                 let id = card_id.clone();
                 d.child(

@@ -186,3 +186,44 @@ pub fn start_daemon(paths: &Paths) -> Result<()> {
     }
     bail!("lilad did not come up in terminal {addr}; see `hc read {addr}`")
 }
+
+/// How long `lila hook PermissionRequest` waits for the person before leaving the
+/// question to the terminal (under the hook's own 600 s, `daemon::hooks`).
+pub const HOOK_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(570);
+
+/// `lila hook <event>`: a Claude Code hook in a member's session. Hands the event
+/// (its JSON on stdin) to lilad; for a permission request, waits for the person's
+/// answer and prints the decision. Never fails the session: with lilad away, or no
+/// answer in time, it prints nothing and Claude Code asks in its terminal.
+pub fn hook(paths: &Paths, event: &str) -> Result<()> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
+    let Ok(r) = request(paths, "hook", json!({"event": event, "payload": payload}), false) else { return Ok(()) };
+    if event != "PermissionRequest" {
+        return Ok(());
+    }
+    let decide = |d: &Value| -> Option<String> { d.as_str().map(String::from) };
+    let mut decision = decide(&r["decision"]);
+    if let Some(id) = r["wait"].as_str() {
+        let until = std::time::Instant::now() + HOOK_ANSWER_WAIT;
+        while std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let Ok(a) = request(paths, "hook.answer", json!({"id": id}), false) else { continue };
+            if a["pending"] == true {
+                continue;
+            }
+            decision = decide(&a["decision"]);
+            break;
+        }
+    }
+    if let Some(d) = decision {
+        let behavior = if d == "allow" { "allow" } else { "deny" };
+        let mut out = json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": behavior}}});
+        if behavior == "deny" {
+            out["hookSpecificOutput"]["decision"]["message"] = json!("The person said no in Lila.");
+        }
+        println!("{out}");
+    }
+    Ok(())
+}

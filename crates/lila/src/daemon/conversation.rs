@@ -56,6 +56,10 @@ impl<T: Terminals> Daemon<T> {
             if items.is_empty() {
                 continue;
             }
+            // The reply being written is in the transcript now.
+            if items.iter().any(|i| matches!(i.kind, lila_agent::ItemKind::AgentMessage { .. })) && self.writing.remove(&key).is_some() {
+                self.live_version += 1;
+            }
             let rows: Vec<(String, i64, String)> = items.iter().map(|i| (i.id.clone(), i.at_ms, serde_json::to_string(i).unwrap_or_default())).collect();
             if let Err(e) = self.store.put_items(&pid, &mid, &session, &rows) {
                 self.say(format!("{pid}: conversation of {mid}: {e:#}"));
@@ -82,7 +86,8 @@ impl<T: Terminals> Daemon<T> {
         };
         let seq = rows.iter().map(|(n, _)| *n).max().unwrap_or(after);
         let items: Vec<Value> = rows.into_iter().filter_map(|(_, body)| serde_json::from_str(&body).ok()).collect();
-        Ok(json!({"member": mid, "session": session, "seq": seq, "items": items, "caps": caps, "status": live.status.as_str()}))
+        let writing = self.writing_of(&pid, mid);
+        Ok(json!({"member": mid, "session": session, "seq": seq, "items": items, "caps": caps, "status": live.status.as_str(), "writing": writing}))
     }
 
     /// `conversation.send {member, text}`: the person's words to a member, as if typed in

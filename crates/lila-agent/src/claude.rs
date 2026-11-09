@@ -153,7 +153,7 @@ fn unwrap_paste(text: &str) -> &str {
 
 
 /// The tool's kind and a one-line title from its input.
-fn describe(name: &str, input: &Value) -> (ToolKind, String) {
+pub fn describe(name: &str, input: &Value) -> (ToolKind, String) {
     let field = |k: &str| input[k].as_str().unwrap_or_default().lines().next().unwrap_or_default().to_owned();
     let (kind, title) = match name {
         "Bash" => (ToolKind::Execute, field("command")),

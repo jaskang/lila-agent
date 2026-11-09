@@ -4,6 +4,7 @@
 
 mod conversation;
 mod flows;
+mod hooks;
 mod host;
 mod requests;
 mod review;
@@ -141,6 +142,11 @@ pub struct Daemon<T: Terminals> {
     hosts: HashMap<(String, String), std::sync::mpsc::Sender<String>>,
     /// Open permission cards (`host`), by (project, inbox id).
     asking: HashMap<(String, String), host::Asking>,
+    /// Answers waiting for the Claude Code hook that asked (`hooks`), by request id: the option, or none (left to the terminal).
+    hook_answers: HashMap<String, Option<String>>,
+    next_hook: u64,
+    /// What Claude members are writing now (`MessageDisplay`), by (project, member): (message id, text so far).
+    writing: HashMap<(String, String), (String, String)>,
     contexts: Contexts,
     /// Token use per member and window, from the same records (budgets, quotas).
     scanner: Scanner,
@@ -247,6 +253,9 @@ impl<T: Terminals> Daemon<T> {
             tails: HashMap::new(),
             hosts: HashMap::new(),
             asking: HashMap::new(),
+            hook_answers: HashMap::new(),
+            next_hook: 0,
+            writing: HashMap::new(),
             contexts: Contexts::default(),
             scanner: Scanner::default(),
             quota_checked: BTreeMap::new(),
@@ -441,7 +450,9 @@ impl<T: Terminals> Daemon<T> {
         if back_free {
             self.resolve_open(pid, "runaway", mid, now);
         }
-        if new == AgentStatus::Blocked && old != AgentStatus::Blocked && self.store.open_inbox_for(pid, "terminal", mid).map(|v| v.is_empty()).unwrap_or(false) {
+        // Waiting on a permission Lila already put to the person as a card: no second card.
+        let carded = !self.store.open_inbox_for(pid, "permission", mid).unwrap_or_default().is_empty();
+        if new == AgentStatus::Blocked && old != AgentStatus::Blocked && !carded && self.store.open_inbox_for(pid, "terminal", mid).map(|v| v.is_empty()).unwrap_or(false) {
             let what = if msg.is_empty() { kind.as_deref().unwrap_or("input").to_owned() } else { msg };
             let _ = self.store.add_inbox(pid, "terminal", Some(mid), None, &inbox::terminal(mid, &what), &[], now);
         }

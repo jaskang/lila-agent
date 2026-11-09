@@ -4,7 +4,7 @@
 
 先读这份。需要细节时再读：
 - `docs/product-v3.md`：下一阶段的产品方案（请求为中心、多来源、worktree 槽），M1 起按它做。
-- `docs/architecture-v3.md`：**正在做的**。多 agent 运行时与原生 GUI。默认 GUI；Codex 走 `codex app-server`，omp 走 ACP，都由 `lila host` 托管在 hc 终端里；Claude 照跑 TUI，Lila 代理出 GUI，可切换。§13 的决定全部按建议（P1 先做 Claude、对话存 SQLite、host 原始日志放菜单、omp 的账号交给 omp）。进度：P0 原型 ✅（§14），P1 Claude 对话视图 ✅（§15），P2 `lila host` + Codex app-server ✅（§16），**下一步 P3**（Claude hooks：权限卡片、逐字显示、准确的轮次结束）、P4（omp ACP）。用户的目标是「按建议从 P0 做到完成」。
+- `docs/architecture-v3.md`：**正在做的**。多 agent 运行时与原生 GUI。默认 GUI；Codex 走 `codex app-server`，omp 走 ACP，都由 `lila host` 托管在 hc 终端里；Claude 照跑 TUI，Lila 代理出 GUI，可切换。§13 的决定全部按建议（P1 先做 Claude、对话存 SQLite、host 原始日志放菜单、omp 的账号交给 omp）。进度：P0 原型 ✅（§14），P1 Claude 对话视图 ✅（§15），P2 `lila host` + Codex app-server ✅（§16），P3 Claude hooks ✅（§17），**下一步 P4：omp（ACP）**（Claude hooks：权限卡片、逐字显示、准确的轮次结束）、P4（omp ACP）。用户的目标是「按建议从 P0 做到完成」。
 - `docs/architecture-v2.md`：参考四篇文章（README 末尾）重新评估后的架构，分阶段落地。阶段 A–E 已完成，记录在 §10–§14；§15 是第一版上线前的精简。
 - `DESIGN.md`（仓库根目录）：界面规范。第一条规则：不写说明文字，看不懂就改布局。
 - 各阶段的旧记录（m1–m3、spikes、最初的 design.md）和 HTML 原型已经从仓库里去掉，要查就看 git 历史。
@@ -91,6 +91,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | ↳ `github.rs`、`daemon/sources.rs` | GitHub 来源（只用 `gh`）：定时拉 issue 建成给 PM 的任务、`lila triage` 和「要修吗？」卡片、`lila draft` 和评论草稿、发评论；验收后开 PR 在 `commit.rs`（`docs/product-v3.md` §8） |
 | ↳ `daemon/conversation.rs` | 成员的对话：每 250ms（spool 那一拍）跟读运行中 Claude 成员的会话记录，条目存进 `conv_items`（没变的不动）；`conversation.read`（某个 seq 之后的条目和能力）、`conversation.send`（人的话打进终端，成员卡在对话框时拒绝）；`caps()` 是每种运行时能显示什么 |
 | ↳ `host.rs`、`daemon/host.rs` | `lila host codex`（隐藏子命令）：在 Codex 成员的 hc 终端里跑，起 `codex app-server`，用 `host.attach` 挂到 lilad 的 socket（事件出、命令进，lilad 回来时自动重连并重发会话、条目、待答的权限），用 OSC 7501 报状态，终端里打印一行行日志（「原始日志」），app-server 自己的日志在 `state/hosts/<项目>.<成员>.log`。lilad 这边：`tell` 把派活、通知、人的话按成员发给 host 或打进终端；host 的事件变成会话、条目、权限卡片（`lila …` 命令自动允许）；`permission` 卡片的回答送回 host |
+| ↳ `daemon/hooks.rs`、`client::hook` | Claude Code 的 hooks：每个 Claude 成员启动时带 `--settings state/prompts/<项目>/<成员>.settings.json`，里面 PermissionRequest（600s）、MessageDisplay、UserPromptSubmit、Stop、StopFailure 都跑 `lila hook <事件>`（隐藏子命令）。权限请求变成 `permission` 卡片，hook 每 0.5s 问 `hook.answer` 等答案（最多 570s），答了就输出 allow/deny，卡片关掉或 lilad 重启丢了就什么都不输出、交给终端问（另出一张「终端在等你」）；`lila …` 命令直接允许。MessageDisplay 的增量攒成「正在写」（`conversation.read` 的 `writing`），Stop、新一轮或会话记录里出现回复时清掉 |
 | ↳ `daemon/slots.rs` | 哪条链在哪个槽、排队占槽、链结束后放槽或给验收卡片、合并失败的 `merge` 条目 |
 | ↳ `sessions.rs` | Claude 会话记录的位置、找 Codex 的会话、读上下文大小 |
 | ↳ `accounts.rs` | 订阅账号（`accounts.toml`）、成员用哪个账号、读每个账号的额度 |

@@ -119,6 +119,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// A Claude Code hook in a member's session (its settings file runs this).
+    #[command(hide = true)]
+    Hook { event: String },
     /// Runs a member's agent through its protocol (lilad starts it in the member's terminal).
     #[command(hide = true)]
     Host {
@@ -349,6 +352,7 @@ fn run() -> Result<()> {
         Cmd::Pause => out(call("pause", json!({}))?, &|_| "paused: no new tasks are delivered".into()),
         Cmd::Resume => out(call("resume", json!({}))?, &|_| "resumed".into()),
         Cmd::Daemon { cmd: DaemonCmd::Run } => daemon::serve(paths.clone(), client::hc_bin())?,
+        Cmd::Hook { event } => client::hook(&paths, &event)?,
         Cmd::Host { cmd: HostCmd::Codex { program, model, effort, sandbox, prompt_file, thread, extra } } => {
             let instructions = std::fs::read_to_string(&prompt_file).with_context(|| format!("read {}", prompt_file.display()))?;
             let cwd = std::env::current_dir()?.to_string_lossy().to_string();

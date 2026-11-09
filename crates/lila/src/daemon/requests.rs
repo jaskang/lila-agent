@@ -21,6 +21,8 @@ impl<T: Terminals> Daemon<T> {
             "request.show" => self.request_show(&caller, params),
             "conversation.read" => self.conversation_read(&caller, params),
             "conversation.send" => self.conversation_send(&caller, params),
+            "hook" => self.hook(&caller, params, now),
+            "hook.answer" => self.hook_answer(&caller, params),
             "triage" => self.triage(&caller, params, now),
             "draft" => self.draft(&caller, params, now),
             "task.new" => self.task_new(&caller, params, now),
@@ -167,6 +169,12 @@ impl<T: Terminals> Daemon<T> {
             other => other,
         };
         let mut launch = runtime::launch(&member.role, &prompt_path.to_string_lossy(), &session);
+        if rt == lila_core::Runtime::Claude {
+            // Its hooks report to lilad (permission cards, the reply as it is written).
+            let settings = prompts.join(format!("{mid}.settings.json"));
+            std::fs::write(&settings, serde_json::to_string_pretty(&hooks::settings(&self.lila_bin))?)?;
+            launch.argv.extend(["--settings".to_owned(), settings.to_string_lossy().to_string()]);
+        }
         let (program, mut env) = self.member_env(&member.role)?;
         if launch.argv[0] == "lila" {
             // Driven through its protocol by `lila host <runtime>`, which starts the CLI.
@@ -1001,7 +1009,7 @@ impl<T: Terminals> Daemon<T> {
             "merge" => self.merge_answer(&pid, &item, text, now)?,
             "triage" => self.triage_answer(&pid, &item, text, now)?,
             "draft" => self.draft_answer(&pid, &item, text, now)?,
-            "permission" => self.permission_answer(&pid, &item, text)?,
+            "permission" => self.permission_answer(&pid, &item, text, now)?,
             "budget" => self.budget_answer(&pid, &item, text, now)?,
             _ => {}
         }

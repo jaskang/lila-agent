@@ -447,3 +447,20 @@ CREATE INDEX conv_items_seq ON conv_items(project, member, seq);
 - 成员会继承用户全局的 `~/.codex/config.toml`（MCP 服务器、Rex 的 hook），这一点 TUI 时也一样。
 
 **还没做的**：Codex 的逐字显示（`item/agentMessage/delta`）；中断按钮；`Usage` 事件还没用上（用量页仍读 rollout，app-server 也写 rollout，所以照常）。
+
+## 17. P3 记录：Claude Code 的 hooks（2026-11-09）
+
+**做了什么**
+- 每个 Claude 成员带 `--settings <state>/prompts/<项目>/<成员>.settings.json` 启动，里面五个 hook 都跑 `lila hook <事件>`：PermissionRequest（超时 600s）、MessageDisplay、UserPromptSubmit、Stop、StopFailure。只对 Lila 起的会话生效。
+- `lila hook`（`client::hook`）：把 stdin 的载荷交给 lilad 的 `hook`。权限请求：lilad 用 `ask_permission`（和 Codex 共用）出 `permission` 卡片，返回 `wait`；hook 每 0.5s 问 `hook.answer`，最多 570s。答「允许」输出 `{"decision":{"behavior":"allow"}}`，「拒绝」输出 deny 和「The person said no in Lila.」；没答、卡片被关掉、lilad 丢了这个请求：什么都不输出，Claude Code 在终端里自己问，Lila 补一张「终端在等你」。lilad 不在时 hook 立刻退出，不卡会话。
+- 一张卡就够：成员已有权限卡片时，状态变成 blocked 不再出「终端在等你」；后到的权限卡片会关掉先到的终端卡片。
+- MessageDisplay 的增量攒成「正在写」，窗口在对话最后显示（转圈 + Secondary），Stop、新一轮、或会话记录里出现回复时清掉。StopFailure 记成 `turn_failed` 事件。
+- 窗口：对话最底部贴着这个成员待答的权限卡片；权限卡片不显示「知道了」。
+
+**真跑**（PM 用 Haiku，`--permission-mode manual`）
+- 让 PM 跑 `ls -la`：Claude Code 当作只读，直接跑了，不问。
+- 跑 `touch probe-lila.txt`：出现 Q5「pm 想运行：touch probe-lila.txt」，下面是它自己写的说明；PM 的状态是 blocked。答「允许」：文件建好，PM 说 DONE。
+- 当时还多出一张 Q6「终端在等你」（同一件事），按上面的规则修掉；换新 lilad 再试，只有权限卡片，贴在对话底部。
+- 答「拒绝」：Claude Code 显示「Denied by PermissionRequest hook · Reason: The person said no in Lila.」，没有重试。
+
+**还没做的**：Codex 的逐字显示；中断按钮。

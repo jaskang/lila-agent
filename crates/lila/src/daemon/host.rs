@@ -13,6 +13,12 @@ pub(super) struct Asking {
     options: Vec<PermOption>,
 }
 
+impl Asking {
+    pub(super) fn request(&self) -> &str {
+        &self.request
+    }
+}
+
 impl<T: Terminals> Daemon<T> {
     /// The member's agent runs through `lila host` (Codex: `codex app-server`).
     pub(super) fn hosted(&self, pid: &str, mid: &str) -> bool {
@@ -79,7 +85,12 @@ impl<T: Terminals> Daemon<T> {
                     self.say(format!("{pid}: conversation of {mid}: {e:#}"));
                 }
             }
-            AgentEvent::Permission { request } => self.ask_permission(pid, mid, request, now),
+            AgentEvent::Permission { request } => {
+                let id = request.id.clone();
+                if let Some(option) = self.ask_permission(pid, mid, request, now) {
+                    let _ = self.host_command(pid, mid, &Command::Answer { permission: id, option });
+                }
+            }
             AgentEvent::PermissionResolved { id } => {
                 let done: Vec<String> = self.asking.iter().filter(|(k, a)| k.0 == pid && a.member == mid && a.request == id).map(|(k, _)| k.1.clone()).collect();
                 for q in done {
@@ -110,13 +121,12 @@ impl<T: Terminals> Daemon<T> {
         }
     }
 
-    /// A member asks before acting: Lila's own protocol goes ahead; the rest is a card.
-    fn ask_permission(&mut self, pid: &str, mid: &str, r: PermissionRequest, now: i64) {
+    /// A member asks before acting: Lila's own protocol goes ahead (the option to
+    /// answer at once); the rest is a card the person answers.
+    pub(super) fn ask_permission(&mut self, pid: &str, mid: &str, r: PermissionRequest, now: i64) -> Option<String> {
         if r.tool == ToolKind::Execute && (r.title == "lila" || r.title.starts_with("lila ")) {
-            let allow = r.options.first().map(|o| o.id.clone()).unwrap_or_else(|| "accept".into());
-            let _ = self.host_command(pid, mid, &Command::Answer { permission: r.id.clone(), option: allow });
             let _ = self.store.event(pid, None, "lilad", "allowed", &format!("{mid}: {}", r.title), now);
-            return;
+            return Some(r.options.first().map(|o| o.id.clone()).unwrap_or_else(|| "accept".into()));
         }
         let what = match r.tool {
             ToolKind::Execute => "运行",
@@ -136,19 +146,44 @@ impl<T: Terminals> Daemon<T> {
                     Ok(item) => item.id,
                     Err(e) => {
                         self.say(format!("{pid}: permission card for {mid}: {e:#}"));
-                        return;
+                        return None;
                     }
                 }
             }
         };
         self.asking.insert((pid.to_owned(), q), Asking { member: mid.to_owned(), request: r.id, options: r.options });
+        // Its terminal said it waits before the card was there: the card says it now.
+        for item in self.store.open_inbox_for(pid, "terminal", mid).unwrap_or_default() {
+            let _ = self.store.resolve_inbox(pid, &item.id, None, now);
+        }
+        None
     }
 
-    /// The person's answer to a permission card: the option whose label it is (else the last: no).
-    pub(super) fn permission_answer(&mut self, pid: &str, item: &lila_store::InboxItem, text: Option<&str>) -> Result<()> {
+    /// The person's answer to a permission card: the option whose label it is (else the
+    /// last: no). A host gets it as a command; a Claude Code hook picks it up (`hook.answer`),
+    /// and a card closed without an answer leaves the question to its terminal.
+    pub(super) fn permission_answer(&mut self, pid: &str, item: &lila_store::InboxItem, text: Option<&str>, now: i64) -> Result<()> {
         let key = (pid.to_owned(), item.id.clone());
-        let Some(a) = self.asking.remove(&key) else { bail!("{} is no longer waiting for an answer", item.id) };
-        let option = text.and_then(|t| a.options.iter().find(|o| o.label == t || o.id == t)).or(a.options.last()).map(|o| o.id.clone()).unwrap_or_else(|| "decline".into());
+        let Some(a) = self.asking.remove(&key) else {
+            // Asked before lilad restarted: a hook has given up and its terminal asks now
+            // (a host would have asked again, under a new card). Close it and say where.
+            if let Some(mid) = item.member.as_deref().filter(|m| !self.hosted(pid, m)) {
+                let what = item.text.lines().next().unwrap_or_default().to_owned();
+                self.store.add_inbox(pid, "terminal", Some(mid), None, &inbox::terminal(mid, &what), &[], now)?;
+            }
+            return Ok(());
+        };
+        let picked = text.and_then(|t| a.options.iter().find(|o| o.label == t || o.id == t)).map(|o| o.id.clone());
+        if !self.hosted(pid, &a.member) {
+            // Closed without an answer: its terminal asks, and says so.
+            if picked.is_none() {
+                let what = item.text.lines().next().unwrap_or_default().to_owned();
+                let _ = self.store.add_inbox(pid, "terminal", Some(&a.member), None, &inbox::terminal(&a.member, &what), &[], now);
+            }
+            self.hook_answers.insert(a.request.clone(), picked);
+            return Ok(());
+        }
+        let option = picked.or(a.options.last().map(|o| o.id.clone())).unwrap_or_else(|| "decline".into());
         if let Err(e) = self.host_command(pid, &a.member, &Command::Answer { permission: a.request.clone(), option }) {
             self.asking.insert(key, a);
             return Err(e);

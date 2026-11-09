@@ -112,7 +112,8 @@ Lila 是管理一队编程 agent 的桌面工具，一个 macOS 原生窗口。�
 - 工具调用：24 高的一行，13px 图标（执行 square-terminal、读 file-text、改 replace、搜 search、网页 globe），Menlo 12 Secondary 的标题，进行中转圈、失败红色 ×，有内容时右端 chevron。点开：每个文件的 diff（新增绿、删除红，各 12% 底），然后输出（Well 底，最高 240，可滚动）。
 - 底部：上面一条 Divider，2 行的输入框（占位「消息…」）和蓝色 arrow-up 按钮，⌘↩ 发送。成员在终端里等你回答时发不出去，提示切到终端。
 - 没有终端可切的运行时（Codex，经 `lila host`）：标题行没有切换；成员行的右键菜单「原始日志」显示 host 的终端（它打印的一行行日志），这时标题行出现切换，用来回到对话。
-- 权限卡片（`permission`，「要你允许」，黄色 triangle-alert）：正文「tester 想运行：npm install …」，下面是 host 给的选项胶囊（允许 / 本会话都允许 / 拒绝），和其他收件箱卡片一样出现在右边和「需要你」里。
+- 权限卡片（`permission`，「要你允许」，黄色 triangle-alert）：正文「tester 想运行：npm install …」，下面是运行时给的选项胶囊（Codex：允许 / 本会话都允许 / 拒绝；Claude Code：允许 / 拒绝），没有「知道了」。出现在右边、「需要你」里，也贴在这个成员对话的最底部（黄色 35% 描边、6% 底）。
+- 成员正在写的回复（Claude Code 的 `MessageDisplay`）：对话最后一条，左边转圈，正文 Secondary；写进会话记录后换成正常的一条。
 
 ### Status Pill
 整个窗口里唯一写出状态词的地方。20 高，圆角 10，11/600，状态色 15% 的底，文字是状态色往白混 15%。词：工作中、等你、刚完成、空闲、出错、未运行、启动中。

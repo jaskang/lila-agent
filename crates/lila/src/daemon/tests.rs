@@ -2089,3 +2089,43 @@ fn a_codex_members_host_reports_its_thread_items_and_permissions() {
     ev(&mut w, AgentEvent::PermissionResolved { id: "p3".into() });
     assert!(w.inbox_kinds().is_empty());
 }
+
+#[test]
+fn claude_members_hooks_ask_through_cards_and_show_the_reply_as_it_comes() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    // Its session is hooked: each event runs `lila hook <event>`.
+    let argv: Vec<String> = w.d.term.runs[0]["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_owned()).collect();
+    let at = argv.iter().position(|a| a == "--settings").expect("--settings");
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&argv[at + 1]).unwrap()).unwrap();
+    assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], "'/opt/lila/bin/lila' hook PermissionRequest");
+    assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 600);
+
+    let hook = |w: &mut World, event: &str, payload: Value| w.ok(Some("owner"), "hook", json!({"event": event, "payload": payload}));
+    let r = hook(&mut w, "PermissionRequest", json!({"tool_name": "Bash", "tool_input": {"command": "npm test", "description": "Run the tests"}}));
+    let id = r["wait"].as_str().expect("waits for the person").to_owned();
+    let card = w.d.store.inbox("shop", false).unwrap().into_iter().find(|i| i.kind == "permission").unwrap();
+    assert_eq!((card.text.as_str(), card.options.clone()), ("owner 想运行：npm test\nRun the tests", vec!["允许".to_string(), "拒绝".to_string()]));
+    assert_eq!(w.ok(Some("owner"), "hook.answer", json!({"id": id})), json!({"pending": true}));
+    w.ok(None, "answer", json!({"id": card.id, "text": "允许"}));
+    assert_eq!(w.ok(Some("owner"), "hook.answer", json!({"id": id})), json!({"decision": "allow"}));
+    // Closed without an answer: the terminal asks.
+    let r = hook(&mut w, "PermissionRequest", json!({"tool_name": "Write", "tool_input": {"file_path": "/r/a.txt"}}));
+    let id = r["wait"].as_str().unwrap().to_owned();
+    let card = w.d.store.inbox("shop", false).unwrap().into_iter().find(|i| i.kind == "permission").unwrap();
+    assert!(card.text.starts_with("owner 想修改：/r/a.txt"), "{}", card.text);
+    w.ok(None, "answer", json!({"id": card.id}));
+    assert_eq!(w.ok(Some("owner"), "hook.answer", json!({"id": id})), json!({"decision": null}));
+    // Lila's own commands go ahead.
+    assert_eq!(hook(&mut w, "PermissionRequest", json!({"tool_name": "Bash", "tool_input": {"command": "lila task done T1 --summary x"}}))["decision"], "allow");
+
+    // The reply as it is written, until the turn ends.
+    hook(&mut w, "MessageDisplay", json!({"message_id": "m1", "index": 0, "final": false, "delta": "Checking "}));
+    hook(&mut w, "MessageDisplay", json!({"message_id": "m1", "index": 1, "final": true, "delta": "the tests."}));
+    assert_eq!(w.ok(None, "conversation.read", json!({"member": "owner"}))["writing"], "Checking the tests.");
+    hook(&mut w, "Stop", json!({"last_assistant_message": "Checking the tests."}));
+    assert!(w.ok(None, "conversation.read", json!({"member": "owner"}))["writing"].is_null());
+    // The person can't hook as a member.
+    assert!(w.call(None, "hook", json!({"event": "Stop", "payload": {}})).is_err());
+}
