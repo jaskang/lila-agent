@@ -8,7 +8,7 @@
 
 ## 安装
 
-需要 Rust（版本见 `rust-toolchain.toml`）、[herdr-core](https://github.com/herdrdev/herdr-core) 的 `hc`，以及 `claude` 和/或 `codex`。终端用的 libghostty-vt 1.0 在 Apple Silicon 上已经预编译好放在仓库里（`crates/ghostty-sys/libghostty-vt`）；其他平台还要 `git submodule update --init --depth 1` 和 Zig 0.17 现场编译。
+需要 Rust（版本见 `rust-toolchain.toml`）、[herdr-core](https://github.com/herdrdev/herdr-core) 的 `hc`，以及 `claude` 和/或 `codex`。终端用的 libghostty-vt 1.0 是预编译好放在仓库里的（`crates/ghostty-sys/libghostty-vt`），目前只有 Apple Silicon 的。
 
 ```sh
 cargo install --path crates/lila

@@ -2,8 +2,8 @@
 # Refreshes the prebuilt libghostty-vt in libghostty-vt/ from an official release:
 #   crates/ghostty-sys/update-prebuilt.sh 1.0.0
 # macOS arm64 only for now: the release's xcframework, checked against its
-# SHA256SUMS, thinned to arm64 and stripped of debug info. Other targets build
-# from vendor/ghostty with Zig (see build.rs).
+# SHA256SUMS, thinned to arm64 and stripped of debug info. Other targets need
+# their library added under libghostty-vt/<target>/ (build.rs says which).
 set -eu
 version=${1:?usage: update-prebuilt.sh <version, such as 1.0.0>}
 here=$(cd "$(dirname "$0")" && pwd)

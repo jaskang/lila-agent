@@ -1,7 +1,6 @@
 [workspace]
 members = ["crates/lila-core", "crates/lila-store", "crates/hc-client", "crates/lila", "crates/ghostty-sys", "crates/lila-term", "crates/lila-app"]
 resolver = "3"
-exclude = ["vendor/ghostty"]
 
 [workspace.package]
 edition = "2024"
