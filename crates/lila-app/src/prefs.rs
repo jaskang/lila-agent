@@ -402,7 +402,7 @@ impl LilaApp {
         dialog::scroll(
             "prefs-about",
             vec![
-                group(None, vec![row("版本", None, value_text(env!("CARGO_PKG_VERSION"), cx), cx), row("lilad", None, value_text(daemon, cx), cx)], cx),
+                group(None, vec![row("版本", None, value_text(env!("CARGO_PKG_VERSION"), cx), cx), row("lilad", None, value_text(daemon, cx), cx), row("libghostty-vt", None, value_text(lila_term::ghostty_version(), cx), cx)], cx),
                 group(None, vec![row("角色", None, value_text(tilde(paths.roles()), cx), cx), row("数据库", None, value_text(tilde(paths.db()), cx), cx), row("日志", None, value_text(tilde(paths.state.clone()), cx), cx)], cx),
             ],
         )

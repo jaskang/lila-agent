@@ -12,3 +12,9 @@ mod win32_keys;
 
 pub use hc::Core;
 pub use view::TerminalView;
+
+/// The libghostty-vt this build links, such as "1.0.0".
+pub fn ghostty_version() -> String {
+    // Never NULL, owned by the library for as long as it is loaded.
+    unsafe { std::ffi::CStr::from_ptr(ghostty_sys::ghostty_version()) }.to_string_lossy().into_owned()
+}

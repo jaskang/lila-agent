@@ -74,7 +74,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
   - gpui-kit 的组件源码：`~/.cargo/registry/src/*/gpui-component-0.9.0/src/`；输入框 `InputState` 在 `gpui-base-0.9.0/src/input/`。
   - 图标只有 gpui-kit 打包的那一部分能显示，名单见 `target/debug/build/gpui-kit-assets-*/out/icon_name.rs` 里 `__component_icon_names` 之后的部分（比如没有 `Trash`）。缺的图标放进 `crates/lila-app/assets/lila/`，再在 `style::Assets` 里登记（垃圾桶就是这样加的）。
   - **测试模块里不要 `use super::*`**：会把 `gpui::*` 里的 `test` 宏引进来，盖住标准库的 `#[test]`，报的错是「recursion limit」。
-- 终端渲染：libghostty-vt 1.0（子模块 `vendor/ghostty`，tag `vt-1.0.0`）。注意 `*_get`/`*_set` 的输出是 `void*`，1.0 改了的类型（如 GRAPHEMES_BUF 要 `GhosttyCodepointBuffer`）编译器查不出来，升级时要对照头文件逐个核对。终端进程：herdr-core（`hc`）。
+- 终端渲染：libghostty-vt 1.0（子模块 `vendor/ghostty`，tag `vt-1.0.0`）。注意 `*_get`/`*_set` 的输出是 `void*`，1.0 改了的类型（如 GRAPHEMES_BUF 要 `GhosttyCodepointBuffer`）编译器查不出来，升级时要对照头文件逐个核对。Kitty 图片的位置直接取渲染状态的图片列表（`Vt::placements`，占位符也由库解析）；视图还没有画图片，`placements`/`image_bgra` 目前只有测试在用。终端进程：herdr-core（`hc`）。
 - 从 herdr-app（Apache-2.0）移植的代码记在 `THIRD-PARTY.md`。
 
 ## 代码地图

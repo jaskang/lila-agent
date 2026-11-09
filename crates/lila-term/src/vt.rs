@@ -8,7 +8,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -160,6 +159,9 @@ pub struct Placement {
     pub offset: [u32; 2],
     /// Placeholder geometry uses integer cells; the view may use fractional cells.
     pub cell_pixels: Option<[u32; 2]>,
+    /// GhosttyImageLayer: below the backgrounds, below the text, above it.
+    pub layer: u8,
+    /// Order within the layer.
     pub z: i32,
 }
 
@@ -173,208 +175,6 @@ impl Placement {
             self.height as f32 * sy,
         ]
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KittyVirtualPlacementSpec {
-    image_id: u32,
-    placement_id: u32,
-    columns: u32,
-    rows: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KittyVirtualCell {
-    x: u16,
-    y: u16,
-    image_id_low: u32,
-    image_id_high: Option<u32>,
-    placement_id: u32,
-    row: Option<u32>,
-    col: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KittyVirtualRun {
-    x: u16,
-    y: u16,
-    image_id_low: u32,
-    image_id_high: Option<u32>,
-    placement_id: u32,
-    row: u32,
-    col: u32,
-    width: u32,
-}
-
-static KITTY_PLACEHOLDER_DIACRITICS: OnceLock<HashMap<u32, u32>> = OnceLock::new();
-
-fn kitty_virtual_cell(x: u16, y: u16, grid_ref: &GhosttyGridRef) -> Option<KittyVirtualCell> {
-    let mut graphemes = vec![0u32; 4];
-    let mut len = 0;
-    let mut style = GhosttyStyle::default();
-    unsafe {
-        let result = ghostty_grid_ref_graphemes(grid_ref, graphemes.as_mut_ptr(), graphemes.len(), &mut len);
-        if result == GHOSTTY_OUT_OF_SPACE {
-            graphemes.resize(len, 0);
-            if ghostty_grid_ref_graphemes(grid_ref, graphemes.as_mut_ptr(), graphemes.len(), &mut len) != GHOSTTY_SUCCESS {
-                return None;
-            }
-        } else if result != GHOSTTY_SUCCESS {
-            return None;
-        }
-        if len == 0 || graphemes[0] != 0x10eeee {
-            return None;
-        }
-        if ghostty_grid_ref_style(grid_ref, &mut style) != GHOSTTY_SUCCESS {
-            return None;
-        }
-    }
-    graphemes.truncate(len);
-    Some(KittyVirtualCell {
-        x,
-        y,
-        image_id_low: kitty_placeholder_color_to_id(style.fg_color),
-        image_id_high: graphemes.get(3).and_then(|c| kitty_placeholder_diacritic_index(*c)).filter(|high| *high <= 255),
-        placement_id: kitty_placeholder_color_to_id(style.underline_color),
-        row: graphemes.get(1).and_then(|c| kitty_placeholder_diacritic_index(*c)),
-        col: graphemes.get(2).and_then(|c| kitty_placeholder_diacritic_index(*c)),
-    })
-}
-
-fn kitty_placeholder_color_to_id(color: GhosttyStyleColor) -> u32 {
-    unsafe {
-        match GhosttyStyleColorTag::from(color.tag) {
-            GHOSTTY_STYLE_COLOR_PALETTE => u32::from(color.value.palette),
-            GHOSTTY_STYLE_COLOR_RGB => {
-                let rgb = color.value.rgb;
-                (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
-            }
-            _ => 0,
-        }
-    }
-}
-
-fn kitty_virtual_placement_geometry(
-    run: KittyVirtualRun,
-    spec: KittyVirtualPlacementSpec,
-    image_width: u32,
-    image_height: u32,
-    cell_width: u32,
-    cell_height: u32,
-    generation: u64,
-) -> Option<Placement> {
-    if image_width == 0 || image_height == 0 {
-        return None;
-    }
-    let cols = if spec.columns == 0 { image_width.div_ceil(cell_width) } else { spec.columns };
-    let rows = if spec.rows == 0 { image_height.div_ceil(cell_height) } else { spec.rows };
-    if run.col >= cols || run.row >= rows {
-        return None;
-    }
-    let (grid_width, grid_height) = (f64::from(cols) * f64::from(cell_width), f64::from(rows) * f64::from(cell_height));
-    let scale = (grid_width / f64::from(image_width)).min(grid_height / f64::from(image_height));
-    let (image_left, image_top) = ((grid_width - f64::from(image_width) * scale) / 2.0, (grid_height - f64::from(image_height) * scale) / 2.0);
-    let (left, top) = (f64::from(run.col) * f64::from(cell_width), f64::from(run.row) * f64::from(cell_height));
-    let (right, bottom) = (f64::from((run.col + run.width).min(cols)) * f64::from(cell_width), top + f64::from(cell_height));
-    let (x0, y0) = (left.max(image_left), top.max(image_top));
-    let (x1, y1) = (right.min(image_left + f64::from(image_width) * scale), bottom.min(image_top + f64::from(image_height) * scale));
-    if x1 <= x0 || y1 <= y0 {
-        return None;
-    }
-    let sx0 = (((x0 - image_left) / scale).round() as u32).min(image_width - 1);
-    let sy0 = (((y0 - image_top) / scale).round() as u32).min(image_height - 1);
-    let sx1 = (((x1 - image_left) / scale).round() as u32).clamp(sx0 + 1, image_width);
-    let sy1 = (((y1 - image_top) / scale).round() as u32).clamp(sy0 + 1, image_height);
-    // Round shared edges, not slice lengths, so neighboring runs meet exactly.
-    let width = (x1.round() - x0.round()) as u32;
-    let height = (y1.round() - y0.round()) as u32;
-    if width == 0 || height == 0 {
-        return None;
-    }
-    Some(Placement {
-        image: spec.image_id,
-        generation,
-        col: i32::from(run.x),
-        row: i32::from(run.y),
-        width,
-        height,
-        source: [sx0, sy0, sx1 - sx0, sy1 - sy0],
-        offset: [(x0.round() - left) as u32, (y0.round() - top) as u32],
-        cell_pixels: Some([cell_width, cell_height]),
-        // Ghostty gives placeholder images a fixed layer, ignoring the virtual placement's z.
-        z: -1,
-    })
-}
-
-fn kitty_placeholder_diacritic_index(codepoint: u32) -> Option<u32> {
-    let map = KITTY_PLACEHOLDER_DIACRITICS.get_or_init(|| {
-        // Reuse Ghostty's vendored table so Herdr decodes the same placeholder
-        // row/column diacritics that libghostty accepts.
-        let source =
-            include_str!("../../../vendor/ghostty/src/terminal/kitty/graphics_unicode.zig");
-        let mut map = HashMap::new();
-        let mut in_table = false;
-        for line in source.lines() {
-            let line = line.trim();
-            if line.starts_with("const diacritics:") {
-                in_table = true;
-                continue;
-            }
-            if !in_table {
-                continue;
-            }
-            if line == "};" {
-                break;
-            }
-            let Some(hex) = line
-                .strip_prefix("0x")
-                .and_then(|value| value.strip_suffix(','))
-            else {
-                continue;
-            };
-            if let Ok(value) = u32::from_str_radix(hex, 16) {
-                map.insert(value, map.len() as u32);
-            }
-        }
-        map
-    });
-    map.get(&codepoint).copied()
-}
-
-
-impl KittyVirtualRun {
-    fn from_cell(cell: KittyVirtualCell) -> Self {
-        Self {
-            x: cell.x,
-            y: cell.y,
-            image_id_low: cell.image_id_low,
-            image_id_high: cell.image_id_high,
-            placement_id: cell.placement_id,
-            row: cell.row.unwrap_or(0),
-            col: cell.col.unwrap_or(0),
-            width: 1,
-        }
-    }
-
-    fn append(&mut self, cell: KittyVirtualCell) -> bool {
-        if self.image_id_low != cell.image_id_low
-            || self.placement_id != cell.placement_id
-            || cell.row.is_some_and(|row| row != self.row)
-            || cell.col.is_some_and(|col| col != self.col + self.width)
-            || cell
-                .image_id_high
-                .is_some_and(|high| Some(high) != self.image_id_high)
-        {
-            return false;
-        }
-        self.width += 1;
-        true
-    }
-
-    fn image_id(self) -> u32 {
-        self.image_id_low | (self.image_id_high.unwrap_or(0) << 24)
-    }
-
 }
 
 unsafe extern "C" fn on_write_pty(_t: GhosttyTerminal, userdata: *mut c_void, data: *const u8, len: usize) {
@@ -763,136 +563,98 @@ impl Vt {
         std::mem::take(&mut self.shared.replies)
     }
 
-    /// Visible kitty graphics placements, bottom layer first.
+    /// Visible kitty graphics placements in drawing order: by layer, then z.
+    /// libghostty lays them out, including the ones that placeholder cells
+    /// (Unicode virtual placements) show.
     pub fn placements(&self) -> Vec<Placement> {
         if let Some(placements) = self.placements_cache.borrow().as_ref() {
             return placements.clone();
         }
         let mut out = Vec::new();
         unsafe {
-            let mut g: GhosttyKittyGraphics = std::ptr::null_mut();
-            if ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &mut g as *mut _ as *mut c_void) != GHOSTTY_SUCCESS || g.is_null() {
+            let state = self.shared.state;
+            // A held frame (synchronized output) keeps what it captured.
+            if self.shared.held_since.is_none() {
+                ghostty_render_state_update(state, self.term);
+            }
+            let mut it: GhosttyRenderStateImageIterator = std::ptr::null_mut();
+            if ghostty_render_state_image_iterator_new(std::ptr::null(), &mut it) != GHOSTTY_SUCCESS {
                 return out;
             }
-            let mut it: GhosttyKittyGraphicsPlacementIterator = std::ptr::null_mut();
-            if ghostty_kitty_graphics_placement_iterator_new(std::ptr::null(), &mut it) != GHOSTTY_SUCCESS {
-                return out;
-            }
-            let mut specs = Vec::new();
-            if ghostty_kitty_graphics_get(g, GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR, &mut it as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
-                while ghostty_kitty_graphics_placement_next(it) {
-                    let (mut id, mut z, mut virt) = (0u32, 0i32, false);
-                    ghostty_kitty_graphics_placement_get(it, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID, &mut id as *mut _ as *mut c_void);
-                    ghostty_kitty_graphics_placement_get(it, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z, &mut z as *mut _ as *mut c_void);
-                    ghostty_kitty_graphics_placement_get(it, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL, &mut virt as *mut _ as *mut c_void);
-                    let img = ghostty_kitty_graphics_image(g, id);
-                    if virt {
-                        let (mut placement_id, mut columns, mut rows) = (0u32, 0u32, 0u32);
-                        ghostty_kitty_graphics_placement_get(it, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID, &mut placement_id as *mut _ as *mut c_void);
-                        ghostty_kitty_graphics_placement_get(it, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_COLUMNS, &mut columns as *mut _ as *mut c_void);
-                        ghostty_kitty_graphics_placement_get(it, GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_ROWS, &mut rows as *mut _ as *mut c_void);
-                        specs.push(KittyVirtualPlacementSpec { image_id: id, placement_id, columns, rows });
+            if ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR, &mut it as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
+                let (mut cell_w, mut cell_h) = (0u32, 0u32);
+                ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_WIDTH_PX, &mut cell_w as *mut _ as *mut c_void);
+                ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_HEIGHT_PX, &mut cell_h as *mut _ as *mut c_void);
+                let cell = [(cell_w / u32::from(self.cols.max(1))).max(1), (cell_h / u32::from(self.rows.max(1))).max(1)];
+                while ghostty_render_state_image_iterator_next(it) {
+                    let get = |data: GhosttyRenderStateImageData, out: *mut c_void| ghostty_render_state_image_get(it, data, out);
+                    let mut protocol: GhosttyImageProtocol = GHOSTTY_IMAGE_PROTOCOL_KITTY;
+                    get(GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL, &mut protocol as *mut _ as *mut c_void);
+                    if protocol != GHOSTTY_IMAGE_PROTOCOL_KITTY {
                         continue;
                     }
-                    if img.is_null() {
-                        continue;
+                    let (mut image, mut generation, mut layer, mut z) = (0u32, 0u64, GHOSTTY_IMAGE_LAYER_BELOW_TEXT, 0i32);
+                    let (mut col, mut row, mut ox, mut oy, mut w, mut h) = (0i32, 0i32, 0u32, 0u32, 0u32, 0u32);
+                    let (mut sx, mut sy, mut sw, mut sh) = (0u32, 0u32, 0u32, 0u32);
+                    let mut kind: GhosttyRenderStateKittyPlacementKind = GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_FIXED;
+                    for (data, out) in [
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID, &mut image as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION, &mut generation as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER, &mut layer as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_Z, &mut z as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL, &mut col as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW, &mut row as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X, &mut ox as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y, &mut oy as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH, &mut w as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT, &mut h as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X, &mut sx as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y, &mut sy as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH, &mut sw as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT, &mut sh as *mut _ as *mut c_void),
+                        (GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_KIND, &mut kind as *mut _ as *mut c_void),
+                    ] {
+                        get(data, out);
                     }
-                    let mut info = GhosttyKittyGraphicsPlacementRenderInfo { size: std::mem::size_of::<GhosttyKittyGraphicsPlacementRenderInfo>(), ..Default::default() };
-                    if ghostty_kitty_graphics_placement_render_info(it, img, self.term, &mut info) != GHOSTTY_SUCCESS || !info.viewport_visible {
-                        continue;
+                    // An image smaller than its cells comes back with slices under a
+                    // pixel, rounded to nothing: keep at least one pixel, inside the image.
+                    if sw == 0 || sh == 0 {
+                        let mut g: GhosttyKittyGraphics = std::ptr::null_mut();
+                        ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &mut g as *mut _ as *mut c_void);
+                        let img = if g.is_null() { std::ptr::null_mut() } else { ghostty_kitty_graphics_image(g, image) };
+                        let (mut iw, mut ih) = (1u32, 1u32);
+                        if !img.is_null() {
+                            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH, &mut iw as *mut _ as *mut c_void);
+                            ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT, &mut ih as *mut _ as *mut c_void);
+                        }
+                        let fit = |start: u32, len: u32, size: u32| {
+                            let start = start.min(size.max(1) - 1);
+                            (start, len.max(1).min(size.max(1) - start))
+                        };
+                        (sx, sw) = fit(sx, sw, iw);
+                        (sy, sh) = fit(sy, sh, ih);
                     }
-                    let mut generation = 0u64;
-                    ghostty_kitty_graphics_image_get(img, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION, &mut generation as *mut _ as *mut c_void);
                     out.push(Placement {
-                        image: id,
+                        image,
                         generation,
-                        col: info.viewport_col,
-                        row: info.viewport_row,
-                        width: info.pixel_width,
-                        height: info.pixel_height,
-                        source: [info.source_x, info.source_y, info.source_width, info.source_height],
-                        offset: [0, 0],
-                        cell_pixels: None,
+                        col,
+                        row,
+                        width: w,
+                        height: h,
+                        source: [sx, sy, sw, sh],
+                        offset: [ox, oy],
+                        // Placeholder cells lay the image out in whole cells of the terminal's size.
+                        cell_pixels: (kind == GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_VIRTUAL).then_some(cell),
+                        layer: layer as u8,
                         z,
                     });
                 }
             }
-            ghostty_kitty_graphics_placement_iterator_free(it);
-            out.extend(self.kitty_virtual_image_placements(g, &specs));
+            ghostty_render_state_image_iterator_free(it);
         }
-        out.sort_by_key(|p| p.z);
+        out.sort_by_key(|p| (p.layer, p.z));
         *self.placements_cache.borrow_mut() = Some(out.clone());
         out
-    }
-
-    fn kitty_virtual_image_placements(&self, graphics: GhosttyKittyGraphics, specs: &[KittyVirtualPlacementSpec]) -> Vec<Placement> {
-        if specs.is_empty() {
-            return Vec::new();
-        }
-        let (mut width, mut height) = (0u32, 0u32);
-        unsafe {
-            ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_WIDTH_PX, &mut width as *mut _ as *mut c_void);
-            ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_HEIGHT_PX, &mut height as *mut _ as *mut c_void);
-        }
-        let cell_width = (width / u32::from(self.cols.max(1))).max(1);
-        let cell_height = (height / u32::from(self.rows.max(1))).max(1);
-        let mut runs = Vec::new();
-        for y in 0..self.rows {
-            let Some(first) = self.grid_ref(GHOSTTY_POINT_TAG_VIEWPORT, 0, u32::from(y)) else { continue };
-            let mut row = GhosttyRow::default();
-            let mut placeholders = false;
-            unsafe {
-                ghostty_grid_ref_row(&first, &mut row);
-                ghostty_row_get(row, GHOSTTY_ROW_DATA_KITTY_VIRTUAL_PLACEHOLDER, &mut placeholders as *mut _ as *mut c_void);
-            }
-            if !placeholders {
-                continue;
-            }
-            let mut current: Option<KittyVirtualRun> = None;
-            for x in 0..self.cols {
-                let cell = self.grid_ref(GHOSTTY_POINT_TAG_VIEWPORT, x, u32::from(y))
-                    .and_then(|grid_ref| kitty_virtual_cell(x, y, &grid_ref));
-                match cell {
-                    Some(cell) => {
-                        if let Some(run) = current.as_mut() {
-                            if run.append(cell) {
-                                continue;
-                            }
-                            runs.push(*run);
-                        }
-                        current = Some(KittyVirtualRun::from_cell(cell));
-                    }
-                    None => {
-                        if let Some(run) = current.take() {
-                            runs.push(run);
-                        }
-                    }
-                }
-            }
-            if let Some(run) = current {
-                runs.push(run);
-            }
-        }
-        let mut placements = Vec::new();
-        for run in runs {
-            let id = run.image_id();
-            let Some(spec) = specs.iter().find(|spec| spec.image_id == id
-                && (run.placement_id == 0 || spec.placement_id == run.placement_id)) else { continue };
-            let image = unsafe { ghostty_kitty_graphics_image(graphics, id) };
-            if image.is_null() {
-                continue;
-            }
-            let (mut image_width, mut image_height, mut generation) = (0u32, 0u32, 0u64);
-            unsafe {
-                ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH, &mut image_width as *mut _ as *mut c_void);
-                ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT, &mut image_height as *mut _ as *mut c_void);
-                ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION, &mut generation as *mut _ as *mut c_void);
-            }
-            if let Some(placement) = kitty_virtual_placement_geometry(run, *spec, image_width, image_height, cell_width, cell_height, generation) {
-                placements.push(placement);
-            }
-        }
-        placements
     }
 
     /// An image's pixels as BGRA (what GPUI uploads), cropped to `source`.
@@ -1637,14 +1399,18 @@ impl Vt {
             }
             let mut text = String::new();
             if wide != GHOSTTY_CELL_WIDE_SPACER_TAIL && wide != GHOSTTY_CELL_WIDE_SPACER_HEAD && !style.has(GHOSTTY_STYLE_FLAG_INVISIBLE) {
-                let mut len: u32 = 0;
-                ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &mut len as *mut _ as *mut c_void);
-                if len > 0 {
-                    let mut cps = vec![0u32; len as usize];
-                    let mut buf = GhosttyCodepointBuffer { ptr: cps.as_mut_ptr(), cap: cps.len(), len: 0 };
-                    if ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, &mut buf as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
-                        cps.truncate(buf.len);
-                        text = cps.into_iter().filter_map(char::from_u32).collect();
+                // The cell's text as UTF-8; a cluster too long for the stack buffer asks again.
+                let mut small = [0u8; 32];
+                let mut buf = GhosttyBuffer { ptr: small.as_mut_ptr(), cap: small.len(), len: 0 };
+                let r = ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &mut buf as *mut _ as *mut c_void);
+                if r == GHOSTTY_SUCCESS {
+                    text = String::from_utf8_lossy(&small[..buf.len]).into_owned();
+                } else if r == GHOSTTY_OUT_OF_SPACE {
+                    let mut big = vec![0u8; buf.len];
+                    let mut buf = GhosttyBuffer { ptr: big.as_mut_ptr(), cap: big.len(), len: 0 };
+                    if ghostty_render_state_row_cells_get(c, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &mut buf as *mut _ as *mut c_void) == GHOSTTY_SUCCESS {
+                        big.truncate(buf.len);
+                        text = String::from_utf8(big).unwrap_or_default();
                     }
                 }
             }
@@ -2270,13 +2036,6 @@ mod tests {
         assert_eq!(placements.len(), 2);
         assert_eq!((placements[0].image, placements[0].z), (7, -1));
         assert_eq!((placements[1].image, placements[1].z), (8, 1));
-    }
-
-    #[test]
-    fn kitty_placeholder_diacritics_match_the_vendored_table() {
-        assert_eq!(kitty_placeholder_diacritic_index(0x305), Some(0));
-        assert_eq!(kitty_placeholder_diacritic_index(0x1d244), Some(296));
-        assert_eq!(kitty_placeholder_diacritic_index(0x301), None);
     }
 
     #[test]
