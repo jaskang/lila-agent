@@ -829,6 +829,9 @@ impl<T: Terminals> Daemon<T> {
 
     /// What a member doing a step is told about the rest of its flow.
     pub(super) fn step_hint(&self, pid: &str, task: &Task) -> Option<StepHint> {
+        if let Some(asked) = self.asked_hint(pid, task) {
+            return Some(asked);
+        }
         let (anchor, step) = task.run.as_ref()?;
         let run = self.store.run(pid, anchor).ok()??;
         let f = self.projects[pid].team.flows.get(&run.flow)?;
@@ -836,6 +839,21 @@ impl<T: Terminals> Daemon<T> {
         Some(if st.wants_verdict() { StepHint::Verdict } else { StepHint::HandOn(flow::later(f, *step, self.check_cmd(pid).as_deref())) })
     }
 
+    /// A request sent again while its reporter's answer is awaited: nothing was
+    /// started under it since the comment went out.
+    fn asked_hint(&self, pid: &str, task: &Task) -> Option<StepHint> {
+        if task.parent.is_some() {
+            return None;
+        }
+        let ext = self.store.external_for(pid, &task.id).ok()??;
+        let at = ext.asked_ms?;
+        let tasks = self.store.tasks(pid).ok()?;
+        if tasks.iter().any(|(t, _)| t.parent.as_deref() == Some(task.id.as_str()) && t.created_ms >= at) {
+            return None;
+        }
+        let comment = self.store.events(pid, Some(&task.id), 200).ok()?.into_iter().rfind(|e| e.kind == "commented").map(|e| e.detail).unwrap_or_default();
+        Some(StepHint::Asked { who: ext.author, comment })
+    }
 
     /// Changes a task you assigned. Queued: rewritten in place. Already delivered:
     /// what was typed can't change, so `append` goes to the member as an update.

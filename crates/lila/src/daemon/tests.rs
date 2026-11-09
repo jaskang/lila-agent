@@ -1933,6 +1933,12 @@ fn not_fixing_closes_it_and_a_draft_goes_out_once_sent() {
     w.d.tick(t0 + 12 * 60_000);
     let kinds: Vec<String> = w.d.store.events("shop", Some("T2"), 50).unwrap().into_iter().map(|e| e.kind).collect();
     assert!(!kinds.iter().any(|k| k == "nudged" || k == "stalled"), "{kinds:?}");
+    // The team restarts: the PM hears it already asked, and does not sort it again.
+    w.ok(None, "project.down", json!({}));
+    w.up();
+    w.all_idle();
+    let resent = w.sends_to("owner").into_iter().rfind(|s| s.contains("task=\"T2\"")).expect("T2 sent again");
+    assert!(resent.contains("You already sorted this one and asked @alice on GitHub: https://github.com/o/r/issues/143#issuecomment-1"), "{resent}");
 }
 
 #[test]

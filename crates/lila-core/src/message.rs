@@ -21,6 +21,9 @@ pub enum StepHint {
     HandOn(Vec<String>),
     /// The step gives a verdict.
     Verdict,
+    /// Sent again (a restart, a new session) while the reporter's answer is awaited:
+    /// who was asked, and the comment.
+    Asked { who: String, comment: String },
 }
 
 /// `chain`: the brief of the task this one's chain started from, when that is another task.
@@ -55,6 +58,9 @@ pub fn task_delivery(task: &Task, file: &str, chain: Option<ChainBrief>, hint: O
         Some(StepHint::Verdict) => s.push_str(
             "\nThis is a verification: test it against the bar above and give a verdict. For a fail, say what fails: expected vs actual and how to reproduce. Lila sends it back.\n",
         ),
+        Some(StepHint::Asked { who, comment }) => s.push_str(&format!(
+            "\nYou already sorted this one and asked @{who} on GitHub: {comment}. No answer has come in (Lila doesn't read replies yet). Don't sort it again or start work: start it and wait until the person tells you the reply.\n"
+        )),
         _ => {}
     }
     let verdict = if hint == Some(&StepHint::Verdict) { " --verdict pass|fail" } else { "" };
