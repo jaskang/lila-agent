@@ -98,7 +98,7 @@ fn doing_words(r: &Value, owner: &str) -> String {
 }
 
 /// How long, in the largest unit: 刚刚, 12 分钟, 3 小时, 2 天.
-fn ago(ms: i64) -> String {
+pub(crate) fn ago(ms: i64) -> String {
     let m = (data::now_ms() - ms).max(0) / 60_000;
     match m {
         0 => "刚刚".to_owned(),
@@ -114,7 +114,7 @@ fn ended(ms: i64) -> String {
     if t.date_naive() == chrono::Local::now().date_naive() { t.format("%H:%M").to_string() } else { t.format("%-m月%-d日").to_string() }
 }
 
-fn sublabel(title: &str, count: usize) -> Div {
+pub(crate) fn sublabel(title: &str, count: usize) -> Div {
     h_flex()
         .px_2()
         .pt(px(2.))
@@ -170,7 +170,7 @@ impl LilaApp {
     }
 
     /// An inbox item about no request, listed with what needs the person.
-    fn loose_row(&self, i: &Value, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn loose_row(&self, i: &Value, cx: &mut Context<Self>) -> AnyElement {
         let id = s(i, "id");
         let active = self.request.as_deref() == Some(id.as_str());
         let open = id.clone();

@@ -184,4 +184,77 @@ impl LilaApp {
                 .into_any_element(),
         )
     }
+
+    /// A project with its team running and nothing asked yet: the box to ask the PM,
+    /// and where else work comes from (its sources).
+    pub fn first_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let ask = match &self.ask {
+            Some(a) => a.clone(),
+            None => {
+                let a = cx.new(|cx| TextareaState::new(window, cx).rows(5).placeholder("新需求…"));
+                a.update(cx, |t, cx| t.focus(window, cx));
+                self.ask = Some(a.clone());
+                a
+            }
+        };
+        let sources: Vec<Value> = self.snap.status.as_ref().and_then(|v| v["sources"].as_array().cloned()).unwrap_or_default();
+        let source_row = |n: usize, src: &Value| {
+            let error = src["error"].as_str().map(String::from);
+            let when = src["last_ms"].as_i64().map(crate::requests::ago);
+            h_flex()
+                .id(SharedString::from(format!("first-source-{n}")))
+                .gap(px(6.))
+                .text_xs()
+                .text_color(crate::style::muted())
+                .child(gpui::component::Icon::new(gpui::component::IconName::Github).size(px(13.)))
+                .child(s(src, "query"))
+                .when_some(when.filter(|_| error.is_none()), |d, w| d.child(div().text_color(crate::style::muted2()).child(w)))
+                .when_some(error, |d, e| d.child(dot(crate::style::red())).tooltip(move |window, cx| gpui::component::tooltip::Tooltip::new(e.clone()).build(window, cx)))
+        };
+        // What already waits for the person (a member at its trust prompt, say), below.
+        let loose = self.loose_inbox();
+        let waiting: Vec<AnyElement> = loose.iter().map(|i| self.loose_row(i, cx)).collect();
+        v_flex()
+            .flex_1()
+            .items_center()
+            .px_6()
+            .pt(relative(0.18))
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(560.))
+                    .gap_3()
+                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                        let k = &ev.keystroke;
+                        if k.key == "enter" && k.modifiers.platform {
+                            this.submit_ask(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(Textarea::new(&ask).area())
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .children(sources.iter().enumerate().map(|(n, src)| source_row(n, src)))
+                            .child(div().flex_1())
+                            .child(Button::new("first-ask").primary().label("交给助理").tooltip("⌘↩").on_click(cx.listener(|this, _, _, cx| this.submit_ask(cx)))),
+                    )
+                    .when(!waiting.is_empty(), |d| d.child(v_flex().pt_6().gap(px(2.)).child(crate::requests::sublabel("需要你", waiting.len())).children(waiting))),
+            )
+            .into_any_element()
+    }
+
+    /// The first line is the title (cut when long); the whole text, when there is more, the body.
+    fn submit_ask(&mut self, cx: &mut Context<Self>) {
+        let Some(ask) = &self.ask else { return };
+        let text = ask.read(cx).value().trim().to_owned();
+        let Some(first) = text.lines().next().map(str::trim).filter(|l| !l.is_empty()) else { return };
+        let Some(to) = self.members().iter().find(|m| m["owner"] == true).map(|m| s(m, "id")) else { return };
+        let title = if first.chars().count() > 80 { format!("{}…", first.chars().take(79).collect::<String>()) } else { first.to_owned() };
+        let body = if title == text { String::new() } else { text.clone() };
+        self.request("task.new", json!({"to": to, "title": title, "body": body}), cx, |this, v, cx| {
+            this.ask = None;
+            this.select_request(s(&v, "id"), cx);
+        });
+    }
 }

@@ -80,6 +80,8 @@ pub struct LilaApp {
     pub removing: Option<data::Project>,
     /// The new-task form, while open.
     pub draft: Option<crate::compose::Draft>,
+    /// The box a project without requests opens with: a first request for the PM.
+    pub ask: Option<Entity<gpui::component::input::TextareaState>>,
     /// A queued task being rewritten in the detail panel.
     pub rewrite: Option<crate::compose::Rewrite>,
     /// Refreshes now, without waiting for lilad to say something changed.
@@ -152,7 +154,7 @@ impl LilaApp {
             });
         })
         .detach();
-        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, request: None, active: true, away_since: None, recap: None, recap_only: false, needs_seen: HashMap::new(), core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, task_back: Vec::new(), append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
+        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, request: None, active: true, away_since: None, recap: None, recap_only: false, needs_seen: HashMap::new(), core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, task_back: Vec::new(), append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, ask: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
         app.start_usage(window, cx);
         cx.observe_window_activation(window, |this, window, cx| this.activated(window.is_window_active(), cx)).detach();
         app
@@ -631,7 +633,7 @@ impl Render for LilaApp {
                                             gpui::base::h_resizable("work")
                                                 .with_handle_appearance(gutter(0.))
                                                 .child(resizable_panel().child(self.center(window, cx).into_any_element()))
-                                                .child(resizable_panel().visible(self.right_open && self.selected.is_some()).size(px(360.)).size_range(px(300.)..px(640.)).fixed().child(self.right(window, cx).into_any_element())),
+                                                .child(resizable_panel().visible(self.right_open && self.selected.is_some() && (self.request.is_some() || self.task.is_some())).size(px(360.)).size_range(px(300.)..px(640.)).fixed().child(self.right(window, cx).into_any_element())),
                                         ),
                                     )
                                     .into_any_element(),

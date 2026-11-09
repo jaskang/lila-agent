@@ -488,7 +488,7 @@ impl LilaApp {
             (None, None) if self.snap.projects.is_empty() => empty().child(Button::new("new-project-big").primary().icon(IconName::Plus).label("新建项目").on_click(cx.listener(|this, _, window, cx| this.new_project(window, cx)))).into_any_element(),
             (None, None) if self.project().is_none() => empty().into_any_element(),
             (None, None) if self.member.is_none() && !self.snap.requests.is_empty() => self.request_list(cx),
-            (None, None) if self.member.is_none() && self.team_running() => empty().into_any_element(),
+            (None, None) if self.member.is_none() && self.team_running() => self.first_ask(window, cx),
             (None, None) => empty().child(Button::new("start-big").primary().icon(IconName::Play).label("启动团队").on_click(cx.listener(|this, _, _, cx| this.act("project.up", json!({}), true, cx)))).into_any_element(),
         };
         let header = self.header(member.as_ref(), terminal_view, cx).into_any_element();
