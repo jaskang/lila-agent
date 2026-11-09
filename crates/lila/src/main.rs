@@ -62,6 +62,31 @@ enum Cmd {
         #[arg(long)]
         task: Option<String>,
     },
+    /// (PM) Your call on an issue that came in: the person sees it and says 修 or 不做.
+    Triage {
+        id: String,
+        /// fix | ask | skip | dup
+        #[arg(long)]
+        decision: String,
+        /// s | m | l: how big the fix is.
+        #[arg(long)]
+        size: Option<String>,
+        /// One line: why.
+        #[arg(long)]
+        why: String,
+        /// How you would fix it.
+        #[arg(long)]
+        plan: Option<String>,
+    },
+    /// A comment for an issue's reporter; the person reads it and sends it.
+    Draft {
+        /// The task (under the issue's request).
+        id: String,
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<std::path::PathBuf>,
+    },
     /// What needs you: questions, blocked terminals, reports.
     Inbox {
         /// Include resolved items.
@@ -276,6 +301,16 @@ fn run() -> Result<()> {
             out(call("ask", json!({"question": question, "options": options, "task": task}))?, &|v| format!("asked as {}. {}", v["id"].as_str().unwrap_or("?"), v["note"].as_str().unwrap_or("")))
         }
         Cmd::Inbox { all } => out(call("inbox", json!({"all": all}))?, &fmt_inbox),
+        Cmd::Triage { id, decision, size, why, plan } => {
+            out(call("triage", json!({"id": id, "decision": decision, "size": size, "why": why, "plan": plan}))?, &|v| format!("{} sorted: {}. {}", v["id"].as_str().unwrap_or("?"), v["triage"].as_str().unwrap_or("?"), v["note"].as_str().unwrap_or("")))
+        }
+        Cmd::Draft { id, body, body_file } => {
+            let body = match body_file {
+                Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?,
+                None => body.context("give --body or --body-file")?,
+            };
+            out(call("draft", json!({"id": id, "body": body}))?, &|v| format!("drafted as {}. {}", v["id"].as_str().unwrap_or("?"), v["note"].as_str().unwrap_or("")))
+        }
         Cmd::Answer { id, text } => out(call("answer", json!({"id": id, "text": text}))?, &|v| format!("{} resolved", v["id"].as_str().unwrap_or("?"))),
         Cmd::Log { limit, task } => out(call("log", json!({"limit": limit, "task": task}))?, &fmt_log),
         Cmd::Usage { days } => usage(days, cli.json)?,
@@ -550,6 +585,14 @@ fn fmt_status(v: &Value) -> String {
     if !slots.is_empty() {
         let each: Vec<String> = slots.iter().map(|w| format!("{} {}", w["slot"], w["chain"].as_str().unwrap_or("free"))).collect();
         s.push_str(&format!("  worktrees: {}\n", each.join(", ")));
+    }
+    for src in v["sources"].as_array().into_iter().flatten() {
+        let when = src["last_ms"].as_i64().map(|at| {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(at);
+            format!("looked {} min ago", (now - at).max(0) / 60_000)
+        });
+        let state = src["error"].as_str().map(|e| format!("failing: {e}")).or(when).unwrap_or_else(|| "not looked yet".into());
+        s.push_str(&format!("  {} \"{}\": {state}\n", src["kind"].as_str().unwrap_or(""), src["query"].as_str().unwrap_or("")));
     }
     let worktree = v["held_for_worktree"].as_u64().unwrap_or(0);
     if worktree > 0 {

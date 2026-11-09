@@ -97,6 +97,40 @@ pub fn commit_failed(chain: &str, why: &str) -> String {
     format!("验收后没能提交 {chain} 的改动，改动还在项目文件夹里，需要你自己提交。git：{why}")
 }
 
+pub fn source_failed(query: &str, why: &str) -> String {
+    format!("没能从 GitHub 拉 issue（{query}）。好了以后会自动继续。gh：{why}")
+}
+
+/// The PM's call on an issue, for the person to say 修 or 不做.
+pub fn triage(number: &str, title: &str, decision: &str, size: Option<&str>, why: &str, plan: Option<&str>) -> String {
+    let call = match decision {
+        "fix" => "建议修",
+        "skip" => "建议不做",
+        "dup" => "重复了",
+        _ => "要先问报告人",
+    };
+    let size = match size {
+        Some("s") => "（小）",
+        Some("m") => "（中）",
+        Some("l") => "（大）",
+        _ => "",
+    };
+    let title = title.strip_prefix(&format!("#{number} ")).unwrap_or(title);
+    let mut s = format!("#{number}「{title}」{call}{size}：{why}");
+    if let Some(p) = plan.filter(|p| !p.trim().is_empty()) {
+        s.push_str(&format!("\n方案：{}", p.trim()));
+    }
+    s
+}
+
+pub fn comment_failed(task: &str, why: &str) -> String {
+    format!("{task} 的评论没发出去。gh：{why}")
+}
+
+pub fn pr_failed(chain: &str, why: &str) -> String {
+    format!("{chain} 的改动已经提交到分支 lila/{chain}，但没能推送或开 PR。处理好后点「重试」。{why}")
+}
+
 pub fn worktree_failed(chain: &str, why: &str) -> String {
     format!("没能给 {chain} 准备 worktree，它先排着，一分钟后再试。git：{why}")
 }

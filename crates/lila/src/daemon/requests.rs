@@ -19,6 +19,8 @@ impl<T: Terminals> Daemon<T> {
             "status" => self.status(&caller),
             "request.list" => self.request_list(&caller, params),
             "request.show" => self.request_show(&caller, params),
+            "triage" => self.triage(&caller, params, now),
+            "draft" => self.draft(&caller, params, now),
             "task.new" => self.task_new(&caller, params, now),
             "task.start" => self.task_move(&caller, params, Transition::Start, now),
             "task.done" => self.task_move(&caller, params, Transition::Done, now),
@@ -474,7 +476,7 @@ impl<T: Terminals> Daemon<T> {
             "project": pid, "cwd": proj.cwd, "paused": paused, "members": members, "open_tasks": open, "inbox": inbox, "runs": runs,
             "held_for_review": held, "unreviewed": self.unreviewed(&pid), "codex_paused_until": codex_until,
             "open_chains": self.open_chains(&pid, &plain), "held_for_folder": held_folder,
-            "worktrees": self.slots_json(&pid), "held_for_worktree": held_worktree,
+            "worktrees": self.slots_json(&pid), "held_for_worktree": held_worktree, "sources": self.sources_json(&pid),
         }))
     }
 
@@ -574,7 +576,13 @@ impl<T: Terminals> Daemon<T> {
             held.insert(t.id.clone(), why);
         }
         let slots: BTreeMap<String, usize> = proj.slots.iter().enumerate().filter_map(|(i, s)| s.chain.clone().map(|c| (c, i + 1))).collect();
-        let facts = Facts { tasks: &tasks, owner: &owner, inbox: &inbox, runs: &runs, committing: &committing, held: &held, slots: &slots };
+        let external: BTreeMap<String, request::External> = self
+            .store
+            .externals(&pid)?
+            .into_iter()
+            .map(|e| (e.task.clone(), request::External { source: e.source, rf: e.rf, url: e.url, author: e.author, triage: e.triage, pr: e.pr }))
+            .collect();
+        let facts = Facts { tasks: &tasks, owner: &owner, inbox: &inbox, runs: &runs, committing: &committing, held: &held, slots: &slots, external: &external };
         Ok(request::requests(&facts))
     }
 
@@ -964,6 +972,8 @@ impl<T: Terminals> Daemon<T> {
             }
             "review" => self.review_answer(&pid, &item, text, now)?,
             "merge" => self.merge_answer(&pid, &item, text, now)?,
+            "triage" => self.triage_answer(&pid, &item, text, now)?,
+            "draft" => self.draft_answer(&pid, &item, text, now)?,
             "budget" => self.budget_answer(&pid, &item, text, now)?,
             _ => {}
         }

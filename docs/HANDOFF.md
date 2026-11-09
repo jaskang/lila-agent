@@ -88,6 +88,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | ↳ `daemon/` | lilad。`mod.rs`：状态、herdr-core 的事件、pump（投递和通知）、spool。`requests.rs`：`Daemon::handle` 和每个请求。`flows.rs`：流程推进、检查命令。`session.rs`：换链时的会话、PM 摘要。`review.rs`：验收卡片、一条链占目录、验收时提交、预算。`watch.rs`：Watchdog 和 `tick`。`server.rs`：socket、事件流和后台线程。`tests.rs` 用 Fake 终端，CLI 的会话记录目录指向临时目录 |
 | ↳ `check.rs` | 后台跑流程的检查命令（进程组、超时） |
 | ↳ `worktree.rs`、`commit.rs` | worktree 槽的 git 命令（占槽、放槽、取消时保留）；验收时提交，从槽里合成一个提交、rebase、快进合并（`docs/product-v3.md` §7.1） |
+| ↳ `github.rs`、`daemon/sources.rs` | GitHub 来源（只用 `gh`）：定时拉 issue 建成给 PM 的任务、`lila triage` 和「要修吗？」卡片、`lila draft` 和评论草稿、发评论；验收后开 PR 在 `commit.rs`（`docs/product-v3.md` §8） |
 | ↳ `daemon/slots.rs` | 哪条链在哪个槽、排队占槽、链结束后放槽或给验收卡片、合并失败的 `merge` 条目 |
 | ↳ `sessions.rs` | Claude 会话记录的位置、找 Codex 的会话、读上下文大小 |
 | ↳ `accounts.rs` | 订阅账号（`accounts.toml`）、成员用哪个账号、读每个账号的额度 |

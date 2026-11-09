@@ -165,6 +165,7 @@ impl<T: Terminals> Daemon<T> {
             self.watch_quota(pid, now);
             self.tend_slots(pid, now);
             self.unstick(pid, now);
+            self.poll_sources(pid, now);
         }
         for pid in pids {
             let settings = self.projects[&pid].team.settings.clone();

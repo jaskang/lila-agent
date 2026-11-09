@@ -220,7 +220,9 @@ impl<T: Terminals> Daemon<T> {
         let retry = vec!["重试".to_owned()];
         let dir = self.projects[pid].slots[i].path.to_string_lossy().to_string();
         let item = match r {
-            CommitResult::Committed(_) | CommitResult::Nothing => return self.free_slot(pid, i, true, now),
+            // Pushed: the branch lives on the remote, the pull request has it.
+            CommitResult::Committed(_) | CommitResult::Nothing | CommitResult::Pr(_) => return self.free_slot(pid, i, true, now),
+            CommitResult::PrFailed(why) => (inbox::pr_failed(chain, why), retry),
             CommitResult::NotRepo => return self.free_slot(pid, i, false, now),
             CommitResult::Conflict(files) => {
                 self.conflicts.insert((pid.to_owned(), chain.to_owned()), files.clone());

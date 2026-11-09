@@ -19,6 +19,15 @@ pub struct CommitJob {
     pub path_env: String,
     /// The chain worked in a slot (`cwd`): its work goes into this project folder's branch.
     pub merge_into: Option<PathBuf>,
+    /// Instead of moving the project's branch, push the chain's branch and open a pull request.
+    pub pr: Option<PrSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrSpec {
+    pub repo: Option<String>,
+    pub title: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +46,10 @@ pub enum CommitResult {
     /// The project folder could not move to the chain's commit (its own changes are
     /// in the way): what git said. The commit is on the chain's branch.
     NotMerged(String),
+    /// The pull request is open: its URL.
+    Pr(String),
+    /// The branch could not be pushed or the pull request opened: what was said.
+    PrFailed(String),
 }
 
 /// `git add -A`, then one commit with `job.message`; from a slot, then onto the
@@ -105,6 +118,12 @@ pub fn run(job: &CommitJob) -> CommitResult {
                 let _ = git(&["rebase", "--abort"]);
                 return CommitResult::Conflict(files.lines().map(String::from).collect());
             }
+            if let Some(pr) = &job.pr {
+                return match crate::github::open_pr(&job.cwd, &job.path_env, pr.repo.as_deref(), &branch, &t, &pr.title, &pr.body) {
+                    Ok(url) => CommitResult::Pr(url),
+                    Err(e) => CommitResult::PrFailed(format!("{e:#}")),
+                };
+            }
             match crate::worktree::out(main, &job.path_env, &["merge", "-q", "--ff-only", &branch]) {
                 Ok(_) => break,
                 Err(e) if tries < 3 && e.to_string().contains("Not possible to fast-forward") => tries += 1,
@@ -130,6 +149,7 @@ mod tests {
             message: "Add login\n\nLila-Task: T1".into(),
             path_env: std::env::var("PATH").unwrap_or_default(),
             merge_into: None,
+            pr: None,
         }
     }
 
@@ -235,6 +255,26 @@ mod tests {
             assert!(why.contains("a.txt"), "{why}");
             assert_eq!(std::fs::read_to_string(main.join("a.txt")).unwrap(), "mine, uncommitted\n");
             assert_eq!(sh(&slot, &["log", "-1", "--format=%s"]), "Add login");
+        }
+
+        #[test]
+        fn an_issue_s_work_ends_as_a_pull_request() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (main, slot, remote, bin) = (tmp.path().join("main"), tmp.path().join("wt/1"), tmp.path().join("remote.git"), tmp.path().join("bin"));
+            repo(&main);
+            sh(tmp.path(), &["init", "-q", "--bare", &remote.to_string_lossy()]);
+            sh(&main, &["remote", "add", "origin", &remote.to_string_lossy()]);
+            crate::github::tests::fake_gh(&bin);
+            worktree::prepare(&main, &slot, "T5", &path_env()).unwrap();
+            std::fs::write(slot.join("fix.rs"), "// fixed\n").unwrap();
+            let pr = PrSpec { repo: None, title: "Login loops".into(), body: "Fixes #142".into() };
+            let job = CommitJob { path_env: format!("{}:{}", bin.display(), path_env()), pr: Some(pr), ..slot_job(&main, &slot) };
+            assert_eq!(run(&job), CommitResult::Pr("https://github.com/o/r/pull/7".into()));
+            // Pushed; the project's branch did not move; gh got the title and body.
+            assert_eq!(sh(&remote, &["log", "-1", "--format=%s", "lila/T5"]), "Add login");
+            assert_eq!(sh(&main, &["log", "-1", "--format=%s"]), "first");
+            let log = std::fs::read_to_string(bin.join("gh.log")).unwrap();
+            assert!(log.contains("ARGS pr create --head lila/T5 --base main --title Login loops --body-file -\nFixes #142"), "{log}");
         }
 
         #[test]

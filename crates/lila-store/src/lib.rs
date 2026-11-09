@@ -95,6 +95,21 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_ms INTEGER NOT NULL,
     PRIMARY KEY (project, id)
 );
+CREATE TABLE IF NOT EXISTS external (
+    project TEXT NOT NULL,
+    task TEXT NOT NULL,
+    source TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    url TEXT NOT NULL,
+    author TEXT NOT NULL DEFAULT '',
+    triage TEXT,
+    size TEXT,
+    why TEXT,
+    plan TEXT,
+    pr TEXT,
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY (project, source, ref)
+);
 CREATE TABLE IF NOT EXISTS session_chains (
     project TEXT NOT NULL,
     session TEXT NOT NULL,
@@ -113,6 +128,26 @@ pub struct ProjectRow {
     pub id: String,
     pub cwd: String,
     pub paused: bool,
+}
+
+/// A request that came from outside: the issue it is, how the PM sorted it, its PR.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ExternalRow {
+    /// The request's root task.
+    pub task: String,
+    /// `github`.
+    pub source: String,
+    /// The issue's number.
+    pub rf: String,
+    pub url: String,
+    pub author: String,
+    /// The PM's call: fix | ask | skip | dup.
+    pub triage: Option<String>,
+    pub size: Option<String>,
+    pub why: Option<String>,
+    pub plan: Option<String>,
+    pub pr: Option<String>,
+    pub created_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -392,7 +427,7 @@ impl Store {
     /// Forgets a project and everything Lila recorded for it. Its folder is not touched.
     pub fn remove_project(&self, project: &str) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        for table in ["members", "tasks", "task_events", "artifacts", "inbox", "outbox", "runs", "sessions", "session_chains"] {
+        for table in ["members", "tasks", "task_events", "artifacts", "inbox", "outbox", "runs", "sessions", "session_chains", "external"] {
             tx.execute(&format!("DELETE FROM {table} WHERE project = ?1"), [project])?;
         }
         tx.execute("DELETE FROM projects WHERE id = ?1", [project])?;
@@ -421,6 +456,69 @@ impl Store {
         Ok(st
             .query_map([project], |r| Ok(MemberRow { id: r.get(0)?, role: r.get(1)?, terminal: r.get(2)?, started_ms: r.get(3)?, session: r.get(4)? }))?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ---------- requests from outside (`[[sources]]`) ----------
+
+    pub fn add_external(&self, project: &str, e: &ExternalRow) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO external (project, task, source, ref, url, author, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![project, e.task, e.source, e.rf, e.url, e.author, e.created_ms],
+        )?;
+        Ok(())
+    }
+
+    fn external_where(&self, project: &str, cond: &str, p1: &str, p2: Option<&str>) -> Result<Vec<ExternalRow>> {
+        let sql = format!("SELECT task, source, ref, url, author, triage, size, why, plan, pr, created_ms FROM external WHERE project = ?1 AND {cond} ORDER BY created_ms");
+        let mut st = self.db.prepare(&sql)?;
+        let row = |r: &rusqlite::Row| {
+            Ok(ExternalRow {
+                task: r.get(0)?,
+                source: r.get(1)?,
+                rf: r.get(2)?,
+                url: r.get(3)?,
+                author: r.get(4)?,
+                triage: r.get(5)?,
+                size: r.get(6)?,
+                why: r.get(7)?,
+                plan: r.get(8)?,
+                pr: r.get(9)?,
+                created_ms: r.get(10)?,
+            })
+        };
+        let rows = match p2 {
+            Some(p2) => st.query_map(params![project, p1, p2], row)?.collect::<rusqlite::Result<_>>()?,
+            None => st.query_map(params![project, p1], row)?.collect::<rusqlite::Result<_>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// The outside item a request (its root task) came from.
+    pub fn external_for(&self, project: &str, task: &str) -> Result<Option<ExternalRow>> {
+        Ok(self.external_where(project, "task = ?2", task, None)?.into_iter().next())
+    }
+
+    pub fn external_by_ref(&self, project: &str, source: &str, rf: &str) -> Result<Option<ExternalRow>> {
+        Ok(self.external_where(project, "source = ?2 AND ref = ?3", source, Some(rf))?.into_iter().next())
+    }
+
+    /// Items a source brought in since `since_ms`.
+    pub fn externals_since(&self, project: &str, source: &str, since_ms: i64) -> Result<Vec<ExternalRow>> {
+        Ok(self.external_where(project, "source = ?2", source, None)?.into_iter().filter(|e| e.created_ms >= since_ms).collect())
+    }
+
+    pub fn externals(&self, project: &str) -> Result<Vec<ExternalRow>> {
+        self.external_where(project, "?2 IS NOT NULL", "", None)
+    }
+
+    pub fn set_triage(&self, project: &str, task: &str, triage: &str, size: Option<&str>, why: &str, plan: Option<&str>) -> Result<()> {
+        self.db.execute("UPDATE external SET triage = ?3, size = ?4, why = ?5, plan = ?6 WHERE project = ?1 AND task = ?2", params![project, task, triage, size, why, plan])?;
+        Ok(())
+    }
+
+    pub fn set_pr(&self, project: &str, task: &str, url: &str) -> Result<()> {
+        self.db.execute("UPDATE external SET pr = ?3 WHERE project = ?1 AND task = ?2", params![project, task, url])?;
+        Ok(())
     }
 
     // ---------- sessions ----------

@@ -16,6 +16,10 @@ pub(super) enum Input {
     CheckDone(String, String, CheckResult),
     /// An accepted chain's commit finished: project, chain, result.
     CommitDone(String, String, CommitResult),
+    /// A source was looked at: project, source index, its issues.
+    Polled(String, usize, std::result::Result<Vec<crate::github::Issue>, String>),
+    /// A comment was posted: project, task, its URL.
+    Posted(String, String, std::result::Result<String, String>),
     Stop,
 }
 
@@ -165,6 +169,8 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
             Input::Spool => daemon.process_spool(now),
             Input::CheckDone(pid, anchor, r) => daemon.on_check_done(&pid, &anchor, &r, now),
             Input::CommitDone(pid, chain, r) => daemon.on_commit_done(&pid, &chain, &r, now),
+            Input::Polled(pid, source, r) => daemon.on_polled(&pid, source, r, now),
+            Input::Posted(pid, task, r) => daemon.on_posted(&pid, &task, r, now),
             Input::Stop => break,
         }
         spawn_checks(&mut daemon, &tx);
@@ -188,6 +194,20 @@ pub(super) fn spawn_checks<T: Terminals>(daemon: &mut Daemon<T>, tx: &std::sync:
         std::thread::spawn(move || {
             let r = crate::check::run(&job);
             let _ = tx.send(Input::CheckDone(job.project, job.anchor, r));
+        });
+    }
+    for job in daemon.take_polls() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let r = job.run();
+            let _ = tx.send(Input::Polled(job.project, job.source, r));
+        });
+    }
+    for job in daemon.take_posts() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let r = job.run();
+            let _ = tx.send(Input::Posted(job.project, job.task, r));
         });
     }
     for job in daemon.take_commits() {

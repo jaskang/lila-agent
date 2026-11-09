@@ -8,9 +8,11 @@ mod review;
 mod server;
 mod session;
 mod slots;
+mod sources;
 mod watch;
 
 pub use server::serve;
+pub use sources::{PollJob, PostJob};
 
 use crate::check::{CheckJob, CheckResult};
 use crate::commit::{CommitJob, CommitResult};
@@ -23,7 +25,7 @@ use lila_core::dispatch::{self, AgentStatus, MemberView, QueuedTask, StallAction
 use lila_core::flow::{self, Flow, Next};
 use lila_core::message::StepHint;
 use lila_core::route::{self, DoneRoute};
-use lila_core::{Actor, Brief, Outcome, ProjectConfig, Task, TaskState, Team, Transition, inbox, message, prompt, runtime};
+use lila_core::{Actor, Brief, Outcome, ProjectConfig, SourceSpec, Task, TaskState, Team, Transition, inbox, message, prompt, runtime};
 use lila_store::{NewTask, Run, RunState, SessionRow, Store};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -149,6 +151,14 @@ pub struct Daemon<T: Terminals> {
     commit_task: BTreeMap<(String, String), String>,
     /// Projects with a commit running: the next one waits for it.
     merging: BTreeSet<String>,
+    /// Looks at sources to make (`take_polls`), those under way, and when each source last looked.
+    polls: Vec<PollJob>,
+    polling: BTreeSet<(String, usize)>,
+    last_poll: BTreeMap<(String, usize), i64>,
+    /// What went wrong at a source's last look (the person hears once per new error).
+    source_error: BTreeMap<(String, usize), String>,
+    /// Comments the person sent, to post (`take_posts`).
+    posts: Vec<PostJob>,
 }
 
 /// How a member gets work from another chain than its session's.
@@ -236,6 +246,11 @@ impl<T: Terminals> Daemon<T> {
             conflicts: BTreeMap::new(),
             commit_task: BTreeMap::new(),
             merging: BTreeSet::new(),
+            polls: Vec::new(),
+            polling: BTreeSet::new(),
+            last_poll: BTreeMap::new(),
+            source_error: BTreeMap::new(),
+            posts: Vec::new(),
         };
         let rows = d.store.projects().unwrap_or_default();
         for p in rows {

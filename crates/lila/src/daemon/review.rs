@@ -61,7 +61,6 @@ impl<T: Terminals> Daemon<T> {
 
     /// The person accepted `id`: its chain's changes become one commit (`commit_on_accept`).
     pub(super) fn queue_commit(&mut self, pid: &str, id: &str) {
-        let p = &self.projects[pid];
         let tasks: Vec<Task> = self.store.tasks(pid).unwrap_or_default().into_iter().map(|(t, _)| t).collect();
         let Some(task) = tasks.iter().find(|t| t.id == id) else { return };
         // The chain's title and the person's words; what came of it from the accepted task (a rework's).
@@ -70,6 +69,13 @@ impl<T: Terminals> Daemon<T> {
         what.summary = task.summary.clone();
         what.outcome = task.outcome.clone();
         let chain = what.id.clone();
+        // An issue's request: the commit says it fixes it, and a pull request carries it.
+        let external = self.external_of(pid, &chain).map(|(_, row)| row);
+        if let Some(row) = &external {
+            what.brief.quote = what.brief.quote.as_deref().and_then(|q| q.lines().next()).map(String::from);
+            what.title = what.title.strip_prefix(&format!("#{} ", row.rf)).unwrap_or(&what.title).to_owned();
+        }
+        let p = &self.projects[pid];
         // From a worktree it always goes: that is how the work reaches the project folder.
         let slot = self.slot_of(pid, &chain).map(|i| p.slots[i].path.clone());
         if slot.is_none() && !p.team.settings.commit_on_accept {
@@ -80,8 +86,19 @@ impl<T: Terminals> Daemon<T> {
         }
         self.commit_task.insert((pid.to_owned(), chain.clone()), id.to_owned());
         let merge_into = slot.is_some().then(|| p.cwd.clone());
+        let mut msg = message::commit_message(&what);
+        let pr = match &external {
+            Some(row) => {
+                msg = msg.replace("\n\nLila-Task:", &format!("\n\nFixes #{}\n\nLila-Task:", row.rf));
+                let body = msg.split_once("\n\n").map(|(_, b)| b.to_owned()).unwrap_or_default();
+                let repo = self.projects[pid].team.sources.iter().find(|s| s.kind == row.source).and_then(|s| s.repo.clone());
+                // Without a worktree there is no branch of its own to open a pull request from.
+                slot.is_some().then(|| crate::commit::PrSpec { repo, title: what.title.clone(), body })
+            }
+            None => None,
+        };
         let cwd = slot.unwrap_or_else(|| p.cwd.clone());
-        self.commits.push(CommitJob { project: pid.to_owned(), chain, cwd, message: message::commit_message(&what), path_env: self.path_env.clone(), merge_into });
+        self.commits.push(CommitJob { project: pid.to_owned(), chain, cwd, message: msg, path_env: self.path_env.clone(), merge_into, pr });
     }
 
     /// Commits to make now; each result comes back through `on_commit_done`.
@@ -116,7 +133,12 @@ impl<T: Terminals> Daemon<T> {
             CommitResult::Failed(why) => ("commit_failed", format!("{chain}'s changes could not be committed: {why}")),
             CommitResult::Conflict(files) => ("commit_failed", format!("{chain}'s commit conflicts with the project's branch in {}", files.join(", "))),
             CommitResult::NotMerged(why) => ("commit_failed", format!("{chain} is committed on its branch, but the project folder did not move to it: {why}")),
+            CommitResult::Pr(url) => ("pr", url.clone()),
+            CommitResult::PrFailed(why) => ("commit_failed", format!("{chain} is committed on its branch, but no pull request: {why}")),
         };
+        if let CommitResult::Pr(url) = r {
+            let _ = self.store.set_pr(pid, chain, url);
+        }
         let _ = self.store.event(pid, Some(chain), LILAD, kind, &detail, now);
         if let Some(i) = self.slot_of(pid, chain) {
             self.slot_commit_done(pid, i, chain, &task, r, now);
@@ -145,7 +167,9 @@ impl<T: Terminals> Daemon<T> {
         lines.sort_by_key(|(at, _)| *at);
         let steps: Vec<String> = lines.into_iter().map(|(_, l)| l).collect();
         let text = inbox::review(task, &steps);
-        self.store.add_inbox(pid, "review", Some(&task.to), Some(&task.id), &text, &["通过".to_owned()], now)?;
+        // An issue's work ends as a pull request: the button says so.
+        let accept = if self.external_of(pid, &task.id).is_some() { "开 PR" } else { "通过" };
+        self.store.add_inbox(pid, "review", Some(&task.to), Some(&task.id), &text, &[accept.to_owned()], now)?;
         Ok(())
     }
 
@@ -153,7 +177,7 @@ impl<T: Terminals> Daemon<T> {
     /// which goes to the PM as a new task in the same chain.
     pub(super) fn review_answer(&mut self, pid: &str, item: &lila_store::InboxItem, text: Option<&str>, now: i64) -> Result<()> {
         let id = item.task.clone().context("a review without its task")?;
-        let accepted = text.is_none_or(|t| matches!(t.trim().to_lowercase().as_str(), "通过" | "accept" | "accepted" | "ok" | "pass" | "yes"));
+        let accepted = text.is_none_or(|t| matches!(t.trim().to_lowercase().as_str(), "通过" | "开 pr" | "accept" | "accepted" | "ok" | "pass" | "yes"));
         if accepted {
             self.store.event(pid, Some(&id), "human", "accepted", &format!("{id} signed off"), now)?;
             self.queue_commit(pid, &id);

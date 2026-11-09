@@ -249,6 +249,44 @@ pub struct ProjectConfig {
     /// Flows besides (or replacing) the built-in `code` and `quick` (`flow::builtin`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub flows: BTreeMap<String, Flow>,
+    /// Where requests come from besides the person (`[[sources]]`): GitHub issues.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceSpec>,
+}
+
+/// One `[[sources]]` entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSpec {
+    /// `github`.
+    pub kind: String,
+    /// GitHub: the issues to take, in `gh` search syntax.
+    #[serde(default = "SourceSpec::default_query")]
+    pub query: String,
+    /// `owner/name`; without it, the project folder's git remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Minutes between looks.
+    #[serde(default = "SourceSpec::default_every")]
+    pub every: u64,
+    /// New requests taken a day; the rest wait for the next day.
+    #[serde(default = "SourceSpec::default_max_per_day")]
+    pub max_per_day: u32,
+    /// The PM starts on what it finds small and worth fixing without asking the person.
+    #[serde(default)]
+    pub auto_fix: bool,
+}
+
+impl SourceSpec {
+    fn default_query() -> String {
+        "is:open".into()
+    }
+    fn default_every() -> u64 {
+        10
+    }
+    fn default_max_per_day() -> u32 {
+        5
+    }
 }
 
 impl ProjectConfig {
@@ -309,6 +347,7 @@ pub struct Team {
     pub pools: BTreeMap<String, Vec<String>>,
     /// The built-in flows that fit the team, and the project's own.
     pub flows: BTreeMap<String, Flow>,
+    pub sources: Vec<SourceSpec>,
 }
 
 impl Team {
@@ -391,7 +430,15 @@ impl Team {
         if !wanted.is_empty() && wanted != "none" && !flows.contains_key(wanted) && !builtin_names().contains(&wanted.as_str()) {
             return Err(format!("settings.flow: no flow {wanted:?} (have: {})", flows.keys().cloned().collect::<Vec<_>>().join(", ")));
         }
-        Ok(Team { project: config.name.clone(), owner, members, assign, settings: config.settings.clone(), pools, flows })
+        for s in &config.sources {
+            if s.kind != "github" {
+                return Err(format!("source kind {:?}: Lila knows \"github\"", s.kind));
+            }
+            if s.every == 0 {
+                return Err("a source's `every` must be at least 1 (minutes)".into());
+            }
+        }
+        Ok(Team { project: config.name.clone(), owner, members, assign, settings: config.settings.clone(), pools, flows, sources: config.sources.clone() })
     }
 
     /// Gives the members of one `[[members]]` entry their own prompt.

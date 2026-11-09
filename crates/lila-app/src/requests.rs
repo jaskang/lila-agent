@@ -51,6 +51,8 @@ pub fn who(member: &str, owner: &str) -> String {
 pub fn inbox_words(kind: &str) -> &'static str {
     match kind {
         "review" => "等你验收",
+        "triage" => "要修吗？",
+        "draft" => "评论草稿",
         "question" => "助理在问你",
         "merge" => "合并没成功",
         "budget" => "超出预算",
@@ -70,6 +72,8 @@ fn doing_words(r: &Value, owner: &str) -> String {
     let d = &r["doing"];
     match d["kind"].as_str().unwrap_or("") {
         "you" => inbox_words(d["inbox"].as_str().unwrap_or("")).to_owned(),
+        // An issue the PM has not sorted yet.
+        "member" if r["external"].is_object() && r["external"]["triage"].is_null() && d["member"] == owner => "助理在分拣".to_owned(),
         "member" => {
             let m = who(d["member"].as_str().unwrap_or(""), owner);
             if d["state"] == "blocked" { format!("{m} 卡住了") } else { format!("{m} 在做") }
@@ -289,7 +293,16 @@ impl LilaApp {
             .collect();
         let collect = |key: &str| -> Vec<String> { tasks.iter().flat_map(|t| t[key].as_array().cloned().unwrap_or_default()).filter_map(|x| x.as_str().map(String::from)).collect() };
         let (decisions, unverified) = (collect("decisions"), collect("unverified"));
-        let from = if r["from"] == "human" { "你提的".to_owned() } else { format!("{}开的", who(r["from"].as_str().unwrap_or(""), &owner)) };
+        let ext = r["external"].clone();
+        let from = if ext.is_object() {
+            format!("@{} 在 GitHub 提的", s(&ext, "author"))
+        } else if r["from"] == "human" {
+            "你提的".to_owned()
+        } else {
+            format!("{}开的", who(r["from"].as_str().unwrap_or(""), &owner))
+        };
+        // The issue and its pull request, opened in the browser.
+        let links: Vec<(String, String)> = [(format!("#{}", s(&ext, "ref")), s(&ext, "url")), ("PR".to_owned(), s(&ext, "pr"))].into_iter().filter(|(_, u)| !u.is_empty()).collect();
         let member = (r["doing"]["kind"] == "member").then(|| s(&r["doing"], "member"));
         let mark: AnyElement = if group == "working" {
             Spinner::new().xsmall().color(style::blue()).into_any_element()
@@ -363,7 +376,18 @@ impl LilaApp {
                                 .px_4()
                                 .pt(px(14.))
                                 .gap(px(6.))
-                                .child(h_flex().gap_2().child(id_tag(&group, s(&r, "id"))).child(div().text_xs().text_color(muted2()).child(format!("{from} · {}", data::clock(r["created_ms"].as_i64().unwrap_or(0))))))
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(id_tag(&group, s(&r, "id")))
+                                        .child(div().text_xs().text_color(muted2()).child(format!("{from} · {}", data::clock(r["created_ms"].as_i64().unwrap_or(0)))))
+                                        .child(div().flex_1())
+                                        .children(links.into_iter().enumerate().map(|(n, (label, url))| {
+                                            style::link(SharedString::from(format!("request-link-{n}")), label, false).text_xs().on_click(move |_, _, _| {
+                                                let _ = std::process::Command::new("open").arg(&url).spawn();
+                                            })
+                                        })),
+                                )
                                 .child(div().text_size(px(15.)).font_semibold().line_height(relative(1.35)).child(s(&r, "title")))
                                 // An inbox card below says what waits for the person.
                                 .when(cards.is_empty(), |d| d.child(div().pt_1().child(now))),

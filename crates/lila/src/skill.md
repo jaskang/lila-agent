@@ -99,6 +99,11 @@ there. Accepting a chain makes its work one commit on the project folder's
 branch. When every worktree is taken, a new chain waits. Without git, members
 share the project folder and one chain has it until the person accepts it
 (`max_chains`); accepting commits what changed (`commit_on_accept`).
+With a GitHub source (`[[sources]]` in project.toml), new issues come to the PM
+as tasks titled `#142 …`. The PM sorts each with `lila triage <task> --decision
+fix|ask|skip|dup --size s|m|l --why "…" [--plan "…"]`; the person says 修 or 不做.
+`lila draft <task> --body "…"` writes a comment for the reporter, which the
+person sends. Accepted work on an issue ends as a pull request (`Fixes #142`).
 `--budget 300k` on `lila task new` caps a flow's tokens: over it, the flow
 waits for the person before its next step.
 

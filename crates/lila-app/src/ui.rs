@@ -527,6 +527,7 @@ impl LilaApp {
             let placeholder = match i["kind"].as_str() {
                 Some("question") => "回答…",
                 Some("review") => "返工意见…",
+                Some("draft") => "改写…",
                 _ => continue,
             };
             let id = s(i, "id");
@@ -554,13 +555,19 @@ impl LilaApp {
             "lost" => (IconName::CircleX, style::red(), "成员退出"),
             "report" => (IconName::CircleCheck, style::green(), "完成报告"),
             "review" => (IconName::CircleCheck, style::green(), "等你验收"),
+            "triage" => (IconName::Github, style::yellow(), "要修吗？"),
+            "draft" => (IconName::Github, style::yellow(), "评论草稿"),
             "budget" => (IconName::TriangleAlert, style::yellow(), "超出预算"),
             "quota" => (IconName::CircleX, style::red(), "额度用完"),
             "runaway" => (IconName::TriangleAlert, style::yellow(), "可能在打转"),
             _ => (IconName::Info, muted(), "提醒"),
         };
         // A review signs off with 通过 or sends back what the person wrote; it has its own row.
+        // A review and a draft go with their first option (通过 / 开 PR / 发出), or send back
+        // (a review) or send reworded (a draft) what the person wrote.
         let review = kind == "review";
+        let primary_row = review || kind == "draft";
+        let first = item["options"][0].as_str().unwrap_or("通过").to_owned();
         let options: Vec<String> = item["options"].as_array().into_iter().flatten().filter_map(|o| o.as_str().map(String::from)).collect();
         let input = self.answers.get(&id).cloned();
         let card_id = id.clone();
@@ -584,7 +591,7 @@ impl LilaApp {
                 let text = s(&item, "text");
                 if review { text.lines().next().unwrap_or_default().to_owned() } else { text }
             }))
-            .when(!options.is_empty() && !review, |d| {
+            .when(!options.is_empty() && !primary_row, |d| {
                 d.child(h_flex().gap(px(6.)).flex_wrap().children(options.into_iter().enumerate().map(|(n, opt)| {
                     let (id, text) = (id.clone(), opt.clone());
                     Button::new(SharedString::from(format!("opt-{id}-{n}"))).small().small_button().outline().rounded_full().label(opt).on_click(cx.listener(move |this, _, window, cx| this.answer(id.clone(), Some(text.clone()), window, cx)))
@@ -596,15 +603,22 @@ impl LilaApp {
                 d.child(
                     h_flex()
                         .gap(px(6.))
-                        .when(review, |d| {
-                            d.child(Button::new(SharedString::from(format!("accept-{card_id}"))).primary().label("通过").on_click(cx.listener(move |this, _, window, cx| {
-                                this.answer(accept_id.clone(), Some("通过".into()), window, cx)
+                        .when(primary_row, |d| {
+                            let label = first.clone();
+                            d.child(Button::new(SharedString::from(format!("accept-{card_id}"))).primary().label(label.clone()).on_click(cx.listener(move |this, _, window, cx| {
+                                this.answer(accept_id.clone(), Some(label.clone()), window, cx)
                             })))
                         })
                         .child(div().flex_1().child(Input::new(&input).control()))
                         .child({
-                            let send = Button::new(SharedString::from(format!("send-{card_id}"))).label(if review { "打回" } else { "回答" });
-                            let send = if review { send.ghost() } else { send.primary() };
+                            let send = Button::new(SharedString::from(format!("send-{card_id}"))).label(if review {
+                                "打回"
+                            } else if primary_row {
+                                "发出改写"
+                            } else {
+                                "回答"
+                            });
+                            let send = if primary_row { send.ghost() } else { send.primary() };
                             send.on_click(cx.listener(move |this, _, window, cx| {
                                 let text = field.read(cx).value().to_string();
                                 if !text.trim().is_empty() {
@@ -614,7 +628,7 @@ impl LilaApp {
                         }),
                 )
             })
-            .when(!matches!(kind.as_str(), "question" | "review" | "budget"), |d| {
+            .when(!matches!(kind.as_str(), "question" | "review" | "budget" | "triage" | "draft"), |d| {
                 let open = member.clone().filter(|_| matches!(kind.as_str(), "terminal" | "startup" | "stalled" | "runaway"));
                 let id = card_id.clone();
                 d.child(

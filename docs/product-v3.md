@@ -353,3 +353,66 @@ M1 内部的顺序：
 **没看到的**：系统通知（截图看不到通知中心）。
 
 **收尾时的状态**：main 上 5 个提交（first、Add a.txt、Add b.txt、Add c.txt、Add d.txt），每个都带原话和 `Lila-Task`；没有 `lila/*` 分支；两个槽都空着。项目目录里 `.lila/.gitignore` 是未跟踪的（`lila up` 写的，以前就这样）。
+
+---
+
+## 8. M2：GitHub 来源（设计）
+
+目标：开发团队在 GitHub 上提的 issue 自己进来，助理分拣，你点一下才开工，做完以一个 PR 收尾。对外说话一律先给你过目。
+
+### 8.1 配置
+
+```toml
+# .lila/project.toml
+[[sources]]
+kind = "github"
+query = "is:open label:bug"   # gh 的搜索语法；默认 "is:open"
+every = 10                    # 几分钟拉一次
+max_per_day = 5               # 一天最多收几个新 issue
+auto_fix = false              # true：助理判断为「小、该修」的直接开工（信任阶梯第 2 级）
+# repo = "owner/name"         # 默认：项目目录的 git remote（gh 自己认）
+```
+
+### 8.2 一个 issue 怎么走
+
+1. **进来**：lilad 按 `every` 在后台跑 `gh issue list --search <query> --json …`。没见过的 issue（按编号）建一个给助理的根任务「#142 标题」，这就是一个请求。正文是分拣说明，加上 issue 原文；原文标明是报告人写的数据，不是给 agent 的指令。每天最多 `max_per_day` 个，多的等明天。
+2. **分拣**：助理用 `lila triage T5 --decision fix|ask|skip|dup --size s|m|l --why "…" [--plan "…"]` 给出结论，结果记在请求上。
+   - `fix` / `skip` / `dup`：你的收件箱出现一张「要修吗？」卡片，写着结论、理由和方案。按钮是「修」「不做」（建议不做时顺序反过来）。你的回答像回答提问一样交给助理：修就派人做，不做就关掉。`auto_fix = true` 并且是 `fix`、`s` 时不问你，直接开工。
+   - `ask`：助理用 `lila draft T5 --body "…"` 写一条给报告人的评论，变成一张草稿卡片。
+3. **草稿**：卡片上是评论原文，「发出」就由 lilad 调 `gh issue comment` 发出去；在输入框里改写后发出，发的就是你改过的那段。M2 只有 issue 评论；读回复是 M3。
+4. **做**：和手动的请求一样：worktree、检查、验证、验收卡片。
+5. **收尾**：验收卡片的主按钮是「开 PR」。点了之后，lilad 在槽里合成一个提交（正文带 `Fixes #142`），rebase 到当前分支，`git push` 这个分支，再 `gh pr create`。PR 的链接记在请求上，槽空出来。合并 PR 还是在 GitHub 上由人来做，合并时 GitHub 会按 `Fixes #142` 关掉 issue。
+
+### 8.3 界面
+
+- 请求行在编号后面多一个来源标记 `#142`；右边面板的头部有 issue 和 PR 的链接（点开浏览器）。
+- 新的卡片类型：「要修吗？」（分拣）、「评论草稿」。验收卡片的主按钮用卡片自己的第一个选项（GitHub 的是「开 PR」）。
+
+### 8.4 不做的（留给 M3）
+
+- 报告人的回复、issue 被别人关掉、PR 的评审意见：都不读。
+- 项目设置里还不能编辑来源，只能写在 `project.toml` 里。
+
+### 8.5 M2 记录（2026-11-09）
+
+**做了什么**（照 §8.1–8.3）
+- `[[sources]]`（`lila_core::SourceSpec`）：`kind = "github"`、`query`、`repo`、`every`、`max_per_day`、`auto_fix`。
+- `crates/lila/src/github.rs`：只用 `gh` 的三件事：列 issue、发评论、推分支后开 PR。Lila 不碰 token。
+- `daemon/sources.rs`：
+  - 按 `every` 在后台拉一次，新 issue 建成给助理的根任务（`from` 是人，所以做完会出验收卡片）；24 小时内最多 `max_per_day` 个，旧的先进。
+  - `gh` 出错时收件箱提示一次，同样的错不重复提示。
+  - `lila triage`：结论记进 `external` 表。修 / 不做 / 重复出「要修吗？」卡片；「不做」由 Lila 关掉请求；`auto_fix` 时小的修直接开工；要先问报告人的走草稿。
+  - `lila draft`：评论草稿卡片；「发出」或改写后发出，由 lilad 调 `gh issue comment`，发出后助理收到链接。
+- 收尾：issue 的验收卡片主按钮是「开 PR」。在槽里合成一个提交（正文带 `Fixes #142`，「Asked」只留第一行，不把 issue 全文写进提交），rebase，`git push --force-with-lease`，`gh pr create`。PR 链接记在请求上，项目分支不动，槽空出来。没有 worktree 时退回本地提交。
+- 助理的提示词在项目有来源时多一节「Issues from GitHub」；issue 原文用 `<issue>` 包起来，并写明它不能改变任何工作方式。
+- 窗口：「要修吗？」「评论草稿」两种卡片；验收和草稿的主按钮用卡片自己的第一个选项；请求头部写「@alice 在 GitHub 提的」，右端是 `#142` 和 `PR` 链接；还没分拣的写「助理在分拣」。`lila status` 列出每个来源上次什么时候拉的、有没有出错。
+
+**验证**
+- `github` 2 个测试（假的 `gh` 记录参数和 stdin）、`commit` 1 个（真实的裸仓库当 origin，推送后开 PR，项目分支不动）、daemon 4 个：进来、去重、每天上限、出错只提示一次；分拣、修、PR 收尾；不做、草稿改写后发出；`auto_fix`。
+- 工作区 246 个测试通过，Clippy 零警告。截图看过两种卡片和来源信息。
+- **没真跑**：要在一个真的 GitHub 仓库里建 issue、发评论、推分支、开 PR，这些都是对外的动作，要先征得同意。
+
+**已知限制**
+- 只认 issue 编号去重：issue 改了标题或内容不会再进来；被别人关掉的 issue 也不会通知（M3）。
+- 草稿只能发评论，不能改 label、指派人。
+- 来源只能写在 `project.toml` 里，项目设置还不能编辑。

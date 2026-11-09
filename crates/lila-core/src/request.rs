@@ -66,6 +66,19 @@ pub struct InboxFact {
     pub created_ms: i64,
 }
 
+/// Where a request came from, when not from the person: an issue, how the PM
+/// sorted it, the pull request it ended in.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct External {
+    pub source: String,
+    #[serde(rename = "ref")]
+    pub rf: String,
+    pub url: String,
+    pub author: String,
+    pub triage: Option<String>,
+    pub pr: Option<String>,
+}
+
 /// An open flow run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunFact {
@@ -85,6 +98,8 @@ pub struct Facts<'a> {
     pub held: &'a BTreeMap<String, Hold>,
     /// Chains in a worktree, and its number.
     pub slots: &'a BTreeMap<String, usize>,
+    /// Requests that came from a source, by root task.
+    pub external: &'a BTreeMap<String, External>,
 }
 
 /// What is happening to a request now.
@@ -123,10 +138,11 @@ pub struct Request {
     pub unverified: usize,
     pub tasks: usize,
     pub slot: Option<usize>,
+    pub external: Option<External>,
 }
 
 /// Inbox kinds that ask the person to act, most pressing first.
-const NEEDS: [&str; 8] = ["review", "question", "merge", "budget", "terminal", "startup", "stalled", "runaway"];
+const NEEDS: [&str; 10] = ["review", "triage", "question", "draft", "merge", "budget", "terminal", "startup", "stalled", "runaway"];
 
 fn root_of<'a>(tasks: &'a [Task], t: &'a Task) -> &'a Task {
     let mut cur = t;
@@ -205,6 +221,7 @@ fn one(f: &Facts, root: &Task, tasks: &[&Task]) -> Request {
         unverified: tasks.iter().map(|t| t.outcome.unverified.len()).sum(),
         tasks: tasks.len(),
         slot: f.slots.get(&root.id).copied(),
+        external: f.external.get(&root.id).cloned(),
     }
 }
 
@@ -236,7 +253,8 @@ mod tests {
 
     fn list(tasks: &[Task], inbox: &[InboxFact], runs: &[RunFact], committing: &[String], held: &BTreeMap<String, Hold>) -> Vec<(String, Group, Doing)> {
         let slots = BTreeMap::from([("T1".to_owned(), 1)]);
-        let f = Facts { tasks, owner: "pm", inbox, runs, committing, held, slots: &slots };
+        let external = BTreeMap::new();
+        let f = Facts { tasks, owner: "pm", inbox, runs, committing, held, slots: &slots, external: &external };
         requests(&f).into_iter().map(|r| (r.id, r.group, r.doing)).collect()
     }
 
@@ -288,7 +306,8 @@ mod tests {
         ];
         let slots = BTreeMap::from([("T1".to_owned(), 2)]);
         let held = BTreeMap::new();
-        let f = Facts { tasks: &tasks, owner: "pm", inbox: &inbox, runs: &[], committing: &[], held: &held, slots: &slots };
+        let external = BTreeMap::new();
+        let f = Facts { tasks: &tasks, owner: "pm", inbox: &inbox, runs: &[], committing: &[], held: &held, slots: &slots, external: &external };
         let r = &requests(&f)[0];
         assert_eq!((r.group, &r.doing, r.since_ms, r.inbox.clone(), r.slot), (Group::NeedsYou, &Doing::You { inbox: "question".into() }, 25, vec!["Q3".into(), "Q2".into()], Some(2)));
         assert_eq!(list(&tasks, &[], &[], &["T1".into()], &held)[0].2, Doing::Commit);

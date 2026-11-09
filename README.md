@@ -68,6 +68,18 @@ lila pause / resume / down
   ```
 
 - **项目**：`.lila/project.toml`，随仓库提交。成员（`[[members]]`，可以覆盖角色的 `runtime`、`model`、`effort`、`count`）、指派规则（`[assign]`）、自定义流程（`[flows.<名字>]`）和 `[settings]`（同时进行几件 `parallel`、检查命令 `check`、`max_rounds`、`stall_minutes` 等）。git 仓库里每件事在自己的 worktree 里做，验收后合成一个提交落到当前分支。
+- **GitHub 来源**：在 `.lila/project.toml` 里加一段，issue 会自己进来，助理分拣，你点「修」才开工，做完开 PR：
+
+  ```toml
+  [[sources]]
+  kind = "github"
+  query = "is:open label:bug"   # gh 的搜索语法
+  every = 10                    # 分钟
+  max_per_day = 5
+  ```
+
+  需要装好并登录 `gh`。
+
 - `LILA_HOME=<目录>` 把配置、数据库和 socket 都放进这个目录。
 
 ## 开发
