@@ -1922,6 +1922,17 @@ fn not_fixing_closes_it_and_a_draft_goes_out_once_sent() {
     assert!(w.d.store.events("shop", Some("T2"), 20).unwrap().iter().any(|e| e.kind == "commented" && e.detail.ends_with("#issuecomment-1")));
     let log = std::fs::read_to_string(bin.join("gh.log")).unwrap();
     assert!(log.contains("ARGS issue comment 143 --body-file -\nWhich browser and version?"), "{log}");
+    // Now it waits for the reporter: no reminders to the PM, a group of its own.
+    let list = w.ok(None, "request.list", json!({}));
+    let t2 = list.as_array().unwrap().iter().find(|r| r["id"] == "T2").cloned().unwrap();
+    assert_eq!((t2["group"].as_str(), t2["doing"]["kind"].as_str()), (Some("waiting"), Some("reply")), "{t2}");
+    w.ok(Some("owner"), "task.start", json!({"id": "T2"}));
+    w.status("owner", "idle");
+    let t0 = w.now;
+    w.d.tick(t0 + 6 * 60_000);
+    w.d.tick(t0 + 12 * 60_000);
+    let kinds: Vec<String> = w.d.store.events("shop", Some("T2"), 50).unwrap().into_iter().map(|e| e.kind).collect();
+    assert!(!kinds.iter().any(|k| k == "nudged" || k == "stalled"), "{kinds:?}");
 }
 
 #[test]

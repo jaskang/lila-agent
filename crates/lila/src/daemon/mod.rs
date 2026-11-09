@@ -540,6 +540,7 @@ impl<T: Terminals> Daemon<T> {
                     status: proj.live[&m.id].status,
                     holds_task: held(TaskState::is_active),
                     busy: held(|s| matches!(s, TaskState::Delivered | TaskState::InProgress)),
+                    unstarted: held(|s| s == TaskState::Delivered),
                 }
             })
             .collect();

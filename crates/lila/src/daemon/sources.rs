@@ -220,6 +220,7 @@ impl<T: Terminals> Daemon<T> {
         match r {
             Ok(url) => {
                 let _ = self.store.event(pid, Some(task), "human", "commented", &url, now);
+                let _ = self.store.set_asked(pid, task, now);
                 let _ = self.store.push_outbox(pid, &owner, &message::note(task, &format!("The person posted the comment: {url}. Replies are not read yet; the person tells you.")), now);
             }
             Err(e) => {

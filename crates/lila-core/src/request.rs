@@ -15,7 +15,7 @@ pub enum Group {
     NeedsYou,
     /// A member works on it, or Lila runs its check or makes its commit.
     Working,
-    /// Waits for someone outside the team (a reporter's reply). From M3.
+    /// Waits for someone outside the team: the reporter's reply to a comment.
     Waiting,
     /// Its work waits to start: a worktree, the review backlog, a member, the quota.
     Queued,
@@ -77,6 +77,8 @@ pub struct External {
     pub author: String,
     pub triage: Option<String>,
     pub pr: Option<String>,
+    /// When a comment last went to the reporter.
+    pub asked_ms: Option<i64>,
 }
 
 /// An open flow run.
@@ -114,6 +116,8 @@ pub enum Doing {
     Commit,
     /// Its work waits to start.
     Wait { hold: Hold },
+    /// The reporter was asked something and nothing has happened since.
+    Reply,
     Done,
     Dropped,
 }
@@ -179,6 +183,15 @@ pub fn requests(f: &Facts) -> Vec<Request> {
     out
 }
 
+/// When the reporter was asked, if the request still waits for the answer: only the
+/// PM's own task is open, and nothing started since the comment went out.
+pub fn asked(f: &Facts, root: &Task, tasks: &[&Task]) -> Option<i64> {
+    let at = f.external.get(&root.id)?.asked_ms?;
+    let open = |t: &&&Task| !matches!(t.state, TaskState::Done | TaskState::Cancelled);
+    let quiet = tasks.iter().filter(open).all(|t| t.id == root.id) && tasks.iter().all(|t| t.id == root.id || t.created_ms < at);
+    (open(&&root) && root.state != TaskState::Queued && quiet && !f.committing.contains(&root.id) && !f.runs.iter().any(|r| r.anchor == root.id)).then_some(at)
+}
+
 fn one(f: &Facts, root: &Task, tasks: &[&Task]) -> Request {
     let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
     let mut inbox: Vec<&InboxFact> = f.inbox.iter().filter(|i| NEEDS.contains(&i.kind.as_str()) && i.task.as_deref().is_some_and(|t| ids.contains(&t))).collect();
@@ -192,6 +205,8 @@ fn one(f: &Facts, root: &Task, tasks: &[&Task]) -> Request {
     let queued: Vec<&&Task> = tasks.iter().filter(|t| t.state == TaskState::Queued).collect();
     let (group, doing, since) = if let Some(first) = inbox.first() {
         (Group::NeedsYou, Doing::You { inbox: first.kind.clone() }, inbox.iter().map(|i| i.created_ms).min().unwrap_or(first.created_ms))
+    } else if let Some(at) = asked(f, root, tasks) {
+        (Group::Waiting, Doing::Reply, at)
     } else if let Some(t) = working {
         let doing = Doing::Member { member: t.to.clone(), task: t.id.clone(), title: t.title.clone(), state: t.state.as_str().to_owned() };
         (Group::Working, doing, t.updated_ms)
@@ -256,6 +271,28 @@ mod tests {
         let external = BTreeMap::new();
         let f = Facts { tasks, owner: "pm", inbox, runs, committing, held, slots: &slots, external: &external };
         requests(&f).into_iter().map(|r| (r.id, r.group, r.doing)).collect()
+    }
+
+    #[test]
+    fn an_issue_waits_for_its_reporter_until_work_starts_again() {
+        use TaskState::*;
+        let ext = |asked| External { source: "github".into(), rf: "7".into(), url: String::new(), author: "alice".into(), triage: Some("ask".into()), pr: None, asked_ms: asked };
+        let group = |tasks: &[Task], asked: Option<i64>| {
+            let external = BTreeMap::from([("T1".to_owned(), ext(asked))]);
+            let (slots, held) = (BTreeMap::new(), BTreeMap::new());
+            let f = Facts { tasks, owner: "pm", inbox: &[], runs: &[], committing: &[], held: &held, slots: &slots, external: &external };
+            let r = requests(&f).remove(0);
+            (r.group, r.doing, r.since_ms)
+        };
+        let asked = [task("T1", None, "human", "pm", InProgress, 10)];
+        assert_eq!(group(&asked, None).0, Group::Working, "not asked yet");
+        assert_eq!(group(&asked, Some(20)), (Group::Waiting, Doing::Reply, 20));
+        // The reply came (the person told the PM) and an engineer works on it.
+        let again = [task("T1", None, "human", "pm", InProgress, 10), task("T2", Some("T1"), "pm", "engineer", InProgress, 30)];
+        assert_eq!(group(&again, Some(20)).0, Group::Working);
+        // Done under it since, the PM wraps up: no longer waiting.
+        let wrapped = [task("T1", None, "human", "pm", InProgress, 10), task("T2", Some("T1"), "pm", "engineer", Done, 30)];
+        assert_eq!(group(&wrapped, Some(20)).0, Group::Working);
     }
 
     #[test]

@@ -61,6 +61,8 @@ pub struct MemberView {
     pub holds_task: bool,
     /// Has a delivered or in-progress task (counts toward `max_working`).
     pub busy: bool,
+    /// Has a delivered task it has not started yet.
+    pub unstarted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +75,8 @@ pub struct QueuedTask {
 
 /// (task, member) pairs to deliver now, at most one per member, highest priority
 /// first, without exceeding `max_working` busy non-owner members (0: no limit). The owner is
-/// never limited: it is the one planning.
+/// never limited: it is the one planning. It also takes new work while its earlier tasks
+/// wait on others (every request starts with it), once it has started the last one.
 pub fn pick_deliveries(members: &[MemberView], queued: &[QueuedTask], max_working: u32) -> Vec<(String, String)> {
     let mut busy = members.iter().filter(|m| !m.is_owner && m.busy).count() as u32;
     let mut order: Vec<&QueuedTask> = queued.iter().collect();
@@ -82,7 +85,8 @@ pub fn pick_deliveries(members: &[MemberView], queued: &[QueuedTask], max_workin
     let mut out = Vec::new();
     for t in order {
         let Some(m) = members.iter().find(|m| m.id == t.to) else { continue };
-        if taken.contains(&m.id.as_str()) || m.holds_task || !m.status.is_free() {
+        let occupied = if m.is_owner { m.unstarted } else { m.holds_task };
+        if taken.contains(&m.id.as_str()) || occupied || !m.status.is_free() {
             continue;
         }
         if !m.is_owner {
@@ -153,7 +157,7 @@ mod tests {
     }
 
     fn m(id: &str, owner: bool, status: AgentStatus, holds: bool, busy: bool) -> MemberView {
-        MemberView { id: id.into(), is_owner: owner, status, holds_task: holds, busy }
+        MemberView { id: id.into(), is_owner: owner, status, holds_task: holds, busy, unstarted: false }
     }
 
     fn q(id: &str, to: &str, priority: i64, seq: i64) -> QueuedTask {
@@ -178,6 +182,14 @@ mod tests {
     fn holding_a_task_blocks_new_ones() {
         let members = [m("eng", false, Idle, true, false)];
         assert!(pick_deliveries(&members, &[q("T1", "eng", 0, 1)], 9).is_empty());
+    }
+
+    #[test]
+    fn the_owner_takes_the_next_request_while_others_work_on_the_last() {
+        let waiting = m("owner", true, Done, true, true);
+        assert_eq!(pick_deliveries(std::slice::from_ref(&waiting), &[q("T2", "owner", 0, 1)], 9), [("T2".to_string(), "owner".to_string())]);
+        let unread = MemberView { unstarted: true, ..waiting };
+        assert!(pick_deliveries(&[unread], &[q("T2", "owner", 0, 1)], 9).is_empty(), "not before it opened the last one");
     }
 
     #[test]

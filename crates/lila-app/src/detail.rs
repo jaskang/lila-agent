@@ -49,6 +49,8 @@ pub fn event_line(actor: &str, kind: &str, detail: &str) -> (String, Option<Stri
     if kind == "worktree" && !detail.contains(" works in ") {
         return (format!("{who} 收尾"), None);
     }
+    // "Q3: 修": the answer is what matters.
+    let detail = if kind == "answered" { detail.split_once(": ").map_or(detail, |(_, a)| a) } else { detail };
     let (what, said) = match kind {
         "created" => ("创建", false),
         "delivered" => ("送达", false),

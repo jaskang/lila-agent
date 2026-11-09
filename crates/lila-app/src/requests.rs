@@ -89,7 +89,10 @@ fn doing_words(r: &Value, owner: &str) -> String {
             "stopped" => "团队没启动".to_owned(),
             _ => "等成员有空".to_owned(),
         },
+        "reply" => format!("等 @{} 回复", r["external"]["author"].as_str().unwrap_or("")),
         "dropped" => "已放弃".to_owned(),
+        // Handed over as a pull request; people merge it on GitHub.
+        _ if r["external"]["pr"].is_string() => "已开 PR".to_owned(),
         _ => "已交付".to_owned(),
     }
 }
@@ -276,16 +279,24 @@ impl LilaApp {
         let group = s(&r, "group");
         let tasks: Vec<Value> = v["tasks"].as_array().cloned().unwrap_or_default();
         let items: Vec<Value> = v["inbox"].as_array().cloned().unwrap_or_default();
+        let ext = r["external"].clone();
         // Who did what and said what; Lila's own bookkeeping (deliveries, sessions,
         // worktrees, the tasks it opens for a flow's steps) stays in `lila log`.
-        let events: Vec<Value> = v["events"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        let all: Vec<Value> = v["events"].as_array().cloned().unwrap_or_default();
+        // An answer that the next line already tells (通过, 打回, 发出评论).
+        let told = |e: &Value| {
+            let at = e["at_ms"].as_i64().unwrap_or(0);
+            all.iter().any(|x| x["task"] == e["task"] && matches!(x["kind"].as_str(), Some("accepted" | "rejected" | "commented")) && (x["at_ms"].as_i64().unwrap_or(0) - at).abs() < 10_000)
+        };
+        let events: Vec<Value> = all
+            .iter()
             .filter(|e| {
                 let (actor, kind, detail) = (e["actor"].as_str().unwrap_or(""), e["kind"].as_str().unwrap_or(""), e["detail"].as_str().unwrap_or(""));
-                let bookkeeping = matches!(kind, "delivered" | "fresh_session" | "resumed_session" | "worktree" | "flow" | "member_started" | "member_gone" | "edited" | "answered")
+                let bookkeeping = matches!(kind, "delivered" | "fresh_session" | "resumed_session" | "worktree" | "flow" | "member_started" | "member_gone" | "edited")
+                    || (kind == "answered" && told(e))
                     || (kind == "created" && actor == "lilad")
+                    // An issue: "Lila 从 GitHub 收到" says it, not "你 创建".
+                    || (kind == "created" && ext.is_object() && e["task"] == r["id"])
                     || (kind == "check" && detail.starts_with("running"));
                 !bookkeeping
             })
@@ -293,7 +304,6 @@ impl LilaApp {
             .collect();
         let collect = |key: &str| -> Vec<String> { tasks.iter().flat_map(|t| t[key].as_array().cloned().unwrap_or_default()).filter_map(|x| x.as_str().map(String::from)).collect() };
         let (decisions, unverified) = (collect("decisions"), collect("unverified"));
-        let ext = r["external"].clone();
         let from = if ext.is_object() {
             format!("@{} 在 GitHub 提的", s(&ext, "author"))
         } else if r["from"] == "human" {

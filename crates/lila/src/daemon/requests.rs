@@ -580,7 +580,7 @@ impl<T: Terminals> Daemon<T> {
             .store
             .externals(&pid)?
             .into_iter()
-            .map(|e| (e.task.clone(), request::External { source: e.source, rf: e.rf, url: e.url, author: e.author, triage: e.triage, pr: e.pr }))
+            .map(|e| (e.task.clone(), request::External { source: e.source, rf: e.rf, url: e.url, author: e.author, triage: e.triage, pr: e.pr, asked_ms: e.asked_ms }))
             .collect();
         let facts = Facts { tasks: &tasks, owner: &owner, inbox: &inbox, runs: &runs, committing: &committing, held: &held, slots: &slots, external: &external };
         Ok(request::requests(&facts))

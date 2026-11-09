@@ -631,6 +631,7 @@ fn fmt_requests(v: &Value) -> String {
             "check" => "check running".to_owned(),
             "commit" => "committing".to_owned(),
             "wait" => format!("waits: {}", d["hold"].as_str().unwrap_or("")),
+            "reply" => format!("waits for @{}'s reply", r["external"]["author"].as_str().unwrap_or("")),
             other => other.to_owned(),
         };
         let mins = (now - r["since_ms"].as_i64().unwrap_or(now)).max(0) / 60_000;

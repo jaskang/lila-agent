@@ -200,6 +200,11 @@ impl<T: Terminals> Daemon<T> {
                 if open_runs.iter().any(|a| *a == t.id || route::ancestors(&all, a).iter().any(|x| x.id == t.id)) {
                     continue;
                 }
+                // Or it asked a reporter and waits for the reply.
+                let asked = self.store.external_for(&pid, &t.id).ok().flatten().and_then(|e| e.asked_ms);
+                if asked.is_some_and(|at| all.iter().filter(|x| x.parent.as_deref() == Some(t.id.as_str())).all(|x| x.created_ms < at)) {
+                    continue;
+                }
                 match dispatch::stall_check(now, live.free_since, meta.nudged_ms, meta.stall_reported, stall_ms) {
                     StallAction::None => {}
                     StallAction::Nudge => {

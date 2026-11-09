@@ -148,6 +148,8 @@ pub struct ExternalRow {
     pub plan: Option<String>,
     pub pr: Option<String>,
     pub created_ms: i64,
+    /// When a comment last went to the reporter: the request then waits for their reply.
+    pub asked_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,6 +260,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("members", "session", "TEXT"),
     ("runs", "budget", "INTEGER"),
     ("runs", "hold", "TEXT"),
+    ("external", "asked_ms", "INTEGER"),
 ];
 
 fn migrate(db: &Connection) -> Result<()> {
@@ -469,7 +472,7 @@ impl Store {
     }
 
     fn external_where(&self, project: &str, cond: &str, p1: &str, p2: Option<&str>) -> Result<Vec<ExternalRow>> {
-        let sql = format!("SELECT task, source, ref, url, author, triage, size, why, plan, pr, created_ms FROM external WHERE project = ?1 AND {cond} ORDER BY created_ms");
+        let sql = format!("SELECT task, source, ref, url, author, triage, size, why, plan, pr, created_ms, asked_ms FROM external WHERE project = ?1 AND {cond} ORDER BY created_ms");
         let mut st = self.db.prepare(&sql)?;
         let row = |r: &rusqlite::Row| {
             Ok(ExternalRow {
@@ -484,6 +487,7 @@ impl Store {
                 plan: r.get(8)?,
                 pr: r.get(9)?,
                 created_ms: r.get(10)?,
+                asked_ms: r.get(11)?,
             })
         };
         let rows = match p2 {
@@ -513,6 +517,11 @@ impl Store {
 
     pub fn set_triage(&self, project: &str, task: &str, triage: &str, size: Option<&str>, why: &str, plan: Option<&str>) -> Result<()> {
         self.db.execute("UPDATE external SET triage = ?3, size = ?4, why = ?5, plan = ?6 WHERE project = ?1 AND task = ?2", params![project, task, triage, size, why, plan])?;
+        Ok(())
+    }
+
+    pub fn set_asked(&self, project: &str, task: &str, at_ms: i64) -> Result<()> {
+        self.db.execute("UPDATE external SET asked_ms = ?3 WHERE project = ?1 AND task = ?2", params![project, task, at_ms])?;
         Ok(())
     }
 
