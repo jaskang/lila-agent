@@ -374,3 +374,36 @@ CREATE INDEX conv_items_seq ON conv_items(project, member, seq);
 2. **对话存在 SQLite（建议）** 还是每次从各自的记录文件现读。SQLite 的好处是三种运行时一视同仁，窗口按序号增量读，也和「lilad 是唯一写入方」一致。
 3. **Codex 成员要不要保留一个隐藏的原始日志视图**，就是 host 终端里的那些日志，用来排查问题。建议放在成员菜单里，平时不显示。
 4. **omp 用 API key**（DeepSeek、MiniMax 等）：要不要放开「只用订阅」的原则。
+
+---
+
+## 14. P0 原型记录（2026-11-09）
+
+决定按 §13 的建议处理：P1 先做 Claude；对话存进 SQLite；host 的原始日志放在成员菜单里，平时不显示；omp 的账号交给 omp 自己管理（`~/.omp`），Lila 不保存任何 key。
+
+**S4 host 的状态报告：✅** 在 hc 终端里，一个 shell 脚本依次写出 `ESC ]7501;state=…:app=lila-probe[:kind=…][:msg=<base64>] ESC \`，`hc get` 报出 `idle`、`working`，以及带 kind 的 `blocked`（msg 已经解码成 `waiting on Q7`），`reported` 为 true。`lila host` 只要写这几个序列就够了。
+
+**S1 Claude 的 hooks：✅**
+- `--settings <文件>` 能注入只对这一次会话生效的 hooks（不用 `--plugin-dir`）。
+- `PermissionRequest` 只在需要问人的时候触发。本机默认的权限模式是 auto，执行 Bash 不会问；加上 `--permission-mode manual`（Lila 给有 allow 规则的角色就是这么启动的）才触发。hook 等了 4 秒后输出 `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`，命令随后执行，说明**它能停下来等**。
+- 载荷：所有事件都带 `session_id`、`transcript_path`、`cwd`、`prompt_id`。`PermissionRequest` 带 `tool_name`、`tool_input`（Bash 的是 `command` 和 `description`）、`permission_suggestions`。`PostToolUse` 带 `tool_response`、`tool_use_id`、`duration_ms`。`Stop` 带 `last_assistant_message`。`SessionStart` 带 `source` 和 `model`。
+- **`MessageDisplay` 带回复的文字增量：** `turn_id`、`message_id`、`index`、`final`、`delta`。所以 Claude 的 GUI 也能逐字显示，不用等整条消息写进会话记录文件。
+- 顺序：SessionStart → UserPromptSubmit → PreToolUse → PermissionRequest → PostToolUse → MessageDisplay → Stop。
+- 等待 hook 期间，hc 的状态仍然由 Claude 自己报告。
+
+**S2 Codex app-server：✅（用 ChatGPT 订阅）**
+- `initialize`，然后 `account/read`，返回 `{"type":"chatgpt","planType":"pro"}`。
+- `thread/start`（cwd、model、`approvalPolicy: "untrusted"`、sandbox、`developerInstructions`）返回 `thread.id`。开发者指令生效：回复以 PROBE 结尾。
+- 审批：线程状态出现 `activeFlags: ["waitingOnApproval"]`，服务端发来 `item/commandExecution/requestApproval`（带 `command`、`cwd`、`itemId`），回复 `{"decision":"accept"}` 后收到 `serverRequest/resolved`。
+- `turn/steer`（`expectedTurnId`）生效，最终回复是 `WAITED STEERED PROBE`。
+- 推送有：`thread/tokenUsage/updated`（含缓存的 token）、`account/rateLimits/updated`（`primary.usedPercent`、`resetsAt`、`windowDurationMins`）、`item/agentMessage/delta`、`item/completed`（`userMessage`、`reasoning`、`agentMessage`（`phase` 为 commentary 或 final_answer）、`commandExecution`）、`thread/status/changed`（idle 或 active）。
+- **要注意的两点：**
+  - 一轮还没结束时再调 `turn/start`，消息会被并进正在进行的这一轮（turn id 不变）。所以运行中一律用 `turn/steer`。
+  - 成员会继承用户全局的 `~/.codex/config.toml`：14 个 MCP 服务器（其中一个一直返回 503），以及 Rex 注入的 hook（会让模型先跑 `rex session rename`）。第一轮在 120 秒内都没开始执行命令，很可能是在等 MCP 服务器启动。TUI 模式下也是这样，不是 app-server 带来的问题；以后可以考虑在 `thread/start` 的 `config` 里给成员关掉 MCP。
+
+**S3 omp 的 ACP：✅**
+- `omp --append-system-prompt "…" acp`：**全局参数要放在 `acp` 前面**，系统提示词生效（回复是 `DONE OMPPROBE`）。
+- `initialize` 返回 `agentCapabilities.loadSession`、`sessionCapabilities.list/fork`；认证方式只有一种，就是 `agent`，用 `~/.omp` 里已有的凭据。
+- `session/new` 返回 `sessionId` 和 `configOptions`：`mode`（default、plan）以及 `model`，可选的模型就是 omp 能用的全部模型（本机经 magpie 管理，比如 `magpie/codex/gpt-6.1-sol`、`magpie/claude/…`）。
+- `session/request_permission` 带 `toolCall`（`title`、`kind: "execute"`、`rawInput.command`）和标准的四个选项；回复 `{"outcome":{"outcome":"selected","optionId":…}}`。
+- 更新：`agent_message_chunk`（带 `messageId`）、`tool_call`、`tool_call_update`（从 pending 到 in_progress 再到 completed，`rawOutput.content`）、`usage_update`（`size`、`used`、`cost`）、`available_commands_update`、`session_info_update`。`session/prompt` 返回 `stopReason` 和 `usage`。
