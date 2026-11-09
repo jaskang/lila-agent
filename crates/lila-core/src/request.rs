@@ -146,7 +146,7 @@ pub struct Request {
 }
 
 /// Inbox kinds that ask the person to act, most pressing first.
-const NEEDS: [&str; 10] = ["review", "triage", "question", "draft", "merge", "budget", "terminal", "startup", "stalled", "runaway"];
+const NEEDS: [&str; 11] = ["review", "triage", "question", "permission", "draft", "merge", "budget", "terminal", "startup", "stalled", "runaway"];
 
 fn root_of<'a>(tasks: &'a [Task], t: &'a Task) -> &'a Task {
     let mut cur = t;

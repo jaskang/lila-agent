@@ -42,11 +42,16 @@ impl Terminals for Fake {
     }
 }
 
+/// A stand-in host: what lilad sends it, and what was read so far.
+type StandIn = (std::sync::mpsc::Receiver<String>, Vec<lila_agent::Command>);
+
 struct World {
     d: Daemon<Fake>,
     repo: PathBuf,
     _tmp: tempfile::TempDir,
     now: i64,
+    /// Stand-in hosts of Codex members (`lila host codex`): the commands lilad sent them.
+    hosts: std::cell::RefCell<BTreeMap<String, StandIn>>,
 }
 
 const PROJECT: &str = r#"
@@ -85,7 +90,7 @@ fn world_with(project_toml: &str) -> World {
     let mut d = Daemon::new(store, Fake::default(), paths, bin.to_string_lossy().to_string(), PathBuf::from("/opt/lila/bin/lila"));
     // The CLIs' session records, here instead of the real ~/.claude and ~/.codex.
     d.sources = Sources { claude: root.join("claude-home"), codex: root.join("codex-home") };
-    World { d, repo, _tmp: tmp, now: 1_000_000 }
+    World { d, repo, _tmp: tmp, now: 1_000_000, hosts: Default::default() }
 }
 
 fn world() -> World {
@@ -126,8 +131,26 @@ impl World {
         self.d.projects["shop"].live[member].terminal.clone().unwrap()
     }
 
+    /// A hosted member's host attaches when it first reports (as `lila host` does once running).
+    fn attach(&mut self, member: &str) {
+        if self.d.hosted("shop", member) && !self.hosts.borrow().contains_key(member) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.hosts.borrow_mut().insert(member.to_owned(), (rx, Vec::new()));
+            self.d.host_attach("shop", member, tx, self.now);
+        }
+    }
+
+    /// The commands a hosted member's host got so far.
+    fn commands(&self, member: &str) -> Vec<lila_agent::Command> {
+        let mut hosts = self.hosts.borrow_mut();
+        let Some((rx, got)) = hosts.get_mut(member) else { return Vec::new() };
+        got.extend(rx.try_iter().filter_map(|l| serde_json::from_str(&l).ok()));
+        got.clone()
+    }
+
     fn status(&mut self, member: &str, word: &str) {
         self.now += 1000;
+        self.attach(member);
         let t = self.terminal(member);
         let ev = json!({"jsonrpc":"2.0","method":"event","params":{"seq":1,"type":"status","terminal":t,"data":{"status":{"app":"x","state":word},"reported":true,"records":{}}}});
         self.d.on_event(&ev, self.now);
@@ -139,7 +162,14 @@ impl World {
         }
     }
 
+    /// What a member was given: typed into its terminal, or its host's prompts.
     fn sends_to(&self, member: &str) -> Vec<String> {
+        if self.d.hosted("shop", member) {
+            return self.commands(member).into_iter().filter_map(|c| match c {
+                lila_agent::Command::Prompt { text } => Some(text),
+                _ => None,
+            }).collect();
+        }
         let t = self.terminal(member);
         self.d.term.sends.iter().filter(|(to, _, _)| *to == t).map(|(_, text, _)| text.clone()).collect()
     }
@@ -183,8 +213,12 @@ fn up_starts_every_member_with_its_command() {
     assert_eq!(owner["name"], "lila-shop-owner");
     assert_eq!(owner["no_parent"], true);
     let tester = &runs[2];
-    assert!(tester["argv"][0].as_str().unwrap().ends_with("/bin/codex"));
-    assert!(tester["argv"][7].as_str().unwrap().starts_with("developer_instructions=\""));
+    // Codex runs through `codex app-server`, driven by `lila host codex` in the member's terminal.
+    let targv: Vec<&str> = tester["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(targv[..4], ["/opt/lila/bin/lila", "host", "codex", "--program"]);
+    assert!(targv[4].ends_with("/bin/codex"), "resolved on PATH: {targv:?}");
+    let pf = targv.iter().position(|a| *a == "--prompt-file").unwrap();
+    assert!(std::fs::read_to_string(targv[pf + 1]).unwrap().contains("tester"));
     assert!(tester["env"]["CLAUDE_CODE_NO_FLICKER"].is_null(), "Codex is full-screen anyway");
 
     // A second `up` leaves running members alone.
@@ -2001,11 +2035,57 @@ fn the_person_writes_to_a_member_unless_it_waits_on_a_dialog() {
     assert_eq!(w.sends_to("engineer").last().map(String::as_str), Some("what are you on?"));
     w.status("engineer", "blocked");
     let err = w.call(None, "conversation.send", json!({"member": "engineer", "text": "yes"})).unwrap_err();
-    assert!(err.to_string().contains("waiting on its terminal"), "{err:#}");
+    assert!(err.to_string().contains("waiting for an answer"), "{err:#}");
     assert!(w.call(None, "conversation.send", json!({"member": "engineer", "text": "  "})).is_err());
-    // Codex keeps its terminal for now: no conversation is drawn for it.
+    // Codex goes through its host: a conversation, no terminal to switch to.
     let tester = w.ok(None, "conversation.read", json!({"member": "tester"}));
-    assert_eq!(tester["caps"]["gui"], false);
+    assert_eq!((tester["caps"]["gui"].as_bool(), tester["caps"]["tui"].as_bool()), (Some(true), Some(false)));
+    w.ok(None, "conversation.send", json!({"member": "tester", "text": "status?"}));
+    assert_eq!(w.sends_to("tester").last().map(String::as_str), Some("status?"), "to its host");
     let status = w.ok(None, "status", json!({}));
     assert_eq!(status["members"].as_array().unwrap().iter().find(|m| m["id"] == "owner").unwrap()["caps"]["tui"], true);
+}
+
+#[test]
+fn a_codex_members_host_reports_its_thread_items_and_permissions() {
+    use lila_agent::{AgentEvent, Command, Item, ItemKind, ItemState, PermOption, PermissionRequest, ToolKind};
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    let ev = |w: &mut World, e: AgentEvent| {
+        w.now += 1000;
+        w.d.host_event("shop", "tester", e, w.now)
+    };
+    ev(&mut w, AgentEvent::Session { id: "th1".into() });
+    assert_eq!(w.d.projects["shop"].live["tester"].session.as_deref(), Some("th1"));
+    assert_eq!(w.d.store.session("shop", "th1").unwrap().unwrap().member, "tester");
+    let said = Item { id: "m1".into(), turn: None, at_ms: 5, state: ItemState::Done, kind: ItemKind::AgentMessage { text: "PASS".into() } };
+    ev(&mut w, AgentEvent::Item { item: said });
+    let r = w.ok(None, "conversation.read", json!({"member": "tester"}));
+    assert_eq!((r["session"].as_str(), r["items"][0]["text"].as_str()), (Some("th1"), Some("PASS")));
+
+    let ask = |id: &str, title: &str| PermissionRequest {
+        id: id.into(),
+        tool: ToolKind::Execute,
+        title: title.into(),
+        detail: String::new(),
+        options: vec![PermOption { id: "accept".into(), label: "允许".into() }, PermOption { id: "decline".into(), label: "拒绝".into() }],
+    };
+    // Lila's own protocol goes ahead without asking.
+    ev(&mut w, AgentEvent::Permission { request: ask("p1", "lila task done T1 --summary ok") });
+    assert_eq!(w.commands("tester").last(), Some(&Command::Answer { permission: "p1".into(), option: "accept".into() }));
+    assert!(w.inbox_kinds().is_empty());
+    // Anything else is a card; asked again (lilad came back), still one card.
+    ev(&mut w, AgentEvent::Permission { request: ask("p2", "npm install left-pad") });
+    ev(&mut w, AgentEvent::Permission { request: ask("p2", "npm install left-pad") });
+    let cards: Vec<_> = w.d.store.inbox("shop", false).unwrap().into_iter().filter(|i| i.kind == "permission").collect();
+    assert_eq!(cards.len(), 1);
+    assert_eq!((cards[0].text.as_str(), cards[0].options.clone()), ("tester 想运行：npm install left-pad", vec!["允许".to_string(), "拒绝".to_string()]));
+    w.ok(None, "answer", json!({"id": cards[0].id, "text": "拒绝"}));
+    assert_eq!(w.commands("tester").last(), Some(&Command::Answer { permission: "p2".into(), option: "decline".into() }));
+    // A request the turn took back closes its card.
+    ev(&mut w, AgentEvent::Permission { request: ask("p3", "rm -rf build") });
+    assert_eq!(w.inbox_kinds(), ["permission"]);
+    ev(&mut w, AgentEvent::PermissionResolved { id: "p3".into() });
+    assert!(w.inbox_kinds().is_empty());
 }

@@ -7,6 +7,7 @@ pub mod client;
 pub mod commit;
 pub mod daemon;
 pub mod github;
+pub mod host;
 pub mod init;
 pub mod magpie;
 pub mod paths;

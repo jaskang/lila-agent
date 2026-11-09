@@ -70,7 +70,7 @@ impl Transcript {
                 turn: Some(turn),
                 at_ms,
                 state: ItemState::Done,
-                kind: ItemKind::UserMessage { text: text.to_owned(), origin: origin(text) },
+                kind: ItemKind::UserMessage { text: text.to_owned(), origin: crate::model::origin(text) },
             });
         }
         out
@@ -151,15 +151,6 @@ fn unwrap_paste(text: &str) -> &str {
     inner.rfind("</pasted_content").map_or(inner, |end| &inner[..end]).trim()
 }
 
-/// Lila's deliveries open with `<lila task="T3" …>`, `<lila note …>`, `<lila answer …>`.
-fn origin(text: &str) -> Origin {
-    if !text.starts_with("<lila") {
-        return Origin::Person;
-    }
-    let head = text.lines().next().unwrap_or_default();
-    let task = head.split("task=\"").nth(1).and_then(|r| r.split('"').next()).map(String::from);
-    Origin::Lila { task }
-}
 
 /// The tool's kind and a one-line title from its input.
 fn describe(name: &str, input: &Value) -> (ToolKind, String) {

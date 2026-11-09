@@ -82,7 +82,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 |---|---|
 | `lila-core` | 纯逻辑，不做 IO。`config.rs`：角色（含 `[tools]`）、ProjectConfig、`[settings]`、成员池、Team::build、`flow_for`。`flow.rs`：流程模板和 `after`（下一步做什么）。`task.rs`：状态机、Brief（原话、验收标准、不做什么）、Outcome（决定、没验到的、verdict）。`prompt.rs`：系统提示词和协议，PM 还有 Flows 一节。`runtime.rs`：claude/codex 启动参数（工具限制、`--session-id`、`--resume`）。`dispatch.rs`：派发、沉默判定、`pick_slot`。`route.rs`：完成通知给谁。`message.rs`：所有打进终端的文字（投递、通知、摘要等，英文）。`inbox.rs`：给人看的收件箱文字（验收卡片等，中文）。 |
 | `lila-store` | SQLite：projects、members（含 `session`）、tasks（含简报、结果、run）、task_events、artifacts、inbox、outbox、runs（流程运行、预算、暂停）、sessions、session_chains、conv_items（成员对话的条目，按成员递增的 seq）。新列在 `ADDED_COLUMNS` 里，打开旧数据库时自动加上。 |
-| `lila-agent` | 运行时与对话模型（docs/architecture-v3.md）：`model.rs` 对话条目（消息、思考、工具调用、diff）和能力；`claude.rs` 把 Claude Code 的会话记录读成条目（只认 user/assistant 的 text、thinking、tool_use、tool_result，剥掉粘贴外壳 `<pasted_content>`）。`examples/read_transcript.rs` 打印一份会话记录的条目 |
+| `lila-agent` | 运行时与对话模型（docs/architecture-v3.md）：`model.rs` 对话条目（消息、思考、工具调用、diff）和能力；`claude.rs` 把 Claude Code 的会话记录读成条目（只认 user/assistant 的 text、thinking、tool_use、tool_result，剥掉粘贴外壳 `<pasted_content>`）。`codex.rs` 是 `codex app-server` 的协议翻译（握手、开线程或续接、轮次、运行中 `turn/steer`、审批变成权限请求、条目、用量和额度、卡住 120 秒没动静时插一句「继续」），纯函数，不碰进程。`examples/read_transcript.rs` 打印一份会话记录的条目 |
 | `hc-client` | herdr-core JSON-RPC 客户端 |
 | `lila` | CLI 和 lilad，详见下面几行 |
 | ↳ `daemon/` | lilad。`mod.rs`：状态、herdr-core 的事件、pump（投递和通知）、spool。`requests.rs`：`Daemon::handle` 和每个请求。`flows.rs`：流程推进、检查命令。`session.rs`：换链时的会话、PM 摘要。`review.rs`：验收卡片、一条链占目录、验收时提交、预算。`watch.rs`：Watchdog 和 `tick`。`server.rs`：socket、事件流和后台线程。`tests.rs` 用 Fake 终端，CLI 的会话记录目录指向临时目录 |
@@ -90,6 +90,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | ↳ `worktree.rs`、`commit.rs` | worktree 槽的 git 命令（占槽、放槽、取消时保留）；验收时提交，从槽里合成一个提交、rebase、快进合并（`docs/product-v3.md` §7.1） |
 | ↳ `github.rs`、`daemon/sources.rs` | GitHub 来源（只用 `gh`）：定时拉 issue 建成给 PM 的任务、`lila triage` 和「要修吗？」卡片、`lila draft` 和评论草稿、发评论；验收后开 PR 在 `commit.rs`（`docs/product-v3.md` §8） |
 | ↳ `daemon/conversation.rs` | 成员的对话：每 250ms（spool 那一拍）跟读运行中 Claude 成员的会话记录，条目存进 `conv_items`（没变的不动）；`conversation.read`（某个 seq 之后的条目和能力）、`conversation.send`（人的话打进终端，成员卡在对话框时拒绝）；`caps()` 是每种运行时能显示什么 |
+| ↳ `host.rs`、`daemon/host.rs` | `lila host codex`（隐藏子命令）：在 Codex 成员的 hc 终端里跑，起 `codex app-server`，用 `host.attach` 挂到 lilad 的 socket（事件出、命令进，lilad 回来时自动重连并重发会话、条目、待答的权限），用 OSC 7501 报状态，终端里打印一行行日志（「原始日志」），app-server 自己的日志在 `state/hosts/<项目>.<成员>.log`。lilad 这边：`tell` 把派活、通知、人的话按成员发给 host 或打进终端；host 的事件变成会话、条目、权限卡片（`lila …` 命令自动允许）；`permission` 卡片的回答送回 host |
 | ↳ `daemon/slots.rs` | 哪条链在哪个槽、排队占槽、链结束后放槽或给验收卡片、合并失败的 `merge` 条目 |
 | ↳ `sessions.rs` | Claude 会话记录的位置、找 Codex 的会话、读上下文大小 |
 | ↳ `accounts.rs` | 订阅账号（`accounts.toml`）、成员用哪个账号、读每个账号的额度 |

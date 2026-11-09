@@ -166,7 +166,7 @@ impl LilaApp {
         let tile = style::cli_tile(&s(m, "runtime"), 22.);
         let tile = if status == "blocked" { waiting_ring(tile, id.clone()) } else { tile.into_any_element() };
         let in_tree = branch.is_some();
-        h_flex()
+        let row = h_flex()
             .id(SharedString::from(format!("member-{id}")))
             .relative()
             .when(in_tree, |d| d.mr_2())
@@ -199,8 +199,23 @@ impl LilaApp {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.member = Some(click.clone());
                 cx.notify();
-            }))
-            .into_any_element()
+            }));
+        // A member Lila drives through a protocol: its host's log, for when something looks off.
+        if m["caps"]["gui"] == true && m["caps"]["tui"] != true && m["terminal"].is_string() {
+            let weak = cx.entity().downgrade();
+            return row
+                .context_menu(move |menu, _, _| {
+                    let (weak, id) = (weak.clone(), id.clone());
+                    menu.item(PopupMenuItem::new("原始日志").icon(IconName::SquareTerminal).on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.member = Some(id.clone());
+                            this.set_view(&id, true, cx);
+                        });
+                    }))
+                })
+                .into_any_element();
+        }
+        row.into_any_element()
     }
 
     pub fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -415,7 +430,8 @@ impl LilaApp {
                             .tooltip(move |window, cx| gpui::component::tooltip::Tooltip::new(spec.clone()).build(window, cx)),
                     )
                     .child(style::status_pill(&s(m, "status"), cx))
-                    .when(m["caps"]["gui"] == true && m["caps"]["tui"] == true, |d| d.child(self.view_switch(m, cx)))
+                    // Both views: Claude Code's TUI; or a host's log, opened from the member's menu.
+                    .when(m["caps"]["gui"] == true && (m["caps"]["tui"] == true || !self.shows_gui(m)), |d| d.child(self.view_switch(m, cx)))
                     .when(m["stale"] == true, |d| {
                         let id = id.clone();
                         d.child(Button::new("restart-member").small().small_button().outline().rounded_full().text_color(style::yellow()).icon(IconName::RefreshCw).label("重启").tooltip("设置改过了：用新设置重启，当前对话会丢失").on_click(cx.listener(move |this, _, _, cx| {
@@ -559,6 +575,7 @@ impl LilaApp {
         let member = item["member"].as_str().map(String::from);
         let (icon, accent, label_text) = match kind.as_str() {
             "question" => (IconName::CircleAlert, style::yellow(), "助理在问你"),
+            "permission" => (IconName::TriangleAlert, style::yellow(), "要你允许"),
             "merge" => (IconName::TriangleAlert, style::red(), "合并没成功"),
             "terminal" => (IconName::SquareTerminal, style::red(), "终端在等你"),
             "startup" => (IconName::TriangleAlert, style::red(), "启动卡住"),

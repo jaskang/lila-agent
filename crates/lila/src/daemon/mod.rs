@@ -4,6 +4,7 @@
 
 mod conversation;
 mod flows;
+mod host;
 mod requests;
 mod review;
 mod server;
@@ -136,6 +137,10 @@ pub struct Daemon<T: Terminals> {
     sources: Sources,
     /// How far each member's transcript has been read (`conversation`), by (project, member).
     tails: HashMap<(String, String), conversation::Tail>,
+    /// Attached hosts of protocol members (`host`), by (project, member): their command channel.
+    hosts: HashMap<(String, String), std::sync::mpsc::Sender<String>>,
+    /// Open permission cards (`host`), by (project, inbox id).
+    asking: HashMap<(String, String), host::Asking>,
     contexts: Contexts,
     /// Token use per member and window, from the same records (budgets, quotas).
     scanner: Scanner,
@@ -240,6 +245,8 @@ impl<T: Terminals> Daemon<T> {
             committing: BTreeSet::new(),
             sources: Sources::from_env(),
             tails: HashMap::new(),
+            hosts: HashMap::new(),
+            asking: HashMap::new(),
             contexts: Contexts::default(),
             scanner: Scanner::default(),
             quota_checked: BTreeMap::new(),
@@ -515,7 +522,7 @@ impl<T: Terminals> Daemon<T> {
             let (Some(t), true) = (live.terminal.clone(), live.status.accepts_notes()) else { continue };
             let text = msgs.iter().map(|m| m.text.as_str()).collect::<Vec<_>>().join("\n");
             noted.push(member.clone());
-            match self.term.send(&t, &text, None) {
+            match self.tell(pid, &member, &t, &text, None) {
                 Ok(()) => {
                     for m in &msgs {
                         let _ = self.store.pop_outbox(m.id);
@@ -596,7 +603,7 @@ impl<T: Terminals> Daemon<T> {
             // Type only if it is still idle. hc's `if` knows `idle` and `working`
             // only; `done` (finished while unseen) takes input like idle, unguarded.
             let guard = (live.status == AgentStatus::Idle).then_some("idle");
-            match self.term.send(&terminal, &text, guard) {
+            match self.tell(pid, &mid, &terminal, &text, guard) {
                 Ok(()) => {
                     self.failed_sends.remove(&tid);
                     let _ = self.store.transition(pid, &tid, Transition::Deliver, &Actor::Member("lilad".into()), &format!("to {terminal}"), now);

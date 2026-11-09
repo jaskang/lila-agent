@@ -21,7 +21,8 @@ pub(super) struct Tail {
 pub fn caps(runtime: lila_core::Runtime) -> Caps {
     match runtime {
         lila_core::Runtime::Claude => Caps { tui: true, gui: true, steer: true },
-        lila_core::Runtime::Codex => Caps { tui: true, gui: false, steer: false },
+        // Through `codex app-server` (`lila host codex`): no TUI to switch to.
+        lila_core::Runtime::Codex => Caps { tui: false, gui: true, steer: true },
     }
 }
 
@@ -97,10 +98,10 @@ impl<T: Terminals> Daemon<T> {
         let terminal = live.terminal.clone().ok_or_else(|| anyhow!("{mid} is not running"))?;
         match live.status {
             AgentStatus::Idle | AgentStatus::Done | AgentStatus::Working => {}
-            AgentStatus::Blocked => bail!("{mid} is waiting on its terminal: answer there first"),
+            AgentStatus::Blocked => bail!("{mid} is waiting for an answer (its card, or its terminal): give it first"),
             other => bail!("{mid} can't take a message now ({})", other.as_str()),
         }
-        self.term.send(&terminal, &text, None)?;
+        self.tell(&pid, mid, &terminal, &text, None)?;
         Ok(json!({"sent": true}))
     }
 }

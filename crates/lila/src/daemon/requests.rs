@@ -166,9 +166,15 @@ impl<T: Terminals> Daemon<T> {
             runtime::Session::New(None) if rt == lila_core::Runtime::Claude => runtime::Session::New(Some(sessions::new_uuid())),
             other => other,
         };
-        let mut launch = runtime::launch(&member.role, &prompt_path.to_string_lossy(), &text, &session);
+        let mut launch = runtime::launch(&member.role, &prompt_path.to_string_lossy(), &session);
         let (program, mut env) = self.member_env(&member.role)?;
-        launch.argv[0] = program.to_string_lossy().to_string();
+        if launch.argv[0] == "lila" {
+            // Driven through its protocol by `lila host <runtime>`, which starts the CLI.
+            launch.argv[0] = self.lila_bin.to_string_lossy().to_string();
+            launch.argv.splice(3..3, ["--program".to_owned(), program.to_string_lossy().to_string()]);
+        } else {
+            launch.argv[0] = program.to_string_lossy().to_string();
+        }
         env.insert("LILA_PROJECT".into(), pid.to_owned());
         env.insert("LILA_ROOT".into(), cwd.clone());
         env.insert("LILA_MEMBER".into(), mid.to_owned());
@@ -236,8 +242,8 @@ impl<T: Terminals> Daemon<T> {
         if role.file.runtime == lila_core::Runtime::Claude {
             env.entry("CLAUDE_CODE_NO_FLICKER".into()).or_insert_with(|| "1".into());
         }
-        let name = runtime::launch(role, "", "", &runtime::Session::New(None)).argv[0].clone();
-        let program = which(&name, &path).ok_or_else(|| anyhow!("{name:?} is not on PATH for role {}; add its folder to the role's env.PATH", role.id))?;
+        let name = runtime::cli(role.file.runtime);
+        let program = which(name, &path).ok_or_else(|| anyhow!("{name:?} is not on PATH for role {}; add its folder to the role's env.PATH", role.id))?;
         env.insert("PATH".into(), path);
         // Members run on their CLI's current account (`accounts`): its own config folder.
         if let Some((var, dir)) = self.account(role.file.runtime).and_then(|a| a.env()) {
@@ -995,6 +1001,7 @@ impl<T: Terminals> Daemon<T> {
             "merge" => self.merge_answer(&pid, &item, text, now)?,
             "triage" => self.triage_answer(&pid, &item, text, now)?,
             "draft" => self.draft_answer(&pid, &item, text, now)?,
+            "permission" => self.permission_answer(&pid, &item, text)?,
             "budget" => self.budget_answer(&pid, &item, text, now)?,
             _ => {}
         }

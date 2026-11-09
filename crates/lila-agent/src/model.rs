@@ -80,6 +80,117 @@ pub struct Item {
     pub kind: ItemKind,
 }
 
+/// A runtime asks the person before doing something (running a command, changing files).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    /// The runtime's own id for the request; the answer names it.
+    pub id: String,
+    pub tool: ToolKind,
+    /// What it wants to do: the command, the files.
+    pub title: String,
+    /// Why, or where: the reason it gave, the folder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// The answers it takes, first the one to suggest.
+    pub options: Vec<PermOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// A host (`lila host <runtime>`) → lilad. One JSON line each.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// The conversation's id, once the runtime has one (a new thread, or the one resumed).
+    Session { id: String },
+    Item { item: Item },
+    Permission { request: PermissionRequest },
+    /// Answered (by the person, or it went away with its turn).
+    PermissionResolved { id: String },
+    TurnStarted { turn: String },
+    TurnEnded {
+        turn: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failed: Option<String>,
+    },
+    /// Tokens the session has used so far.
+    Usage { input: u64, output: u64, cached: u64 },
+    /// The account's usage window.
+    Limits {
+        used_percent: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resets_ms: Option<i64>,
+    },
+    /// Something the person should hear (not signed in, the runtime stopped…).
+    Notice { text: String },
+}
+
+/// lilad → a host. One JSON line each.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum Command {
+    /// Words for the member: a task, a note, the person's message. While it works,
+    /// they join the running turn where the runtime can (`Caps::steer`), else wait.
+    Prompt { text: String },
+    Interrupt,
+    Answer { permission: String, option: String },
+}
+
+/// What a host reports to hc (OSC 7501), and so lilad's dispatch sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostStatus {
+    Idle,
+    Working,
+    /// A finished turn nobody has looked at yet.
+    Done,
+    Blocked { why: String },
+    Error { why: String },
+}
+
+impl HostStatus {
+    /// The OSC 7501 record: `ESC ]7501;state=…:app=…[:kind=…][:msg=<base64>] ESC \`.
+    pub fn osc(&self, app: &str) -> String {
+        let (state, kind, msg) = match self {
+            HostStatus::Idle => ("idle", None, None),
+            HostStatus::Working => ("working", None, None),
+            HostStatus::Done => ("done", None, None),
+            HostStatus::Blocked { why } => ("blocked", Some("permission"), Some(why.as_str())),
+            HostStatus::Error { why } => ("error", None, Some(why.as_str())),
+        };
+        let mut body = format!("state={state}");
+        if let Some(k) = kind {
+            body.push_str(&format!(":kind={k}"));
+        }
+        body.push_str(&format!(":app={app}"));
+        if let Some(m) = msg.map(|m| m.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|m| !m.is_empty()) {
+            body.push_str(&format!(":msg={}", base64(clip(&m, 2000).as_bytes())));
+        }
+        format!("\x1b]7501;{body}\x1b\\")
+    }
+}
+
+/// Standard base64 with padding (OSC 7501's `msg`).
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// What a runtime can do; the window and lilad decide by these, not by names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Caps {
@@ -89,6 +200,16 @@ pub struct Caps {
     pub gui: bool,
     /// A message sent while it works reaches the running turn.
     pub steer: bool,
+}
+
+/// Who wrote a message: Lila's deliveries open with `<lila task="T3" …>`, `<lila note …>`, `<lila answer …>`.
+pub fn origin(text: &str) -> Origin {
+    if !text.starts_with("<lila") {
+        return Origin::Person;
+    }
+    let head = text.lines().next().unwrap_or_default();
+    let task = head.split("task=\"").nth(1).and_then(|r| r.split('"').next()).map(String::from);
+    Origin::Lila { task }
 }
 
 /// Longest tool output kept on an item; the rest is in the CLI's own record.
@@ -122,6 +243,16 @@ mod tests {
         let v = serde_json::to_value(&item).unwrap();
         assert_eq!(v, serde_json::json!({"id": "u1", "turn": "p1", "at_ms": 5, "state": "done", "kind": "user_message", "text": "hi", "from": "lila", "task": "T3"}));
         assert_eq!(serde_json::from_value::<Item>(v).unwrap(), item);
+    }
+
+    #[test]
+    fn host_status_is_an_osc_7501_record() {
+        assert_eq!(HostStatus::Idle.osc("lila-codex"), "\x1b]7501;state=idle:app=lila-codex\x1b\\");
+        assert_eq!(HostStatus::Blocked { why: "waiting on Q7".into() }.osc("x"), "\x1b]7501;state=blocked:kind=permission:app=x:msg=d2FpdGluZyBvbiBRNw==\x1b\\");
+        assert_eq!(base64(b"ab"), "YWI=");
+        let ev: AgentEvent = serde_json::from_str(r#"{"event":"session","id":"t1"}"#).unwrap();
+        assert_eq!(ev, AgentEvent::Session { id: "t1".into() });
+        assert_eq!(serde_json::to_string(&Command::Prompt { text: "hi".into() }).unwrap(), r#"{"command":"prompt","text":"hi"}"#);
     }
 
     #[test]

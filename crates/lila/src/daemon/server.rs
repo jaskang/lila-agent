@@ -12,6 +12,12 @@ pub(super) enum Input {
     Tick,
     /// Look for spool requests (fast: sandboxed members wait on them).
     Spool,
+    /// A member's host attached: project, member, its command channel.
+    HostAttach(String, String, std::sync::mpsc::Sender<String>),
+    /// An event from a member's host.
+    HostEvent(String, String, lila_agent::AgentEvent),
+    /// A member's host detached.
+    HostGone(String, String),
     /// A flow's check finished: project, run anchor, result.
     CheckDone(String, String, CheckResult),
     /// An accepted chain's commit finished: project, chain, result.
@@ -63,7 +69,8 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
                     Ok(w) => w,
                     Err(_) => return,
                 };
-                for line in BufReader::new(conn).lines().map_while(Result::ok) {
+                let mut lines = BufReader::new(conn).lines();
+                while let Some(Ok(line)) = lines.next() {
                     let reply = match serde_json::from_str::<Value>(&line) {
                         Ok(req) if req["method"] == "subscribe" => {
                             let (wtx, wrx) = mpsc::channel::<String>();
@@ -76,6 +83,30 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
                                     return;
                                 }
                             }
+                            return;
+                        }
+                        // A member's host: events in, commands out, until it goes.
+                        Ok(req) if req["method"] == "host.attach" => {
+                            let (pid, mid) = (req["params"]["project"].as_str().unwrap_or_default().to_owned(), req["params"]["member"].as_str().unwrap_or_default().to_owned());
+                            let (ctx, crx) = mpsc::channel::<String>();
+                            if writeln!(writer, "{}", json!({"result": {"attached": true}})).is_err() || tx.send(Input::HostAttach(pid.clone(), mid.clone(), ctx)).is_err() {
+                                return;
+                            }
+                            std::thread::spawn(move || {
+                                for cmd in crx {
+                                    if writeln!(writer, "{cmd}").is_err() {
+                                        return;
+                                    }
+                                }
+                            });
+                            for line in lines.by_ref().map_while(Result::ok) {
+                                if let Ok(ev) = serde_json::from_str::<lila_agent::AgentEvent>(&line)
+                                    && tx.send(Input::HostEvent(pid.clone(), mid.clone(), ev)).is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            let _ = tx.send(Input::HostGone(pid, mid));
                             return;
                         }
                         Ok(req) => {
@@ -167,6 +198,9 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
             Input::Hc(line) => daemon.on_event(&line, now),
             Input::Tick => daemon.tick(now),
             Input::Spool => daemon.process_spool(now),
+            Input::HostAttach(pid, mid, ctx) => daemon.host_attach(&pid, &mid, ctx, now),
+            Input::HostEvent(pid, mid, ev) => daemon.host_event(&pid, &mid, ev, now),
+            Input::HostGone(pid, mid) => daemon.host_gone(&pid, &mid),
             Input::CheckDone(pid, anchor, r) => daemon.on_check_done(&pid, &anchor, &r, now),
             Input::CommitDone(pid, chain, r) => daemon.on_commit_done(&pid, &chain, &r, now),
             Input::Polled(pid, source, r) => daemon.on_polled(&pid, source, r, now),

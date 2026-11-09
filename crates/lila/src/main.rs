@@ -119,6 +119,37 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// Runs a member's agent through its protocol (lilad starts it in the member's terminal).
+    #[command(hide = true)]
+    Host {
+        #[command(subcommand)]
+        cmd: HostCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HostCmd {
+    /// Codex through `codex app-server`, in the current folder.
+    Codex {
+        /// The codex program.
+        #[arg(long)]
+        program: std::path::PathBuf,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        effort: Option<String>,
+        #[arg(long)]
+        sandbox: Option<String>,
+        /// Lila's system prompt for the member.
+        #[arg(long)]
+        prompt_file: std::path::PathBuf,
+        /// A thread to go on with.
+        #[arg(long)]
+        thread: Option<String>,
+        /// More arguments for `codex app-server`.
+        #[arg(last = true)]
+        extra: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -318,6 +349,12 @@ fn run() -> Result<()> {
         Cmd::Pause => out(call("pause", json!({}))?, &|_| "paused: no new tasks are delivered".into()),
         Cmd::Resume => out(call("resume", json!({}))?, &|_| "resumed".into()),
         Cmd::Daemon { cmd: DaemonCmd::Run } => daemon::serve(paths.clone(), client::hc_bin())?,
+        Cmd::Host { cmd: HostCmd::Codex { program, model, effort, sandbox, prompt_file, thread, extra } } => {
+            let instructions = std::fs::read_to_string(&prompt_file).with_context(|| format!("read {}", prompt_file.display()))?;
+            let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+            let opts = lila_agent::codex::Options { cwd, model, effort, sandbox, instructions, thread };
+            lila::host::codex(&paths, lila::host::CodexArgs { program, opts, extra })?
+        }
         Cmd::Daemon { cmd: DaemonCmd::Stop } => {
             if client::daemon_state(&paths)? {
                 call("stop", json!({}))?;

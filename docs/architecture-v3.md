@@ -426,3 +426,24 @@ CREATE INDEX conv_items_seq ON conv_items(project, member, seq);
 - markdown 的行内代码默认用 accent（亮蓝底）太抢眼：改成 Fill 底、正文色。
 
 **留到 P3**：逐字显示（`MessageDisplay` hook）、权限卡片、轮次的准确结束。
+
+## 16. P2 记录：`lila host` 和 Codex app-server（2026-11-09）
+
+**做了什么**
+- `lila_agent::codex::AppServer`：app-server 协议的纯翻译。握手（`initialize` → `initialized` → `account/read`，没登录就报错误状态）；`thread/start` 或 `thread/resume`（找不到就新开），带 `developerInstructions`、`approvalPolicy: "on-request"`、角色的 sandbox；话来了：空闲时 `turn/start`，运行中（包括 `turn/start` 刚发出、还没开始时）先排队再 `turn/steer`；审批请求变成 `PermissionRequest`（允许 / 本会话都允许 / 拒绝），其余服务端请求直接回 -32601；条目翻译（用户消息、成员消息、计划、思考摘要、命令（剥掉 `/bin/zsh -lc '…'`）、文件修改（diff）、MCP、网页搜索）；用量、额度、错误。
+- `lila host codex`（`crates/lila/src/host.rs`）：起 app-server，`host.attach` 挂到 lilad（lilad 回来时重连并重发），OSC 7501 报状态（`app=lila-codex`），终端打印日志。
+- lilad（`daemon/host.rs`）：Codex 成员改由 `lila host codex --program <codex> …` 启动（`lila_core::runtime::launch` 的 Codex 分支）；`tell` 统一了「给成员的话」；host 报的线程就是会话 id（不再靠找 rollout）；条目进 `conv_items`；`lila …` 命令的审批自动允许，其余变成 `permission` 卡片，回答送回 host；额度事件更新 `codex_paused`。
+- 窗口：Codex 成员默认显示对话；成员右键菜单「原始日志」；权限卡片。
+- 测试：翻译器 6 个、lilad 1 个（会话、条目、权限卡片的去重、回答、撤回）；测试里 Codex 成员用替身 host（`World::attach`、`commands`）。
+
+**真跑**（空项目，tester 用 Codex gpt-6.1-sol low）
+- `lila up`：tester 的终端里是 `lila host codex`，`hc get` 报 `{"app":"lila-codex","state":"idle"}`，日志里「lilad attached」「thread …」。
+- 派 T2：tester 在 worktree 2 里重启（新线程），`lila task start`、`sed` 读 README，对话视图逐条出现。
+- `lilad` 重启：host 打印「lilad went away」「lilad attached」，重发的条目都没变（seq 不动）。
+- 原始日志：右键菜单打开 host 的终端，标题行的切换回到对话。
+
+**发现的**
+- **Codex 偶尔停在工具结果之后**：rollout 里 09:21:10 `sed` 的结果回来后，到 09:27:00 一点动静都没有，直到 Lila 插了一句话（`conversation.send` → `turn/steer`），它才接着跑完（`lila task done`）。P0 S2 的第一轮也是这样。关掉 MCP 的 `-c mcp_servers={}` 没有效果（MCP 照样启动），而且不是每次都会停。原因不明，先在 host 里兜底：一轮在进行、没有在跑的条目、没有待答的审批、120 秒没有任何消息，就插一句「(Lila: no progress for a while. Continue the task.)」，每轮一次，并记一条 notice。
+- 成员会继承用户全局的 `~/.codex/config.toml`（MCP 服务器、Rex 的 hook），这一点 TUI 时也一样。
+
+**还没做的**：Codex 的逐字显示（`item/agentMessage/delta`）；中断按钮；`Usage` 事件还没用上（用量页仍读 rollout，app-server 也写 rollout，所以照常）。

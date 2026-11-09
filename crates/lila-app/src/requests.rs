@@ -54,6 +54,7 @@ pub fn inbox_words(kind: &str) -> &'static str {
         "triage" => "要修吗？",
         "draft" => "评论草稿",
         "question" => "助理在问你",
+        "permission" => "要你允许",
         "merge" => "合并没成功",
         "budget" => "超出预算",
         "terminal" => "终端在等你",
