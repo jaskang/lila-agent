@@ -464,3 +464,25 @@ CREATE INDEX conv_items_seq ON conv_items(project, member, seq);
 - 答「拒绝」：Claude Code 显示「Denied by PermissionRequest hook · Reason: The person said no in Lila.」，没有重试。
 
 **还没做的**：Codex 的逐字显示；中断按钮。
+
+## 18. P4 记录：omp 经 ACP（2026-11-09）
+
+**做了什么**
+- `Runtime::Omp`（角色 `runtime = "omp"`，`model` 是 omp 认得的 `provider/model`）。启动成 `lila host omp --program <omp> --model … --prompt-file … [--session …] [-- extra]`；host 起 `omp --append-system-prompt <提示词> [--model …] … acp`（omp 的全局参数必须在 `acp` 前面，P0 S3）。
+- `lila_agent::acp::Acp`：ACP 客户端的纯翻译。收到的东西（`session/update` 的各种更新、`session/request_permission`）用官方的类型 crate `agent-client-protocol-schema`（`default-features = false`，只有 serde 类型，没有异步运行时）解析；发出的请求（`initialize`、`session/new`、`session/load`（不行就新开）、`session/prompt`、`session/cancel`）直接拼 JSON。回复按块攒，每 0.8s 显示一次正在写的样子，换了别的更新或这一轮结束时定稿；工具调用和更新、计划；编辑的 `oldText`/`newText` 用 `similar` 生成统一 diff；权限选项映射成 允许 / 总是允许 / 拒绝 / 总是拒绝；Lila 不给它文件和终端能力（`fs/*`、`terminal/*` 回 -32601）。ACP 不能插话：运行中来的话排队，这一轮结束后合成一条发出。ACP 也不回显提示词，所以发出时自己记成这一轮的第一条。
+- `lila host` 的主循环改成对 `Protocol` 泛型，Codex 和 ACP 共用；OSC 7501 的 `app` 分别是 `lila-codex`、`lila-omp`。
+- lilad：omp 和 Codex 一样是 host 成员（`hosted`）；能力是有对话、没终端、不能插话；会话行的 runtime 按成员写。账号：omp 的登录在 omp 自己（`~/.omp`、`--profile`），Lila 不存 omp 的账号和 key（§13 第 4 条按建议）。
+- 窗口：角色的模型选择多一组「omp」（放当前的 omp 模型）；成员图标是蓝色的终端提示符。
+- README：三种 runtime 和 omp 角色的例子。
+
+**真跑**（omp 18.18.3，模型 `magpie/codex/gpt-6.1-sol`）
+- `lila up`：deep 的终端里是 `lila host omp`，`hc get` 报 `{"app":"lila-omp","state":"idle"}`，日志里「lilad attached」和会话 id。
+- 派 T3、T4：在 worktree 里开新会话，omp 跑 `lila task start` / `done` 前都按 ACP 请求权限，被 Lila 的规则直接允许（日志「allowed deep: lila task …」），二三十秒做完，出验收卡片。对话视图里是任务、回复、命令（第一次 omp 自己失败重试）、思考、总结。
+
+**v3 计划之外、还没做的**
+- 中断按钮（`Command::Interrupt` 三种运行时都能处理，窗口还没有按钮）。
+- Codex 的逐字显示（`item/agentMessage/delta`）。
+- `Usage` 事件还没进用量页（用量页仍读 Claude 和 Codex 的会话记录；omp 的用量还看不到）。
+- omp 的模型列表：角色设置里只能保留当前写的模型，还不能从 omp 列出可选的（ACP 的 `configOptions` 里有）。
+- 把 Lila 的协议做成 MCP 工具（P5，可选）。
+- Codex 偶尔停在工具结果之后的原因（§16）。

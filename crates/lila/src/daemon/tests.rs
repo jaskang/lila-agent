@@ -2129,3 +2129,36 @@ fn claude_members_hooks_ask_through_cards_and_show_the_reply_as_it_comes() {
     // The person can't hook as a member.
     assert!(w.call(None, "hook", json!({"event": "Stop", "payload": {}})).is_err());
 }
+
+#[test]
+fn an_omp_member_runs_through_its_host_over_acp() {
+    let toml = r#"
+name = "shop"
+[[members]]
+id = "owner"
+role = "pm"
+[[members]]
+id = "deep"
+role = "deep"
+"#;
+    let tmp_roles = |w: &World| w.d.paths.roles();
+    let mut w = world_with(toml);
+    std::fs::write(tmp_roles(&w).join("deep.toml"), "name = \"DeepSeek 工程师\"\nruntime = \"omp\"\nmodel = \"deepseek/deepseek-v4\"\n").unwrap();
+    std::fs::write(tmp_roles(&w).join("deep.md"), "You write code.\n").unwrap();
+    let omp = PathBuf::from(&w.d.path_env).join("omp");
+    std::fs::write(&omp, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    w.up();
+    let run = w.d.term.runs.iter().find(|r| r["labels"]["lila.member"] == "deep").unwrap().clone();
+    let argv: Vec<&str> = run["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(argv[..5], ["/opt/lila/bin/lila", "host", "omp", "--program", omp.to_string_lossy().as_ref()]);
+    assert!(argv.windows(2).any(|p| p == ["--model", "deepseek/deepseek-v4"]), "{argv:?}");
+    w.status("owner", "idle");
+    w.status("deep", "idle");
+    w.d.host_event("shop", "deep", lila_agent::AgentEvent::Session { id: "acp-s1".into() }, w.now);
+    assert_eq!(w.d.store.session("shop", "acp-s1").unwrap().unwrap().runtime, "omp");
+    w.ok(Some("owner"), "task.new", json!({"to": "deep", "title": "Try it"}));
+    assert!(w.sends_to("deep").last().unwrap().contains("Try it"), "to its host");
+    let caps = &w.ok(None, "conversation.read", json!({"member": "deep"}))["caps"];
+    assert_eq!((caps["gui"].as_bool(), caps["tui"].as_bool(), caps["steer"].as_bool()), (Some(true), Some(false), Some(false)));
+}

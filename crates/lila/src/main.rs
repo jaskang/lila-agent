@@ -153,6 +153,23 @@ enum HostCmd {
         #[arg(last = true)]
         extra: Vec<String>,
     },
+    /// omp over ACP (`omp acp`), in the current folder.
+    Omp {
+        /// The omp program.
+        #[arg(long)]
+        program: std::path::PathBuf,
+        #[arg(long)]
+        model: Option<String>,
+        /// Lila's system prompt for the member.
+        #[arg(long)]
+        prompt_file: std::path::PathBuf,
+        /// A session to go on with.
+        #[arg(long)]
+        session: Option<String>,
+        /// More options for omp (before `acp`).
+        #[arg(last = true)]
+        extra: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -356,8 +373,22 @@ fn run() -> Result<()> {
         Cmd::Host { cmd: HostCmd::Codex { program, model, effort, sandbox, prompt_file, thread, extra } } => {
             let instructions = std::fs::read_to_string(&prompt_file).with_context(|| format!("read {}", prompt_file.display()))?;
             let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-            let opts = lila_agent::codex::Options { cwd, model, effort, sandbox, instructions, thread };
-            lila::host::codex(&paths, lila::host::CodexArgs { program, opts, extra })?
+            let args = std::iter::once("app-server".to_owned()).chain(extra).collect();
+            let opts = lila_agent::codex::Options { cwd: cwd.clone(), model, effort, sandbox, instructions, thread };
+            lila::host::run(&paths, lila::host::Agent { program, args, cwd }, lila_agent::codex::AppServer::new(opts))?
+        }
+        Cmd::Host { cmd: HostCmd::Omp { program, model, prompt_file, session, extra } } => {
+            let instructions = std::fs::read_to_string(&prompt_file).with_context(|| format!("read {}", prompt_file.display()))?;
+            let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+            // omp's own options go before `acp` (P0 S3).
+            let mut args = vec!["--append-system-prompt".to_owned(), instructions];
+            if let Some(m) = model {
+                args.extend(["--model".to_owned(), m]);
+            }
+            args.extend(extra);
+            args.push("acp".into());
+            let acp = lila_agent::acp::Acp::new(lila_agent::acp::Options { cwd: cwd.clone(), session });
+            lila::host::run(&paths, lila::host::Agent { program, args, cwd }, acp)?
         }
         Cmd::Daemon { cmd: DaemonCmd::Stop } => {
             if client::daemon_state(&paths)? {

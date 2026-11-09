@@ -71,6 +71,19 @@ pub fn launch(role: &Role, prompt_path: &str, session: &Session) -> Launch {
             }
             return Launch { argv };
         }
+        // omp over ACP (`omp acp`), driven by `lila host omp`; its model is any omp
+        // knows (`provider/model`), its account is omp's own (~/.omp).
+        Runtime::Omp => {
+            argv.extend(["lila".into(), "host".into(), "omp".into(), "--model".into(), f.model.clone(), "--prompt-file".into(), prompt_path.into()]);
+            if let Session::Resume(id) = session {
+                argv.extend(["--session".into(), id.clone()]);
+            }
+            if !f.extra_args.is_empty() {
+                argv.push("--".into());
+                argv.extend(f.extra_args.iter().cloned());
+            }
+            return Launch { argv };
+        }
     }
     argv.extend(f.extra_args.iter().cloned());
     Launch { argv }
@@ -81,6 +94,7 @@ pub fn cli(runtime: crate::config::Runtime) -> &'static str {
     match runtime {
         Runtime::Claude => "claude",
         Runtime::Codex => "codex",
+        Runtime::Omp => "omp",
     }
 }
 
@@ -118,6 +132,15 @@ mod tests {
     fn codex_runs_through_the_host() {
         let l = launch(&role(Runtime::Codex, Some("high")), "/p.md", &Session::New(None));
         assert_eq!(l.argv, ["lila", "host", "codex", "--model", "the-model", "--effort", "high", "--prompt-file", "/p.md", "--", "--foo"]);
+    }
+
+    #[test]
+    fn omp_runs_through_the_host() {
+        let mut r = role(Runtime::Omp, None);
+        r.file.model = "deepseek/deepseek-v4".into();
+        let l = launch(&r, "/p.md", &Session::Resume("s9".into()));
+        assert_eq!(l.argv, ["lila", "host", "omp", "--model", "deepseek/deepseek-v4", "--prompt-file", "/p.md", "--session", "s9", "--", "--foo"]);
+        assert_eq!(cli(Runtime::Omp), "omp");
     }
 
     #[test]

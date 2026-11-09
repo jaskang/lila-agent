@@ -140,21 +140,29 @@ pub fn effort_control(id: String, effort: Option<&str>, pick: impl Fn(&mut LilaA
 
 pub type ModelSelect = Entity<SelectState<SearchableVec<SelectGroup<SharedString>>>>;
 
-/// The model as one choice from two groups, Claude Code and ChatGPT (Codex):
-/// the group is the CLI. A model not offered is kept, in its CLI's group.
+/// The model as one choice from groups, Claude Code and ChatGPT (Codex), and omp
+/// when the role runs on it (its models are omp's to list): the group is the
+/// runtime. A model not offered is kept, in its runtime's group.
 pub fn model_select(model: &str, runtime: Runtime, window: &mut Window, cx: &mut Context<LilaApp>) -> ModelSelect {
     let mut claude: Vec<SharedString> = CLAUDE_MODELS.iter().map(|m| SharedString::from(*m)).collect();
     let mut codex: Vec<SharedString> = CODEX_MODELS.iter().map(|m| SharedString::from(*m)).collect();
+    let mut omp: Vec<SharedString> = Vec::new();
     let model = model.trim();
-    if !model.is_empty() && !CLAUDE_MODELS.contains(&model) && !CODEX_MODELS.contains(&model) {
+    if runtime == Runtime::Omp && !model.is_empty() {
+        omp.push(model.to_owned().into());
+    } else if !model.is_empty() && !CLAUDE_MODELS.contains(&model) && !CODEX_MODELS.contains(&model) {
         match runtime {
             Runtime::Claude => claude.push(model.to_owned().into()),
-            Runtime::Codex => codex.push(model.to_owned().into()),
+            Runtime::Codex | Runtime::Omp => codex.push(model.to_owned().into()),
         }
     }
     let at = |list: &[SharedString], section: usize| list.iter().position(|m| m.as_ref() == model).map(|row| IndexPath::new(row).section(section));
-    let selected = at(&claude, 0).or_else(|| at(&codex, 1));
-    let groups = SearchableVec::new(vec![SelectGroup::new("Claude Code").items(claude), SelectGroup::new("ChatGPT · Codex").items(codex)]);
+    let selected = if runtime == Runtime::Omp { at(&omp, 2) } else { at(&claude, 0).or_else(|| at(&codex, 1)) };
+    let mut groups = vec![SelectGroup::new("Claude Code").items(claude), SelectGroup::new("ChatGPT · Codex").items(codex)];
+    if !omp.is_empty() {
+        groups.push(SelectGroup::new("omp").items(omp));
+    }
+    let groups = SearchableVec::new(groups);
     cx.new(|cx| SelectState::new(groups, selected, window, cx))
 }
 
@@ -163,7 +171,14 @@ pub fn selected_model(select: &ModelSelect, cx: &App) -> Option<(Runtime, String
     let s = select.read(cx);
     let ix = s.selected_index(cx)?;
     let model = s.selected_value()?.to_string();
-    Some((if ix.section == 1 { Runtime::Codex } else { Runtime::Claude }, model))
+    Some((
+        match ix.section {
+            1 => Runtime::Codex,
+            2 => Runtime::Omp,
+            _ => Runtime::Claude,
+        },
+        model,
+    ))
 }
 
 pub fn model_control(select: &ModelSelect) -> AnyElement {

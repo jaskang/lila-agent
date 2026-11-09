@@ -20,9 +20,9 @@ impl Asking {
 }
 
 impl<T: Terminals> Daemon<T> {
-    /// The member's agent runs through `lila host` (Codex: `codex app-server`).
+    /// The member's agent runs through `lila host` (Codex: `codex app-server`; omp: ACP).
     pub(super) fn hosted(&self, pid: &str, mid: &str) -> bool {
-        self.projects.get(pid).and_then(|p| p.team.member(mid)).is_some_and(|m| m.role.file.runtime == lila_core::Runtime::Codex)
+        self.projects.get(pid).and_then(|p| p.team.member(mid)).is_some_and(|m| matches!(m.role.file.runtime, lila_core::Runtime::Codex | lila_core::Runtime::Omp))
     }
 
     pub fn host_attach(&mut self, pid: &str, mid: &str, tx: Sender<String>, now: i64) {
@@ -71,7 +71,8 @@ impl<T: Terminals> Daemon<T> {
                 live.session = Some(id.clone());
                 let (chain, started) = (live.chain.clone(), live.started_ms.unwrap_or(now));
                 self.live_version += 1;
-                let row = SessionRow { id: id.clone(), member: mid.to_owned(), runtime: "codex".into(), file: None, started_ms: started };
+                let runtime = self.projects[pid].team.member(mid).map(|m| m.role.file.runtime.to_string()).unwrap_or_default();
+                let row = SessionRow { id: id.clone(), member: mid.to_owned(), runtime, file: None, started_ms: started };
                 if self.store.add_session(pid, &row).is_ok()
                     && let Some(c) = chain
                 {

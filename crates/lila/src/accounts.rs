@@ -42,6 +42,7 @@ impl Account {
         self.dir.clone().unwrap_or_else(|| home.join(match self.runtime {
             Runtime::Claude => ".claude",
             Runtime::Codex => ".codex",
+            Runtime::Omp => ".omp",
         }))
     }
 
@@ -50,6 +51,8 @@ impl Account {
         let argv = match self.runtime {
             Runtime::Claude => vec!["claude", "auth", "login"],
             Runtime::Codex => vec!["codex", "login"],
+            // omp signs in from inside (`/login`); it keeps its own logins in ~/.omp.
+            Runtime::Omp => vec!["omp"],
         };
         (argv, self.env())
     }
@@ -58,6 +61,7 @@ impl Account {
         let argv = match self.runtime {
             Runtime::Claude => vec!["claude", "auth", "logout"],
             Runtime::Codex => vec!["codex", "logout"],
+            Runtime::Omp => vec!["omp"],
         };
         (argv, self.env())
     }
@@ -67,6 +71,8 @@ pub fn env_var(r: Runtime) -> &'static str {
     match r {
         Runtime::Claude => "CLAUDE_CONFIG_DIR",
         Runtime::Codex => "CODEX_HOME",
+        // omp's own profiles (`--profile`) keep accounts apart; Lila holds none for it.
+        Runtime::Omp => "LILA_OMP_UNUSED",
     }
 }
 
@@ -235,6 +241,8 @@ pub struct AccountUsage {
 /// What an account's records say about its usage windows.
 pub fn usage(a: &Account, home: &Path) -> AccountUsage {
     match a.runtime {
+        // Lila reads no usage of omp's own accounts.
+        Runtime::Omp => AccountUsage::default(),
         Runtime::Claude => {
             // CLAUDE_CONFIG_DIR keeps `.claude.json` inside it; the default lives in the home folder.
             let json = match &a.dir {

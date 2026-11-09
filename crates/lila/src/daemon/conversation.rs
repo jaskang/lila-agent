@@ -23,6 +23,8 @@ pub fn caps(runtime: lila_core::Runtime) -> Caps {
         lila_core::Runtime::Claude => Caps { tui: true, gui: true, steer: true },
         // Through `codex app-server` (`lila host codex`): no TUI to switch to.
         lila_core::Runtime::Codex => Caps { tui: false, gui: true, steer: true },
+        // Over ACP (`lila host omp`): words wait for the prompt under way.
+        lila_core::Runtime::Omp => Caps { tui: false, gui: true, steer: false },
     }
 }
 

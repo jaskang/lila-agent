@@ -11,12 +11,13 @@ fn builtin_names() -> [&'static str; 2] {
     ["code", "quick"]
 }
 
-/// Which official CLI runs a role.
+/// Which agent runs a role: the official CLIs, or omp (any model it can reach).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Runtime {
     Claude,
     Codex,
+    Omp,
 }
 
 impl fmt::Display for Runtime {
@@ -24,6 +25,7 @@ impl fmt::Display for Runtime {
         f.write_str(match self {
             Runtime::Claude => "claude",
             Runtime::Codex => "codex",
+            Runtime::Omp => "omp",
         })
     }
 }

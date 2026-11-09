@@ -1,4 +1,5 @@
-//! `lila host <runtime>`: runs a member's agent through its protocol inside the
+//! `lila host <runtime>`: runs a member's agent through its protocol (Codex's
+//! app-server, ACP for omp) inside the
 //! member's hc terminal (architecture v3 §4 D1). It starts the agent, attaches
 //! to lilad over its socket (events out, commands in; reattaching when lilad
 //! comes back), reports its status to hc with OSC 7501 like any program, and
@@ -6,7 +7,7 @@
 
 use crate::paths::Paths;
 use anyhow::{Context, Result, anyhow};
-use lila_agent::codex::{AppServer, Options};
+use lila_agent::codex::{AppServer, Step};
 use lila_agent::{AgentEvent, Command, HostStatus, Item, PermissionRequest};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -60,29 +61,77 @@ impl Kept {
     }
 }
 
-pub struct CodexArgs {
-    pub program: PathBuf,
-    pub opts: Options,
-    /// More arguments for `codex app-server` (the role's `extra_args`).
-    pub extra: Vec<String>,
+/// A protocol a host speaks with its agent: pure translation (`lila_agent`).
+pub trait Protocol {
+    /// For OSC 7501's `app`.
+    const APP: &'static str;
+    fn start(&mut self) -> Step;
+    fn on_message(&mut self, m: &Value, now_ms: i64) -> Step;
+    fn command(&mut self, c: Command, now_ms: i64) -> Step;
+    fn tick(&mut self, now_ms: i64) -> Step;
+    fn status(&self) -> HostStatus;
 }
 
-/// Runs a Codex member until its app-server exits.
-pub fn codex(paths: &Paths, args: CodexArgs) -> Result<()> {
+impl Protocol for AppServer {
+    const APP: &'static str = "lila-codex";
+    fn start(&mut self) -> Step {
+        AppServer::start(self)
+    }
+    fn on_message(&mut self, m: &Value, now_ms: i64) -> Step {
+        AppServer::on_message(self, m, now_ms)
+    }
+    fn command(&mut self, c: Command, _: i64) -> Step {
+        AppServer::command(self, c)
+    }
+    fn tick(&mut self, now_ms: i64) -> Step {
+        AppServer::tick(self, now_ms)
+    }
+    fn status(&self) -> HostStatus {
+        AppServer::status(self)
+    }
+}
+
+impl Protocol for lila_agent::acp::Acp {
+    const APP: &'static str = "lila-omp";
+    fn start(&mut self) -> Step {
+        lila_agent::acp::Acp::start(self)
+    }
+    fn on_message(&mut self, m: &Value, now_ms: i64) -> Step {
+        lila_agent::acp::Acp::on_message(self, m, now_ms)
+    }
+    fn command(&mut self, c: Command, now_ms: i64) -> Step {
+        lila_agent::acp::Acp::command(self, c, now_ms)
+    }
+    fn tick(&mut self, now_ms: i64) -> Step {
+        lila_agent::acp::Acp::tick(self, now_ms)
+    }
+    fn status(&self) -> HostStatus {
+        lila_agent::acp::Acp::status(self)
+    }
+}
+
+/// The agent's program, its arguments, and the folder it runs in.
+pub struct Agent {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: String,
+}
+
+/// Runs a member's agent until it exits, translating with `proto`.
+pub fn run<P: Protocol>(paths: &Paths, agent: Agent, mut server: P) -> Result<()> {
     let project = std::env::var("LILA_PROJECT").context("LILA_PROJECT is not set: lilad starts hosts")?;
     let member = std::env::var("LILA_MEMBER").context("LILA_MEMBER is not set: lilad starts hosts")?;
     let (tx, rx) = mpsc::channel::<In>();
-    let mut child = spawn_codex(paths, &args, &project, &member, &tx)?;
-    let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin for codex app-server"))?;
+    let mut child = spawn_agent(paths, &agent, &project, &member, &tx)?;
+    let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin for {}", agent.program.display()))?;
     attach_loop(paths.clone(), project, member, tx.clone());
 
-    let mut server = AppServer::new(args.opts);
     let mut kept = Kept::default();
     let mut lilad: Option<UnixStream> = None;
     let mut shown = None;
     let step = server.start();
     send_all(&mut stdin, &step.send);
-    report(&server.status(), &mut shown);
+    report(&server.status(), P::APP, &mut shown);
     loop {
         let input = match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(i) => Some(i),
@@ -99,8 +148,8 @@ pub fn codex(paths: &Paths, args: CodexArgs) -> Result<()> {
                     Err(_) => continue,
                 },
                 In::AgentExited(why) => {
-                    report(&HostStatus::Error { why: why.clone() }, &mut shown);
-                    println!("codex app-server ended: {why}");
+                    report(&HostStatus::Error { why: why.clone() }, P::APP, &mut shown);
+                    println!("{} ended: {why}", agent.program.display());
                     break;
                 }
                 In::Attached(conn) => {
@@ -118,7 +167,7 @@ pub fn codex(paths: &Paths, args: CodexArgs) -> Result<()> {
                 }
                 In::Command(c) => {
                     log_command(&c);
-                    server.command(c)
+                    server.command(c, now)
                 }
             },
         };
@@ -128,27 +177,26 @@ pub fn codex(paths: &Paths, args: CodexArgs) -> Result<()> {
             kept.note(ev);
             emit(&mut lilad, ev);
         }
-        report(&server.status(), &mut shown);
+        report(&server.status(), P::APP, &mut shown);
     }
     let _ = child.kill();
     Ok(())
 }
 
-fn spawn_codex(paths: &Paths, args: &CodexArgs, project: &str, member: &str, tx: &mpsc::Sender<In>) -> Result<Child> {
+fn spawn_agent(paths: &Paths, agent: &Agent, project: &str, member: &str, tx: &mpsc::Sender<In>) -> Result<Child> {
     // The server's own log goes to a file: the terminal shows what the member does.
     let logs = paths.state.join("hosts");
     std::fs::create_dir_all(&logs)?;
     let log = std::fs::File::create(logs.join(format!("{project}.{member}.log")))?;
-    let mut child = std::process::Command::new(&args.program)
-        .arg("app-server")
-        .args(&args.extra)
-        .current_dir(&args.opts.cwd)
+    let mut child = std::process::Command::new(&agent.program)
+        .args(&agent.args)
+        .current_dir(&agent.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log))
         .spawn()
-        .with_context(|| format!("start {} app-server", args.program.display()))?;
-    let out = child.stdout.take().ok_or_else(|| anyhow!("no stdout for codex app-server"))?;
+        .with_context(|| format!("start {}", agent.program.display()))?;
+    let out = child.stdout.take().ok_or_else(|| anyhow!("no stdout for {}", agent.program.display()))?;
     let tx = tx.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(out).lines().map_while(Result::ok) {
@@ -209,9 +257,9 @@ fn emit(lilad: &mut Option<UnixStream>, ev: &AgentEvent) {
 }
 
 /// Tells hc (OSC 7501) when the status changes.
-fn report(status: &HostStatus, shown: &mut Option<HostStatus>) {
+fn report(status: &HostStatus, app: &str, shown: &mut Option<HostStatus>) {
     if shown.as_ref() != Some(status) {
-        print!("{}", status.osc("lila-codex"));
+        print!("{}", status.osc(app));
         let _ = std::io::stdout().flush();
         *shown = Some(status.clone());
     }
@@ -233,7 +281,7 @@ fn log_command(c: &Command) {
 fn log_event(ev: &AgentEvent) {
     use lila_agent::ItemKind::*;
     match ev {
-        AgentEvent::Session { id } => println!("· thread {id}"),
+        AgentEvent::Session { id } => println!("· session {id}"),
         AgentEvent::Item { item } if item.state != lila_agent::ItemState::Running => match &item.kind {
             AgentMessage { text } => println!("{}", one_line(text, 160)),
             ToolCall { title, .. } => println!("$ {}", one_line(title, 140)),

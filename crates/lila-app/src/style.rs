@@ -162,8 +162,11 @@ pub fn pill(color: Hsla, text: impl Into<SharedString>) -> Div {
 /// Which CLI a member runs, as a small tile: Claude Code's asterisk in its
 /// orange, Codex as a neutral prompt.
 pub fn cli_tile(runtime: &str, size: f32) -> Div {
-    let codex = runtime == "codex";
-    let (color, bg, line, icon) = if codex { (c(0xe5e5eaff), c(0xffffff17), c(0xffffff1a), "lila/prompt.svg") } else { (claude(), claude().opacity(0.16), claude().opacity(0.2), "lila/claude.svg") };
+    let (color, bg, line, icon) = match runtime {
+        "codex" => (c(0xe5e5eaff), c(0xffffff17), c(0xffffff1a), "lila/prompt.svg"),
+        "omp" => (blue(), blue().opacity(0.16), blue().opacity(0.22), "lila/prompt.svg"),
+        _ => (claude(), claude().opacity(0.16), claude().opacity(0.2), "lila/claude.svg"),
+    };
     div()
         .size(px(size))
         .flex_none()

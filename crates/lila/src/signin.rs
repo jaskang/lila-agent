@@ -78,6 +78,8 @@ pub fn command(a: &Account, program: &Path, browser: &Path, opened: &Path, path_
         Runtime::Codex => {
             cmd.arg("login");
         }
+        // omp signs in from inside (`/login`).
+        Runtime::Omp => {}
     }
     // None of the wiring that would point it at another folder or session.
     for k in ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_HOME", "BROWSER"] {

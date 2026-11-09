@@ -9,3 +9,7 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# ACP's own types (types only, no async runtime): what omp and other ACP agents send.
+agent-client-protocol-schema = { version = "1.16", default-features = false }
+# Unified diffs of the before/after text ACP gives for an edit.
+similar = "2"
