@@ -78,6 +78,8 @@ pub struct ProjectSettings {
     pub settings: Settings,
     /// Every role a member can be added with, by id.
     pub roles: Vec<Role>,
+    /// The project's flows, built-in ones included (read only: `[flows]` is edited in the file).
+    pub flows: BTreeMap<String, lila_core::flow::Flow>,
 }
 
 impl ProjectSettings {
@@ -249,6 +251,7 @@ pub fn load(root: &Path, roles_dir: &Path) -> Result<ProjectSettings> {
         assign: BTreeMap::new(),
         settings: cfg.settings.clone(),
         roles: roles.into_values().collect(),
+        flows: team.flows.clone(),
     };
     // Keep only rows that say something the roles don't.
     for (k, row) in &cfg.assign {

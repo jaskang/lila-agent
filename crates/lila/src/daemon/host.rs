@@ -3,7 +3,7 @@
 //! them go to the host as commands; what they do comes back as events.
 
 use super::*;
-use lila_agent::{AgentEvent, Command, PermOption, PermissionRequest, ToolKind};
+use lila_agent::{AgentEvent, Attachment, AttachmentKind, Command, PermOption, PermissionRequest, ToolKind};
 use std::sync::mpsc::Sender;
 
 /// An open permission card: whose request it is and the answers it maps to.
@@ -51,10 +51,16 @@ impl<T: Terminals> Daemon<T> {
 
     /// Words for a member: to its host, or typed into its terminal (`guard`: only while that status).
     pub(super) fn tell(&mut self, pid: &str, mid: &str, terminal: &str, text: &str, guard: Option<&str>) -> Result<()> {
+        self.tell_with(pid, mid, terminal, text, &[], guard)
+    }
+
+    /// Words with files: a host gets them as the runtime's own inputs; Claude Code's terminal gets
+    /// them as `@path` mentions after the words, which it reads (images too) when the message is sent.
+    pub(super) fn tell_with(&mut self, pid: &str, mid: &str, terminal: &str, text: &str, files: &[Attachment], guard: Option<&str>) -> Result<()> {
         if self.hosted(pid, mid) {
-            self.host_command(pid, mid, &Command::Prompt { text: text.to_owned() })
+            self.host_command(pid, mid, &Command::Prompt { text: text.to_owned(), attachments: files.to_vec() })
         } else {
-            self.term.send(terminal, text, guard)
+            self.term.send(terminal, &claude_text(text, files), guard)
         }
     }
 
@@ -117,6 +123,13 @@ impl<T: Terminals> Daemon<T> {
             AgentEvent::Notice { text } => {
                 self.say(format!("{pid}: {mid}: {text}"));
                 let _ = self.store.event(pid, None, mid, "notice", &text, now);
+            }
+            AgentEvent::Config { .. } => {
+                self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap().config.apply(&ev);
+                self.live_version += 1;
+            }
+            AgentEvent::Commands { commands } => {
+                self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap().commands = commands;
             }
             AgentEvent::TurnStarted { .. } | AgentEvent::TurnEnded { .. } | AgentEvent::Usage { .. } => {}
         }
@@ -191,4 +204,19 @@ impl<T: Terminals> Daemon<T> {
         }
         Ok(())
     }
+}
+
+/// The words as Claude Code's terminal gets them: the files after them as `@/absolute/path` mentions
+/// (quoted when the path has spaces), which it reads when the message is sent. A skill is called by its words.
+pub(super) fn claude_text(text: &str, files: &[Attachment]) -> String {
+    let mut out = text.trim().to_owned();
+    for f in files.iter().filter(|f| f.kind != AttachmentKind::Skill) {
+        out.push(' ');
+        if f.path.contains(char::is_whitespace) {
+            out.push_str(&format!("@\"{}\"", f.path));
+        } else {
+            out.push_str(&format!("@{}", f.path));
+        }
+    }
+    out.trim_start().to_owned()
 }

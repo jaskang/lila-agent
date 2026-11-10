@@ -73,6 +73,25 @@ pub fn builtin(has: impl Fn(&str) -> bool) -> BTreeMap<String, Flow> {
     out
 }
 
+/// Verdict steps judged by the same models that did the work: `(verifier, author)`
+/// as the flows name them (a member or a pool). A model tends to pass its own
+/// output, so the person is told; one subscription is reason enough to keep it so.
+/// `source(by)`: what stands behind a member, `None` when it is not in the team.
+pub fn self_verified<S: PartialEq>(flows: &BTreeMap<String, Flow>, source: impl Fn(&str) -> Option<S>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for flow in flows.values() {
+        for step in flow.steps.iter().filter(|s| s.wants_verdict()) {
+            let author = flow.steps.iter().find(|s| Some(&s.action) == step.on_fail.as_ref()).and_then(|s| s.by.clone());
+            let (Some(v), Some(a)) = (step.by.clone(), author) else { continue };
+            let same = matches!((source(&v), source(&a)), (Some(x), Some(y)) if x == y);
+            if same && !out.contains(&(v.clone(), a.clone())) {
+                out.push((v, a));
+            }
+        }
+    }
+    out
+}
+
 /// Checks a flow against the team. `is_target(id)`: a member or pool id.
 pub fn validate(name: &str, flow: &Flow, is_target: impl Fn(&str) -> bool) -> Result<(), String> {
     let first = flow.steps.first().ok_or_else(|| format!("flows.{name}: no steps"))?;
@@ -154,6 +173,15 @@ mod tests {
 
     fn code() -> Flow {
         builtin(|_| true).remove("code").unwrap()
+    }
+
+    #[test]
+    fn a_verdict_by_the_authors_models_is_found() {
+        let flows = builtin(|_| true);
+        let source = |pairs: &'static [(&'static str, &'static str)]| move |by: &str| pairs.iter().find(|(m, _)| *m == by).map(|(_, s)| *s);
+        assert!(self_verified(&flows, source(&[("engineer", "claude"), ("tester", "codex")])).is_empty());
+        assert_eq!(self_verified(&flows, source(&[("engineer", "claude"), ("tester", "claude")])), [("tester".to_owned(), "engineer".to_owned())]);
+        assert!(self_verified(&flows, source(&[("engineer", "claude")])).is_empty(), "a member the team lacks");
     }
 
     #[test]

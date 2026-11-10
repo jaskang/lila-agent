@@ -34,6 +34,25 @@ fn group_color(group: &str) -> Option<Hsla> {
     }
 }
 
+/// One child of the list's scroll area.
+enum Row {
+    /// A group's title and how many it holds.
+    Title(&'static str, usize),
+    /// An inbox item about no request.
+    Loose(Value),
+    Request(Value),
+}
+
+impl Row {
+    /// What selecting it selects; a title is not a row to stop on.
+    fn id(&self) -> Option<String> {
+        match self {
+            Row::Title(..) => None,
+            Row::Loose(v) | Row::Request(v) => Some(s(v, "id")),
+        }
+    }
+}
+
 /// An id as a tag in its group's color (neutral for queued and dropped).
 fn id_tag(group: &str, id: String) -> Div {
     match group_color(group) {
@@ -98,6 +117,17 @@ fn doing_words(r: &Value, owner: &str) -> String {
     }
 }
 
+/// The same in a list row, under its group's title: a finished request says
+/// only what the title does not (it ended as a pull request).
+fn row_words(r: &Value, owner: &str) -> Option<String> {
+    let words = doing_words(r, owner);
+    let finished = matches!(r["group"].as_str(), Some("delivered" | "dropped"));
+    (!finished || words == "已开 PR").then_some(words)
+}
+
+/// Width of a row's id column: tags up to `T999` end at the same place, so titles line up.
+const ID_COL: f32 = 40.;
+
 /// How long, in the largest unit: 刚刚, 12 分钟, 3 小时, 2 天.
 pub(crate) fn ago(ms: i64) -> String {
     let m = (data::now_ms() - ms).max(0) / 60_000;
@@ -155,6 +185,7 @@ impl LilaApp {
         h_flex()
             .id(SharedString::from(format!("request-{id}")))
             .h(px(34.))
+            .flex_none()
             .px_2()
             .gap(px(10.))
             .rounded(px(style::R_CTL))
@@ -162,10 +193,10 @@ impl LilaApp {
             .when(active, |d| d.bg(style::accent()))
             .when(!active, |d| d.hover(|d| d.bg(style::hover())))
             .on_click(cx.listener(move |this, _, _, cx| this.select_request(open.clone(), cx)))
-            .child(id_tag(&group, id))
+            .child(h_flex().flex_none().min_w(px(ID_COL)).child(id_tag(&group, id)))
             .child(div().flex_1().min_w_0().text_size(px(13.)).truncate().when(finished, |d| d.text_color(muted())).child(s(r, "title")))
             .when(working, |d| d.child(Spinner::new().xsmall().color(style::blue())))
-            .child(div().flex_none().max_w(px(150.)).truncate().text_xs().text_color(if group == "needs_you" { style::tint(style::red(), 0.35) } else { muted2() }).child(doing_words(r, owner)))
+            .when_some(row_words(r, owner), |d, words| d.child(div().flex_none().max_w(px(150.)).truncate().text_xs().text_color(if group == "needs_you" { style::tint(style::red(), 0.35) } else { muted2() }).child(words)))
             .child(div().flex_none().w(px(46.)).text_xs().text_color(muted2()).flex().justify_end().child(when))
             .into_any_element()
     }
@@ -179,6 +210,7 @@ impl LilaApp {
         h_flex()
             .id(SharedString::from(format!("loose-{id}")))
             .h(px(34.))
+            .flex_none()
             .px_2()
             .gap(px(10.))
             .rounded(px(style::R_CTL))
@@ -236,32 +268,97 @@ impl LilaApp {
         )
     }
 
-    /// The middle card's body: every request, by whose move it is.
-    pub fn request_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let owner = self.owner_id();
-        let recap = self.recap.and_then(|since| self.recap_line(since, cx).map(|line| (since, line)));
-        let only = recap.as_ref().filter(|_| self.recap_only).map(|(since, _)| *since);
-        let requests: Vec<Value> = self.snap.requests.iter().filter(|r| only.is_none_or(|t| r["group"] == "needs_you" || r["updated_ms"].as_i64().unwrap_or(0) >= t)).cloned().collect();
+    /// The requests the list shows now (all, or only what happened while away).
+    fn listed(&self, only: Option<i64>) -> Vec<Value> {
+        self.snap.requests.iter().filter(|r| only.is_none_or(|t| r["group"] == "needs_you" || r["updated_ms"].as_i64().unwrap_or(0) >= t)).cloned().collect()
+    }
+
+    /// The list top to bottom, as the scroll area's children: group titles and
+    /// rows. Drawing and the arrow keys both go by it.
+    fn rows(&self) -> Vec<Row> {
+        let requests = self.listed(self.recap.filter(|_| self.recap_only));
         let loose = self.loose_inbox();
-        let mut groups: Vec<AnyElement> = Vec::new();
+        let mut out = Vec::new();
         for (key, title, limit) in GROUPS {
             let rows: Vec<&Value> = requests.iter().filter(|r| r["group"] == key).collect();
             let extra = if key == "needs_you" { loose.len() } else { 0 };
             if rows.is_empty() && extra == 0 {
                 continue;
             }
-            let mut body: Vec<AnyElement> = Vec::new();
+            out.push(Row::Title(title, rows.len() + extra));
             if key == "needs_you" {
-                body.extend(loose.iter().map(|i| self.loose_row(i, cx)));
+                out.extend(loose.iter().cloned().map(Row::Loose));
             }
-            body.extend(rows.iter().take(limit).map(|r| self.request_row(r, &owner, cx)));
-            groups.push(v_flex().gap(px(2.)).child(sublabel(title, rows.len() + extra)).children(body).into_any_element());
+            out.extend(rows.into_iter().take(limit).cloned().map(Row::Request));
         }
+        out
+    }
+
+    /// ↑ / ↓ (or k / j): the row above or below the selected one (none selected:
+    /// the first), scrolled into view.
+    pub fn step_request(&mut self, down: bool, cx: &mut Context<Self>) {
+        let rows = self.rows();
+        // (child index in the scroll area, id) of every row that can be selected.
+        let ids: Vec<(usize, String)> = rows.iter().enumerate().filter_map(|(ix, row)| row.id().map(|id| (ix, id))).collect();
+        let at = self.request.as_ref().and_then(|id| ids.iter().position(|(_, x)| x == id));
+        let next = match at {
+            Some(i) if down => (i + 1).min(ids.len().saturating_sub(1)),
+            Some(i) => i.saturating_sub(1),
+            None => 0,
+        };
+        let Some((ix, id)) = ids.get(next).cloned() else { return };
+        // The first row goes back to the very top, its group's title and the padding above it in view.
+        if next == 0 {
+            self.req_scroll.set_offset(point(px(0.), px(0.)));
+        } else {
+            self.req_scroll.scroll_to_item(ix);
+        }
+        if Some(&id) != self.request.as_ref() {
+            self.select_request(id, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// ↩ on the selected request: the terminal of the member working on it (看现场).
+    pub fn look_at_request(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(r) = self.request.as_ref().and_then(|id| self.snap.requests.iter().find(|r| r["id"] == id.as_str())) else { return false };
+        if r["doing"]["kind"] != "member" {
+            return false;
+        }
+        let member = s(&r["doing"], "member");
+        self.show_member(member, cx);
+        true
+    }
+
+    /// The middle card's body: every request, by whose move it is.
+    pub fn request_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let owner = self.owner_id();
+        let recap = self.recap.and_then(|since| self.recap_line(since, cx));
+        let rows = self.rows();
+        // Titles and rows are the scroll area's own children, so a row can be
+        // scrolled to by its place among them. A title sits 16 below the group before it.
+        let body: Vec<AnyElement> = rows
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| match row {
+                Row::Title(title, count) => sublabel(title, *count).flex_none().when(ix > 0, |d| d.mt(px(14.))).into_any_element(),
+                Row::Loose(i) => self.loose_row(i, cx),
+                Row::Request(r) => self.request_row(r, &owner, cx),
+            })
+            .collect();
         v_flex()
             .flex_1()
             .min_h_0()
-            .children(recap.map(|(_, line)| line))
-            .child(v_flex().id("requests").flex_1().min_h_0().overflow_y_scrollbar().px_2().pt(px(10.)).pb(px(10.)).gap_4().children(groups))
+            .children(recap)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(v_flex().id("requests").size_full().overflow_y_scroll().track_scroll(&self.req_scroll).px_2().pt(px(10.)).pb(px(10.)).gap(px(2.)).children(body))
+                    .vertical_scrollbar(&self.req_scroll),
+            )
             .into_any_element()
     }
 
@@ -305,6 +402,22 @@ impl LilaApp {
             .collect();
         let collect = |key: &str| -> Vec<String> { tasks.iter().flat_map(|t| t[key].as_array().cloned().unwrap_or_default()).filter_map(|x| x.as_str().map(String::from)).collect() };
         let (decisions, unverified) = (collect("decisions"), collect("unverified"));
+        // What done was said to look like, each point once.
+        let mut accept: Vec<String> = Vec::new();
+        for a in collect("accept") {
+            if !accept.contains(&a) {
+                accept.push(a);
+            }
+        }
+        // The person's ask in full, when it says more than its title. An issue's
+        // body is the PM's sorting brief; its text is a click away on GitHub.
+        let root = tasks.iter().find(|t| t["id"] == r["id"]);
+        let title = s(&r, "title");
+        let ask = root
+            .filter(|_| r["from"] == "human" && !ext.is_object())
+            .map(|t| s(t, "body"))
+            .map(|b| b.trim().strip_prefix(title.trim()).unwrap_or(b.trim()).trim().to_owned())
+            .filter(|b| !b.is_empty());
         let from = if ext.is_object() {
             format!("@{} 在 GitHub 提的", s(&ext, "author"))
         } else if r["from"] == "human" {
@@ -329,16 +442,20 @@ impl LilaApp {
             .child(div().flex_1())
             .when_some(member, |d, m| {
                 d.child(Button::new("request-look").small().small_button().outline().icon(IconName::SquareTerminal).label("看现场").on_click(cx.listener(move |this, _, _, cx| {
-                    this.member = Some(m.clone());
-                    cx.notify();
+                    this.show_member(m.clone(), cx);
                 })))
             });
         let cards: Vec<AnyElement> = items.into_iter().enumerate().map(|(n, item)| self.inbox_card(item, n > 0, cx).into_any_element()).collect();
+        // The request itself is the panel; its steps are the work under it.
         let steps: Vec<AnyElement> = tasks
             .iter()
+            .filter(|t| t["id"] != r["id"])
             .map(|t| {
                 let tid = s(t, "id");
                 let open = tid.clone();
+                // Lila names a flow's verification after the work it checks: the row above says which.
+                let name = s(t, "title");
+                let name = if name.starts_with("Verify: ") { "验证".to_owned() } else { name };
                 h_flex()
                     .id(SharedString::from(format!("step-{tid}")))
                     .px_2()
@@ -349,7 +466,7 @@ impl LilaApp {
                     .hover(|d| d.bg(style::hover()))
                     .text_size(px(13.))
                     .child(crate::detail::state_tag(&s(t, "state"), tid))
-                    .child(div().flex_1().min_w_0().truncate().child(s(t, "title")))
+                    .child(div().flex_1().min_w_0().truncate().child(name))
                     .child(div().text_xs().text_color(muted()).flex_none().child(who(&s(t, "to"), &owner)))
                     .on_click(cx.listener(move |this, _, _, cx| this.show_task(open.clone(), cx)))
                     .into_any_element()
@@ -363,7 +480,7 @@ impl LilaApp {
                 .gap_2()
                 .items_start()
                 .text_xs()
-                .child(div().absolute().left(px(-20.)).top(px(4.)).size(px(7.)).rounded_full().bg(if i + 1 == n { style::blue() } else { gpui::Hsla::from(rgba(0x48484eff)) }))
+                .child(div().absolute().left(px(-20.)).top(px(6.)).size(px(7.)).rounded_full().bg(if i + 1 == n { style::blue() } else { gpui::Hsla::from(rgba(0x48484eff)) }))
                 .child(div().flex_none().text_color(muted()).child(data::clock(e["at_ms"].as_i64().unwrap_or(0))))
                 .child(div().flex_none().child(line))
                 .when_some(detail, |d, detail| d.child(div().flex_1().min_w_0().text_color(muted2()).child(detail)))
@@ -399,7 +516,8 @@ impl LilaApp {
                                             })
                                         })),
                                 )
-                                .child(div().text_size(px(15.)).font_semibold().line_height(relative(1.35)).child(s(&r, "title")))
+                                .child(div().text_size(px(15.)).font_semibold().line_height(relative(1.35)).child(title.clone()))
+                                .when_some(ask, |d, ask| d.child(div().text_size(px(13.)).line_height(relative(1.55)).text_color(muted()).child(ask)))
                                 // An inbox card below says what waits for the person.
                                 .when(cards.is_empty(), |d| d.child(div().pt_1().child(now))),
                         )
@@ -408,9 +526,10 @@ impl LilaApp {
                             v_flex()
                                 .px_4()
                                 .gap_4()
+                                .when(!accept.is_empty(), |d| d.child(section("验收标准", muted()).child(bullets(&accept, style::fg()))))
                                 .when(!decisions.is_empty(), |d| d.child(section("替你做的决定", muted()).child(bullets(&decisions, style::fg()))))
                                 .when(!unverified.is_empty(), |d| d.child(section("没验证", style::yellow()).child(bullets(&unverified, style::fg()))))
-                                .when(steps.len() > 1, |d| d.child(section("步骤", muted()).child(v_flex().children(steps))))
+                                .when(!steps.is_empty(), |d| d.child(section("步骤", muted()).child(v_flex().children(steps))))
                                 .when(n > 0, |d| d.child(section("经过", muted()).child(timeline))),
                         ),
                 )

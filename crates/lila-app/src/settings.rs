@@ -374,7 +374,15 @@ impl LilaApp {
             owner: bool,
             running: bool,
             codex: bool,
+            /// Its verdict is on work done by the same models.
+            same_source: bool,
         }
+        // As the form has them now: picking another model moves the mark at once.
+        let sources: Vec<(String, String)> = f.members.iter().zip(&f.value.members).map(|(m, v)| {
+            let (runtime, model) = m.choice(cx);
+            (v.id.clone(), lila_core::config::model_source(runtime, &model))
+        }).collect();
+        let same: Vec<String> = lila_core::flow::self_verified(&f.value.flows, |by| sources.iter().find(|(id, _)| id == by).map(|(_, s)| s.clone())).into_iter().map(|(verifier, _)| verifier).collect();
         let items: Vec<Item> = f
             .members
             .iter()
@@ -387,6 +395,7 @@ impl LilaApp {
                     owner: v.ids().contains(&owner),
                     running: v.ids().iter().any(|i| running.contains(i)),
                     codex: m.choice(cx).0 == Runtime::Codex,
+                    same_source: same.contains(&v.id),
                 }
             })
             .collect();
@@ -416,7 +425,13 @@ impl LilaApp {
                                 .flex_1()
                                 .min_w_0()
                                 .child(h_flex().gap_1().child(div().text_size(px(13.)).font_medium().truncate().child(if it.id.is_empty() { "（未命名）".to_owned() } else { it.id.clone() })).when(it.count > 1, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(format!("×{}", it.count)))))
-                                .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(it.role.clone())),
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .min_w_0()
+                                        .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(it.role.clone()))
+                                        .when(it.same_source, |d| d.child(div().flex_none().text_xs().text_color(crate::style::yellow()).child("同源验证"))),
+                                ),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(f) = this.settings.as_mut() {

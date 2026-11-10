@@ -86,10 +86,11 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | `hc-client` | herdr-core JSON-RPC 客户端 |
 | `lila` | CLI 和 lilad，详见下面几行 |
 | ↳ `daemon/` | lilad。`mod.rs`：状态、herdr-core 的事件、pump（投递和通知）、spool。`requests.rs`：`Daemon::handle` 和每个请求。`flows.rs`：流程推进、检查命令。`session.rs`：换链时的会话、PM 摘要。`review.rs`：验收卡片、一条链占目录、验收时提交、预算。`watch.rs`：Watchdog 和 `tick`。`server.rs`：socket、事件流和后台线程。`tests.rs` 用 Fake 终端，CLI 的会话记录目录指向临时目录 |
+| ↳ `commands.rs` | 成员的 CLI 在磁盘上找得到的 skill 和自定义命令（Claude Code：用户配置目录、已启用的插件、项目的 `.claude/skills`、`.claude/commands`；Codex：`.agents/skills` 到仓库根、`~/.agents/skills`、`$CODEX_HOME/skills`），front matter 用 `yaml-rust2` 解析 |
 | ↳ `check.rs` | 后台跑流程的检查命令（进程组、超时） |
 | ↳ `worktree.rs`、`commit.rs` | worktree 槽的 git 命令（占槽、放槽、取消时保留）；验收时提交，从槽里合成一个提交、rebase、快进合并（`docs/product-v3.md` §7.1） |
 | ↳ `github.rs`、`daemon/sources.rs` | GitHub 来源（只用 `gh`）：定时拉 issue 建成给 PM 的任务、`lila triage` 和「要修吗？」卡片、`lila draft` 和评论草稿、发评论；验收后开 PR 在 `commit.rs`（`docs/product-v3.md` §8） |
-| ↳ `daemon/conversation.rs` | 成员的对话：每 250ms（spool 那一拍）跟读运行中 Claude 成员的会话记录，条目存进 `conv_items`（没变的不动）；`conversation.read`（某个 seq 之后的条目和能力）、`conversation.send`（人的话打进终端，成员卡在对话框时拒绝）；`caps()` 是每种运行时能显示什么 |
+| ↳ `daemon/conversation.rs` | 成员的对话：每 250ms（spool 那一拍）跟读运行中 Claude 成员的会话记录，条目存进 `conv_items`（没变的不动）；`conversation.read`（某个 seq 之后的条目和能力）、`conversation.send {member, text, attachments}`（人的话和文件打进终端或交给 host，成员卡在对话框时拒绝）、`conversation.commands`（`/` 菜单的内容）、`conversation.files`（`@` 的文件，`git ls-files`）、`conversation.model`（只改当前会话的模型/努力程度：Codex、omp）、`conversation.run`（Codex 的 compact）、`conversation.interrupt`（只在成员工作时：托管的运行时发 `Command::Interrupt`，Claude 在终端按 Esc）；`caps()` 是每种运行时能显示什么 |
 | ↳ `host.rs`、`daemon/host.rs` | `lila host codex` 和 `lila host omp`（隐藏子命令，主循环对 `Protocol` 泛型）：在 Codex 成员的 hc 终端里跑，起 `codex app-server`，用 `host.attach` 挂到 lilad 的 socket（事件出、命令进，lilad 回来时自动重连并重发会话、条目、待答的权限），用 OSC 7501 报状态，终端里打印一行行日志（「原始日志」），app-server 自己的日志在 `state/hosts/<项目>.<成员>.log`。lilad 这边：`tell` 把派活、通知、人的话按成员发给 host 或打进终端；host 的事件变成会话、条目、权限卡片（`lila …` 命令自动允许）；`permission` 卡片的回答送回 host |
 | ↳ `daemon/hooks.rs`、`client::hook` | Claude Code 的 hooks：每个 Claude 成员启动时带 `--settings state/prompts/<项目>/<成员>.settings.json`，里面 PermissionRequest（600s）、MessageDisplay、UserPromptSubmit、Stop、StopFailure 都跑 `lila hook <事件>`（隐藏子命令）。权限请求变成 `permission` 卡片，hook 每 0.5s 问 `hook.answer` 等答案（最多 570s），答了就输出 allow/deny，卡片关掉或 lilad 重启丢了就什么都不输出、交给终端问（另出一张「终端在等你」）；`lila …` 命令直接允许。MessageDisplay 的增量攒成「正在写」（`conversation.read` 的 `writing`），Stop、新一轮或会话记录里出现回复时清掉 |
 | ↳ `daemon/slots.rs` | 哪条链在哪个槽、排队占槽、链结束后放槽或给验收卡片、合并失败的 `merge` 条目 |
@@ -100,7 +101,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | ↳ `usage.rs` | 按成员统计 token（读两个 CLI 的会话记录）、时间解析 |
 | ↳ 其他 | `settings.rs`（项目设置读写，用 toml_edit 保留注释）、`roles.rs`（角色和默认角色升级）、`init.rs`、`client.rs`、`paths.rs`、`skill.md`（给 agent 的协议说明） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app） |
-| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、窗口自己的焦点、选中的请求、离开期间和通知。`ui.rs`：侧栏卡片、中间卡片（标题行、终端）、收件箱卡片（含验收、预算、合并）。`requests.rs`：请求列表和右边的请求详情。`style.rs`：配色和小部件。`tree.rs`：成员树动画。`data.rs`：拉数据、本地时间。`dialog.rs`：对话框外壳（`footer: false` 不显示保存栏）。`settings.rs`：项目设置。`prefs.rs`：全局设置（角色 / 用量 / 关于）。`usage.rs`：用量页（账号、浏览器登录、magpie）。`wizard.rs`（新建项目）、`detail.rs`（任务详情）、`compose.rs`（新建任务）、`conversation.rs`（成员的对话视图、对话/终端切换、输入框）、`build.rs`。 |
+| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、窗口自己的焦点、选中的请求、离开期间和通知。`ui.rs`：侧栏卡片、中间卡片（标题行、终端）、收件箱卡片（含验收、预算、合并）。`requests.rs`：请求列表和右边的请求详情。`style.rs`：配色和小部件。`tree.rs`：成员树动画。`data.rs`：拉数据、本地时间。`dialog.rs`：对话框外壳（`footer: false` 不显示保存栏）。`settings.rs`：项目设置。`prefs.rs`：全局设置（角色 / 用量 / 关于）。`usage.rs`：用量页（账号、浏览器登录、magpie）。`wizard.rs`（新建项目）、`detail.rs`（任务详情）、`compose.rs`（新建任务）、`conversation.rs`（成员的对话视图、对话/终端切换）、`composer.rs`（对话底部的输入区：草稿、附件、`@` 和 `/` 浮层、模型、输入历史）、`build.rs`。 |
 
 ## 关键机制（v2 之后）
 
@@ -169,6 +170,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 - `LILA_APP_PREFS=roles|usage|about`、`LILA_APP_SETTINGS=general|members`（加 `LILA_APP_SETTINGS_ADD=<角色>`）。
 - `LILA_APP_SIGNIN=claude:<名称>`：直接开始添加账号；`LILA_APP_NO_OPEN=1` 不打开浏览器。截完图要 `pkill -f "claude auth login"`。
 - `LILA_APP_REQUEST=T3`（选中请求）、`LILA_APP_MEMBER=pm`（中间显示终端）、`LILA_APP_AWAY=360`（像离开了 6 小时回来）。
+- `LILA_APP_CONV=top,row:60,open:25,openall:2,focus,key:h,key:enter`（还有输入区的：`fill:<话>`（`_` 是空格、`\n` 是换行）、`attach:<路径>`、`menu`（命令菜单）、`show:<成员>`；`key:down`、`key:escape` 等走窗口自己的按键分发，能验证浮层的键盘操作）（成员对话：滚到某一行、展开某一行、把光标放进输入框并按键，步骤用逗号隔开，行号是列表里的行，见 `conversation::dev_conv`）。
 - `LILA_APP_FAKE_STATUS=designer:working,tester:blocked`、`LILA_APP_OPEN_TASK=T5`、`LILA_APP_COMPOSE=<成员>`、`LILA_APP_NEW=<文件夹>`（空：还没选文件夹）、`LILA_APP_SWITCH=a,b`、`LILA_APP_GUTTERS=1`、`LILA_APP_DEBUG=1`。
 
 截图用临时的 `LILA_HOME`，不碰用户的真实数据：

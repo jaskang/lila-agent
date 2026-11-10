@@ -14,9 +14,17 @@ fn main() {
     println!("cargo:rerun-if-changed={}", prebuilt.display());
 
     // Only the static archive in the search path, so the linker can't pick a shared one.
-    let name = if msvc { "ghostty-vt.lib" } else { "libghostty-vt.a" };
+    let name = if msvc {
+        "ghostty-vt.lib"
+    } else {
+        "libghostty-vt.a"
+    };
     let staged = prebuilt.join(&target).join(name);
-    assert!(staged.is_file(), "no prebuilt libghostty-vt for {target}: add {} (see update-prebuilt.sh)", staged.display());
+    assert!(
+        staged.is_file(),
+        "no prebuilt libghostty-vt for {target}: add {} (see update-prebuilt.sh)",
+        staged.display()
+    );
     let lib = out.join("lib");
     std::fs::create_dir_all(&lib).unwrap();
     std::fs::copy(&staged, lib.join(name)).unwrap();
@@ -30,7 +38,10 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         // Apple's libclang has its builtin headers but needs the SDK for the C library.
         if let Ok(sdk) = Command::new("xcrun").args(["--show-sdk-path"]).output() {
-            builder = builder.clang_arg(format!("-isysroot{}", String::from_utf8_lossy(&sdk.stdout).trim()));
+            builder = builder.clang_arg(format!(
+                "-isysroot{}",
+                String::from_utf8_lossy(&sdk.stdout).trim()
+            ));
         }
     }
     builder

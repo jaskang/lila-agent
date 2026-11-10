@@ -226,6 +226,13 @@ impl AssetSource for Assets {
             "lila/claude.svg" => Some(include_bytes!("../assets/lila/claude.svg")),
             "lila/prompt.svg" => Some(include_bytes!("../assets/lila/prompt.svg")),
             "lila/trash.svg" => Some(include_bytes!("../assets/lila/trash.svg")),
+            "lila/brain.svg" => Some(include_bytes!("../assets/lila/brain.svg")),
+            "lila/archive.svg" => Some(include_bytes!("../assets/lila/archive.svg")),
+            "lila/paperclip.svg" => Some(include_bytes!("../assets/lila/paperclip.svg")),
+            "lila/image.svg" => Some(include_bytes!("../assets/lila/image.svg")),
+            "lila/square-slash.svg" => Some(include_bytes!("../assets/lila/square-slash.svg")),
+            "lila/sparkles.svg" => Some(include_bytes!("../assets/lila/sparkles.svg")),
+            "lila/command.svg" => Some(include_bytes!("../assets/lila/command.svg")),
             _ => None,
         };
         match own {

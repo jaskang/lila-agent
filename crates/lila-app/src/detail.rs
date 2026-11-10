@@ -193,8 +193,7 @@ impl LilaApp {
             .child({
                 let m = to.clone();
                 Button::new("detail-terminal").small().small_button().outline().icon(IconName::SquareTerminal).label("打开终端").on_click(cx.listener(move |this, _, _, cx| {
-                    this.member = Some(m.clone());
-                    cx.notify();
+                    this.show_member(m.clone(), cx);
                 }))
             })
             .when(!file.is_empty(), |d| {

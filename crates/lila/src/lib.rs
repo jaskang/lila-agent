@@ -3,6 +3,7 @@
 
 pub mod accounts;
 pub mod check;
+pub mod commands;
 pub mod client;
 pub mod commit;
 pub mod daemon;

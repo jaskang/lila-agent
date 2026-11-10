@@ -486,3 +486,14 @@ CREATE INDEX conv_items_seq ON conv_items(project, member, seq);
 - omp 的模型列表：角色设置里只能保留当前写的模型，还不能从 omp 列出可选的（ACP 的 `configOptions` 里有）。
 - 把 Lila 的协议做成 MCP 工具（P5，可选）。
 - Codex 偶尔停在工具结果之后的原因（§16）。
+
+## 19. 输入区记录：附件、`@`、`/`、会话级模型（2026-11-10）
+
+**四个运行时的事实（都是实测或读协议，不是印象）**
+
+- **Claude Code 的 TUI**：`hc send` 是粘贴加回车。粘贴进去的 `@/绝对路径`（带空格的用 `@"…"`）提交时会被当成文件提及：文本文件读进来，图片作为图片内容附上（真跑：问 `note.txt` 里的暗号答对了，问红色 PNG 答「Red」）；粘贴的文字不会触发 `@` 的补全浮层。粘贴进去的 `/pong hello`（自定义命令）正常执行。`/compact`、`/context` 不弹窗；`/usage` 弹交互界面（Esc 关闭）；`/clear` 会换一个新的会话 id（lilad 跟着的文件就断了）；**`/model <名>`、`/effort <级>` 在 TUI 里会写进用户的 `~/.claude/settings.json`（「saved as your default for new sessions」）**，`claude -p` 里才是只管当前会话。所以 Lila 不在 Claude 成员上提供切模型和努力程度。
+- **转写文件里的斜杠命令**：`<command-name>/x</command-name>…<command-args>` 在 `user` 或 `system/local_command` 条目里（两种都见过，标签顺序也不固定），它打印的结果是 `system/local_command` 的 `<local-command-stdout>`（TUI 里带 ANSI 颜色）。窗口把前者显示成「你说的话」`/x args`，后者显示成一行安静的记号（`from: local`）。
+- **Codex app-server**（0.166，`generate-json-schema`）：`turn/start` 的 `model`、`effort`「对这一轮和之后的轮次生效」；输入项有 `text`、`image`、`localImage {path}`、`skill {name, path}`、`mention {name, path}`；`thread/compact/start {threadId}`；`skills/list` 的位置：`$CWD` 往上到仓库根的 `.agents/skills`、`~/.agents/skills`、`$CODEX_HOME/skills`（自带的在 `.system`）。自定义 prompt（`~/.codex/prompts`）是 TUI 的功能，app-server 不展开。
+- **omp 的 ACP**（18.18.3）：`promptCapabilities.image` 为真；`session/new` 的 `configOptions` 有 `model` 和 `thinking`（`category: thought_level`）两个 select，用 `session/set_config_option {sessionId, configId, value}` 改，回复里是新的 `configOptions`（真跑：模型和努力程度都改成了）；`available_commands_update` 声明了一百多条命令，skill 叫 `skill:名`。
+
+**做法**：`Command::Prompt` 带 `attachments`（图片、文件、skill）；Claude 把文件接在话后面当 `@路径`，Codex 翻成 `localImage`/`mention`/`skill`（话里的 `@相对路径` 和 `$skill` 由 lilad 认出来补上），omp 图片内联（`image` 块，8 MB 以内）其余是 `resource_link`。新增 `Command::{SetModel, SetEffort, Compact}`、`AgentEvent::{Config, Commands}`；lilad 在 `Live` 里记每个成员当前会话的模型和努力程度（Claude 取自会话记录里最近一条回复的 `model`），重启后回到角色的设置。窗口从 `conversation.read` 的 `config` 读。

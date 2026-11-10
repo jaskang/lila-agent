@@ -197,8 +197,7 @@ impl LilaApp {
             )
             .child(status_mark(&status, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.member = Some(click.clone());
-                cx.notify();
+                this.show_member(click.clone(), cx);
             }));
         // A member Lila drives through a protocol: its host's log, for when something looks off.
         if m["caps"]["gui"] == true && m["caps"]["tui"] != true && m["terminal"].is_string() {
@@ -599,6 +598,8 @@ impl LilaApp {
         let options: Vec<String> = item["options"].as_array().into_iter().flatten().filter_map(|o| o.as_str().map(String::from)).collect();
         let input = self.answers.get(&id).cloned();
         let card_id = id.clone();
+        // In its own request's panel the header above already names the request.
+        let own = self.task.is_none() && self.request.is_some() && self.request.as_deref() == item["task"].as_str();
         v_flex()
             .px_4()
             .pt(px(if divided { 14. } else { 4. }))
@@ -611,13 +612,22 @@ impl LilaApp {
                     .child(Icon::new(icon).small().text_color(accent))
                     .child(div().text_size(px(13.)).font_semibold().child(label_text))
                     .child(div().flex_1())
-                    .when_some(item["task"].as_str().map(String::from), |d, t| d.child(div().text_xs().child(crate::detail::task_link(&t, &format!("inbox-{card_id}"), cx)))),
+                    .when_some(item["task"].as_str().map(String::from).filter(|_| !own), |d, t| d.child(div().text_xs().child(crate::detail::task_link(&t, &format!("inbox-{card_id}"), cx)))),
             )
             .child(div().text_size(px(13.)).line_height(relative(1.55)).child({
                 // A review keeps its outcome: the decisions, the unchecked points and each
                 // step's evidence are in the request's panel below it.
                 let text = s(&item, "text");
-                if review { text.lines().next().unwrap_or_default().to_owned() } else { text }
+                if review {
+                    let first = text.lines().next().unwrap_or_default();
+                    // "T1「标题」做完了：结果": under the request's title, the result alone.
+                    match first.split_once("做完了：").filter(|_| own) {
+                        Some((_, result)) => result.to_owned(),
+                        None => first.to_owned(),
+                    }
+                } else {
+                    text
+                }
             }))
             .when(!options.is_empty() && !primary_row, |d| {
                 d.child(h_flex().gap(px(6.)).flex_wrap().children(options.into_iter().enumerate().map(|(n, opt)| {
@@ -665,8 +675,7 @@ impl LilaApp {
                         .gap(px(6.))
                         .when_some(open, |d, m| {
                             d.child(Button::new(SharedString::from(format!("open-{card_id}"))).small().small_button().outline().rounded_full().icon(IconName::SquareTerminal).label("打开终端").on_click(cx.listener(move |this, _, _, cx| {
-                                this.member = Some(m.clone());
-                                cx.notify();
+                                this.show_member(m.clone(), cx);
                             })))
                         })
                         .child(div().flex_1())

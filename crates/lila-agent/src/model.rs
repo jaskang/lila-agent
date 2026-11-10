@@ -10,6 +10,61 @@ pub enum Origin {
     Person,
     /// Delivered by Lila: a task (its id) or a note, an answer, a reminder.
     Lila { task: Option<String> },
+    /// What Claude Code wrote down when it compacted the context: the CLI's own, not a message.
+    Summary,
+    /// What a slash command printed in the CLI itself (`/compact`'s "Not enough messages"): a note, not a message.
+    Local,
+}
+
+/// What kind of file the person put on a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Image,
+    #[default]
+    File,
+    /// A skill the message calls (Codex takes it as an input item, not as text).
+    Skill,
+}
+
+/// A file (or image, or skill) that goes with a message: an absolute path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub path: String,
+    /// What to call it (a skill's name; else the file's name).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default)]
+    pub kind: AttachmentKind,
+}
+
+impl Attachment {
+    /// A file or image at `path`, told apart by its extension.
+    pub fn file(path: &str) -> Attachment {
+        let kind = if image_mime(path).is_some() { AttachmentKind::Image } else { AttachmentKind::File };
+        Attachment { path: path.to_owned(), name: file_name(path), kind }
+    }
+
+    /// What it is called: its name, else its file's.
+    pub fn label(&self) -> String {
+        if self.name.is_empty() { file_name(&self.path) } else { self.name.clone() }
+    }
+}
+
+fn file_name(path: &str) -> String {
+    path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path).to_owned()
+}
+
+/// The media type of an image file, by its extension (the ones every runtime takes).
+pub fn image_mime(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 /// What kind of tool ran: the window picks its icon from this (ACP's kinds).
@@ -49,6 +104,9 @@ pub enum ItemKind {
         text: String,
         #[serde(flatten)]
         origin: Origin,
+        /// The files that went with it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     /// Markdown.
     AgentMessage { text: String },
@@ -127,6 +185,70 @@ pub enum AgentEvent {
     },
     /// Something the person should hear (not signed in, the runtime stopped…).
     Notice { text: String },
+    /// The model and effort the session runs on now, and the ones it offers when the runtime lists them (ACP).
+    Config {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        models: Vec<Choice>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        efforts: Vec<Choice>,
+    },
+    /// The slash commands the agent declares (ACP's `available_commands_update`).
+    Commands { commands: Vec<SlashCommand> },
+}
+
+/// What a session runs on, as `AgentEvent::Config` events add up: a later event changes only what it carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Config {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub models: Vec<Choice>,
+    pub efforts: Vec<Choice>,
+}
+
+impl Config {
+    /// Folds in an event (others are not about the config).
+    pub fn apply(&mut self, ev: &AgentEvent) {
+        let AgentEvent::Config { model, effort, models, efforts } = ev else { return };
+        if model.is_some() {
+            self.model = model.clone();
+        }
+        if effort.is_some() {
+            self.effort = effort.clone();
+        }
+        if !models.is_empty() {
+            self.models = models.clone();
+        }
+        if !efforts.is_empty() {
+            self.efforts = efforts.clone();
+        }
+    }
+
+    /// The event that gives this config again.
+    pub fn event(&self) -> AgentEvent {
+        AgentEvent::Config { model: self.model.clone(), effort: self.effort.clone(), models: self.models.clone(), efforts: self.efforts.clone() }
+    }
+}
+
+/// One thing a runtime offers to pick: an id to send back, a name to show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choice {
+    pub id: String,
+    pub name: String,
+}
+
+/// A slash command an agent declares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// What follows the name, if anything (`[focus]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// lilad → a host. One JSON line each.
@@ -135,9 +257,19 @@ pub enum AgentEvent {
 pub enum Command {
     /// Words for the member: a task, a note, the person's message. While it works,
     /// they join the running turn where the runtime can (`Caps::steer`), else wait.
-    Prompt { text: String },
+    Prompt {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
     Interrupt,
     Answer { permission: String, option: String },
+    /// Run on this model from now on, in this session only.
+    SetModel { model: String },
+    /// Think at this effort from now on, in this session only.
+    SetEffort { effort: String },
+    /// Compact the context (Codex: `thread/compact/start`; the others take `/compact` as words).
+    Compact,
 }
 
 /// What a host reports to hc (OSC 7501), and so lilad's dispatch sees.
@@ -174,7 +306,7 @@ impl HostStatus {
 }
 
 /// Standard base64 with padding (OSC 7501's `msg`).
-fn base64(bytes: &[u8]) -> String {
+pub fn base64(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
@@ -238,7 +370,7 @@ mod tests {
             turn: Some("p1".into()),
             at_ms: 5,
             state: ItemState::Done,
-            kind: ItemKind::UserMessage { text: "hi".into(), origin: Origin::Lila { task: Some("T3".into()) } },
+            kind: ItemKind::UserMessage { text: "hi".into(), origin: Origin::Lila { task: Some("T3".into()) }, attachments: Vec::new() },
         };
         let v = serde_json::to_value(&item).unwrap();
         assert_eq!(v, serde_json::json!({"id": "u1", "turn": "p1", "at_ms": 5, "state": "done", "kind": "user_message", "text": "hi", "from": "lila", "task": "T3"}));
@@ -252,7 +384,20 @@ mod tests {
         assert_eq!(base64(b"ab"), "YWI=");
         let ev: AgentEvent = serde_json::from_str(r#"{"event":"session","id":"t1"}"#).unwrap();
         assert_eq!(ev, AgentEvent::Session { id: "t1".into() });
-        assert_eq!(serde_json::to_string(&Command::Prompt { text: "hi".into() }).unwrap(), r#"{"command":"prompt","text":"hi"}"#);
+        assert_eq!(serde_json::to_string(&Command::Prompt { text: "hi".into(), attachments: Vec::new() }).unwrap(), r#"{"command":"prompt","text":"hi"}"#);
+    }
+
+    #[test]
+    fn a_later_config_changes_only_what_it_carries() {
+        let mut c = Config::default();
+        let ids = |v: &[(&str, &str)]| v.iter().map(|(i, n)| Choice { id: (*i).into(), name: (*n).into() }).collect::<Vec<_>>();
+        c.apply(&AgentEvent::Config { model: Some("a".into()), effort: Some("high".into()), models: ids(&[("a", "A"), ("b", "B")]), efforts: vec![] });
+        c.apply(&AgentEvent::Config { model: Some("b".into()), effort: None, models: vec![], efforts: vec![] });
+        c.apply(&AgentEvent::Notice { text: "x".into() });
+        assert_eq!((c.model.as_deref(), c.effort.as_deref(), c.models.len()), (Some("b"), Some("high"), 2));
+        let mut again = Config::default();
+        again.apply(&c.event());
+        assert_eq!(again, c);
     }
 
     #[test]

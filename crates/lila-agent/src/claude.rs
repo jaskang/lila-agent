@@ -18,11 +18,18 @@ pub struct Transcript {
     turn: Option<String>,
     /// Tool calls waiting for their result, by tool_use id.
     open: HashMap<String, Item>,
+    /// The model of the latest reply: what the session really runs on.
+    model: Option<String>,
 }
 
 impl Transcript {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The model that wrote the latest reply read so far.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     pub fn feed(&mut self, line: &str) -> Vec<Item> {
@@ -36,9 +43,36 @@ impl Transcript {
         let content = &e["message"]["content"];
         match e["type"].as_str() {
             Some("user") => self.user(&e, uuid, content, at_ms),
-            Some("assistant") => self.assistant(uuid, content, at_ms),
+            Some("assistant") => {
+                // Replies the CLI made up itself (`<synthetic>`, a slash command's) name no model.
+                if let Some(m) = e["message"]["model"].as_str().filter(|m| !m.is_empty() && !m.starts_with('<')) {
+                    self.model = Some(m.to_owned());
+                }
+                self.assistant(uuid, content, at_ms)
+            }
+            // What a slash command printed in the CLI itself, and the line that says which one ran.
+            Some("system") if e["subtype"] == "local_command" => self.local(uuid, e["content"].as_str().unwrap_or_default(), at_ms),
             _ => Vec::new(),
         }
+    }
+
+    /// A `system` record of a slash command: the command typed, or what it printed.
+    fn local(&mut self, uuid: &str, content: &str, at_ms: i64) -> Vec<Item> {
+        let kind = if let Some(call) = command_call(content) {
+            ItemKind::UserMessage { text: call, origin: Origin::Person, attachments: Vec::new() }
+        } else if let Some(out) = tag(content, "local-command-stdout") {
+            let out = String::from_utf8_lossy(&strip_ansi_escapes::strip(out.trim())).trim().to_owned();
+            if out.is_empty() {
+                return Vec::new();
+            }
+            ItemKind::UserMessage { text: out, origin: Origin::Local, attachments: Vec::new() }
+        } else {
+            return Vec::new();
+        };
+        if uuid.is_empty() {
+            return Vec::new();
+        }
+        vec![Item { id: uuid.to_owned(), turn: self.turn.clone(), at_ms, state: ItemState::Done, kind }]
     }
 
     fn user(&mut self, e: &Value, uuid: &str, content: &Value, at_ms: i64) -> Vec<Item> {
@@ -61,16 +95,25 @@ impl Transcript {
             }
             _ => {}
         }
-        let text = unwrap_paste(text.trim());
+        let called = command_call(&text);
+        let (text, attachments) = match &called {
+            Some(call) => (call.as_str(), Vec::new()),
+            None => split_attachments(unwrap_paste(text.trim())),
+        };
         if !text.is_empty() && !uuid.is_empty() {
+            // After a compaction the CLI records its summary as a user message, flagged `isCompactSummary`
+            // (checked on real transcripts: every such message has it). It starts no turn.
+            let summary = e["isCompactSummary"] == true;
             let turn = e["promptId"].as_str().unwrap_or(uuid).to_owned();
-            self.turn = Some(turn.clone());
+            if !summary {
+                self.turn = Some(turn.clone());
+            }
             out.push(Item {
                 id: uuid.to_owned(),
                 turn: Some(turn),
                 at_ms,
                 state: ItemState::Done,
-                kind: ItemKind::UserMessage { text: text.to_owned(), origin: crate::model::origin(text) },
+                kind: ItemKind::UserMessage { text: text.to_owned(), origin: if summary { Origin::Summary } else { crate::model::origin(text) }, attachments },
             });
         }
         out
@@ -152,6 +195,46 @@ fn unwrap_paste(text: &str) -> &str {
 }
 
 
+/// What is between `<name>` and `</name>`.
+fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let open = text.find(&format!("<{name}>"))? + name.len() + 2;
+    let end = text[open..].find(&format!("</{name}>"))?;
+    Some(&text[open..open + end])
+}
+
+/// A slash command as the CLI records it (`<command-name>/pong</command-name>`, its args), as typed: `/pong hello`.
+fn command_call(text: &str) -> Option<String> {
+    let name = tag(text, "command-name")?.trim();
+    let args = tag(text, "command-args").unwrap_or_default().trim();
+    Some(if args.is_empty() { name.to_owned() } else { format!("{name} {args}") })
+}
+
+/// The files Lila put at the end of a message as `@/absolute/path` (quoted when the path has spaces):
+/// the words before them, and the files. A mention of a relative path, or in the middle of the words, stays words.
+fn split_attachments(text: &str) -> (&str, Vec<Attachment>) {
+    let mut files: Vec<Attachment> = Vec::new();
+    let mut rest = text.trim_end();
+    loop {
+        let (head, token) = if let Some(body) = rest.strip_suffix('"') {
+            // `@"/path with spaces"`
+            match body.rfind("@\"/") {
+                Some(at) => (&rest[..at], &body[at + 2..]),
+                None => break,
+            }
+        } else {
+            let at = rest.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+            match rest[at..].strip_prefix("@/") {
+                Some(_) => (&rest[..at], &rest[at + 1..]),
+                None => break,
+            }
+        };
+        files.push(Attachment::file(token));
+        rest = head.trim_end();
+    }
+    files.reverse();
+    (rest, files)
+}
+
 /// The tool's kind and a one-line title from its input.
 pub fn describe(name: &str, input: &Value) -> (ToolKind, String) {
     let field = |k: &str| input[k].as_str().unwrap_or_default().lines().next().unwrap_or_default().to_owned();
@@ -211,7 +294,7 @@ mod tests {
         let start = t.feed(&line(json!({"type": "user", "uuid": "u1", "promptId": "p1", "timestamp": "2026-11-09T08:48:49.835Z",
             "message": {"role": "user", "content": "<lila task=\"T3\" from=\"pm\" file=\".lila/tasks/T3.md\">\nFix median\n</lila>"}})));
         assert_eq!(start.len(), 1);
-        assert_eq!(start[0].kind, ItemKind::UserMessage { text: "<lila task=\"T3\" from=\"pm\" file=\".lila/tasks/T3.md\">\nFix median\n</lila>".into(), origin: Origin::Lila { task: Some("T3".into()) } });
+        assert_eq!(start[0].kind, ItemKind::UserMessage { text: "<lila task=\"T3\" from=\"pm\" file=\".lila/tasks/T3.md\">\nFix median\n</lila>".into(), origin: Origin::Lila { task: Some("T3".into()) }, attachments: vec![] });
         assert_eq!((start[0].turn.as_deref(), start[0].at_ms), (Some("p1"), 1_794_214_129_835));
 
         let call = t.feed(&line(json!({"type": "assistant", "uuid": "a1", "timestamp": "2026-11-09T08:48:51.735Z",
@@ -261,7 +344,7 @@ mod tests {
             assert!(t.feed(&l).is_empty(), "{l}");
         }
         let typed = t.feed(&json!({"type": "user", "uuid": "p", "message": {"content": [{"type": "text", "text": "  what changed?  "}]}}).to_string());
-        assert_eq!(typed[0].kind, ItemKind::UserMessage { text: "what changed?".into(), origin: Origin::Person });
+        assert_eq!(typed[0].kind, ItemKind::UserMessage { text: "what changed?".into(), origin: Origin::Person, attachments: vec![] });
     }
 
     #[test]
@@ -269,8 +352,71 @@ mod tests {
         let mut t = Transcript::new();
         let pasted = "<pasted_content id=\"c851\">\n<lila task=\"T1\" from=\"human\">\nCreate hello.txt\n</lila>\n</pasted_content id=\"c851\">";
         let got = t.feed(&json!({"type": "user", "uuid": "u", "message": {"content": pasted}}).to_string());
-        assert_eq!(got[0].kind, ItemKind::UserMessage { text: "<lila task=\"T1\" from=\"human\">\nCreate hello.txt\n</lila>".into(), origin: Origin::Lila { task: Some("T1".into()) } });
+        assert_eq!(got[0].kind, ItemKind::UserMessage { text: "<lila task=\"T1\" from=\"human\">\nCreate hello.txt\n</lila>".into(), origin: Origin::Lila { task: Some("T1".into()) }, attachments: vec![] });
         assert_eq!(unwrap_paste("plain"), "plain");
+    }
+
+    #[test]
+    fn the_context_summary_after_a_compaction_is_not_something_the_person_said() {
+        let mut t = Transcript::new();
+        let words = "This session is being continued from a previous conversation that ran out of context.";
+        let got = t.feed(&json!({"type": "user", "uuid": "s", "promptId": "p9", "isCompactSummary": true, "isVisibleInTranscriptOnly": true, "message": {"role": "user", "content": words}}).to_string());
+        assert_eq!(got[0].kind, ItemKind::UserMessage { text: words.into(), origin: Origin::Summary, attachments: vec![] });
+        // Told by the flag, not by the words: the same words typed are the person's.
+        let typed = t.feed(&json!({"type": "user", "uuid": "u", "promptId": "p10", "message": {"role": "user", "content": words}}).to_string());
+        assert_eq!(typed[0].kind, ItemKind::UserMessage { text: words.into(), origin: Origin::Person, attachments: vec![] });
+        assert_eq!(serde_json::to_value(&got[0]).unwrap()["from"], "summary");
+        // It starts no turn: the next call belongs to the turn the person's message began.
+        let call = t.feed(&json!({"type": "assistant", "uuid": "a", "message": {"content": [{"type": "tool_use", "id": "x", "name": "Bash", "input": {"command": "ls"}}]}}).to_string());
+        assert_eq!(call[0].turn.as_deref(), Some("p10"));
+    }
+
+    #[test]
+    fn files_lila_put_at_the_end_of_a_message_are_its_attachments() {
+        let mut t = Transcript::new();
+        let sent = |t: &mut Transcript, text: &str| t.feed(&json!({"type": "user", "uuid": "u", "message": {"content": text}}).to_string());
+        let got = sent(&mut t, "What is in these? @/tmp/a/note.txt @\"/tmp/b c/red one.png\"");
+        assert_eq!(
+            got[0].kind,
+            ItemKind::UserMessage {
+                text: "What is in these?".into(),
+                origin: Origin::Person,
+                attachments: vec![Attachment::file("/tmp/a/note.txt"), Attachment::file("/tmp/b c/red one.png")],
+            }
+        );
+        assert_eq!(Attachment::file("/tmp/b c/red one.png").kind, AttachmentKind::Image);
+        assert_eq!(Attachment::file("/tmp/b c/red one.png").label(), "red one.png");
+        // Typed mentions, relative or in the middle of the words, are words.
+        let words = "look at @src/main.rs and @/abs/file.rs please";
+        assert_eq!(split_attachments(words), (words, vec![]));
+        assert_eq!(split_attachments("see @src/main.rs"), ("see @src/main.rs", vec![]));
+    }
+
+    #[test]
+    fn slash_commands_show_as_typed_and_what_they_printed_as_a_note() {
+        let mut t = Transcript::new();
+        // A custom command: the call (in either tag order), and the expanded prompt that is bookkeeping.
+        let call = t.feed(&json!({"type": "user", "uuid": "c", "message": {"content": "<command-message>pong</command-message>\n<command-name>/pong</command-name>\n<command-args>hello</command-args>"}}).to_string());
+        assert_eq!(call[0].kind, ItemKind::UserMessage { text: "/pong hello".into(), origin: Origin::Person, attachments: vec![] });
+        assert!(t.feed(&json!({"type": "user", "uuid": "e", "isMeta": true, "message": {"content": [{"type": "text", "text": "Reply with PONG-CMD"}]}}).to_string()).is_empty());
+        // A command the CLI runs itself: recorded as `system`, the call and then its output.
+        let ran = t.feed(&json!({"type": "system", "subtype": "local_command", "uuid": "s1", "content": "<command-name>/compact</command-name>\n <command-message>compact</command-message>\n <command-args></command-args>"}).to_string());
+        assert_eq!(ran[0].kind, ItemKind::UserMessage { text: "/compact".into(), origin: Origin::Person, attachments: vec![] });
+        let out = t.feed(&json!({"type": "system", "subtype": "local_command", "uuid": "s2", "content": "<local-command-stdout>\u{1b}[1mNot enough\u{1b}[22m messages to compact.</local-command-stdout>"}).to_string());
+        assert_eq!(out[0].kind, ItemKind::UserMessage { text: "Not enough messages to compact.".into(), origin: Origin::Local, attachments: vec![] });
+        assert_eq!(serde_json::to_value(&out[0]).unwrap()["from"], "local");
+        let empty = t.feed(&json!({"type": "system", "subtype": "local_command", "uuid": "s3", "content": "<local-command-stdout></local-command-stdout>"}).to_string());
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn the_model_is_the_one_that_wrote_the_latest_reply() {
+        let mut t = Transcript::new();
+        assert_eq!(t.model(), None);
+        t.feed(&json!({"type": "assistant", "uuid": "a", "message": {"model": "claude-haiku-5-5", "content": [{"type": "text", "text": "hi"}]}}).to_string());
+        assert_eq!(t.model(), Some("claude-haiku-5-5"));
+        t.feed(&json!({"type": "assistant", "uuid": "b", "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "x"}]}}).to_string());
+        assert_eq!(t.model(), Some("claude-haiku-5-5"), "a made-up reply names none");
     }
 
     #[test]

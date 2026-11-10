@@ -22,6 +22,8 @@ enum Asked {
     Initialize,
     Session { load: bool },
     Prompt,
+    /// `session/set_config_option`: the model or the effort.
+    SetConfig,
 }
 
 /// Text being streamed (a reply, a thought, the person's words on a load), until it ends.
@@ -45,10 +47,16 @@ pub struct Acp {
     next: u64,
     asked: HashMap<u64, Asked>,
     can_load: bool,
+    /// The agent takes images in a prompt (`promptCapabilities.image`).
+    can_image: bool,
+    /// The ids of the session's model and thought-level options, once it lists them.
+    model_option: Option<String>,
+    effort_option: Option<String>,
     session: Option<String>,
     /// The prompt under way (its request id), if any.
     turn: Option<String>,
     queue: Vec<String>,
+    queue_files: Vec<Attachment>,
     approvals: Vec<(String, Value)>,
     status: HostStatus,
     stream: Option<Stream>,
@@ -57,6 +65,9 @@ pub struct Acp {
     /// The time of the last input, for items made on a command.
     clock: i64,
 }
+
+/// Largest image sent inline; a bigger one goes as a link.
+const MAX_IMAGE: usize = 8 << 20;
 
 /// How often a reply being streamed is shown again.
 const SHOW_EVERY_MS: i64 = 800;
@@ -68,9 +79,13 @@ impl Acp {
             next: 0,
             asked: HashMap::new(),
             can_load: false,
+            can_image: false,
+            model_option: None,
+            effort_option: None,
             session: None,
             turn: None,
             queue: Vec::new(),
+            queue_files: Vec::new(),
             approvals: Vec::new(),
             status: HostStatus::Working,
             stream: None,
@@ -118,25 +133,50 @@ impl Acp {
             return;
         }
         let text = std::mem::take(&mut self.queue).join("\n\n");
-        let id = self.request(step, Asked::Prompt, "session/prompt", json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}));
+        let files = std::mem::take(&mut self.queue_files);
+        let mut blocks = vec![json!({"type": "text", "text": text})];
+        blocks.extend(files.iter().filter_map(|f| self.block(f)));
+        let id = self.request(step, Asked::Prompt, "session/prompt", json!({"sessionId": session, "prompt": blocks}));
         let turn = format!("prompt-{id}");
         self.turn = Some(turn.clone());
         self.status = HostStatus::Working;
         step.events.push(AgentEvent::TurnStarted { turn: turn.clone() });
         // ACP doesn't echo the prompt back: it is the turn's first item.
         let said = text.trim().to_owned();
-        let item = Item { id: format!("{turn}-said"), turn: Some(turn), at_ms: self.clock, state: ItemState::Done, kind: ItemKind::UserMessage { origin: origin(&said), text: said } };
+        let item = Item { id: format!("{turn}-said"), turn: Some(turn), at_ms: self.clock, state: ItemState::Done, kind: ItemKind::UserMessage { origin: origin(&said), text: said, attachments: files } };
         step.events.push(AgentEvent::Item { item });
+    }
+
+    /// A file as a prompt block: an image the agent takes, inline; any other file as a link it reads itself.
+    fn block(&self, f: &Attachment) -> Option<Value> {
+        let uri = format!("file://{}", f.path);
+        if f.kind == AttachmentKind::Skill {
+            return None;
+        }
+        if f.kind == AttachmentKind::Image
+            && self.can_image
+            && let Some(mime) = image_mime(&f.path)
+            && let Ok(bytes) = std::fs::read(&f.path)
+            && bytes.len() <= MAX_IMAGE
+        {
+            return Some(json!({"type": "image", "data": base64(&bytes), "mimeType": mime, "uri": uri}));
+        }
+        Some(json!({"type": "resource_link", "uri": uri, "name": f.label()}))
     }
 
     pub fn command(&mut self, c: Command, now_ms: i64) -> Step {
         self.clock = now_ms;
         let mut step = Step::default();
         match c {
-            Command::Prompt { text } => {
+            Command::Prompt { text, attachments } => {
                 self.queue.push(text);
+                self.queue_files.extend(attachments);
                 self.flush(&mut step);
             }
+            Command::SetModel { model } => self.set_config(&mut step, self.model_option.clone(), model),
+            Command::SetEffort { effort } => self.set_config(&mut step, self.effort_option.clone(), effort),
+            // The agent has `/compact` among its commands, sent as words.
+            Command::Compact => {}
             Command::Interrupt => {
                 if let (Some(session), Some(_)) = (self.session.clone(), self.turn.as_ref()) {
                     step.send.push(json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session}}));
@@ -159,6 +199,36 @@ impl Acp {
             }
         }
         step
+    }
+
+    fn set_config(&mut self, step: &mut Step, option: Option<String>, value: String) {
+        if let (Some(session), Some(option)) = (self.session.clone(), option) {
+            self.request(step, Asked::SetConfig, "session/set_config_option", json!({"sessionId": session, "configId": option, "value": value}));
+        }
+    }
+
+    /// The model and effort the agent lists in `configOptions`, as an event (and the ids to set them by).
+    fn config_event(&mut self, options: &[acp::SessionConfigOption]) -> Option<AgentEvent> {
+        let mut ev = AgentEvent::Config { model: None, effort: None, models: Vec::new(), efforts: Vec::new() };
+        let AgentEvent::Config { model, effort, models, efforts } = &mut ev else { unreachable!() };
+        for o in options {
+            let acp::SessionConfigKind::Select(sel) = &o.kind else { continue };
+            let acp::SessionConfigSelectOptions::Ungrouped(list) = &sel.options else { continue };
+            let choices: Vec<Choice> = list.iter().map(|c| Choice { id: c.value.0.to_string(), name: c.name.clone() }).collect();
+            let current = Some(sel.current_value.0.to_string());
+            match o.category {
+                Some(acp::SessionConfigOptionCategory::Model) => {
+                    self.model_option = Some(o.id.0.to_string());
+                    (*model, *models) = (current, choices);
+                }
+                Some(acp::SessionConfigOptionCategory::ThoughtLevel) => {
+                    self.effort_option = Some(o.id.0.to_string());
+                    (*effort, *efforts) = (current, choices);
+                }
+                _ => {}
+            }
+        }
+        (model.is_some() || effort.is_some()).then_some(ev)
     }
 
     /// Called now and then: a reply streamed in small pieces is shown as it grows.
@@ -197,6 +267,7 @@ impl Acp {
                     return;
                 }
                 self.can_load = r["agentCapabilities"]["loadSession"] == true;
+                self.can_image = r["agentCapabilities"]["promptCapabilities"]["image"] == true;
                 self.open_session(step);
             }
             Asked::Session { load } => {
@@ -218,8 +289,22 @@ impl Acp {
                 if let Some(id) = self.session.clone() {
                     step.events.push(AgentEvent::Session { id });
                 }
+                if let Ok(options) = serde_json::from_value::<Vec<acp::SessionConfigOption>>(r["configOptions"].clone())
+                    && let Some(ev) = self.config_event(&options)
+                {
+                    step.events.push(ev);
+                }
                 self.status = HostStatus::Idle;
                 self.flush(step);
+            }
+            Asked::SetConfig => {
+                if let Some(e) = err {
+                    step.events.push(AgentEvent::Notice { text: e });
+                } else if let Ok(options) = serde_json::from_value::<Vec<acp::SessionConfigOption>>(r["configOptions"].clone())
+                    && let Some(ev) = self.config_event(&options)
+                {
+                    step.events.push(ev);
+                }
             }
             Asked::Prompt => {
                 self.end_stream(step, now_ms);
@@ -357,6 +442,19 @@ impl Acp {
                 }
                 step.events.push(AgentEvent::Item { item });
             }
+            acp::SessionUpdate::AvailableCommandsUpdate(u) => {
+                let commands = u
+                    .available_commands
+                    .into_iter()
+                    .map(|c| SlashCommand { name: c.name, description: c.description, hint: c.input.and_then(|i| match i { acp::AvailableCommandInput::Unstructured(i) => Some(i.hint), _ => None }) })
+                    .collect();
+                step.events.push(AgentEvent::Commands { commands });
+            }
+            acp::SessionUpdate::ConfigOptionUpdate(u) => {
+                if let Some(ev) = self.config_event(&u.config_options) {
+                    step.events.push(ev);
+                }
+            }
             acp::SessionUpdate::Plan(plan) => {
                 self.end_stream(step, now_ms);
                 let text = plan
@@ -380,7 +478,7 @@ fn stream_item(s: &Stream, turn: Option<String>, state: ItemState) -> Item {
     let kind = match s.kind {
         StreamKind::Reply => ItemKind::AgentMessage { text },
         StreamKind::Thought => ItemKind::Thought { text },
-        StreamKind::User => ItemKind::UserMessage { origin: origin(&text), text },
+        StreamKind::User => ItemKind::UserMessage { origin: origin(&text), text, attachments: Vec::new() },
     };
     Item { id: s.id.clone(), turn, at_ms: s.at_ms, state, kind }
 }
@@ -471,7 +569,7 @@ mod tests {
         let mut a = Acp::new(Options { cwd: "/r".into(), session: None });
         let init = a.start();
         assert_eq!(methods(&init), ["initialize"]);
-        assert!(a.command(Command::Prompt { text: "<lila task=\"T1\">\nGo\n</lila>".into() }, 0).send.is_empty(), "waits for the session");
+        assert!(a.command(Command::Prompt { text: "<lila task=\"T1\">\nGo\n</lila>".into(), attachments: vec![] }, 0).send.is_empty(), "waits for the session");
         let new = reply(&mut a, &init, json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}));
         assert_eq!(methods(&new), ["session/new"]);
         let open = reply(&mut a, &new, json!({"sessionId": "s1"}));
@@ -482,7 +580,7 @@ mod tests {
             "the prompt is the turn's first item: {:?}",
             open.events
         );
-        assert!(a.command(Command::Prompt { text: "and docs".into() }, 0).send.is_empty(), "one prompt at a time");
+        assert!(a.command(Command::Prompt { text: "and docs".into(), attachments: vec![] }, 0).send.is_empty(), "one prompt at a time");
         // The reply streams in pieces: shown as it grows, then whole.
         update(&mut a, json!({"sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": {"type": "text", "text": "Read"}}), 100);
         update(&mut a, json!({"sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": {"type": "text", "text": "ing it."}}), 200);
@@ -498,6 +596,73 @@ mod tests {
         assert!(end.events.contains(&AgentEvent::Usage { input: 10, output: 2, cached: 5 }));
         assert_eq!(methods(&end), ["session/prompt"], "then what waited");
         assert_eq!(end.send[0]["params"]["prompt"][0]["text"], "and docs");
+    }
+
+    /// What omp answers to `initialize` and `session/new` (checked on omp 18.18.3), shortened.
+    fn open_session(image: bool) -> (Acp, Step) {
+        let mut a = Acp::new(Options { cwd: "/r".into(), session: None });
+        let init = a.start();
+        let new = reply(&mut a, &init, json!({"agentCapabilities": {"promptCapabilities": {"image": image, "embeddedContext": true}}}));
+        let config = json!({"configOptions": [
+            {"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": "default", "options": [{"value": "default", "name": "Default"}]},
+            {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "magpie/codex/gpt-6.1-sol",
+             "options": [{"value": "magpie/codex/gpt-6.1-sol", "name": "GPT-6.1-Sol"}, {"value": "magpie/codex/gpt-6-luna", "name": "GPT-6-Luna"}]},
+            {"id": "thinking", "name": "Thinking", "category": "thought_level", "type": "select", "currentValue": "high",
+             "options": [{"value": "off", "name": "Off"}, {"value": "low", "name": "low"}, {"value": "high", "name": "high"}]}],
+            "sessionId": "s1"});
+        let open = reply(&mut a, &new, config);
+        (a, open)
+    }
+
+    #[test]
+    fn the_model_and_effort_are_what_the_agent_lists_and_are_set_by_its_option_ids() {
+        let (mut a, open) = open_session(true);
+        let Some(AgentEvent::Config { model, effort, models, efforts }) = open.events.iter().find(|e| matches!(e, AgentEvent::Config { .. })) else { panic!("{:?}", open.events) };
+        assert_eq!((model.as_deref(), effort.as_deref()), (Some("magpie/codex/gpt-6.1-sol"), Some("high")));
+        assert_eq!((models.len(), efforts.iter().map(|c| c.id.as_str()).collect::<Vec<_>>()), (2, vec!["off", "low", "high"]));
+        let set = a.command(Command::SetModel { model: "magpie/codex/gpt-6-luna".into() }, 0);
+        assert_eq!(set.send[0]["method"], "session/set_config_option");
+        assert_eq!(set.send[0]["params"], json!({"sessionId": "s1", "configId": "model", "value": "magpie/codex/gpt-6-luna"}));
+        assert_eq!(a.command(Command::SetEffort { effort: "low".into() }, 0).send[0]["params"]["configId"], "thinking");
+        // Its answer holds the options as they stand now.
+        let id = set.send[0]["id"].as_u64().unwrap();
+        let done = a.on_message(&json!({"jsonrpc": "2.0", "id": id, "result": {"configOptions": [{"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "magpie/codex/gpt-6-luna", "options": [{"value": "magpie/codex/gpt-6-luna", "name": "GPT-6-Luna"}]}]}}), 0);
+        assert!(matches!(&done.events[0], AgentEvent::Config { model: Some(m), .. } if m == "magpie/codex/gpt-6-luna"));
+        // A refusal is a notice, not a change.
+        let id = a.command(Command::SetModel { model: "nope".into() }, 0).send[0]["id"].as_u64().unwrap();
+        let bad = a.on_message(&json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "unknown model"}}), 0);
+        assert_eq!(bad.events, [AgentEvent::Notice { text: "unknown model".into() }]);
+    }
+
+    #[test]
+    fn declared_commands_are_passed_on_and_files_go_as_images_or_links() {
+        let (mut a, _) = open_session(true);
+        let cmds = update(&mut a, json!({"sessionUpdate": "available_commands_update", "availableCommands": [
+            {"name": "compact", "description": "Compact the conversation", "input": {"hint": "[focus]"}}, {"name": "tools", "description": "Show available tools"}]}), 0);
+        assert_eq!(
+            cmds.events,
+            [AgentEvent::Commands { commands: vec![
+                SlashCommand { name: "compact".into(), description: "Compact the conversation".into(), hint: Some("[focus]".into()) },
+                SlashCommand { name: "tools".into(), description: "Show available tools".into(), hint: None }] }]
+        );
+        let dir = std::env::temp_dir().join(format!("lila-acp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (png, md) = (dir.join("a.png"), dir.join("n.md"));
+        std::fs::write(&png, b"\x89PNG").unwrap();
+        std::fs::write(&md, "hi").unwrap();
+        let files = vec![Attachment::file(png.to_str().unwrap()), Attachment::file(md.to_str().unwrap())];
+        let sent = a.command(Command::Prompt { text: "look".into(), attachments: files.clone() }, 5);
+        let prompt = &sent.send[0]["params"]["prompt"];
+        assert_eq!(prompt[0], json!({"type": "text", "text": "look"}));
+        assert_eq!((prompt[1]["type"].as_str(), prompt[1]["mimeType"].as_str(), prompt[1]["data"].as_str()), (Some("image"), Some("image/png"), Some("iVBORw==")));
+        assert_eq!(prompt[2], json!({"type": "resource_link", "uri": format!("file://{}", md.display()), "name": "n.md"}));
+        let said = sent.events.iter().find_map(|e| match e { AgentEvent::Item { item } => Some(item), _ => None }).unwrap();
+        assert!(matches!(&said.kind, ItemKind::UserMessage { attachments, .. } if *attachments == files));
+        // An agent without image input gets the image as a link.
+        let (mut plain, _) = open_session(false);
+        let sent = plain.command(Command::Prompt { text: "look".into(), attachments: files[..1].to_vec() }, 5);
+        assert_eq!(sent.send[0]["params"]["prompt"][1]["type"], "resource_link");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

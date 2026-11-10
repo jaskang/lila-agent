@@ -6,6 +6,7 @@ struct Fake {
     runs: Vec<Value>,
     sends: Vec<(String, String, Option<String>)>,
     kills: Vec<String>,
+    keys: Vec<(String, Vec<String>)>,
     refuse_sends: bool,
     /// Live terminals left over from before this daemon loaded a project.
     existing: Vec<Value>,
@@ -38,6 +39,10 @@ impl Terminals for Fake {
     }
     fn kill(&mut self, terminal: &str) -> Result<()> {
         self.kills.push(terminal.into());
+        Ok(())
+    }
+    fn keys(&mut self, terminal: &str, keys: &[&str]) -> Result<()> {
+        self.keys.push((terminal.into(), keys.iter().map(|k| k.to_string()).collect()));
         Ok(())
     }
 }
@@ -114,6 +119,11 @@ impl World {
 
     fn call(&mut self, member: Option<&str>, method: &str, mut params: Value) -> Result<Value> {
         self.now += 1000;
+        // The PM says what done looks like for work that gets verified, or lilad
+        // refuses it. Tests about something else get one here; `"accept": []` asks for none.
+        if method == "task.new" && member == Some("owner") && params.get("accept").is_none() {
+            params["accept"] = json!(["it works"]);
+        }
         params["caller"] = self.caller(member);
         self.d.handle(method, &params, self.now)
     }
@@ -166,7 +176,7 @@ impl World {
     fn sends_to(&self, member: &str) -> Vec<String> {
         if self.d.hosted("shop", member) {
             return self.commands(member).into_iter().filter_map(|c| match c {
-                lila_agent::Command::Prompt { text } => Some(text),
+                lila_agent::Command::Prompt { text, .. } => Some(text),
                 _ => None,
             }).collect();
         }
@@ -353,7 +363,7 @@ fn the_persons_words_and_the_bar_reach_every_step() {
     w.ok(None, "project.up", json!({"brief": "加一个登录页\n用邮箱和密码"}));
     w.all_idle();
     // Work under the person's task carries their words without the PM copying them.
-    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1"}));
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1", "accept": []}));
     w.ok(Some("engineer"), "task.new", json!({"to": "tester", "title": "Verify login", "parent": "T2", "body": "I changed src/login.rs"}));
     w.ok(Some("engineer"), "task.done", json!({"id": "T2", "summary": "built"}));
     let to_tester = w.sends_to("tester").into_iter().find(|s| s.contains("<lila task=\"T3\"")).unwrap();
@@ -845,7 +855,7 @@ fn sandboxed_members_talk_through_the_spool() {
     let gi = std::fs::read_to_string(w.repo.join(".lila/.gitignore")).unwrap();
     assert!(gi.contains("tasks/") && gi.contains("spool/"));
     let caller = json!({"cwd": w.repo.to_string_lossy(), "project": "shop", "member": "owner"});
-    let id = crate::client::write_spool(&dir, "task.new", &json!({"caller": caller, "to": "engineer", "title": "via spool"})).unwrap();
+    let id = crate::client::write_spool(&dir, "task.new", &json!({"caller": caller, "to": "engineer", "title": "via spool", "accept": ["it works"]})).unwrap();
     let bad = crate::client::write_spool(&dir, "task.done", &json!({"caller": caller, "id": "T9", "summary": "s"})).unwrap();
     w.d.process_spool(w.now);
     let v = crate::client::await_spool(&dir, &id, std::time::Duration::from_secs(1)).unwrap();
@@ -1218,6 +1228,41 @@ fn which_work_runs_a_flow() {
     let inbox = w.ok(None, "inbox", json!({}));
     assert_eq!(inbox[0]["kind"], "review");
     assert_eq!(inbox[0]["text"], "T4「Fix the footer」做完了：fixed\n· T5 tester：PASS");
+}
+
+#[test]
+fn verified_work_from_the_pm_says_what_done_looks_like() {
+    let mut w = world();
+    w.ok(None, "project.up", json!({"brief": "加一个登录页"}));
+    w.all_idle();
+    // The person's words are not a bar: the PM names one, here or above.
+    let e = w.call(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1", "accept": []})).unwrap_err();
+    assert!(e.to_string().contains("--accept") && e.to_string().contains("--flow quick"), "{e}");
+    assert!(w.d.store.task("shop", "T2").unwrap().is_none(), "nothing was created");
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Build login", "parent": "T1", "accept": ["401 on a bad password"]}));
+    // Under it, the bar is already set.
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Login: fix the redirect", "parent": "T2", "accept": []}));
+    // No verdict at the end, or no flow: nothing to judge against.
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Rename", "flow": "quick", "accept": []}));
+    w.ok(Some("owner"), "task.new", json!({"to": "engineer", "title": "Docs", "flow": "none", "accept": []}));
+    w.ok(Some("owner"), "task.new", json!({"to": "architect", "title": "Design", "accept": []}));
+    // The person's own task is their words.
+    w.ok(None, "task.new", json!({"to": "engineer", "title": "Fix the footer"}));
+}
+
+#[test]
+fn a_verdict_from_the_authors_own_models_is_marked_on_the_card() {
+    let same = PROJECT.replace("id = \"tester\"\nrole = \"tester\"", "id = \"tester\"\nrole = \"tester\"\nruntime = \"claude\"\nmodel = \"claude-sonnet-5-5\"");
+    assert_ne!(same, PROJECT);
+    let mut w = world_with(&same);
+    w.up();
+    w.all_idle();
+    w.ok(None, "task.new", json!({"to": "engineer", "title": "Fix the footer"}));
+    w.status("engineer", "idle");
+    w.ok(Some("engineer"), "task.done", json!({"id": "T1", "summary": "fixed"}));
+    w.ok(Some("tester"), "task.done", json!({"id": "T2", "summary": "PASS", "verdict": "pass"}));
+    let inbox = w.ok(None, "inbox", json!({}));
+    assert_eq!(inbox[0]["text"], "T1「Fix the footer」做完了：fixed\n· T2 tester：PASS\n· 同源验证：tester 和 engineer 是同一家模型");
 }
 
 #[test]
@@ -2047,6 +2092,27 @@ fn the_person_writes_to_a_member_unless_it_waits_on_a_dialog() {
 }
 
 #[test]
+fn the_person_stops_a_member_mid_turn_whichever_runtime_it_runs() {
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    // Idle: nothing to stop, and no key is pressed (Esc would clear what is typed at its prompt).
+    let err = w.call(None, "conversation.interrupt", json!({"member": "engineer"})).unwrap_err();
+    assert!(err.to_string().contains("not working"), "{err:#}");
+    assert!(w.d.term.keys.is_empty());
+    // Claude Code runs in a terminal: its stop key is Esc.
+    w.status("engineer", "working");
+    w.ok(None, "conversation.interrupt", json!({"member": "engineer"}));
+    assert_eq!(w.d.term.keys, [(w.terminal("engineer"), vec!["esc".to_string()])]);
+    // Codex goes through its host: told to interrupt, no key pressed.
+    w.status("tester", "working");
+    w.ok(None, "conversation.interrupt", json!({"member": "tester"}));
+    assert_eq!(w.commands("tester").last(), Some(&lila_agent::Command::Interrupt));
+    assert_eq!(w.d.term.keys.len(), 1);
+    assert!(w.call(None, "conversation.interrupt", json!({"member": "nobody"})).is_err());
+}
+
+#[test]
 fn a_codex_members_host_reports_its_thread_items_and_permissions() {
     use lila_agent::{AgentEvent, Command, Item, ItemKind, ItemState, PermOption, PermissionRequest, ToolKind};
     let mut w = world();
@@ -2161,4 +2227,169 @@ role = "deep"
     assert!(w.sends_to("deep").last().unwrap().contains("Try it"), "to its host");
     let caps = &w.ok(None, "conversation.read", json!({"member": "deep"}))["caps"];
     assert_eq!((caps["gui"].as_bool(), caps["tui"].as_bool(), caps["steer"].as_bool()), (Some(true), Some(false), Some(false)));
+}
+
+// ---------------- the box under the conversation ----------------
+
+/// A git repository in the project folder, with a file git ignores and files it knows.
+fn repo_with_files(w: &World) {
+    let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&w.repo).args(args).output().unwrap().status.success(), "git {args:?}");
+    git(&["init", "-q"]);
+    std::fs::write(w.repo.join(".gitignore"), "ignored.txt\ntarget/\n").unwrap();
+    std::fs::create_dir_all(w.repo.join("src")).unwrap();
+    std::fs::create_dir_all(w.repo.join("target")).unwrap();
+    for f in ["a.rs", "ignored.txt", "src/b.rs", "target/out.o", "notes with space.md"] {
+        std::fs::write(w.repo.join(f), "x").unwrap();
+    }
+    git(&["add", "a.rs"]);
+}
+
+#[test]
+fn files_go_along_as_mentions_for_claude_and_as_inputs_for_a_host() {
+    use lila_agent::{Attachment, AttachmentKind, Command};
+    let mut w = world();
+    repo_with_files(&w);
+    w.up();
+    w.all_idle();
+    let img = w._tmp.path().join("shot one.png");
+    let note = w._tmp.path().join("note.txt");
+    std::fs::write(&img, "png").unwrap();
+    std::fs::write(&note, "n").unwrap();
+    let (img_s, note_s) = (img.to_string_lossy().to_string(), note.to_string_lossy().to_string());
+    // Claude Code: after the words, `@path` (quoted with spaces); only files that exist, by absolute path.
+    w.ok(None, "conversation.send", json!({"member": "engineer", "text": "look at these", "attachments": [note_s, img_s]}));
+    assert_eq!(w.sends_to("engineer").last().unwrap(), &format!("look at these @{note_s} @\"{img_s}\""));
+    w.ok(None, "conversation.send", json!({"member": "engineer", "text": "", "attachments": [note_s]}));
+    assert_eq!(w.sends_to("engineer").last().unwrap(), &format!("@{note_s}"), "files alone are a message");
+    for bad in [json!(["relative.txt"]), json!(["/no/such/file"]), json!([w._tmp.path().to_string_lossy()])] {
+        let err = w.call(None, "conversation.send", json!({"member": "engineer", "text": "x", "attachments": bad})).unwrap_err();
+        assert!(err.to_string().contains("is not a file"), "{err:#}");
+    }
+    assert!(w.call(None, "conversation.send", json!({"member": "engineer", "text": " ", "attachments": []})).is_err());
+    // Codex: its host gets the files as attachments; `@relative` words that name a file in its folder come too,
+    // and `$skill` calls become the skill's input.
+    std::fs::create_dir_all(w.repo.join(".agents/skills/tdd")).unwrap();
+    std::fs::write(w.repo.join(".agents/skills/tdd/SKILL.md"), "---\nname: tdd\ndescription: test first\n---\n").unwrap();
+    w.status("tester", "idle");
+    w.ok(None, "conversation.send", json!({"member": "tester", "text": "$tdd check @a.rs and @missing.rs, see @src/b.rs and @\"notes with space.md\"", "attachments": [img_s]}));
+    let Some(Command::Prompt { text, attachments }) = w.commands("tester").pop() else { panic!("a prompt") };
+    assert_eq!(text, "$tdd check @a.rs and @missing.rs, see @src/b.rs and @\"notes with space.md\"");
+    let got: Vec<(&str, AttachmentKind)> = attachments.iter().map(|a| (a.name.as_str(), a.kind)).collect();
+    assert_eq!(got, [("shot one.png", AttachmentKind::Image), ("a.rs", AttachmentKind::File), ("src/b.rs", AttachmentKind::File), ("notes with space.md", AttachmentKind::File), ("tdd", AttachmentKind::Skill)]);
+    assert_eq!(attachments[1], Attachment { path: w.repo.join("a.rs").to_string_lossy().to_string(), name: "a.rs".into(), kind: AttachmentKind::File });
+}
+
+#[test]
+fn files_for_the_at_menu_are_the_ones_git_would_not_ignore() {
+    let mut w = world();
+    repo_with_files(&w);
+    w.up();
+    w.all_idle();
+    let r = w.ok(None, "conversation.files", json!({"member": "engineer"}));
+    let files: Vec<&str> = r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
+    // Tracked and untracked, but not ignored; relative to the folder the member works in.
+    assert_eq!(files, [".gitignore", ".lila/.gitignore", ".lila/project.toml", "a.rs", "notes with space.md", "src/b.rs"]);
+    assert!(w.call(None, "conversation.files", json!({"member": "nobody"})).is_err());
+}
+
+#[test]
+fn the_slash_menu_lists_what_each_runtime_can_run_without_a_terminal_dialog() {
+    use lila_agent::{AgentEvent, SlashCommand};
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    let list = |w: &mut World, m: &str| -> Vec<(String, String)> {
+        w.ok(None, "conversation.commands", json!({"member": m}))["commands"].as_array().unwrap().iter().map(|c| (c["kind"].as_str().unwrap().to_owned(), c["name"].as_str().unwrap().to_owned())).collect()
+    };
+    // Claude Code: /compact, then the user's and the project's skills and commands (never /model, /clear, /usage…).
+    let claude = w.d.sources.claude.clone();
+    std::fs::create_dir_all(claude.join("skills/review")).unwrap();
+    std::fs::write(claude.join("skills/review/SKILL.md"), "---\nname: review\ndescription: Review a change\n---\n").unwrap();
+    std::fs::create_dir_all(w.repo.join(".claude/commands")).unwrap();
+    std::fs::write(w.repo.join(".claude/commands/pong.md"), "---\ndescription: PONG\nargument-hint: [word]\n---\n$ARGUMENTS").unwrap();
+    let eng = list(&mut w, "engineer");
+    assert_eq!(eng, [("builtin".to_owned(), "compact".to_owned()), ("skill".into(), "review".into()), ("command".into(), "pong".into())]);
+    let pong = &w.ok(None, "conversation.commands", json!({"member": "engineer"}))["commands"][2];
+    assert_eq!((pong["insert"].as_str(), pong["hint"].as_str(), pong["description"].as_str()), (Some("/pong "), Some("[word]"), Some("PONG")));
+    assert_eq!(w.ok(None, "conversation.commands", json!({"member": "engineer"}))["commands"][0]["insert"], "/compact ");
+    // Codex: compact is a request of the protocol, not words; its skills are called with `$`.
+    std::fs::create_dir_all(w.repo.join(".agents/skills/tdd")).unwrap();
+    std::fs::write(w.repo.join(".agents/skills/tdd/SKILL.md"), "---\nname: tdd\ndescription: test first\n---\n").unwrap();
+    let tester = w.ok(None, "conversation.commands", json!({"member": "tester"}));
+    let c = tester["commands"].as_array().unwrap();
+    assert_eq!((c[0]["name"].as_str(), c[0]["action"].as_str(), c[0]["insert"].is_null()), (Some("compact"), Some("compact"), true));
+    let tdd = c.iter().find(|c| c["name"] == "tdd").expect("the repo's skill");
+    assert_eq!((tdd["kind"].as_str(), tdd["insert"].as_str()), (Some("skill"), Some("$tdd ")));
+    w.ok(None, "conversation.run", json!({"member": "tester", "action": "compact"}));
+    assert_eq!(w.commands("tester").last(), Some(&lila_agent::Command::Compact));
+    assert!(w.call(None, "conversation.run", json!({"member": "engineer", "action": "compact"})).is_err(), "Claude Code compacts by words");
+    // An ACP agent lists its own; `skill:name` ones are skills.
+    w.status("tester", "idle");
+    w.d.host_event("shop", "tester", AgentEvent::Commands { commands: vec![SlashCommand { name: "compact".into(), description: "Compact".into(), hint: Some("[focus]".into()) }, SlashCommand { name: "skill:tdd".into(), description: "TDD".into(), hint: Some("arguments".into()) }] }, w.now);
+    // (the tester is a Codex member; its declared commands are ignored there)
+    assert_eq!(list(&mut w, "tester")[0].1, "compact");
+}
+
+#[test]
+fn the_model_changes_for_the_session_where_the_runtime_can_and_the_role_comes_back_on_restart() {
+    use lila_agent::{AgentEvent, Choice, Command};
+    let mut w = world();
+    w.up();
+    w.all_idle();
+    // Claude Code: /model and /effort save the person's defaults, so Lila doesn't offer them; it shows what runs.
+    let err = w.call(None, "conversation.model", json!({"member": "engineer", "model": "claude-opus-5-5"})).unwrap_err();
+    assert!(err.to_string().contains("save the defaults"), "{err:#}");
+    let cfg = w.ok(None, "conversation.read", json!({"member": "engineer"}))["config"].clone();
+    assert_eq!((cfg["switch"].as_bool(), cfg["model"].as_str(), cfg["default_model"].as_str()), (Some(false), Some("claude-sonnet-5-5"), Some("claude-sonnet-5-5")));
+    // What its latest reply says it ran on is what it runs on.
+    let sid = w.d.projects["shop"].live["engineer"].session.clone().unwrap();
+    let file = crate::sessions::claude_file(&w.d.sources, &w.repo.to_string_lossy(), &sid);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, json!({"type": "assistant", "uuid": "a1", "message": {"model": "claude-haiku-5-5", "content": [{"type": "text", "text": "hi"}]}}).to_string() + "\n").unwrap();
+    w.d.process_spool(w.now);
+    let cfg = w.ok(None, "conversation.read", json!({"member": "engineer"}))["config"].clone();
+    assert_eq!((cfg["model"].as_str(), cfg["default_model"].as_str()), (Some("claude-haiku-5-5"), Some("claude-sonnet-5-5")));
+    // Codex: told to, and its host reports what it runs on.
+    w.status("tester", "idle");
+    w.ok(None, "conversation.model", json!({"member": "tester", "model": "gpt-6-luna", "effort": "low"}));
+    let got = w.commands("tester");
+    assert_eq!(got[got.len() - 2..], [Command::SetModel { model: "gpt-6-luna".into() }, Command::SetEffort { effort: "low".into() }]);
+    assert!(w.call(None, "conversation.model", json!({"member": "tester"})).is_err());
+    w.d.host_event("shop", "tester", AgentEvent::Config { model: Some("gpt-6-luna".into()), effort: Some("low".into()), models: vec![], efforts: vec![] }, w.now);
+    let cfg = w.ok(None, "conversation.read", json!({"member": "tester"}))["config"].clone();
+    assert_eq!((cfg["switch"].as_bool(), cfg["model"].as_str(), cfg["effort"].as_str()), (Some(true), Some("gpt-6-luna"), Some("low")));
+    assert_ne!(cfg["model"], cfg["default_model"]);
+    // A restart is a new session: the role's model again.
+    w.ok(None, "member.restart", json!({"member": "tester"}));
+    let cfg = w.ok(None, "conversation.read", json!({"member": "tester"}))["config"].clone();
+    assert_eq!(cfg["model"], cfg["default_model"]);
+    let _ = Choice { id: String::new(), name: String::new() };
+}
+
+#[test]
+fn an_omp_member_switches_only_among_the_models_it_lists() {
+    use lila_agent::{AgentEvent, Choice, Command};
+    let toml = "name = \"shop\"\n[[members]]\nid = \"owner\"\nrole = \"pm\"\n[[members]]\nid = \"deep\"\nrole = \"deep\"\n";
+    let mut w = world_with(toml);
+    std::fs::write(w.d.paths.roles().join("deep.toml"), "name = \"Deep\"\nruntime = \"omp\"\nmodel = \"magpie/codex/gpt-6.1-sol\"\n").unwrap();
+    std::fs::write(w.d.paths.roles().join("deep.md"), "You write code.\n").unwrap();
+    let omp = PathBuf::from(&w.d.path_env).join("omp");
+    std::fs::write(&omp, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    w.up();
+    w.status("deep", "idle");
+    let cfg = w.ok(None, "conversation.read", json!({"member": "deep"}))["config"].clone();
+    assert_eq!(cfg["switch"], false, "nothing listed yet: nothing to pick");
+    let choice = |id: &str| Choice { id: id.into(), name: id.to_uppercase() };
+    w.d.host_event("shop", "deep", AgentEvent::Config { model: Some("magpie/codex/gpt-6-luna".into()), effort: Some("high".into()), models: vec![choice("magpie/codex/gpt-6-luna"), choice("magpie/codex/gpt-6.1-sol")], efforts: vec![choice("low"), choice("high")] }, w.now);
+    w.d.host_event("shop", "deep", AgentEvent::Commands { commands: vec![lila_agent::SlashCommand { name: "compact".into(), description: "Compact".into(), hint: Some("[focus]".into()) }, lila_agent::SlashCommand { name: "skill:tdd".into(), description: "TDD".into(), hint: Some("arguments".into()) }] }, w.now);
+    let cfg = w.ok(None, "conversation.read", json!({"member": "deep"}))["config"].clone();
+    assert_eq!((cfg["switch"].as_bool(), cfg["model"].as_str(), cfg["effort"].as_str(), cfg["models"].as_array().map(Vec::len), cfg["efforts"][1]["id"].as_str()), (Some(true), Some("magpie/codex/gpt-6-luna"), Some("high"), Some(2), Some("high")));
+    w.ok(None, "conversation.model", json!({"member": "deep", "effort": "low"}));
+    assert_eq!(w.commands("deep").last(), Some(&Command::SetEffort { effort: "low".into() }));
+    let list = w.ok(None, "conversation.commands", json!({"member": "deep"}));
+    let shape: Vec<(&str, &str, &str)> = list["commands"].as_array().unwrap().iter().map(|c| (c["kind"].as_str().unwrap(), c["name"].as_str().unwrap(), c["insert"].as_str().unwrap())).collect();
+    assert_eq!(shape, [("builtin", "compact", "/compact "), ("skill", "tdd", "/skill:tdd ")]);
+    assert_eq!(list["commands"][0]["hint"], "[focus]");
+    assert_eq!(list["commands"][1]["hint"], "[参数]", "ACP's generic \"arguments\" says it takes some");
 }

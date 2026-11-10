@@ -3,6 +3,7 @@
 
 mod app;
 mod compose;
+mod composer;
 mod conversation;
 mod data;
 mod detail;
@@ -70,8 +71,7 @@ fn main() {
                                 let _ = cx.update(|_, cx| {
                                     view.update(cx, |v, cx| {
                                         if member {
-                                            v.member = Some(id);
-                                            cx.notify();
+                                            v.show_member(id, cx);
                                         } else {
                                             v.select_request(id, cx);
                                         }
@@ -80,6 +80,32 @@ fn main() {
                             })
                             .detach();
                     }
+                }
+                // Put the conversation in a state to look at (`top`, `row:N`, `open:N`, `openall:N`, `focus`, `key:<keystroke>`, `fill:<words>`, `attach:<path>`, `menu`, `show:<id>`; see `dev_conv`, `dev_composer`).
+                if let Ok(spec) = std::env::var("LILA_APP_CONV") {
+                    let view = view.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(3500)).await;
+                            let _ = cx.update(|_, cx| view.update(cx, |v, cx| v.dev_conv(&spec, cx)));
+                            for step in spec.split(',') {
+                                let _ = cx.update(|window, cx| {
+                                    if step.starts_with("fill:") || step.starts_with("attach:") || step.starts_with("show:") || step == "menu" {
+                                        view.update(cx, |v, cx| v.dev_composer(step, window, cx));
+                                    } else if step == "focus" {
+                                        if let Some(h) = view.read(cx).conv_focus(cx) {
+                                            window.focus(&h, cx);
+                                        }
+                                    } else if let Some(key) = step.strip_prefix("key:")
+                                        && let Ok(stroke) = gpui::Keystroke::parse(Box::leak(key.to_owned().into_boxed_str()))
+                                    {
+                                        window.dispatch_keystroke(stroke, cx);
+                                    }
+                                });
+                                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                            }
+                        })
+                        .detach();
                 }
                 // Switch through these projects (comma-separated), one every 3 s.
                 if let Ok(list) = std::env::var("LILA_APP_SWITCH") {

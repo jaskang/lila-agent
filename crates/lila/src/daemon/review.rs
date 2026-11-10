@@ -155,9 +155,17 @@ impl<T: Terminals> Daemon<T> {
         let tasks: Vec<Task> = self.store.tasks(pid)?.into_iter().map(|(t, _)| t).collect();
         let under = |id: &str| id == task.id || route::ancestors(&tasks, id).iter().any(|a| a.id == task.id);
         let mut lines: Vec<(i64, String)> = Vec::new();
+        let team = &self.projects[pid].team;
+        let same = team.self_verified();
         for t in tasks.iter().filter(|t| t.id != task.id && t.state == TaskState::Done && under(&t.id)) {
             let files = self.store.artifacts(pid, &t.id)?;
             lines.push((t.updated_ms, inbox::step_done(t, &files)));
+            // A verdict from the same models that did the work: said under it.
+            if t.outcome.passed.is_some()
+                && let Some((_, author)) = same.iter().find(|(v, _)| team.covers(v, &t.to))
+            {
+                lines.push((t.updated_ms, inbox::same_source(&t.to, author)));
+            }
         }
         for e in self.store.events(pid, None, 1000)? {
             if e.kind == "check" && !e.detail.starts_with("running") && e.task.as_deref().is_some_and(under) {

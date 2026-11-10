@@ -114,6 +114,6 @@ cargo clippy --workspace --all-targets
 ## 参考
 
 - https://code.claude.com/docs/en/sub-agents
-- https://x.com/trq212/status/2061907337154367865
 - https://x.com/DeepSeekHarness/status/2116857257245987236
+- https://x.com/trq212/status/2061907337154367865
 - https://x.com/addyosmani/status/2117512471930167377

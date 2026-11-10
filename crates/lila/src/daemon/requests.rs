@@ -21,6 +21,11 @@ impl<T: Terminals> Daemon<T> {
             "request.show" => self.request_show(&caller, params),
             "conversation.read" => self.conversation_read(&caller, params),
             "conversation.send" => self.conversation_send(&caller, params),
+            "conversation.interrupt" => self.conversation_interrupt(&caller, params),
+            "conversation.commands" => self.conversation_commands(&caller, params),
+            "conversation.files" => self.conversation_files(&caller, params),
+            "conversation.model" => self.conversation_model(&caller, params),
+            "conversation.run" => self.conversation_run(&caller, params),
             "hook" => self.hook(&caller, params, now),
             "hook.answer" => self.hook_answer(&caller, params),
             "triage" => self.triage(&caller, params, now),
@@ -638,6 +643,25 @@ impl<T: Terminals> Daemon<T> {
         let budget = params.get("budget").and_then(Value::as_u64).filter(|b| *b > 0);
         if budget.is_some() && flow_name.is_none() {
             bail!("a budget is for a flow run; this task runs no flow (give --flow)");
+        }
+        // A verdict needs something to be judged against, agreed before the work.
+        // The person's own task is their words; a member's must say what done looks like.
+        if let (Some(f), Actor::Member(_)) = (&flow_name, &actor)
+            && team.is_verified(f)
+            && strings(params, "accept").is_empty()
+        {
+            let mut chain = match &parent {
+                Some(p) => self.store.ancestors(&pid, p)?,
+                None => Vec::new(),
+            };
+            if let Some(p) = &parent {
+                chain.extend(self.store.task(&pid, p)?);
+            }
+            if chain.iter().all(|t| t.brief.accept.is_empty()) {
+                bail!(
+                    "this work ends with a verification in the {f} flow, and nothing says what done looks like: add --accept \"<a checkable outcome>\" (repeat it for more). If you can't name one, ask the person one question first; a change too small to verify can go with --flow quick"
+                );
+            }
         }
         let max_depth = team.settings.max_chain_depth;
         if let Some(p) = &parent

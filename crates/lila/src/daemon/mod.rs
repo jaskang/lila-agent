@@ -43,6 +43,8 @@ pub trait Terminals {
     /// Types text and presses Enter. `only_if`: only when the status word is exactly this.
     fn send(&mut self, terminal: &str, text: &str, only_if: Option<&str>) -> Result<()>;
     fn kill(&mut self, terminal: &str) -> Result<()>;
+    /// Presses named keys (`esc`, `ctrl+c`, …).
+    fn keys(&mut self, terminal: &str, keys: &[&str]) -> Result<()>;
 }
 
 pub struct HcTerminals(pub hc_client::Hc);
@@ -71,6 +73,11 @@ impl Terminals for HcTerminals {
         self.0.call("terminal.kill", json!({"terminal": terminal}))?;
         Ok(())
     }
+
+    fn keys(&mut self, terminal: &str, keys: &[&str]) -> Result<()> {
+        self.0.call("terminal.keys", json!({"terminal": terminal, "keys": keys}))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,11 +103,31 @@ struct Live {
     busy_since: i64,
     /// The folder its CLI runs in: the project folder or a chain's worktree.
     cwd: Option<PathBuf>,
+    /// The model and effort this session runs on, as the runtime reported them (nothing yet: the
+    /// role's own), with the choices it lists. Starts over with the session.
+    config: lila_agent::Config,
+    /// The slash commands an ACP agent declared for this session.
+    commands: Vec<lila_agent::SlashCommand>,
 }
 
 impl Default for Live {
     fn default() -> Self {
-        Live { terminal: None, status: AgentStatus::Gone, kind: None, msg: String::new(), reported: false, free_since: 0, started_ms: None, launched: None, chain: None, session: None, busy_since: 0, cwd: None }
+        Live {
+            terminal: None,
+            status: AgentStatus::Gone,
+            kind: None,
+            msg: String::new(),
+            reported: false,
+            free_since: 0,
+            started_ms: None,
+            launched: None,
+            chain: None,
+            session: None,
+            busy_since: 0,
+            cwd: None,
+            config: Default::default(),
+            commands: Vec::new(),
+        }
     }
 }
 

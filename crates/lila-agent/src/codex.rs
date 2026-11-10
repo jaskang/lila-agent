@@ -47,8 +47,9 @@ pub struct AppServer {
     turn: Option<String>,
     /// A turn/start is out and its turn hasn't started yet.
     starting: bool,
-    /// Words that wait: for the thread, or for a turn to steer into.
+    /// Words that wait: for the thread, or for a turn to steer into, and the files that go with them.
     queue: Vec<String>,
+    queue_files: Vec<Attachment>,
     /// Approvals the person hasn't answered: (permission id, request id).
     approvals: Vec<(String, Value, String)>,
     status: HostStatus,
@@ -80,6 +81,7 @@ impl AppServer {
             turn: None,
             starting: false,
             queue: Vec::new(),
+            queue_files: Vec::new(),
             approvals: Vec::new(),
             status: HostStatus::Working,
             running: Default::default(),
@@ -124,8 +126,23 @@ impl AppServer {
         }
     }
 
-    fn input(text: &str) -> Value {
-        json!([{"type": "text", "text": text}])
+    /// A turn's input: the words, then each file as the item Codex has for it (an image by its path,
+    /// a file as a mention, a skill by name and path).
+    fn input(text: &str, files: &[Attachment]) -> Value {
+        let mut items = vec![json!({"type": "text", "text": text})];
+        for f in files {
+            items.push(match f.kind {
+                AttachmentKind::Image => json!({"type": "localImage", "path": f.path}),
+                AttachmentKind::File => json!({"type": "mention", "name": f.label(), "path": f.path}),
+                AttachmentKind::Skill => json!({"type": "skill", "name": f.label(), "path": f.path}),
+            });
+        }
+        Value::Array(items)
+    }
+
+    /// The model and effort the next turns run on.
+    fn config(&self) -> AgentEvent {
+        AgentEvent::Config { model: Some(self.opts.model.clone()).filter(|m| !m.is_empty()), effort: self.opts.effort.clone(), models: Vec::new(), efforts: Vec::new() }
     }
 
     /// Sends what waits: a new turn when none runs, else into the running one.
@@ -135,10 +152,15 @@ impl AppServer {
             return;
         }
         let text = std::mem::take(&mut self.queue).join("\n\n");
+        let files = std::mem::take(&mut self.queue_files);
         match self.turn.clone() {
-            Some(turn) => self.request(step, Asked::Other, "turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": Self::input(&text)})),
+            Some(turn) => self.request(step, Asked::Other, "turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": Self::input(&text, &files)})),
             None => {
-                let mut p = json!({"threadId": thread, "input": Self::input(&text)});
+                // The model and effort go with every turn: a change made in between is in effect from here on.
+                let mut p = json!({"threadId": thread, "input": Self::input(&text, &files)});
+                if !self.opts.model.is_empty() {
+                    p["model"] = json!(self.opts.model);
+                }
                 if let Some(e) = &self.opts.effort {
                     p["effort"] = json!(e);
                 }
@@ -153,9 +175,23 @@ impl AppServer {
     pub fn command(&mut self, c: Command) -> Step {
         let mut step = Step::default();
         match c {
-            Command::Prompt { text } => {
+            Command::Prompt { text, attachments } => {
                 self.queue.push(text);
+                self.queue_files.extend(attachments);
                 self.flush(&mut step);
+            }
+            Command::SetModel { model } => {
+                self.opts.model = model;
+                step.events.push(self.config());
+            }
+            Command::SetEffort { effort } => {
+                self.opts.effort = Some(effort);
+                step.events.push(self.config());
+            }
+            Command::Compact => {
+                if let Some(thread) = self.thread.clone() {
+                    self.request(&mut step, Asked::Other, "thread/compact/start", json!({"threadId": thread}));
+                }
             }
             Command::Interrupt => {
                 if let (Some(thread), Some(turn)) = (self.thread.clone(), self.turn.clone()) {
@@ -230,6 +266,7 @@ impl AppServer {
                 Some(t) => {
                     self.thread = Some(t.to_owned());
                     step.events.push(AgentEvent::Session { id: t.to_owned() });
+                    step.events.push(self.config());
                     self.status = HostStatus::Idle;
                     self.flush(step);
                 }
@@ -386,10 +423,24 @@ fn item_of(i: &Value, turn: Option<String>, now_ms: i64) -> Option<Item> {
         "userMessage" => {
             let text = strings(&i["content"]);
             let text = text.trim();
-            if text.is_empty() {
+            // What went with the words: images by path, files as mentions (a skill is in the words as `$name`).
+            let attachments: Vec<Attachment> = i["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| {
+                    let path = c["path"].as_str()?;
+                    match c["type"].as_str()? {
+                        "localImage" => Some(Attachment::file(path)),
+                        "mention" => Some(Attachment { path: path.to_owned(), name: c["name"].as_str().unwrap_or_default().to_owned(), kind: AttachmentKind::File }),
+                        _ => None,
+                    }
+                })
+                .collect();
+            if text.is_empty() && attachments.is_empty() {
                 return None;
             }
-            (ItemKind::UserMessage { text: text.to_owned(), origin: origin(text) }, ItemState::Done)
+            (ItemKind::UserMessage { text: text.to_owned(), origin: origin(text), attachments }, ItemState::Done)
         }
         "agentMessage" => {
             let text = i["text"].as_str().unwrap_or_default().trim().to_owned();
@@ -452,18 +503,18 @@ mod tests {
         let acc = reply(&mut s, &init, json!({"userAgent": "x"}));
         assert_eq!(methods(&acc), ["initialized", "account/read"]);
         // Words before the thread is open wait for it.
-        assert!(s.command(Command::Prompt { text: "<lila task=\"T1\">\nVerify\n</lila>".into() }).send.is_empty());
+        assert!(s.command(Command::Prompt { text: "<lila task=\"T1\">\nVerify\n</lila>".into(), attachments: vec![] }).send.is_empty());
         let start = reply(&mut s, &acc, json!({"account": {"type": "chatgpt"}}));
         assert_eq!(methods(&start), ["thread/start"]);
         assert_eq!(start.send[0]["params"]["developerInstructions"], "You are tester.");
         assert_eq!(start.send[0]["params"]["approvalPolicy"], "on-request");
         let open = reply(&mut s, &start, json!({"thread": {"id": "th1"}}));
-        assert_eq!(open.events, [AgentEvent::Session { id: "th1".into() }]);
+        assert_eq!(open.events, [AgentEvent::Session { id: "th1".into() }, AgentEvent::Config { model: Some("gpt".into()), effort: Some("low".into()), models: vec![], efforts: vec![] }]);
         assert_eq!(methods(&open), ["turn/start"], "the waiting words start a turn");
         assert_eq!((open.send[0]["params"]["threadId"].as_str(), open.send[0]["params"]["effort"].as_str()), (Some("th1"), Some("low")));
         assert_eq!(s.status(), HostStatus::Working);
         // A note while the turn is being opened waits, then joins it.
-        assert!(s.command(Command::Prompt { text: "also check docs".into() }).send.is_empty());
+        assert!(s.command(Command::Prompt { text: "also check docs".into(), attachments: vec![] }).send.is_empty());
         let started = s.on_message(&json!({"method": "turn/started", "params": {"turn": {"id": "tu1"}}}), 0);
         assert_eq!(methods(&started), ["turn/steer"]);
         assert_eq!(started.send[0]["params"]["expectedTurnId"], "tu1");
@@ -471,7 +522,7 @@ mod tests {
         assert_eq!(done.events, [AgentEvent::TurnEnded { turn: "tu1".into(), failed: None }]);
         assert_eq!(s.status(), HostStatus::Done);
         // Idle again: the next words open a new turn.
-        assert_eq!(methods(&s.command(Command::Prompt { text: "next".into() })), ["turn/start"]);
+        assert_eq!(methods(&s.command(Command::Prompt { text: "next".into(), attachments: vec![] })), ["turn/start"]);
     }
 
     #[test]
@@ -528,6 +579,53 @@ mod tests {
         assert_eq!(said.at_ms, 7);
         assert!(item(json!({"type": "reasoning", "id": "r1", "summary": [], "content": []})).is_none(), "an empty thought is not shown");
         assert!(item(json!({"type": "contextCompaction", "id": "x"})).is_none());
+    }
+
+    /// A server with a thread open and no turn running.
+    fn idle() -> AppServer {
+        let mut s = server();
+        s.thread = Some("th".into());
+        s
+    }
+
+    #[test]
+    fn files_go_with_the_words_as_the_items_codex_has_for_them() {
+        let mut s = idle();
+        let files = vec![Attachment::file("/r/shot.png"), Attachment::file("/r/notes.md"), Attachment { path: "/home/.agents/skills/tdd/SKILL.md".into(), name: "tdd".into(), kind: AttachmentKind::Skill }];
+        let start = s.command(Command::Prompt { text: "$tdd look at these".into(), attachments: files.clone() });
+        assert_eq!(
+            start.send[0]["params"]["input"],
+            json!([
+                {"type": "text", "text": "$tdd look at these"},
+                {"type": "localImage", "path": "/r/shot.png"},
+                {"type": "mention", "name": "notes.md", "path": "/r/notes.md"},
+                {"type": "skill", "name": "tdd", "path": "/home/.agents/skills/tdd/SKILL.md"},
+            ])
+        );
+        // Into a running turn they go the same way.
+        s.on_message(&json!({"method": "turn/started", "params": {"turn": {"id": "tu1"}}}), 0);
+        let steer = s.command(Command::Prompt { text: "and this".into(), attachments: files[..1].to_vec() });
+        assert_eq!(methods(&steer), ["turn/steer"]);
+        assert_eq!(steer.send[0]["params"]["input"][1], json!({"type": "localImage", "path": "/r/shot.png"}));
+        // The server echoes them back in the user's message: shown as attachments.
+        let mut s2 = idle();
+        let said = s2.on_message(&json!({"method": "item/completed", "params": {"item": {"type": "userMessage", "id": "u9", "content": [{"type": "text", "text": "look"}, {"type": "localImage", "path": "/r/shot.png"}, {"type": "mention", "name": "notes.md", "path": "/r/notes.md"}, {"type": "skill", "name": "tdd", "path": "/s"}]}}}), 5);
+        let AgentEvent::Item { item } = &said.events[0] else { panic!("{said:?}") };
+        assert!(matches!(&item.kind, ItemKind::UserMessage { text, attachments, .. } if text == "look" && attachments.len() == 2 && attachments[0].kind == AttachmentKind::Image && attachments[1].name == "notes.md"));
+    }
+
+    #[test]
+    fn the_model_and_effort_can_change_for_the_rest_of_the_session() {
+        let mut s = idle();
+        let set = s.command(Command::SetModel { model: "gpt-6-luna".into() });
+        assert_eq!(set.events, [AgentEvent::Config { model: Some("gpt-6-luna".into()), effort: Some("low".into()), models: vec![], efforts: vec![] }]);
+        assert!(set.send.is_empty(), "nothing is sent until the next turn");
+        s.command(Command::SetEffort { effort: "xhigh".into() });
+        let turn = s.command(Command::Prompt { text: "go".into(), attachments: vec![] });
+        assert_eq!((turn.send[0]["params"]["model"].as_str(), turn.send[0]["params"]["effort"].as_str()), (Some("gpt-6-luna"), Some("xhigh")));
+        // The context can be compacted: a request of the protocol, not words.
+        let compact = s.command(Command::Compact);
+        assert_eq!((methods(&compact), &compact.send[0]["params"]["threadId"]), (vec!["thread/compact/start"], &json!("th")));
     }
 
     #[test]

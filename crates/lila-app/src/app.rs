@@ -86,8 +86,17 @@ pub struct LilaApp {
     pub conv: Option<crate::conversation::Conv>,
     /// Tool calls opened to show their output.
     pub conv_open: std::collections::HashSet<String>,
-    pub conv_scroll: ScrollHandle,
-    pub conv_input: Option<Entity<gpui::component::input::TextareaState>>,
+    /// The conversation's virtual list, and what it was last told it holds (`conversation::sync_conv`).
+    pub conv_list: Entity<gpui::component::message_scroller::MessageScrollerState>,
+    pub conv_rows: Vec<crate::conversation::Row>,
+    pub conv_key: Option<(String, String, Option<String>)>,
+    /// The request list's scroll: ↑ and ↓ bring the selected row into view.
+    pub req_scroll: ScrollHandle,
+    /// The box under each member's conversation, by "project/member": its draft, files and menu.
+    pub composers: HashMap<String, crate::composer::Composer>,
+    /// What the `@` and `/` menus list for a member, as lilad last said.
+    pub menu_files: HashMap<String, Vec<String>>,
+    pub menu_commands: HashMap<String, crate::composer::Commands>,
     /// The box a project without requests opens with: a first request for the PM.
     pub ask: Option<Entity<gpui::component::input::TextareaState>>,
     /// A queued task being rewritten in the detail panel.
@@ -163,8 +172,11 @@ impl LilaApp {
         })
         .detach();
         let tui = data::load_views(&paths);
-        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, request: None, active: true, away_since: None, recap: None, recap_only: false, needs_seen: HashMap::new(), core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, task_back: Vec::new(), append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, tui, conv: None, conv_open: Default::default(), conv_scroll: ScrollHandle::new(), conv_input: None, ask: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
+        let mut app = LilaApp { paths, focus: cx.focus_handle(), usage: Default::default(), snap: Snapshot::default(), selected: None, restored: false, restoring: Default::default(), settings: None, prefs: None, wizard: None, dialog_offset: Point::default(), dialog_drag: None, member: None, request: None, active: true, away_since: None, recap: None, recap_only: false, needs_seen: HashMap::new(), core: None, core_error: None, terminals: HashMap::new(), answers: HashMap::new(), notice: None, right_open: true, drag_armed: false, task: None, task_back: Vec::new(), append: None, confirm_cancel: None, confirm_refresh: false, removing: None, draft: None, tui, conv: None, conv_open: Default::default(), conv_list: Self::conv_list_state(cx), conv_rows: Vec::new(), conv_key: None, req_scroll: ScrollHandle::new(), composers: HashMap::new(), menu_files: HashMap::new(), menu_commands: HashMap::new(), ask: None, rewrite: None, kick, cache: HashMap::new(), _poll: poll };
         app.start_usage(window, cx);
+        // Pictures pasted into boxes long ago go.
+        let paths = app.paths.clone();
+        cx.background_executor().spawn(async move { crate::composer::prune(&paths) }).detach();
         cx.observe_window_activation(window, |this, window, cx| this.activated(window.is_window_active(), cx)).detach();
         app
     }
@@ -335,6 +347,16 @@ impl LilaApp {
             self.close_task(cx);
         }
         self.right_open = true;
+        cx.notify();
+    }
+
+    /// Shows a member in the middle card. Its conversation is read right away:
+    /// left to the next poll, the card stays empty for up to five seconds.
+    pub fn show_member(&mut self, member: String, cx: &mut Context<Self>) {
+        if self.member.as_deref() != Some(member.as_str()) {
+            self.member = Some(member);
+            self.refresh_now();
+        }
         cx.notify();
     }
 
@@ -513,6 +535,18 @@ impl LilaApp {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Like `request`, but `done` gets the error too (and a window to change the boxes with): for a caller
+    /// that keeps what it was doing until it knows the request went.
+    pub fn request_result(&mut self, method: &'static str, params: Value, window: &mut Window, cx: &mut Context<Self>, done: impl FnOnce(&mut Self, anyhow::Result<Value>, &mut Window, &mut Context<Self>) + 'static) {
+        let Some(project) = self.project() else { return };
+        let paths = self.paths.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { data::act(&paths, &project, method, params, false) }).await;
+            let _ = this.update_in(cx, |this, window, cx| done(this, r, window, cx));
         })
         .detach();
     }
@@ -703,6 +737,24 @@ impl LilaApp {
             self.back_task(cx);
             cx.stop_propagation();
             return;
+        }
+        // ↑ ↓ (and k j) walk the requests while nothing else has the keys: no dialog,
+        // no terminal or input in focus.
+        if !k.modifiers.modified() && self.member.is_none() && self.draft.is_none() && self.focus.is_focused(window) {
+            let down = match k.key.as_str() {
+                "down" | "j" => Some(true),
+                "up" | "k" => Some(false),
+                _ => None,
+            };
+            if let Some(down) = down {
+                self.step_request(down, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if k.key == "enter" && self.look_at_request(cx) {
+                cx.stop_propagation();
+                return;
+            }
         }
         if !k.modifiers.platform || k.modifiers.control || k.modifiers.alt {
             return;

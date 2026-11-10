@@ -30,6 +30,15 @@ impl fmt::Display for Runtime {
     }
 }
 
+/// Whose models a member runs on: two members with the same answer are one
+/// opinion. omp runs any provider's model, so there it is the model itself.
+pub fn model_source(runtime: Runtime, model: &str) -> String {
+    match runtime {
+        Runtime::Omp => format!("omp:{}", model.trim()),
+        r => r.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleFile {
@@ -458,6 +467,22 @@ impl Team {
     /// `member` is `by` or one of the pool `by`.
     pub fn covers(&self, by: &str, member: &str) -> bool {
         by == member || self.pool(by).is_some_and(|p| p.iter().any(|m| m == member))
+    }
+
+    /// `by` (a member or a pool) runs on these models (`model_source`).
+    pub fn source_of(&self, by: &str) -> Option<String> {
+        let id = self.pool(by).and_then(|p| p.first().map(String::as_str)).unwrap_or(by);
+        self.member(id).map(|m| model_source(m.role.file.runtime, &m.role.file.model))
+    }
+
+    /// Verdict steps whose member runs the same models as the one it judges (`flow::self_verified`).
+    pub fn self_verified(&self) -> Vec<(String, String)> {
+        crate::flow::self_verified(&self.flows, |by| self.source_of(by))
+    }
+
+    /// `name`'s work ends with a member's verdict: it needs something to be judged against.
+    pub fn is_verified(&self, name: &str) -> bool {
+        self.flows.get(name).is_some_and(|f| f.steps.iter().any(|s| s.wants_verdict()))
     }
 
     /// The flow a new task to `to` starts. `asked`: `--flow` (`none`: no flow).

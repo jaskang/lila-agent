@@ -36,6 +36,9 @@ struct Kept {
     items: BTreeMap<String, Item>,
     order: Vec<String>,
     asking: Vec<PermissionRequest>,
+    /// The latest model/effort and the commands the agent declared.
+    config: lila_agent::Config,
+    commands: Option<AgentEvent>,
 }
 
 impl Kept {
@@ -49,6 +52,8 @@ impl Kept {
             }
             AgentEvent::Permission { request } => self.asking.push(request.clone()),
             AgentEvent::PermissionResolved { id } => self.asking.retain(|r| r.id != *id),
+            AgentEvent::Config { .. } => self.config.apply(ev),
+            AgentEvent::Commands { .. } => self.commands = Some(ev.clone()),
             _ => {}
         }
     }
@@ -56,6 +61,10 @@ impl Kept {
     fn replay(&self) -> Vec<AgentEvent> {
         let mut out: Vec<AgentEvent> = self.session.iter().map(|id| AgentEvent::Session { id: id.clone() }).collect();
         out.extend(self.order.iter().filter_map(|id| self.items.get(id)).map(|i| AgentEvent::Item { item: i.clone() }));
+        if self.config != lila_agent::Config::default() {
+            out.push(self.config.event());
+        }
+        out.extend(self.commands.clone());
         out.extend(self.asking.iter().map(|r| AgentEvent::Permission { request: r.clone() }));
         out
     }
@@ -272,8 +281,12 @@ fn one_line(s: &str, n: usize) -> String {
 
 fn log_command(c: &Command) {
     match c {
-        Command::Prompt { text } => println!("» {}", one_line(text, 100)),
+        Command::Prompt { text, attachments } if attachments.is_empty() => println!("» {}", one_line(text, 100)),
+        Command::Prompt { text, attachments } => println!("» {} (+{} files)", one_line(text, 100), attachments.len()),
         Command::Interrupt => println!("» interrupt"),
+        Command::SetModel { model } => println!("» model {model}"),
+        Command::SetEffort { effort } => println!("» effort {effort}"),
+        Command::Compact => println!("» compact"),
         Command::Answer { permission, option } => println!("» {permission}: {option}"),
     }
 }

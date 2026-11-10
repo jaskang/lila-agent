@@ -40,6 +40,12 @@ pub fn step_done(t: &Task, files: &[String]) -> String {
     s
 }
 
+/// Under a verdict on a review card: the member that judged the work runs the
+/// same models as the one that did it.
+pub fn same_source(verifier: &str, author: &str) -> String {
+    format!("同源验证：{verifier} 和 {author} 是同一家模型")
+}
+
 /// One run of the check command, from its event's detail ("passed",
 /// "failed (exit 1)", "did not finish"). The command itself is in the project's
 /// settings; repeating it on every line is noise.
