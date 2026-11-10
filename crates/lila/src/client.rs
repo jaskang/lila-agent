@@ -5,29 +5,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub fn hc_bin() -> String {
     std::env::var("LILA_HC").unwrap_or_else(|_| "hc".into())
 }
 
-/// Who is asking: a member (from the env lilad gave its terminal), else the person.
-pub fn caller() -> Value {
-    let cwd = std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    json!({"cwd": cwd, "project": var("LILA_PROJECT"), "member": var("LILA_MEMBER")})
-}
-
 fn try_request(paths: &Paths, method: &str, params: &Value) -> Result<Value, (bool, anyhow::Error)> {
     let sock = paths.socket().map_err(|e| (false, e))?;
-    let mut conn = match UnixStream::connect(&sock) {
-        Ok(c) => c,
-        // A sandbox (codex workspace-write) refusing the socket, not a stopped daemon:
-        // go through the project's spool folder, which the sandbox may write.
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return spool_request(method, params).map_err(|e| (false, e)),
-        Err(e) => return Err((true, anyhow!("cannot reach lilad at {}: {e}", sock.display()))),
-    };
+    let mut conn = UnixStream::connect(&sock).map_err(|e| (true, anyhow!("cannot reach lilad at {}: {e}", sock.display())))?;
     conn.set_read_timeout(Some(Duration::from_secs(120))).ok();
     let line = json!({"method": method, "params": params});
     writeln!(conn, "{line}").map_err(|e| (false, e.into()))?;
@@ -41,10 +28,7 @@ fn try_request(paths: &Paths, method: &str, params: &Value) -> Result<Value, (bo
 }
 
 /// One request. With `autostart`, starts lilad first if it is not running.
-pub fn request(paths: &Paths, method: &str, mut params: Value, autostart: bool) -> Result<Value> {
-    if params.get("caller").is_none() {
-        params["caller"] = caller();
-    }
+pub fn request(paths: &Paths, method: &str, params: Value, autostart: bool) -> Result<Value> {
     match try_request(paths, method, &params) {
         Ok(v) => Ok(v),
         Err((true, e)) if autostart => {
@@ -54,50 +38,6 @@ pub fn request(paths: &Paths, method: &str, mut params: Value, autostart: bool) 
         Err((true, e)) => Err(e.context("lilad is not running; `lila up` starts it")),
         Err((false, e)) => Err(e),
     }
-}
-
-/// The project folder a member works in: `LILA_ROOT` (set by lilad), else `.lila/` above the cwd.
-fn project_root() -> Option<PathBuf> {
-    if let Some(r) = std::env::var_os("LILA_ROOT").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(r));
-    }
-    crate::paths::find_project_root(&std::env::current_dir().ok()?)
-}
-
-fn spool_request(method: &str, params: &Value) -> Result<Value> {
-    let root = project_root().ok_or_else(|| anyhow!("the lilad socket is blocked (sandbox) and there is no .lila/ folder here to use instead"))?;
-    let dir = crate::daemon::spool_dir(&root);
-    let id = write_spool(&dir, method, params)?;
-    let timeout = Duration::from_secs(std::env::var("LILA_SPOOL_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(60));
-    await_spool(&dir, &id, timeout)
-}
-
-pub fn write_spool(dir: &Path, method: &str, params: &Value) -> Result<String> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let id = format!("{nanos}-{}", std::process::id());
-    let tmp = dir.join(format!("{id}.req.tmp"));
-    std::fs::write(&tmp, json!({"method": method, "params": params}).to_string()).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, dir.join(format!("{id}.req.json")))?;
-    Ok(id)
-}
-
-pub fn await_spool(dir: &Path, id: &str, timeout: Duration) -> Result<Value> {
-    let reply = dir.join(format!("{id}.reply.json"));
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(text) = std::fs::read_to_string(&reply) {
-            let _ = std::fs::remove_file(&reply);
-            let v: Value = serde_json::from_str(&text).map_err(|e| anyhow!("bad spool reply: {e}"))?;
-            if let Some(e) = v.get("error") {
-                bail!("{}", e.as_str().unwrap_or("error"));
-            }
-            return Ok(v["result"].clone());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let _ = std::fs::remove_file(dir.join(format!("{id}.req.json")));
-    bail!("lilad did not answer through {} within {}s; is it running? (`lila daemon status` from your own shell)", dir.display(), timeout.as_secs())
 }
 
 /// Hears from lilad whenever anything changes: one `{"event":"changed","seq":N}` per change.
@@ -191,7 +131,7 @@ pub fn start_daemon(paths: &Paths) -> Result<()> {
 /// question to the terminal (under the hook's own 600 s, `daemon::hooks`).
 pub const HOOK_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(570);
 
-/// `lila hook <event>`: a Claude Code hook in a member's session. Hands the event
+/// `lila hook <event>`: a Claude Code hook in a thread's session. Hands the event
 /// (its JSON on stdin) to lilad; for a permission request, waits for the person's
 /// answer and prints the decision. Never fails the session: with lilad away, or no
 /// answer in time, it prints nothing and Claude Code asks in its terminal.
@@ -199,21 +139,23 @@ pub fn hook(paths: &Paths, event: &str) -> Result<()> {
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
     let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
-    let Ok(r) = request(paths, "hook", json!({"event": event, "payload": payload}), false) else { return Ok(()) };
+    let Some(thread) = std::env::var("LILA_THREAD").ok().filter(|t| !t.is_empty()) else { return Ok(()) };
+    let Ok(r) = request(paths, "hook", json!({"thread": thread, "event": event, "payload": payload}), false) else { return Ok(()) };
     if event != "PermissionRequest" {
         return Ok(());
     }
-    let decide = |d: &Value| -> Option<String> { d.as_str().map(String::from) };
-    let mut decision = decide(&r["decision"]);
+    let mut decision = r["decision"].as_str().map(String::from);
+    let mut message = r["message"].as_str().map(String::from);
     if let Some(id) = r["wait"].as_str() {
         let until = std::time::Instant::now() + HOOK_ANSWER_WAIT;
         while std::time::Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            let Ok(a) = request(paths, "hook.answer", json!({"id": id}), false) else { continue };
+            let Ok(a) = request(paths, "hook.answer", json!({"thread": thread, "id": id}), false) else { continue };
             if a["pending"] == true {
                 continue;
             }
-            decision = decide(&a["decision"]);
+            decision = a["decision"].as_str().map(String::from);
+            message = a["message"].as_str().map(String::from);
             break;
         }
     }
@@ -221,7 +163,7 @@ pub fn hook(paths: &Paths, event: &str) -> Result<()> {
         let behavior = if d == "allow" { "allow" } else { "deny" };
         let mut out = json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": behavior}}});
         if behavior == "deny" {
-            out["hookSpecificOutput"]["decision"]["message"] = json!("The person said no in Lila.");
+            out["hookSpecificOutput"]["decision"]["message"] = json!(message.unwrap_or_else(|| "The person said no in Lila.".into()));
         }
         println!("{out}");
     }

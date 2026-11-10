@@ -1,4 +1,4 @@
-//! The server: the socket, herdr-core's events, the check and commit threads, all feeding one `Daemon`.
+//! The server: the socket, herdr-core's events and the hosts, all feeding one `Daemon`.
 
 use super::*;
 
@@ -10,22 +10,14 @@ pub(super) enum Input {
     /// A fresh `events.subscribe` snapshot and when it was taken.
     Snapshot(Value, i64),
     Tick,
-    /// Look for spool requests (fast: sandboxed members wait on them).
-    Spool,
-    /// A member's host attached: project, member, its command channel.
-    HostAttach(String, String, std::sync::mpsc::Sender<String>),
-    /// An event from a member's host.
-    HostEvent(String, String, lila_agent::AgentEvent),
-    /// A member's host detached.
-    HostGone(String, String),
-    /// A flow's check finished: project, run anchor, result.
-    CheckDone(String, String, CheckResult),
-    /// An accepted chain's commit finished: project, chain, result.
-    CommitDone(String, String, CommitResult),
-    /// A source was looked at: project, source index, its issues.
-    Polled(String, usize, std::result::Result<Vec<crate::github::Issue>, String>),
-    /// A comment was posted: project, task, its URL.
-    Posted(String, String, std::result::Result<String, String>),
+    /// Read what Claude Code threads added to their transcripts (fast: the window follows along).
+    Follow,
+    /// A thread's host attached: the thread, its command channel.
+    HostAttach(String, std::sync::mpsc::Sender<String>),
+    /// An event from a thread's host.
+    HostEvent(String, lila_agent::AgentEvent),
+    /// A thread's host detached.
+    HostGone(String),
     Stop,
 }
 
@@ -85,11 +77,11 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
                             }
                             return;
                         }
-                        // A member's host: events in, commands out, until it goes.
+                        // A thread's host: events in, commands out, until it goes.
                         Ok(req) if req["method"] == "host.attach" => {
-                            let (pid, mid) = (req["params"]["project"].as_str().unwrap_or_default().to_owned(), req["params"]["member"].as_str().unwrap_or_default().to_owned());
+                            let tid = req["params"]["thread"].as_str().unwrap_or_default().to_owned();
                             let (ctx, crx) = mpsc::channel::<String>();
-                            if writeln!(writer, "{}", json!({"result": {"attached": true}})).is_err() || tx.send(Input::HostAttach(pid.clone(), mid.clone(), ctx)).is_err() {
+                            if writeln!(writer, "{}", json!({"result": {"attached": true}})).is_err() || tx.send(Input::HostAttach(tid.clone(), ctx)).is_err() {
                                 return;
                             }
                             std::thread::spawn(move || {
@@ -101,12 +93,12 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
                             });
                             for line in lines.by_ref().map_while(Result::ok) {
                                 if let Ok(ev) = serde_json::from_str::<lila_agent::AgentEvent>(&line)
-                                    && tx.send(Input::HostEvent(pid.clone(), mid.clone(), ev)).is_err()
+                                    && tx.send(Input::HostEvent(tid.clone(), ev)).is_err()
                                 {
                                     return;
                                 }
                             }
-                            let _ = tx.send(Input::HostGone(pid, mid));
+                            let _ = tx.send(Input::HostGone(tid));
                             return;
                         }
                         Ok(req) => {
@@ -149,11 +141,11 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
         }
     });
 
-    let tx_spool = tx.clone();
+    let tx_follow = tx.clone();
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            if tx_spool.send(Input::Spool).is_err() {
+            if tx_follow.send(Input::Follow).is_err() {
                 return;
             }
         }
@@ -169,7 +161,6 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
         }
     });
 
-    spawn_checks(&mut daemon, &tx);
     let mut seen = daemon.fingerprint();
     let mut seq: u64 = 0;
     for input in rx {
@@ -197,58 +188,28 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
             }
             Input::Hc(line) => daemon.on_event(&line, now),
             Input::Tick => daemon.tick(now),
-            Input::Spool => daemon.process_spool(now),
-            Input::HostAttach(pid, mid, ctx) => daemon.host_attach(&pid, &mid, ctx, now),
-            Input::HostEvent(pid, mid, ev) => daemon.host_event(&pid, &mid, ev, now),
-            Input::HostGone(pid, mid) => daemon.host_gone(&pid, &mid),
-            Input::CheckDone(pid, anchor, r) => daemon.on_check_done(&pid, &anchor, &r, now),
-            Input::CommitDone(pid, chain, r) => daemon.on_commit_done(&pid, &chain, &r, now),
-            Input::Polled(pid, source, r) => daemon.on_polled(&pid, source, r, now),
-            Input::Posted(pid, task, r) => daemon.on_posted(&pid, &task, r, now),
+            Input::Follow => daemon.follow_transcripts(),
+            Input::HostAttach(tid, ctx) => daemon.host_attach(&tid, ctx, now),
+            Input::HostEvent(tid, ev) => daemon.host_event(&tid, ev, now),
+            Input::HostGone(tid) => daemon.host_gone(&tid),
             Input::Stop => break,
         }
-        spawn_checks(&mut daemon, &tx);
         let fp = daemon.fingerprint();
         if fp != seen {
             seen = fp;
             seq += 1;
-            let event = json!({"event": "changed", "seq": seq}).to_string();
-            watchers.lock().unwrap().retain(|w| w.send(event.clone()).is_ok());
+            let (threads, projects) = daemon.take_dirty();
+            let mut events = vec![json!({"event": "changed", "seq": seq})];
+            events.extend(projects.iter().map(|p| json!({"event": "project", "project": p, "seq": seq})));
+            events.extend(threads.iter().filter_map(|t| daemon.thread_event(t, seq)));
+            let mut watchers = watchers.lock().unwrap();
+            for event in events {
+                let event = event.to_string();
+                watchers.retain(|w| w.send(event.clone()).is_ok());
+            }
         }
     }
     let _ = std::fs::remove_file(&sock);
     eprintln!("[lilad] stopped");
     Ok(())
-}
-
-/// Runs each check and commit lilad asked for on its own thread.
-pub(super) fn spawn_checks<T: Terminals>(daemon: &mut Daemon<T>, tx: &std::sync::mpsc::Sender<Input>) {
-    for job in daemon.take_checks() {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let r = crate::check::run(&job);
-            let _ = tx.send(Input::CheckDone(job.project, job.anchor, r));
-        });
-    }
-    for job in daemon.take_polls() {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let r = job.run();
-            let _ = tx.send(Input::Polled(job.project, job.source, r));
-        });
-    }
-    for job in daemon.take_posts() {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let r = job.run();
-            let _ = tx.send(Input::Posted(job.project, job.task, r));
-        });
-    }
-    for job in daemon.take_commits() {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let r = crate::commit::run(&job);
-            let _ = tx.send(Input::CommitDone(job.project, job.chain, r));
-        });
-    }
 }

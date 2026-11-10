@@ -1,26 +1,23 @@
-//! lila-app: watch and steer a Lila team. Talk to the PM in its terminal,
-//! answer what needs you, follow the task board.
+//! lila-app: Lila's window. Projects and their threads on the left, the shown thread's
+//! conversation (or Claude Code's terminal) in the middle.
 
 mod app;
-mod compose;
 mod composer;
 mod conversation;
 mod data;
-mod detail;
 mod dialog;
+mod engines;
 mod prefs;
-mod requests;
 mod settings;
-mod tree;
+mod sidebar;
 mod style;
 mod ui;
 mod usage;
-mod wizard;
 
 use gpui::*;
 
 fn main() {
-    // lilad and the members it starts inherit this PATH: give them the shell's,
+    // lilad and the engines it starts inherit this PATH: give them the shell's,
     // before any thread runs.
     // SAFETY: nothing else runs yet.
     unsafe { std::env::set_var("PATH", usage::login_path()) };
@@ -47,39 +44,15 @@ fn main() {
             #[cfg(feature = "shots")]
             {
                 shots::start(window, cx);
-                // Checks without a mouse: open this task's panel on start.
-                if let Ok(task) = std::env::var("LILA_APP_OPEN_TASK") {
+                // Show this thread (`LILA_APP_THREAD=t1234abcd`).
+                if let Ok(id) = std::env::var("LILA_APP_THREAD") {
                     let view = view.clone();
                     window
                         .spawn(cx, async move |cx| {
                             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|_, cx| view.update(cx, |v, cx| v.show_task(task, cx)));
+                            let _ = cx.update(|_, cx| view.update(cx, |v, cx| v.show_thread(id, cx)));
                         })
                         .detach();
-                }
-                // As if back after being away since this many minutes ago (`LILA_APP_AWAY=360`).
-                if let Ok(m) = std::env::var("LILA_APP_AWAY").map(|m| m.parse::<i64>().unwrap_or(60)) {
-                    view.update(cx, |v, _| v.recap = Some(data::now_ms() - m * 60_000));
-                }
-                // Select this request (`LILA_APP_REQUEST=T3`) or show a member's terminal (`LILA_APP_MEMBER=pm`).
-                for (var, member) in [("LILA_APP_REQUEST", false), ("LILA_APP_MEMBER", true)] {
-                    if let Ok(id) = std::env::var(var) {
-                        let view = view.clone();
-                        window
-                            .spawn(cx, async move |cx| {
-                                cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                                let _ = cx.update(|_, cx| {
-                                    view.update(cx, |v, cx| {
-                                        if member {
-                                            v.show_member(id, cx);
-                                        } else {
-                                            v.select_request(id, cx);
-                                        }
-                                    })
-                                });
-                            })
-                            .detach();
-                    }
                 }
                 // Put the conversation in a state to look at (`top`, `row:N`, `open:N`, `openall:N`, `focus`, `key:<keystroke>`, `fill:<words>`, `attach:<path>`, `menu`, `show:<id>`; see `dev_conv`, `dev_composer`).
                 if let Ok(spec) = std::env::var("LILA_APP_CONV") {
@@ -107,32 +80,69 @@ fn main() {
                         })
                         .detach();
                 }
-                // Switch through these projects (comma-separated), one every 3 s.
-                if let Ok(list) = std::env::var("LILA_APP_SWITCH") {
+                // A new session's box in a project, with choices made: `LILA_APP_NEW=shop,engine=codex,effort=low,permission=confirm`.
+                if let Ok(spec) = std::env::var("LILA_APP_NEW") {
                     let view = view.clone();
                     window
                         .spawn(cx, async move |cx| {
-                            for id in list.split(',').map(str::to_owned) {
-                                cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
-                                eprintln!("[lila-app] {} switch to {id}", data::clock_ms());
-                                view.update(cx, |v, cx| v.select_project(id, cx));
-                            }
+                            cx.background_executor().timer(std::time::Duration::from_millis(2000)).await;
+                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.dev_new(&spec, window, cx)));
                         })
                         .detach();
                 }
-                // Open the shown project's settings once it has loaded.
-                if let Ok(page) = std::env::var("LILA_APP_SETTINGS") {
+                // Add a folder as a project, as the folder picker would (`LILA_APP_ADD=<dir>`).
+                if let Ok(dir) = std::env::var("LILA_APP_ADD") {
                     let view = view.clone();
-                    let page = crate::settings::Page::parse(&page);
                     window
                         .spawn(cx, async move |cx| {
-                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| {
-                                v.open_settings_at(page, window, cx);
-                                if let Ok(role) = std::env::var("LILA_APP_SETTINGS_ADD") {
-                                    v.add_member(&role, window, cx);
+                            cx.background_executor().timer(std::time::Duration::from_millis(2500)).await;
+                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.add_project(dir.into(), window, cx)));
+                        })
+                        .detach();
+                }
+                // Click as a person would, through the window's own event dispatch: `x,y` (window points),
+                // `right:x,y`, `move:x,y`, `keys:cmd-n h i enter`, `wait:ms`, separated by `;`.
+                if let Ok(spec) = std::env::var("LILA_APP_CLICK") {
+                    let spec: &'static str = Box::leak(spec.into_boxed_str());
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(3000)).await;
+                            for step in spec.split(';') {
+                                if let Some(ms) = step.strip_prefix("wait:") {
+                                    cx.background_executor().timer(std::time::Duration::from_millis(ms.parse().unwrap_or(500))).await;
+                                    continue;
                                 }
-                            }));
+                                if let Some(keys) = step.strip_prefix("keys:") {
+                                    for k in keys.split_whitespace().filter_map(|k| gpui::Keystroke::parse(k).ok()) {
+                                        let _ = cx.update(|window, cx| window.dispatch_keystroke(k, cx));
+                                        cx.background_executor().timer(std::time::Duration::from_millis(40)).await;
+                                    }
+                                    cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                                    continue;
+                                }
+                                if let Some(at) = step.strip_prefix("move:")
+                                    && let Some((x, y)) = at.split_once(',').and_then(|(x, y)| Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?)))
+                                {
+                                    let position = point(px(x), px(y));
+                                    let _ = cx.update(|window, cx| window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, pressed_button: None, modifiers: gpui::Modifiers::default() }), cx));
+                                    cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                                    continue;
+                                }
+                                let (button, at) = step.strip_prefix("right:").map_or((gpui::MouseButton::Left, step), |r| (gpui::MouseButton::Right, r));
+                                let Some((x, y)) = at.split_once(',').and_then(|(x, y)| Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?))) else { continue };
+                                let position = point(px(x), px(y));
+                                let _ = cx.update(|window, cx| {
+                                    let m = gpui::Modifiers::default();
+                                    window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, pressed_button: None, modifiers: m }), cx);
+                                });
+                                cx.background_executor().timer(std::time::Duration::from_millis(150)).await;
+                                let _ = cx.update(|window, cx| {
+                                    let m = gpui::Modifiers::default();
+                                    window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { button, position, modifiers: m, click_count: 1, first_mouse: false }), cx);
+                                    window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { button, position, modifiers: m, click_count: 1 }), cx);
+                                });
+                                cx.background_executor().timer(std::time::Duration::from_millis(700)).await;
+                            }
                         })
                         .detach();
                 }
@@ -162,63 +172,14 @@ fn main() {
                         })
                         .detach();
                 }
-                // Ask about removing this project from the list.
-                if let Ok(id) = std::env::var("LILA_APP_REMOVE") {
-                    let view = view.clone();
-                    window
-                        .spawn(cx, async move |cx| {
-                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|_, cx| view.update(cx, |v, _| v.removing = v.snap.projects.iter().find(|p| p.id == id).cloned()));
-                        })
-                        .detach();
-                }
-                // The role library on this role, its final prompt shown.
-                if let Ok(role) = std::env::var("LILA_APP_PROMPT") {
-                    let view = view.clone();
-                    window
-                        .spawn(cx, async move |cx| {
-                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.dev_preview(&role, window, cx)));
-                        })
-                        .detach();
-                }
-                // Open the global settings: `roles`, `usage` or `about`.
+                // Open the global settings: `usage` or `about`.
                 if let Ok(page) = std::env::var("LILA_APP_PREFS") {
                     let view = view.clone();
-                    let page = match page.as_str() {
-                        "about" => crate::prefs::PrefPage::About,
-                        "usage" => crate::prefs::PrefPage::Usage,
-                        _ => crate::prefs::PrefPage::Roles,
-                    };
+                    let page = if page == "about" { crate::prefs::PrefPage::About } else { crate::prefs::PrefPage::Usage };
                     window
                         .spawn(cx, async move |cx| {
                             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.open_prefs(page, window, cx)));
-                        })
-                        .detach();
-                }
-                // The new-project dialog, on this folder (empty: none yet).
-                if let Ok(dir) = std::env::var("LILA_APP_NEW") {
-                    let view = view.clone();
-                    window
-                        .spawn(cx, async move |cx| {
-                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| {
-                                v.new_project(window, cx);
-                                if !dir.is_empty() {
-                                    v.wizard_set_folder(dir.into(), window, cx);
-                                }
-                            }));
-                        })
-                        .detach();
-                }
-                // The new-task form, once the shown project has loaded.
-                if let Ok(to) = std::env::var("LILA_APP_COMPOSE") {
-                    let view = view.clone();
-                    window
-                        .spawn(cx, async move |cx| {
-                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.compose(Some(to).filter(|t| !t.is_empty()), None, window, cx)));
+                            let _ = cx.update(|_, cx| view.update(cx, |v, cx| v.open_prefs(page, cx)));
                         })
                         .detach();
                 }

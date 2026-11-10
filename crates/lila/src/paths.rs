@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Paths {
-    /// Roles: `<config>/roles/<id>.toml` + prompt.
+    /// `accounts.toml` and the CLI folders of accounts Lila added.
     pub config: PathBuf,
     /// `lila.db`.
     pub data: PathBuf,
-    /// Socket, rendered prompts.
+    /// The socket, thread files, host logs.
     pub state: PathBuf,
     /// Set when `LILA_HOME` is: the daemon then runs without the shared `lilad` name.
     pub isolated: bool,
@@ -50,10 +50,6 @@ impl Paths {
         self.config.join("accounts")
     }
 
-    pub fn roles(&self) -> PathBuf {
-        self.config.join("roles")
-    }
-
     pub fn db(&self) -> PathBuf {
         self.data.join("lila.db")
     }
@@ -77,8 +73,9 @@ impl Paths {
         self.data.join("worktrees").join(project)
     }
 
-    pub fn prompts(&self, project: &str) -> PathBuf {
-        self.state.join("prompts").join(project)
+    /// A thread's files: the hooks' settings file Claude Code starts with.
+    pub fn thread_dir(&self, thread: &str) -> PathBuf {
+        self.state.join("threads").join(thread)
     }
 
     pub fn ensure(&self) -> Result<()> {

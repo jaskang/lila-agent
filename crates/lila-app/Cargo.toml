@@ -1,6 +1,6 @@
 [package]
 name = "lila-app"
-description = "Lila's desktop app: the team, the owner's terminal, the inbox and the task board."
+description = "Lila's desktop app: projects and their sessions with Claude Code, Codex and ACP agents."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

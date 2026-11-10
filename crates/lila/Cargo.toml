@@ -26,6 +26,8 @@ toml.workspace = true
 toml_edit = "0.25"
 chrono.workspace = true
 libc = "0.2"
+regex = "1"
+shlex = "1"
 linkify = "0.10"
 strip-ansi-escapes = "0.2"
 uuid = { version = "1", features = ["v4"] }

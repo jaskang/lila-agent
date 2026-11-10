@@ -1,108 +1,38 @@
-//! `lila`: run an agent team on herdr-core. The person uses it to start projects
-//! and answer the inbox; members use it to start, finish, block and hand on tasks.
+//! `lila`: the command line of Lila. The person uses it to add projects and talk to
+//! their threads (the window does the same through the same socket); the engines
+//! use it for their hooks and hosts.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use lila::client;
 use lila::paths::Paths;
-use lila::{client, daemon, roles};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
-#[command(name = "lila", version, about = "Run a team of coding agents: you talk to the PM, the PM runs the team.")]
+#[command(name = "lila", version, about = "An agent with an interface of its own: projects, and the threads you have in them.")]
 struct Cli {
     /// Print raw JSON instead of text.
     #[arg(long, global = true)]
     json: bool,
-    /// Print the protocol guide for agents and exit.
-    #[arg(long)]
-    skill: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create .lila/project.toml here with the default team, and install the default roles.
-    Init {
-        /// Project name (default: this folder's name).
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// List roles, or install the defaults that are missing.
-    Roles {
+    /// Start lilad if needed, and add this folder as a project.
+    Up,
+    /// Projects: the folders threads work in.
+    Project {
         #[command(subcommand)]
-        cmd: Option<RolesCmd>,
+        cmd: ProjectCmd,
     },
-    /// Start this project's team (and lilad if needed).
-    Up {
-        /// A first request for the PM, as a task from you.
-        #[arg(long)]
-        brief: Option<String>,
-    },
-    /// Stop this project's members. Tasks stay; open ones are re-sent after the next `up`.
-    Down,
-    /// Who is doing what.
-    Status,
-    /// Every request and whose move it is: what needs you, what is moving, what waits.
-    Requests {
-        /// How many finished ones to show.
-        #[arg(short = 'n', default_value_t = 10)]
-        done: u64,
-    },
-    /// Create, update and inspect tasks.
-    Task {
+    /// Threads: conversations with an agent.
+    Thread {
         #[command(subcommand)]
-        cmd: TaskCmd,
+        cmd: ThreadCmd,
     },
-    /// (PM) Ask the person a question; the answer comes back as <lila answer>.
-    Ask {
-        question: String,
-        #[arg(long = "option")]
-        options: Vec<String>,
-        #[arg(long)]
-        task: Option<String>,
-    },
-    /// (PM) Your call on an issue that came in: the person sees it and says 修 or 不做.
-    Triage {
-        id: String,
-        /// fix | ask | skip | dup
-        #[arg(long)]
-        decision: String,
-        /// s | m | l: how big the fix is.
-        #[arg(long)]
-        size: Option<String>,
-        /// One line: why.
-        #[arg(long)]
-        why: String,
-        /// How you would fix it.
-        #[arg(long)]
-        plan: Option<String>,
-    },
-    /// A comment for an issue's reporter; the person reads it and sends it.
-    Draft {
-        /// The task (under the issue's request).
-        id: String,
-        #[arg(long, conflicts_with = "body_file")]
-        body: Option<String>,
-        #[arg(long)]
-        body_file: Option<std::path::PathBuf>,
-    },
-    /// What needs you: questions, blocked terminals, reports.
-    Inbox {
-        /// Include resolved items.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Answer a question, or dismiss any other inbox item (omit the text).
-    Answer { id: String, text: Option<String> },
-    /// Recent activity.
-    Log {
-        #[arg(short = 'n', default_value_t = 30)]
-        limit: u64,
-        #[arg(long)]
-        task: Option<String>,
-    },
-    /// Tokens each member used, from the session records Claude Code and Codex keep here.
+    /// Tokens each thread used, from the session records Claude Code and Codex keep here.
     Usage {
         /// Only the last N days (default: all).
         #[arg(long)]
@@ -110,19 +40,15 @@ enum Cmd {
     },
     /// Subscription accounts and how much of each usage window is used.
     Accounts,
-    /// Stop delivering tasks (notes still go out).
-    Pause,
-    /// Resume delivering tasks.
-    Resume,
-    /// lilad, the background process that delivers tasks and keeps the state.
+    /// lilad, the background process that keeps the state and runs the engines.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
-    /// A Claude Code hook in a member's session (its settings file runs this).
+    /// A Claude Code hook in a thread's session (its settings file runs this).
     #[command(hide = true)]
     Hook { event: String },
-    /// Runs a member's agent through its protocol (lilad starts it in the member's terminal).
+    /// Runs a thread's agent through its protocol (lilad starts it in the thread's terminal).
     #[command(hide = true)]
     Host {
         #[command(subcommand)]
@@ -143,9 +69,12 @@ enum HostCmd {
         effort: Option<String>,
         #[arg(long)]
         sandbox: Option<String>,
-        /// Lila's system prompt for the member.
+        /// When Codex asks first: untrusted, on-request or never.
         #[arg(long)]
-        prompt_file: std::path::PathBuf,
+        approval: Option<String>,
+        /// A system prompt for the thread.
+        #[arg(long)]
+        prompt_file: Option<std::path::PathBuf>,
         /// A thread to go on with.
         #[arg(long)]
         thread: Option<String>,
@@ -153,16 +82,16 @@ enum HostCmd {
         #[arg(last = true)]
         extra: Vec<String>,
     },
-    /// omp over ACP (`omp acp`), in the current folder.
+    /// An ACP agent (omp: `omp acp`), in the current folder.
     Omp {
         /// The omp program.
         #[arg(long)]
         program: std::path::PathBuf,
         #[arg(long)]
         model: Option<String>,
-        /// Lila's system prompt for the member.
+        /// A system prompt for the thread.
         #[arg(long)]
-        prompt_file: std::path::PathBuf,
+        prompt_file: Option<std::path::PathBuf>,
         /// A session to go on with.
         #[arg(long)]
         session: Option<String>,
@@ -173,112 +102,127 @@ enum HostCmd {
 }
 
 #[derive(Subcommand)]
-enum RolesCmd {
-    /// Install default roles that are missing (never overwrites).
-    Init,
+enum ProjectCmd {
+    /// The projects.
+    List,
+    /// Add a folder (default: this one) as a project.
+    Add {
+        path: Option<std::path::PathBuf>,
+        /// The project's id (default: from the folder's name).
+        #[arg(long)]
+        name: Option<String>,
+        /// What the window calls it.
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Forget a project and its threads (the folder stays).
+    Remove { project: Option<String> },
+    /// A project, with its defaults.
+    Show { project: Option<String> },
+    /// Change a project's title or the defaults its new threads start with.
+    Set {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// claude, codex or omp.
+        #[arg(long)]
+        engine: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        /// read_only, confirm or full.
+        #[arg(long)]
+        permission: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
-enum TaskCmd {
-    /// Assign a task to a member.
+enum ThreadCmd {
+    /// Start a thread, with a first message.
     New {
-        /// The member's id (`lila status` lists them).
+        /// The first message.
+        text: Option<String>,
         #[arg(long)]
-        to: String,
-        /// One line: what is to be done.
-        #[arg(long)]
-        title: String,
-        /// The details, in Markdown.
-        #[arg(long, conflicts_with = "body_file")]
-        body: Option<String>,
-        /// The details, read from a file.
-        #[arg(long)]
-        body_file: Option<std::path::PathBuf>,
-        /// The task this is part of.
-        #[arg(long)]
-        parent: Option<String>,
-        /// Lower runs first (default 0).
-        #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
-        priority: i64,
-        /// The person's own words, unchanged; every step of the chain sees them.
-        #[arg(long)]
-        quote: Option<String>,
-        /// A checkable outcome that counts as done (repeatable).
-        #[arg(long)]
-        accept: Vec<String>,
-        /// Something not to do (repeatable).
-        #[arg(long)]
-        out_of_scope: Vec<String>,
-        /// The flow it runs through (`code`, `quick`, the project's own), or `none`.
-        /// Default: the project's flow, for work from the PM or the person.
-        #[arg(long)]
-        flow: Option<String>,
-        /// Tokens the flow may use (300k, 1.5M); over it, it waits for the person between steps.
-        #[arg(long, value_parser = parse_tokens)]
-        budget: Option<u64>,
-    },
-    /// Change a task you assigned: rewrite it while queued, or --append an update once delivered.
-    Edit {
-        id: String,
+        project: Option<String>,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long, conflicts_with = "body_file")]
-        body: Option<String>,
+        /// claude, codex or omp (default: the project's).
         #[arg(long)]
-        body_file: Option<std::path::PathBuf>,
-        /// Added under "Update from <you>"; sent to the member if it already has the task.
+        engine: Option<String>,
         #[arg(long)]
-        append: Option<String>,
-    },
-    /// Say you started a task delivered to you.
-    Start {
-        id: String,
-    },
-    /// Finish a task delivered to you.
-    Done {
-        id: String,
+        model: Option<String>,
         #[arg(long)]
-        summary: String,
-        /// A deliverable or report (repeatable).
+        effort: Option<String>,
+        /// read_only, confirm or full (default: the project's).
+        #[arg(long)]
+        permission: Option<String>,
+        /// A file to send along (repeatable).
         #[arg(long = "file")]
-        files: Vec<String>,
-        /// A choice you made that the task did not settle (repeatable).
-        #[arg(long = "decision")]
-        decisions: Vec<String>,
-        /// Something you did not check (repeatable).
-        #[arg(long)]
-        unverified: Vec<String>,
-        /// For a verification step: pass or fail.
-        #[arg(long, value_parser = ["pass", "fail"])]
-        verdict: Option<String>,
+        files: Vec<std::path::PathBuf>,
     },
-    /// Stop on a task: say exactly what you need. Whoever assigned it hears.
-    Block {
-        id: String,
+    /// The project's threads, or every project's with --all.
+    List {
         #[arg(long)]
-        reason: String,
-    },
-    /// Withdraw a task you assigned.
-    Cancel {
-        id: String,
-        #[arg(long)]
-        reason: Option<String>,
-    },
-    /// One task with its history and files.
-    Show {
-        id: String,
-    },
-    /// Open tasks.
-    Ls {
-        /// Only tasks assigned to or by you.
-        #[arg(long)]
-        mine: bool,
-        /// Only tasks in this state (queued, delivered, in_progress, blocked, done, cancelled).
-        #[arg(long)]
-        state: Option<String>,
-        /// Include closed tasks.
+        project: Option<String>,
         #[arg(long)]
         all: bool,
+        /// Include archived threads.
+        #[arg(long)]
+        archived: bool,
+    },
+    /// A thread: its state and conversation.
+    Show {
+        thread: String,
+        /// Only items after this seq.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+    },
+    /// Send a message.
+    Send {
+        thread: String,
+        text: String,
+        #[arg(long = "file")]
+        files: Vec<std::path::PathBuf>,
+    },
+    /// Stop what the agent is doing this turn.
+    Interrupt { thread: String },
+    /// End the agent; the conversation stays and can be resumed.
+    Stop { thread: String },
+    /// Start an ended thread again, on the session it had.
+    Resume {
+        thread: String,
+        /// A message to send once it is up.
+        text: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        #[arg(long)]
+        permission: Option<String>,
+    },
+    /// Hide a thread (ends its agent).
+    Archive { thread: String },
+    Unarchive { thread: String },
+    Rename { thread: String, title: String },
+    /// Switch a thread's permission tier: read_only, confirm or full.
+    Permission { thread: String, tier: String },
+    /// Answer a permission card: allow, deny, or dismiss (Claude Code then asks in its terminal).
+    Answer { thread: String, card: String, answer: String },
+    /// Change the model or effort (a Codex or ACP thread at once; a Claude Code one when ended).
+    Model {
+        thread: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+    },
+    /// What lilad did for a thread on its own: starts, ends, answers by the tier, cards.
+    Log {
+        thread: String,
+        #[arg(short = 'n', default_value_t = 50)]
+        limit: u64,
     },
 }
 
@@ -286,7 +230,7 @@ enum TaskCmd {
 enum DaemonCmd {
     /// Run in the foreground (what `lila up` starts inside herdr-core).
     Run,
-    /// Stop the running daemon. Members keep running.
+    /// Stop the running daemon. Threads keep running.
     Stop,
     /// Whether it is running.
     Status,
@@ -299,12 +243,20 @@ fn main() {
     }
 }
 
+fn cwd() -> Result<String> {
+    Ok(std::env::current_dir()?.to_string_lossy().to_string())
+}
+
+/// `{project}` when named, else the folder we are in (lilad finds the project that holds it).
+fn at(project: Option<String>) -> Result<Value> {
+    Ok(match project {
+        Some(p) => json!({"project": p}),
+        None => json!({"cwd": cwd()?}),
+    })
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if cli.skill {
-        print!("{}", include_str!("skill.md"));
-        return Ok(());
-    }
     let Some(cmd) = cli.cmd else {
         use clap::CommandFactory;
         Cli::command().print_help()?;
@@ -324,65 +276,52 @@ fn run() -> Result<()> {
     let call = |method: &str, params: Value| client::request(&paths, method, params, false);
 
     match cmd {
-        Cmd::Init { name } => init(&paths, name)?,
-        Cmd::Roles { cmd: Some(RolesCmd::Init) } => {
-            let written = roles::install_defaults(&paths.roles())?;
-            println!("{}", if written.is_empty() { "all default roles already exist".into() } else { format!("installed: {}", written.join(", ")) });
+        Cmd::Up => {
+            let v = client::request(&paths, "project.add", json!({"cwd": cwd()?}), true)?;
+            out(v, &fmt_project);
         }
-        Cmd::Roles { cmd: None } => {
-            let roles = roles::load(&paths.roles())?;
-            if roles.is_empty() {
-                println!("no roles in {}; run `lila roles init`", paths.roles().display());
+        Cmd::Project { cmd } => match cmd {
+            ProjectCmd::List => out(call("project.list", json!({}))?, &|v| v.as_array().into_iter().flatten().map(fmt_project).collect::<Vec<_>>().join("\n")),
+            ProjectCmd::Add { path, name, title } => {
+                let dir = match path {
+                    Some(p) => std::fs::canonicalize(p)?.to_string_lossy().to_string(),
+                    None => cwd()?,
+                };
+                out(client::request(&paths, "project.add", json!({"cwd": dir, "name": name, "title": title}), true)?, &fmt_project)
             }
-            for r in roles.values() {
-                let f = &r.file;
-                println!("{:<10} {:<28} {} {} {}", r.id, f.name, f.runtime, f.model, f.effort.as_deref().unwrap_or(""));
+            ProjectCmd::Remove { project } => out(call("project.remove", at(project)?)?, &|v| format!("{} removed; stopped: {}", v["project"].as_str().unwrap_or("?"), list(&v["stopped"]))),
+            ProjectCmd::Show { project } => out(call("project.show", at(project)?)?, &fmt_project),
+            ProjectCmd::Set { project, title, engine, model, effort, permission } => {
+                let mut p = at(project)?;
+                p["title"] = json!(title);
+                let defaults: serde_json::Map<String, Value> = [("engine", engine), ("model", model), ("effort", effort), ("permission", permission)].into_iter().filter_map(|(k, v)| v.map(|v| (k.to_owned(), json!(v)))).collect();
+                p["defaults"] = Value::Object(defaults);
+                out(call("project.set", p)?, &fmt_project)
             }
-        }
-        Cmd::Up { brief } => {
-            roles::install_defaults(&paths.roles())?;
-            let v = client::request(&paths, "project.up", json!({"brief": brief}), true)?;
-            out(v, &fmt_up);
-        }
-        Cmd::Down => out(call("project.down", json!({}))?, &|v| format!("stopped: {}", list(&v["stopped"]))),
-        Cmd::Status => out(call("status", json!({}))?, &fmt_status),
-        Cmd::Requests { done } => out(call("request.list", json!({"done_limit": done}))?, &fmt_requests),
-        Cmd::Task { cmd } => task(cmd, &call, &out)?,
-        Cmd::Ask { question, options, task } => {
-            out(call("ask", json!({"question": question, "options": options, "task": task}))?, &|v| format!("asked as {}. {}", v["id"].as_str().unwrap_or("?"), v["note"].as_str().unwrap_or("")))
-        }
-        Cmd::Inbox { all } => out(call("inbox", json!({"all": all}))?, &fmt_inbox),
-        Cmd::Triage { id, decision, size, why, plan } => {
-            out(call("triage", json!({"id": id, "decision": decision, "size": size, "why": why, "plan": plan}))?, &|v| format!("{} sorted: {}. {}", v["id"].as_str().unwrap_or("?"), v["triage"].as_str().unwrap_or("?"), v["note"].as_str().unwrap_or("")))
-        }
-        Cmd::Draft { id, body, body_file } => {
-            let body = match body_file {
-                Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?,
-                None => body.context("give --body or --body-file")?,
-            };
-            out(call("draft", json!({"id": id, "body": body}))?, &|v| format!("drafted as {}. {}", v["id"].as_str().unwrap_or("?"), v["note"].as_str().unwrap_or("")))
-        }
-        Cmd::Answer { id, text } => out(call("answer", json!({"id": id, "text": text}))?, &|v| format!("{} resolved", v["id"].as_str().unwrap_or("?"))),
-        Cmd::Log { limit, task } => out(call("log", json!({"limit": limit, "task": task}))?, &fmt_log),
-        Cmd::Usage { days } => usage(days, cli.json)?,
+        },
+        Cmd::Thread { cmd } => thread(cmd, &call, &out)?,
+        Cmd::Usage { days } => usage(&paths, days, cli.json)?,
         Cmd::Accounts => accounts(&paths, cli.json)?,
-        Cmd::Pause => out(call("pause", json!({}))?, &|_| "paused: no new tasks are delivered".into()),
-        Cmd::Resume => out(call("resume", json!({}))?, &|_| "resumed".into()),
-        Cmd::Daemon { cmd: DaemonCmd::Run } => daemon::serve(paths.clone(), client::hc_bin())?,
+        Cmd::Daemon { cmd: DaemonCmd::Run } => lila::daemon::serve(paths.clone(), client::hc_bin())?,
         Cmd::Hook { event } => client::hook(&paths, &event)?,
-        Cmd::Host { cmd: HostCmd::Codex { program, model, effort, sandbox, prompt_file, thread, extra } } => {
-            let instructions = std::fs::read_to_string(&prompt_file).with_context(|| format!("read {}", prompt_file.display()))?;
-            let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+        Cmd::Host { cmd: HostCmd::Codex { program, model, effort, sandbox, approval, prompt_file, thread, extra } } => {
+            let instructions = match prompt_file {
+                Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?,
+                None => String::new(),
+            };
+            let cwd = cwd()?;
             let args = std::iter::once("app-server".to_owned()).chain(extra).collect();
-            let opts = lila_agent::codex::Options { cwd: cwd.clone(), model, effort, sandbox, instructions, thread };
+            let opts = lila_agent::codex::Options { cwd: cwd.clone(), model, effort, sandbox, approval, instructions, thread };
             lila::host::run(&paths, lila::host::Agent { program, args, cwd }, lila_agent::codex::AppServer::new(opts))?
         }
         Cmd::Host { cmd: HostCmd::Omp { program, model, prompt_file, session, extra } } => {
-            let instructions = std::fs::read_to_string(&prompt_file).with_context(|| format!("read {}", prompt_file.display()))?;
-            let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+            let cwd = cwd()?;
             // omp's own options go before `acp` (P0 S3).
-            let mut args = vec!["--append-system-prompt".to_owned(), instructions];
-            if let Some(m) = model {
+            let mut args = Vec::new();
+            if let Some(f) = prompt_file {
+                args.extend(["--append-system-prompt".to_owned(), std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?]);
+            }
+            if let Some(m) = model.filter(|m| !m.is_empty()) {
                 args.extend(["--model".to_owned(), m]);
             }
             args.extend(extra);
@@ -393,7 +332,7 @@ fn run() -> Result<()> {
         Cmd::Daemon { cmd: DaemonCmd::Stop } => {
             if client::daemon_state(&paths)? {
                 call("stop", json!({}))?;
-                println!("lilad stopped; members keep running");
+                println!("lilad stopped; threads keep running");
             } else {
                 println!("lilad is not running; nothing to stop");
             }
@@ -410,83 +349,58 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// "300k", "1.5M", "250000".
-fn parse_tokens(s: &str) -> Result<u64, String> {
-    let t = s.trim().to_lowercase();
-    let (num, mul) = match t.chars().last() {
-        Some('k') => (&t[..t.len() - 1], 1e3),
-        Some('m') => (&t[..t.len() - 1], 1e6),
-        _ => (t.as_str(), 1.0),
-    };
-    let n: f64 = num.trim().parse().map_err(|_| format!("{s:?}: give tokens like 300k or 1.5M"))?;
-    if n <= 0.0 {
-        return Err("a budget must be above 0".into());
-    }
-    Ok((n * mul).round() as u64)
-}
-
 type Out<'a> = dyn Fn(Value, &dyn Fn(&Value) -> String) + 'a;
 
-fn task(cmd: TaskCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out) -> Result<()> {
-    match cmd {
-        TaskCmd::New { to, title, body, body_file, parent, priority, quote, accept, out_of_scope, flow, budget } => {
-            let body = match body_file {
-                Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?,
-                None => body.unwrap_or_default(),
-            };
-            let v = call(
-                "task.new",
-                json!({"to": to, "title": title, "body": body, "parent": parent, "priority": priority, "quote": quote, "accept": accept, "out_of_scope": out_of_scope, "flow": flow, "budget": budget}),
-            )?;
-            out(v, &|v| {
-                let when = match v["held"].as_str() {
-                    Some(why) => format!("queued: {why}"),
-                    None if v["state"] == "delivered" => "delivered now".into(),
-                    None => "queued until they are free".into(),
-                };
-                format!("{} → {}: {} ({when})", v["id"].as_str().unwrap_or("?"), v["to"].as_str().unwrap_or("?"), v["title"].as_str().unwrap_or(""))
-            });
-        }
-        TaskCmd::Edit { id, title, body, body_file, append } => {
-            let body = match body_file {
-                Some(f) => Some(std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?),
-                None => body,
-            };
-            let v = call("task.edit", json!({"id": id, "title": title, "body": body, "append": append}))?;
-            out(v, &|v| {
-                let how = if v["update_sent"] == true { format!("the update goes to {}", v["to"].as_str().unwrap_or("?")) } else { "rewritten before delivery".into() };
-                format!("{} edited; {how}", v["id"].as_str().unwrap_or("?"))
-            });
-        }
-        TaskCmd::Start { id } => out(call("task.start", json!({"id": id}))?, &|v| format!("{} in progress", v["id"].as_str().unwrap_or("?"))),
-        TaskCmd::Done { id, summary, files, decisions, unverified, verdict } => out(
-            call("task.done", json!({"id": id, "summary": summary, "files": files, "decisions": decisions, "unverified": unverified, "verdict": verdict}))?,
-            &|v| {
-            let to = if v["from"] == "human" { "the person".to_string() } else { v["from"].as_str().unwrap_or("?").to_string() };
-            format!("{} done; {to} was told", v["id"].as_str().unwrap_or("?"))
-            },
-        ),
-        TaskCmd::Block { id, reason } => out(call("task.block", json!({"id": id, "reason": reason}))?, &|v| {
-            format!("{} blocked; {} was told. Stop here until you hear back.", v["id"].as_str().unwrap_or("?"), v["from"].as_str().unwrap_or("?"))
-        }),
-        TaskCmd::Cancel { id, reason } => out(call("task.cancel", json!({"id": id, "reason": reason}))?, &|v| format!("{} cancelled", v["id"].as_str().unwrap_or("?"))),
-        TaskCmd::Show { id } => out(call("task.show", json!({"id": id}))?, &fmt_task_show),
-        TaskCmd::Ls { mine, state, all } => out(call("task.ls", json!({"mine": mine, "state": state, "all": all}))?, &|v| {
-            let rows: Vec<String> = v.as_array().into_iter().flatten().map(task_line).collect();
-            if rows.is_empty() { "no tasks".into() } else { rows.join("\n") }
-        }),
-    }
-    Ok(())
+fn files_of(files: Vec<std::path::PathBuf>) -> Result<Vec<String>> {
+    files.into_iter().map(|f| Ok(std::fs::canonicalize(&f).with_context(|| format!("{}", f.display()))?.to_string_lossy().to_string())).collect()
 }
 
-fn init(paths: &Paths, name: Option<String>) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let out = lila::init::init_project(paths, &cwd, name)?;
-    println!("created {}", out.file.display());
-    if !out.roles_installed.is_empty() {
-        println!("installed roles in {}: {}", paths.roles().display(), out.roles_installed.join(", "));
+fn thread(cmd: ThreadCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out) -> Result<()> {
+    match cmd {
+        ThreadCmd::New { text, project, title, engine, model, effort, permission, files } => {
+            let mut p = at(project)?;
+            p["text"] = json!(text);
+            p["title"] = json!(title);
+            p["engine"] = json!(engine);
+            p["model"] = json!(model);
+            p["effort"] = json!(effort);
+            p["permission"] = json!(permission);
+            p["attachments"] = json!(files_of(files)?);
+            out(call("thread.new", p)?, &fmt_thread)
+        }
+        ThreadCmd::List { project, all, archived } => {
+            let mut p = if all { json!({}) } else { at(project)? };
+            p["archived"] = json!(archived);
+            out(call("thread.list", p)?, &|v| {
+                let rows: Vec<String> = v.as_array().into_iter().flatten().map(thread_line).collect();
+                if rows.is_empty() { "no threads".into() } else { rows.join("\n") }
+            })
+        }
+        ThreadCmd::Show { thread, after } => {
+            let v = call("thread.read", json!({"thread": thread, "after": after}))?;
+            out(v, &fmt_conversation)
+        }
+        ThreadCmd::Send { thread, text, files } => out(call("thread.send", json!({"thread": thread, "text": text, "attachments": files_of(files)?}))?, &|v| format!("sent to {}", v["thread"].as_str().unwrap_or("?"))),
+        ThreadCmd::Interrupt { thread } => out(call("thread.interrupt", json!({"thread": thread}))?, &|v| format!("interrupted {}", v["thread"].as_str().unwrap_or("?"))),
+        ThreadCmd::Stop { thread } => out(call("thread.stop", json!({"thread": thread}))?, &fmt_thread),
+        ThreadCmd::Resume { thread, text, model, effort, permission } => out(call("thread.resume", json!({"thread": thread, "text": text, "model": model, "effort": effort, "permission": permission}))?, &fmt_thread),
+        ThreadCmd::Archive { thread } => out(call("thread.archive", json!({"thread": thread}))?, &fmt_thread),
+        ThreadCmd::Unarchive { thread } => out(call("thread.unarchive", json!({"thread": thread}))?, &fmt_thread),
+        ThreadCmd::Rename { thread, title } => out(call("thread.rename", json!({"thread": thread, "title": title}))?, &fmt_thread),
+        ThreadCmd::Permission { thread, tier } => out(call("thread.permission", json!({"thread": thread, "permission": tier}))?, &fmt_thread),
+        ThreadCmd::Answer { thread, card, answer } => {
+            let mut p = json!({"thread": thread, "card": card});
+            match answer.as_str() {
+                "allow" => p["allow"] = json!(true),
+                "deny" => p["allow"] = json!(false),
+                "dismiss" => p["dismiss"] = json!(true),
+                other => p["option"] = json!(other),
+            }
+            out(call("thread.answer", p)?, &|v| format!("{} answered", v["card"].as_str().unwrap_or("?")))
+        }
+        ThreadCmd::Model { thread, model, effort } => out(call("thread.model", json!({"thread": thread, "model": model, "effort": effort}))?, &|_| "set".into()),
+        ThreadCmd::Log { thread, limit } => out(call("thread.log", json!({"thread": thread, "limit": limit}))?, &fmt_log),
     }
-    println!("next: edit the team if you like, then `lila up --brief \"what you want built\"`");
     Ok(())
 }
 
@@ -537,38 +451,39 @@ fn accounts(paths: &Paths, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-fn usage(days: Option<u64>, as_json: bool) -> Result<()> {
-    use lila::usage::{Scanner, Sources, short};
-    let cwd = std::env::current_dir()?;
-    let root = lila::paths::find_project_root(&cwd).context("no .lila/project.toml here or above")?;
-    let text = std::fs::read_to_string(root.join(".lila/project.toml"))?;
-    let name = lila_core::ProjectConfig::parse(&text).map_err(anyhow::Error::msg)?.name;
+fn usage(paths: &Paths, days: Option<u64>, as_json: bool) -> Result<()> {
+    use lila::usage::{Owners, Scanner, Sources, short};
+    let project = client::request(paths, "project.show", at(None)?, false)?;
+    let name = project["id"].as_str().context("no project")?.to_owned();
+    let root = project["cwd"].as_str().context("no folder")?.to_owned();
+    let threads = client::request(paths, "thread.list", json!({"project": name, "archived": true}), false)?;
+    let owners: Owners = threads.as_array().into_iter().flatten().filter_map(|t| Some((t["session"].as_str()?.to_owned(), (name.clone(), t["id"].as_str()?.to_owned())))).collect();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
     let since = days.map(|d| now - d as i64 * 86_400_000);
-    // Members also work in the project's worktree slots.
-    let slots = lila::worktree::existing(&lila::paths::Paths::from_env().worktrees(&name));
-    let cwds: Vec<String> = std::iter::once(root).chain(slots).map(|p| p.to_string_lossy().to_string()).collect();
-    let u = Scanner::default().usage(&Sources::from_env(), &name, &cwds, since);
+    // Threads also work in the project's worktrees.
+    let slots = lila::worktree::existing(&paths.worktrees(&name));
+    let cwds: Vec<String> = std::iter::once(std::path::PathBuf::from(root)).chain(slots).map(|p| p.to_string_lossy().to_string()).collect();
+    let u = Scanner::default().usage(&Sources::from_env(), &name, &cwds, &owners, since);
     if as_json {
-        let members: Vec<Value> = u
-            .members
+        let rows: Vec<Value> = u
+            .threads
             .iter()
-            .map(|m| json!({"member": m.member, "runtime": m.runtime, "sessions": m.sessions, "input": m.tokens.input, "cache_write": m.tokens.cache_write, "cache_read": m.tokens.cache_read, "output": m.tokens.output, "total": m.tokens.total(), "models": m.models.keys().collect::<Vec<_>>()}))
+            .map(|m| json!({"thread": m.thread, "runtime": m.runtime, "sessions": m.sessions, "input": m.tokens.input, "cache_write": m.tokens.cache_write, "cache_read": m.tokens.cache_read, "output": m.tokens.output, "total": m.tokens.total(), "models": m.models.keys().collect::<Vec<_>>()}))
             .collect();
         let limits: Vec<Value> = u.codex_limits.iter().map(|l| json!({"used_percent": l.used_percent, "window_minutes": l.window_minutes, "resets_at_ms": l.resets_at_ms, "seen_ms": l.seen_ms, "plan": l.plan})).collect();
-        println!("{}", serde_json::to_string_pretty(&json!({"project": name, "members": members, "codex_limits": limits}))?);
+        println!("{}", serde_json::to_string_pretty(&json!({"project": name, "threads": rows, "codex_limits": limits}))?);
         return Ok(());
     }
-    if u.members.is_empty() {
-        println!("no sessions of {name}'s members found{}", if days.is_some() { " in that time" } else { "" });
+    if u.threads.is_empty() {
+        println!("no sessions of {name}'s threads found{}", if days.is_some() { " in that time" } else { "" });
     }
-    for m in &u.members {
+    for m in &u.threads {
         let t = &m.tokens;
         let models: Vec<&str> = m.models.keys().map(String::as_str).collect();
-        println!("{:<14} {:>7}  in {:>6}  cache w {:>6} r {:>7}  out {:>6}  {} session(s)  {}", m.member, short(t.total()), short(t.input), short(t.cache_write), short(t.cache_read), short(t.output), m.sessions, models.join(", "));
+        println!("{:<10} {:>7}  in {:>6}  cache w {:>6} r {:>7}  out {:>6}  {} session(s)  {}", m.thread, short(t.total()), short(t.input), short(t.cache_write), short(t.cache_read), short(t.output), m.sessions, models.join(", "));
     }
-    if !u.members.is_empty() {
-        println!("{:<14} {:>7}", "total", short(u.total.total()));
+    if !u.threads.is_empty() {
+        println!("{:<10} {:>7}", "total", short(u.total.total()));
     }
     for l in &u.codex_limits {
         println!("codex: {:.0}% of the {}-minute window used, resets in {} min", l.used_percent, l.window_minutes, ((l.resets_at_ms - now) / 60_000).max(0));
@@ -583,214 +498,76 @@ fn list(v: &Value) -> String {
     if items.is_empty() { "none".into() } else { items.join(", ") }
 }
 
-fn task_line(t: &Value) -> String {
+fn fmt_project(p: &Value) -> String {
+    let d = &p["defaults"];
+    let mut s = format!(
+        "{:<14} {}  [{} {} {} · {}]  {} thread(s)",
+        p["id"].as_str().unwrap_or(""),
+        p["cwd"].as_str().unwrap_or(""),
+        d["engine"].as_str().unwrap_or(""),
+        d["model"].as_str().unwrap_or(""),
+        d["effort"].as_str().unwrap_or("-"),
+        d["permission"].as_str().unwrap_or(""),
+        p["threads"].as_u64().unwrap_or(0)
+    );
+    if let Some(e) = p["error"].as_str() {
+        s.push_str(&format!("\n  ! {e}"));
+    }
+    s
+}
+
+fn thread_line(t: &Value) -> String {
+    let waiting = t["waiting"].as_str().map(|w| format!(" ({w})")).unwrap_or_default();
     format!(
-        "{:<5} {:<11} {} → {:<10} {}",
+        "{:<10} {:<9} {:<6} {:<20} {:<9} {}{}",
         t["id"].as_str().unwrap_or(""),
-        t["state"].as_str().unwrap_or(""),
-        t["from"].as_str().unwrap_or(""),
-        t["to"].as_str().unwrap_or(""),
-        t["title"].as_str().unwrap_or("")
+        format!("{}{waiting}", t["state"].as_str().unwrap_or("")),
+        t["engine"].as_str().unwrap_or(""),
+        t["model"].as_str().unwrap_or(""),
+        t["permission"].as_str().unwrap_or(""),
+        t["title"].as_str().unwrap_or(""),
+        if t["archived"] == true { "  [archived]" } else { "" }
     )
 }
 
-fn fmt_up(v: &Value) -> String {
-    let mut s = format!("project {} ({})\n", v["project"].as_str().unwrap_or("?"), v["cwd"].as_str().unwrap_or(""));
-    for m in v["started"].as_array().into_iter().flatten() {
-        s.push_str(&format!(
-            "  started {:<10} in {:<5} {} {}\n",
-            m["member"].as_str().unwrap_or(""),
-            m["terminal"].as_str().unwrap_or(""),
-            m["runtime"].as_str().unwrap_or(""),
-            m["model"].as_str().unwrap_or("")
-        ));
-    }
-    for m in v["running"].as_array().into_iter().flatten() {
-        s.push_str(&format!("  running {:<10} in {}\n", m["member"].as_str().unwrap_or(""), m["terminal"].as_str().unwrap_or("")));
-    }
-    if let Some(t) = v["brief_task"].as_str() {
-        s.push_str(&format!("brief sent to the PM as {t}\n"));
-    }
-    if !v["started"].as_array().is_none_or(|a| a.is_empty()) {
-        s.push_str("First start in a folder: Claude Code asks whether you trust it. `lila inbox` tells you if a member is waiting.\n");
-    }
-    s.push_str("Talk to the PM in its terminal (lila-app, herdr-app, or `hc attach lila-<project>-pm`).");
-    s
+fn fmt_thread(t: &Value) -> String {
+    thread_line(t)
 }
 
-fn fmt_status(v: &Value) -> String {
-    let mut s = format!("{}{}\n", v["project"].as_str().unwrap_or("?"), if v["paused"] == true { "  (paused)" } else { "" });
-    for m in v["members"].as_array().into_iter().flatten() {
-        let task = m["task"].as_object().map(|t| format!("{} {} [{}]", t["id"].as_str().unwrap_or(""), t["title"].as_str().unwrap_or(""), t["state"].as_str().unwrap_or(""))).unwrap_or_default();
-        let queued = m["queued"].as_u64().unwrap_or(0);
-        let queued = if queued > 0 { format!(" +{queued} queued") } else { String::new() };
-        let msg = m["msg"].as_str().filter(|s| !s.is_empty()).map(|s| format!("\n             ↳ {s}")).unwrap_or_default();
-        s.push_str(&format!(
-            "  {:<10} {:<8} {:<5} {:<18} {task}{queued}{msg}\n",
-            m["id"].as_str().unwrap_or(""),
-            m["status"].as_str().unwrap_or(""),
-            m["terminal"].as_str().unwrap_or("-"),
-            m["model"].as_str().unwrap_or(""),
-        ));
-    }
-    for r in v["runs"].as_array().into_iter().flatten() {
-        let round = r["round"].as_u64().filter(|n| *n > 0).map(|n| format!(", fix round {n}")).unwrap_or_default();
-        s.push_str(&format!(
-            "  flow {} {} \"{}\": {} ({}{round})\n",
-            r["flow"].as_str().unwrap_or(""),
-            r["anchor"].as_str().unwrap_or(""),
-            r["title"].as_str().unwrap_or(""),
-            r["step"].as_str().unwrap_or(""),
-            r["state"].as_str().unwrap_or(""),
-        ));
-    }
-    let held = v["held_for_review"].as_u64().unwrap_or(0);
-    if held > 0 {
-        s.push_str(&format!("  {held} new task(s) wait: {} results wait for the person's review\n", v["unreviewed"].as_u64().unwrap_or(0)));
-    }
-    let folder = v["held_for_folder"].as_u64().unwrap_or(0);
-    if folder > 0 {
-        let open: Vec<&str> = v["open_chains"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
-        s.push_str(&format!("  {folder} task(s) wait for the project folder: chain {} has it until the person signs it off\n", open.join(", ")));
-    }
-    let slots = v["worktrees"].as_array().cloned().unwrap_or_default();
-    if !slots.is_empty() {
-        let each: Vec<String> = slots.iter().map(|w| format!("{} {}", w["slot"], w["chain"].as_str().unwrap_or("free"))).collect();
-        s.push_str(&format!("  worktrees: {}\n", each.join(", ")));
-    }
-    for src in v["sources"].as_array().into_iter().flatten() {
-        let when = src["last_ms"].as_i64().map(|at| {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(at);
-            format!("looked {} min ago", (now - at).max(0) / 60_000)
-        });
-        let state = src["error"].as_str().map(|e| format!("failing: {e}")).or(when).unwrap_or_else(|| "not looked yet".into());
-        s.push_str(&format!("  {} \"{}\": {state}\n", src["kind"].as_str().unwrap_or(""), src["query"].as_str().unwrap_or("")));
-    }
-    let worktree = v["held_for_worktree"].as_u64().unwrap_or(0);
-    if worktree > 0 {
-        s.push_str(&format!("  {worktree} new chain(s) wait for a free worktree\n"));
-    }
-    if v["codex_paused_until"].is_i64() {
-        s.push_str("  Codex's usage limit is used up: its members get no work until it resets\n");
-    }
-    let open = v["open_tasks"].as_array().map(|a| a.len()).unwrap_or(0);
-    s.push_str(&format!("{open} open task(s)"));
-    let inbox = v["inbox"].as_u64().unwrap_or(0);
-    if inbox > 0 {
-        s.push_str(&format!(", {inbox} item(s) need the person (`lila inbox`)"));
-    }
-    s
-}
-
-fn fmt_requests(v: &Value) -> String {
-    let items = v.as_array().cloned().unwrap_or_default();
-    if items.is_empty() {
-        return "no requests yet".into();
-    }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    let mut s = String::new();
-    let mut group = "";
-    for r in &items {
-        let g = r["group"].as_str().unwrap_or("");
-        if g != group {
-            group = g;
-            s.push_str(&format!("{}{}\n", if s.is_empty() { "" } else { "\n" }, g.replace('_', " ")));
+fn fmt_conversation(v: &Value) -> String {
+    let mut s = format!("{}\n", thread_line(&v["thread"]));
+    for i in v["items"].as_array().into_iter().flatten() {
+        let text = |k: &str| i[k].as_str().unwrap_or("").trim().to_owned();
+        match i["kind"].as_str().unwrap_or("") {
+            "user_message" => s.push_str(&format!("\nyou: {}\n", text("text"))),
+            "agent_message" => s.push_str(&format!("\n{}\n", text("text"))),
+            "thought" => s.push_str(&format!("\n(thinking) {}\n", text("text").lines().next().unwrap_or(""))),
+            "tool_call" => {
+                let out = text("output");
+                let tail = out.lines().next().map(|l| format!("\n    {l}")).unwrap_or_default();
+                s.push_str(&format!("\n$ {} {} [{}]{tail}\n", text("name"), text("title"), i["state"].as_str().unwrap_or("")));
+            }
+            _ => {}
         }
-        let d = &r["doing"];
-        let doing = match d["kind"].as_str().unwrap_or("") {
-            "you" => format!("your move: {}", d["inbox"].as_str().unwrap_or("")),
-            "member" => format!("{} on {} ({})", d["member"].as_str().unwrap_or(""), d["task"].as_str().unwrap_or(""), d["state"].as_str().unwrap_or("")),
-            "check" => "check running".to_owned(),
-            "commit" => "committing".to_owned(),
-            "wait" => format!("waits: {}", d["hold"].as_str().unwrap_or("")),
-            "reply" => format!("waits for @{}'s reply", r["external"]["author"].as_str().unwrap_or("")),
-            other => other.to_owned(),
-        };
-        let mins = (now - r["since_ms"].as_i64().unwrap_or(now)).max(0) / 60_000;
-        let slot = r["slot"].as_u64().map(|n| format!(" · worktree {n}")).unwrap_or_default();
-        s.push_str(&format!("  {:<5} {} · {doing} · {mins} min{slot}\n", r["id"].as_str().unwrap_or(""), r["title"].as_str().unwrap_or("")));
     }
-    s.trim_end().to_owned()
-}
-
-fn fmt_inbox(v: &Value) -> String {
-    let items = v.as_array().cloned().unwrap_or_default();
-    if items.is_empty() {
-        return "nothing needs you".into();
+    if let Some(w) = v["writing"].as_str() {
+        s.push_str(&format!("\n… {w}\n"));
     }
-    items
-        .iter()
-        .map(|i| {
-            let mut s = format!("{:<4} [{}] {}", i["id"].as_str().unwrap_or(""), i["kind"].as_str().unwrap_or(""), i["text"].as_str().unwrap_or(""));
-            if let Some(opts) = i["options"].as_array().filter(|o| !o.is_empty()) {
-                s.push_str(&format!("\n     options: {}", opts.iter().filter_map(|o| o.as_str()).collect::<Vec<_>>().join(" / ")));
-            }
-            if let Some(a) = i["answer"].as_str() {
-                s.push_str(&format!("\n     answered: {a}"));
-            }
-            s
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    for c in v["permissions"].as_array().into_iter().flatten() {
+        let opts: Vec<&str> = c["options"].as_array().into_iter().flatten().filter_map(|o| o["id"].as_str()).collect();
+        s.push_str(&format!("\n? [{}] {} — {} ({})\n", c["id"].as_str().unwrap_or(""), c["title"].as_str().unwrap_or(""), c["why"].as_str().unwrap_or(""), opts.join(" / ")));
+    }
+    s.push_str(&format!("\nseq {}", v["seq"]));
+    s
 }
 
 fn fmt_log(v: &Value) -> String {
     v.as_array()
         .into_iter()
         .flatten()
-        .map(|e| {
-            let task = e["task"].as_str().map(|t| format!("{t} ")).unwrap_or_default();
-            format!("{} {:<10} {task}{} {}", clock(e["at_ms"].as_i64().unwrap_or(0)), e["actor"].as_str().unwrap_or(""), e["kind"].as_str().unwrap_or(""), e["detail"].as_str().unwrap_or(""))
-        })
+        .map(|e| format!("{} {:<8} {} {}", clock(e["at_ms"].as_i64().unwrap_or(0)), e["actor"].as_str().unwrap_or(""), e["kind"].as_str().unwrap_or(""), e["detail"].as_str().unwrap_or("")))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn fmt_task_show(v: &Value) -> String {
-    let mut s = format!("{}  {}\n", v["id"].as_str().unwrap_or(""), v["title"].as_str().unwrap_or(""));
-    s.push_str(&format!("state {} · {} → {}", v["state"].as_str().unwrap_or(""), v["from"].as_str().unwrap_or(""), v["to"].as_str().unwrap_or("")));
-    if let Some(p) = v["parent"].as_str() {
-        s.push_str(&format!(" · parent {p}"));
-    }
-    s.push_str(&format!(" · {}\n", v["file"].as_str().unwrap_or("")));
-    if let Some(sum) = v["summary"].as_str() {
-        s.push_str(&format!("summary: {sum}\n"));
-    }
-    if let Some(r) = v["block_reason"].as_str().filter(|_| v["state"] == "blocked") {
-        s.push_str(&format!("blocked: {r}\n"));
-    }
-    let files = list(&v["artifacts"]);
-    if files != "none" {
-        s.push_str(&format!("files: {files}\n"));
-    }
-    for (key, head) in [("decisions", "decided"), ("unverified", "not checked")] {
-        for item in v[key].as_array().into_iter().flatten().filter_map(Value::as_str) {
-            s.push_str(&format!("{head}: {item}\n"));
-        }
-    }
-    let body = v["body"].as_str().unwrap_or("").trim();
-    if !body.is_empty() {
-        s.push_str(&format!("\n{body}\n"));
-    }
-    if let Some(q) = v["quote"].as_str() {
-        s.push_str("\nthe person's words:\n");
-        s.extend(q.lines().map(|l| format!("> {l}\n")));
-    }
-    for (key, head) in [("accept", "done when"), ("out_of_scope", "out of scope")] {
-        let items: Vec<&str> = v[key].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-        if !items.is_empty() {
-            s.push_str(&format!("\n{head}:\n"));
-            s.extend(items.iter().map(|i| format!("- {i}\n")));
-        }
-    }
-    for c in v["children"].as_array().into_iter().flatten() {
-        s.push_str(&format!("\n  sub {}", task_line(c)));
-    }
-    s.push('\n');
-    for e in v["events"].as_array().into_iter().flatten() {
-        s.push_str(&format!("\n{} {} {} {}", clock(e["at_ms"].as_i64().unwrap_or(0)), e["actor"].as_str().unwrap_or(""), e["kind"].as_str().unwrap_or(""), e["detail"].as_str().unwrap_or("")));
-    }
-    s
 }
 
 /// HH:MM:SS in local time.
@@ -800,13 +577,3 @@ fn clock(ms: i64) -> String {
 }
 
 
-#[cfg(test)]
-mod budget_tests {
-    #[test]
-    fn budgets_read_like_people_write_them() {
-        assert_eq!(super::parse_tokens("300k"), Ok(300_000));
-        assert_eq!(super::parse_tokens("1.5M"), Ok(1_500_000));
-        assert_eq!(super::parse_tokens("250000"), Ok(250_000));
-        assert!(super::parse_tokens("lots").is_err() && super::parse_tokens("0").is_err());
-    }
-}

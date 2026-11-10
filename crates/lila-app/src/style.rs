@@ -20,10 +20,8 @@ pub const R_CTL: f32 = 8.;
 /// row never touches the next).
 pub const ROW: f32 = 32.;
 pub const ROW_GAP: f32 = 2.;
-/// A member's two-line row, and the room under it (the tree's lines run through it).
-pub const MEMBER_ROW: f32 = 46.;
-pub const MEMBER_GAP: f32 = 4.;
-
+/// A session row that waits for you has a second line.
+pub const THREAD_ROW_WAITING: f32 = 46.;
 
 
 fn c(hex: u32) -> Hsla {
@@ -56,9 +54,6 @@ pub fn red() -> Hsla {
 pub fn yellow() -> Hsla {
     c(0xffd60aff)
 }
-pub fn orange() -> Hsla {
-    c(0xff9f0aff)
-}
 /// Claude Code's own orange, for its tile.
 pub fn claude() -> Hsla {
     c(0xf0905fff)
@@ -76,7 +71,7 @@ pub fn hover() -> Hsla {
 pub fn accent() -> Hsla {
     c(0xffffff17)
 }
-/// Grouped rows, inbox notes.
+/// Grouped rows in dialogs, message bubbles.
 pub fn fill() -> Hsla {
     c(0xffffff0a)
 }
@@ -118,14 +113,6 @@ pub trait Control: Styled + Sized {
     fn control(self) -> Self {
         self.h(px(CTL)).px(px(12.)).text_size(px(13.)).rounded(px(R_CTL))
     }
-    /// A select: a control on a raised step of glass instead of a well.
-    fn select_control(self) -> Self {
-        self.control().bg(gpui::Hsla::from(rgba(0xffffff12)))
-    }
-    /// A multi-line input (its editor pads itself).
-    fn area(self) -> Self {
-        self.text_size(px(13.)).rounded(px(9.))
-    }
     /// A compact labelled button (kit `small` is 24 tall).
     fn small_button(self) -> Self {
         self.h(px(CTL_SM)).px(px(12.))
@@ -133,6 +120,12 @@ pub trait Control: Styled + Sized {
 }
 
 impl<T: Styled> Control for T {}
+
+/// The quiet button: no surface at rest, the Hover fill under the pointer (gpui-kit's own ghost hovers in the
+/// accent blue, which DESIGN.md keeps for menus).
+pub fn quiet(cx: &App) -> gpui::component::button::ButtonCustomVariant {
+    gpui::component::button::ButtonCustomVariant::new(cx).foreground(fg()).hover(hover()).active(accent())
+}
 
 /// A card: the sidebar, terminal, each overview section, and status bar.
 pub fn card() -> Div {
@@ -149,18 +142,13 @@ pub fn tag(color: Hsla, text: impl Into<SharedString>) -> Div {
     div().h(px(18.)).px(px(6.)).flex_none().flex().items_center().rounded(px(5.)).text_size(px(11.)).font_semibold().whitespace_nowrap().text_color(tint(color, 0.2)).bg(color.opacity(0.18)).child(text.into())
 }
 
-/// A neutral tag (ids of queued or cancelled tasks).
-pub fn tag_neutral(text: impl Into<SharedString>) -> Div {
-    div().h(px(18.)).px(px(6.)).flex_none().flex().items_center().rounded(px(5.)).text_size(px(11.)).font_semibold().text_color(muted()).bg(c(0xffffff14)).child(text.into())
-}
-
-/// A round count (unanswered inbox items).
+/// A round count (sessions waiting for you).
 pub fn pill(color: Hsla, text: impl Into<SharedString>) -> Div {
     tag(color, text).rounded(px(9.)).min_w(px(18.)).justify_center().px(px(5.))
 }
 
-/// Which CLI a member runs, as a small tile: Claude Code's asterisk in its
-/// orange, Codex as a neutral prompt.
+/// Which engine a thread runs on, as a small tile: Claude Code's asterisk in its
+/// orange, Codex as a neutral prompt, omp in blue.
 pub fn cli_tile(runtime: &str, size: f32) -> Div {
     let (color, bg, line, icon) = match runtime {
         "codex" => (c(0xe5e5eaff), c(0xffffff17), c(0xffffff1a), "lila/prompt.svg"),
@@ -199,7 +187,7 @@ pub fn link(id: impl Into<ElementId>, text: impl Into<SharedString>, plus: bool)
         .child(text.into())
 }
 
-/// One place that says what state a member is in: a mark and a word on a soft wash.
+/// One place that says what state a thread is in: a mark and a word on a soft wash.
 pub fn status_pill(status: &str, cx: &App) -> Div {
     let color = crate::ui::status_color(status, cx);
     h_flex()
@@ -233,6 +221,12 @@ impl AssetSource for Assets {
             "lila/square-slash.svg" => Some(include_bytes!("../assets/lila/square-slash.svg")),
             "lila/sparkles.svg" => Some(include_bytes!("../assets/lila/sparkles.svg")),
             "lila/command.svg" => Some(include_bytes!("../assets/lila/command.svg")),
+            "lila/power.svg" => Some(include_bytes!("../assets/lila/power.svg")),
+            "lila/pencil.svg" => Some(include_bytes!("../assets/lila/pencil.svg")),
+            "lila/archive-restore.svg" => Some(include_bytes!("../assets/lila/archive-restore.svg")),
+            "lila/lock.svg" => Some(include_bytes!("../assets/lila/lock.svg")),
+            "lila/shield-check.svg" => Some(include_bytes!("../assets/lila/shield-check.svg")),
+            "lila/zap.svg" => Some(include_bytes!("../assets/lila/zap.svg")),
             _ => None,
         };
         match own {

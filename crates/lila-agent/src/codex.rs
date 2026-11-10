@@ -15,6 +15,8 @@ pub struct Options {
     pub effort: Option<String>,
     /// `read-only`, `workspace-write` or `danger-full-access`.
     pub sandbox: Option<String>,
+    /// `untrusted`, `on-request` or `never`: when Codex asks before running something. Default `on-request`.
+    pub approval: Option<String>,
     /// Lila's system prompt for the member (`developerInstructions`).
     pub instructions: String,
     /// A thread to go on with.
@@ -59,6 +61,18 @@ pub struct AppServer {
     heard_ms: i64,
     /// The turn already nudged (`tick`), once each.
     nudged: Option<String>,
+    /// The files of the file changes started, by item id: what an approval for them is about.
+    file_paths: HashMap<String, Vec<String>>,
+}
+
+/// A sandbox mode (`thread/start`) as the policy a turn takes (`turn/start`).
+fn sandbox_policy(mode: &str) -> Option<Value> {
+    match mode {
+        "read-only" => Some(json!({"type": "readOnly"})),
+        "workspace-write" => Some(json!({"type": "workspaceWrite", "networkAccess": false})),
+        "danger-full-access" => Some(json!({"type": "dangerFullAccess"})),
+        _ => None,
+    }
 }
 
 /// A turn quiet this long with nothing running is stuck (P2: Codex sometimes stops
@@ -68,7 +82,10 @@ pub const NUDGE: &str = "(Lila: no progress for a while. Continue the task.)";
 
 /// The answers a command or a change takes, the suggested first.
 fn approval_options() -> Vec<PermOption> {
-    [("accept", "允许"), ("acceptForSession", "本会话都允许"), ("decline", "拒绝")].into_iter().map(|(id, label)| PermOption { id: id.into(), label: label.into() }).collect()
+    [("accept", "允许", PermKind::Allow), ("acceptForSession", "本会话都允许", PermKind::AllowAlways), ("decline", "拒绝", PermKind::Reject)]
+        .into_iter()
+        .map(|(id, label, kind)| PermOption { id: id.into(), label: label.into(), kind })
+        .collect()
 }
 
 impl AppServer {
@@ -87,6 +104,7 @@ impl AppServer {
             running: Default::default(),
             heard_ms: 0,
             nudged: None,
+            file_paths: HashMap::new(),
         }
     }
 
@@ -108,7 +126,10 @@ impl AppServer {
     }
 
     fn thread_params(&self) -> Value {
-        let mut p = json!({"cwd": self.opts.cwd, "model": self.opts.model, "approvalPolicy": "on-request", "developerInstructions": self.opts.instructions});
+        let mut p = json!({"cwd": self.opts.cwd, "model": self.opts.model, "approvalPolicy": self.opts.approval.as_deref().unwrap_or("on-request")});
+        if !self.opts.instructions.trim().is_empty() {
+            p["developerInstructions"] = json!(self.opts.instructions);
+        }
         if let Some(s) = &self.opts.sandbox {
             p["sandbox"] = json!(s);
         }
@@ -164,6 +185,13 @@ impl AppServer {
                 if let Some(e) = &self.opts.effort {
                     p["effort"] = json!(e);
                 }
+                // So does the permission tier (a switch between turns takes effect from the next one).
+                if let Some(a) = &self.opts.approval {
+                    p["approvalPolicy"] = json!(a);
+                }
+                if let Some(policy) = self.opts.sandbox.as_deref().and_then(sandbox_policy) {
+                    p["sandboxPolicy"] = policy;
+                }
                 self.starting = true;
                 self.status = HostStatus::Working;
                 self.request(step, Asked::TurnStart, "turn/start", p);
@@ -187,6 +215,10 @@ impl AppServer {
             Command::SetEffort { effort } => {
                 self.opts.effort = Some(effort);
                 step.events.push(self.config());
+            }
+            Command::SetPermission { approval, sandbox } => {
+                self.opts.approval = Some(approval);
+                self.opts.sandbox = Some(sandbox);
             }
             Command::Compact => {
                 if let Some(thread) = self.thread.clone() {
@@ -302,20 +334,34 @@ impl AppServer {
 
     fn on_request(&mut self, step: &mut Step, id: Value, method: &str, p: &Value) {
         let request = match method {
-            "item/commandExecution/requestApproval" => Some(PermissionRequest {
-                id: format!("codex-{id}"),
-                tool: ToolKind::Execute,
-                title: unwrap_shell(p["command"].as_str().unwrap_or_default()),
-                detail: p["reason"].as_str().or(p["cwd"].as_str()).unwrap_or_default().to_owned(),
-                options: approval_options(),
-            }),
-            "item/fileChange/requestApproval" => Some(PermissionRequest {
-                id: format!("codex-{id}"),
-                tool: ToolKind::Edit,
-                title: p["grantRoot"].as_str().map(|r| format!("写入 {r}")).unwrap_or_else(|| "修改文件".into()),
-                detail: p["reason"].as_str().unwrap_or_default().to_owned(),
-                options: approval_options(),
-            }),
+            "item/commandExecution/requestApproval" => {
+                let command = unwrap_shell(p["command"].as_str().unwrap_or_default());
+                Some(PermissionRequest {
+                    name: "shell".into(),
+                    command: Some(command.clone()),
+                    cwd: p["cwd"].as_str().map(String::from),
+                    ..PermissionRequest::new(format!("codex-{id}"), ToolKind::Execute, command, p["reason"].as_str().or(p["cwd"].as_str()).unwrap_or_default(), approval_options())
+                })
+            }
+            "item/fileChange/requestApproval" => {
+                // The files are on the item that was started before this asked (`item/started`), by its id.
+                let mut paths = p["itemId"].as_str().and_then(|i| self.file_paths.get(i)).cloned().unwrap_or_default();
+                if let Some(root) = p["grantRoot"].as_str() {
+                    paths.push(root.to_owned());
+                }
+                Some(PermissionRequest {
+                    name: "apply_patch".into(),
+                    paths,
+                    cwd: Some(self.opts.cwd.clone()),
+                    ..PermissionRequest::new(
+                        format!("codex-{id}"),
+                        ToolKind::Edit,
+                        p["grantRoot"].as_str().map(|r| format!("写入 {r}")).unwrap_or_else(|| "修改文件".into()),
+                        p["reason"].as_str().unwrap_or_default(),
+                        approval_options(),
+                    )
+                })
+            }
             _ => None,
         };
         match request {
@@ -360,6 +406,12 @@ impl AppServer {
                     } else {
                         self.running.remove(id);
                     }
+                }
+                if p["item"]["type"] == "fileChange"
+                    && let Some(id) = p["item"]["id"].as_str()
+                {
+                    let paths = p["item"]["changes"].as_array().into_iter().flatten().filter_map(|c| c["path"].as_str().map(String::from)).collect();
+                    self.file_paths.insert(id.to_owned(), paths);
                 }
                 if let Some(item) = item_of(&p["item"], self.turn.clone(), now_ms) {
                     step.events.push(AgentEvent::Item { item });
@@ -482,7 +534,7 @@ mod tests {
     use super::*;
 
     fn server() -> AppServer {
-        AppServer::new(Options { cwd: "/r".into(), model: "gpt".into(), effort: Some("low".into()), sandbox: Some("workspace-write".into()), instructions: "You are tester.".into(), thread: None })
+        AppServer::new(Options { cwd: "/r".into(), model: "gpt".into(), effort: Some("low".into()), sandbox: Some("workspace-write".into()), approval: None, instructions: "You are tester.".into(), thread: None })
     }
 
     /// Answers the request it sent last with `result`.

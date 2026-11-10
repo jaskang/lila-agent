@@ -3,7 +3,7 @@
 //! read from the CLIs' own records off the UI thread, every 30 s and right
 //! after a change). Accounts are added here, signing in in the vendor's web
 //! page (`lila::signin`: the CLI's own login in the background, as magpie does),
-//! made current (members run on it), or removed.
+//! made current (sessions run on it), or removed.
 
 use crate::app::LilaApp;
 use crate::data;
@@ -205,7 +205,7 @@ impl LilaApp {
     pub fn dev_signin(&mut self, spec: &str, window: &mut Window, cx: &mut Context<Self>) {
         let (cli, name) = spec.split_once(':').unwrap_or((spec, ""));
         let r = if cli == "codex" { Runtime::Codex } else { Runtime::Claude };
-        self.open_prefs(crate::prefs::PrefPage::Usage, window, cx);
+        self.open_prefs(crate::prefs::PrefPage::Usage, cx);
         self.account_add(r, window, cx);
         if let Some((_, input)) = &self.usage.adding {
             input.update(cx, |i, cx| i.set_value(name.to_owned(), window, cx));
@@ -474,6 +474,7 @@ impl LilaApp {
     }
 
     fn account_card(&mut self, a: &Account, u: &AccountUsage, color: Hsla, now: i64, cx: &mut Context<Self>) -> AnyElement {
+        let quiet = style::quiet(cx);
         let id = a.id.clone();
         let confirm = self.usage.confirm_remove.as_deref() == Some(&a.id);
         let actions = if a.current {
@@ -487,7 +488,7 @@ impl LilaApp {
                     let remove = if confirm {
                         Button::new(SharedString::from(format!("acct-rm-{id}"))).small().danger().label("确认移除")
                     } else {
-                        Button::new(SharedString::from(format!("acct-rm-{id}"))).ghost().xsmall().icon(style::icon("lila/trash.svg")).tooltip("移除")
+                        Button::new(SharedString::from(format!("acct-rm-{id}"))).custom(quiet).xsmall().icon(style::icon("lila/trash.svg")).tooltip("移除")
                     };
                     d.child(remove.on_click(cx.listener(move |this, _, _, cx| this.account_remove(rm_id.clone(), cx))))
                 })
@@ -519,6 +520,7 @@ impl LilaApp {
     }
 
     fn add_form(&mut self, label: &'static str, color: Hsla, input: Entity<InputState>, cx: &mut Context<Self>) -> AnyElement {
+        let quiet = style::quiet(cx);
         if let Some(s) = self.usage.signing.as_ref().filter(|s| s.account.runtime == if label == "Claude Code" { Runtime::Claude } else { Runtime::Codex }) {
             let (url, code, claude) = (s.url.clone(), s.code.clone(), s.account.runtime == Runtime::Claude);
             return v_flex()
@@ -534,7 +536,7 @@ impl LilaApp {
                         .child(Spinner::new().small().color(style::tint(color, 0.4)))
                         .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_medium().child(format!("正在浏览器里登录「{}」…", s.account.name)))
                         .when_some(url, |d, url| d.child(style::link("acct-reopen", "重新打开登录页", false).text_size(px(13.)).on_click(move |_, _, _| open_url(&url))))
-                        .child(Button::new("acct-cancel").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| this.signin_cancel(cx)))),
+                        .child(Button::new("acct-cancel").custom(quiet).label("取消").on_click(cx.listener(|this, _, _, cx| this.signin_cancel(cx)))),
                 )
                 .when(claude, |d| {
                     d.child(
@@ -543,7 +545,7 @@ impl LilaApp {
                             .pb_3()
                             .gap_2()
                             .child(div().flex_1().child(Input::new(&code).control()))
-                            .child(Button::new("acct-code").ghost().label("提交").on_click(cx.listener(|this, _, window, cx| this.signin_code(window, cx)))),
+                            .child(Button::new("acct-code").custom(quiet).label("提交").on_click(cx.listener(|this, _, window, cx| this.signin_code(window, cx)))),
                     )
                 })
                 .into_any_element();
@@ -559,7 +561,7 @@ impl LilaApp {
                     .py_3()
                     .gap(px(10.))
                     .child(div().flex_1().child(Input::new(&input).control()))
-                    .child(Button::new("acct-cancel").ghost().label("取消").on_click(cx.listener(|this, _, _, cx| this.signin_cancel(cx))))
+                    .child(Button::new("acct-cancel").custom(quiet).label("取消").on_click(cx.listener(|this, _, _, cx| this.signin_cancel(cx))))
                     .child(Button::new("acct-login").primary().label("登录…").on_click(cx.listener(|this, _, window, cx| this.account_login(window, cx)))),
             )
             .into_any_element()

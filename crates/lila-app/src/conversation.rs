@@ -1,4 +1,4 @@
-//! A member's conversation, drawn natively (architecture v3 §10): what it was
+//! A thread's conversation, drawn natively (architecture v3 §10): what it was
 //! asked, what it said and did, and a box to write to it. Claude Code's TUI keeps
 //! running underneath; the header switches to it (`tui`).
 //!
@@ -17,16 +17,15 @@ use gpui::component::collapsible::Collapsible;
 use gpui::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui::component::spinner::Spinner;
 use gpui::component::text::TextView;
-use gpui::component::{Icon, IconName, Sizable, StyledExt, h_flex, v_flex};
+use gpui::component::{Icon, IconName, Sizable, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::*;
 use serde_json::Value;
 use std::ops::Range;
 
-/// The shown member's conversation, merged from reads of what changed since `seq`.
+/// The shown thread's conversation, merged from reads of what changed since `seq`.
 pub struct Conv {
-    pub project: String,
-    pub member: String,
+    pub thread: String,
     pub session: Option<String>,
     pub seq: i64,
     pub items: Vec<Value>,
@@ -35,19 +34,21 @@ pub struct Conv {
     ver: Vec<u32>,
     /// The reply being written now, before it is an item (Claude Code's `MessageDisplay`).
     pub writing: Option<String>,
-    /// The model and effort it runs on, and what the person may change (`conversation.read`'s `config`).
+    /// The model and effort it runs on, and what the person may change (`thread.read`'s `config`).
     pub config: Value,
+    /// The permission cards it waits on (`thread.read`'s `permissions`).
+    pub cards: Vec<Value>,
 }
 
 impl Conv {
-    pub fn new(project: String, member: String) -> Self {
-        Conv { project, member, session: None, seq: 0, items: Vec::new(), ver: Vec::new(), writing: None, config: Value::Null }
+    pub fn new(thread: String) -> Self {
+        Conv { thread, session: None, seq: 0, items: Vec::new(), ver: Vec::new(), writing: None, config: Value::Null, cards: Vec::new() }
     }
 
-    /// Folds a `conversation.read` reply in: a new session starts over; items
+    /// Folds a `thread.read` reply in: a new session starts over; items
     /// already shown are replaced where they stand, new ones go at the end.
     pub fn merge(&mut self, v: &Value) {
-        let session = v["session"].as_str().map(String::from);
+        let session = v["thread"]["session"].as_str().map(String::from);
         if session.is_some() && session != self.session {
             self.session = session;
             self.items.clear();
@@ -69,6 +70,7 @@ impl Conv {
         self.seq = self.seq.max(v["seq"].as_i64().unwrap_or(0));
         self.writing = v["writing"].as_str().map(String::from);
         self.config = v["config"].clone();
+        self.cards = v["permissions"].as_array().cloned().unwrap_or_default();
     }
 }
 
@@ -88,12 +90,12 @@ enum RowKind {
     /// A run of tool calls and thoughts between two messages, by the index of its first.
     Steps(usize),
     Writing,
-    /// A card the member waits on (an inbox item's id).
+    /// A permission card the thread waits on (its id).
     Ask(String),
 }
 
 /// The rows the list shows: one per message, one per run of steps between messages,
-/// the reply being written, and the cards the member waits on.
+/// the reply being written, and the cards the thread waits on.
 fn build_rows(conv: Option<&Conv>, asks: &[String]) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     if let Some(c) = conv {
@@ -118,13 +120,6 @@ fn build_rows(conv: Option<&Conv>, asks: &[String]) -> Vec<Row> {
     }
     rows.extend(asks.iter().map(|id| Row { kind: RowKind::Ask(id.clone()), span: 0..0, ver: 0 }));
     rows
-}
-
-/// Which part of the shown member's conversation the next fetch reads.
-pub struct ConvWant {
-    pub member: String,
-    pub session: Option<String>,
-    pub after: i64,
 }
 
 /// More than this many lines of a message are folded, until asked for.
@@ -164,37 +159,32 @@ fn tool_icon(tool: Option<&str>) -> IconName {
 }
 
 impl LilaApp {
-    /// The key a member's view choice is remembered by.
-    fn view_key(&self, member: &str) -> String {
-        format!("{}/{member}", self.selected.as_deref().unwrap_or_default())
+    /// The thread is shown as its conversation (else its terminal).
+    pub fn shows_gui(&self, t: &Value) -> bool {
+        t["caps"]["gui"] == true && !self.tui.contains(&s(t, "id"))
     }
 
-    /// The member is shown as its conversation (else its terminal).
-    pub fn shows_gui(&self, m: &Value) -> bool {
-        m["caps"]["gui"] == true && !self.tui.contains(&self.view_key(&s(m, "id")))
-    }
-
-    pub fn set_view(&mut self, member: &str, tui: bool, cx: &mut Context<Self>) {
-        let key = self.view_key(member);
-        if tui { self.tui.insert(key) } else { self.tui.remove(&key) };
+    pub fn set_view(&mut self, thread: &str, tui: bool, cx: &mut Context<Self>) {
+        if tui { self.tui.insert(thread.to_owned()) } else { self.tui.remove(thread) };
         data::save_views(self.paths(), &self.tui);
         self.refresh_now();
         cx.notify();
     }
 
     /// The header's two-way switch: the conversation Lila draws, or the CLI's own terminal.
-    pub fn view_switch(&self, m: &Value, cx: &mut Context<Self>) -> impl IntoElement {
-        let gui = self.shows_gui(m);
-        let member = s(m, "id");
+    pub fn view_switch(&self, t: &Value, cx: &mut Context<Self>) -> impl IntoElement {
+        let quiet = style::quiet(cx);
+        let gui = self.shows_gui(t);
+        let thread = s(t, "id");
         let side = |id: &'static str, icon: IconName, tip: &'static str, on: bool, tui: bool| {
-            let member = member.clone();
+            let thread = thread.clone();
             Button::new(id)
-                .ghost()
+                .custom(quiet)
                 .xsmall()
                 .icon(Icon::new(icon).text_color(if on { style::fg() } else { muted() }))
                 .when(on, |b| b.bg(gpui::Hsla::from(rgba(0xffffff14))))
                 .tooltip(tip)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_view(&member, tui, cx)))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_view(&thread, tui, cx)))
         };
         h_flex()
             .gap(px(2.))
@@ -206,27 +196,27 @@ impl LilaApp {
             .child(side("view-tui", IconName::SquareTerminal, "终端", !gui, true))
     }
 
-    /// What the next fetch reads of the shown member's conversation, if it is shown as one.
-    pub fn conv_want(&self) -> Option<ConvWant> {
-        let m = self.shown_member()?;
-        if !self.shows_gui(&m) {
+    /// What the next fetch reads of the shown thread's conversation, if it is shown as one.
+    pub fn conv_want(&self) -> Option<data::Want> {
+        let t = self.shown_thread()?;
+        if !self.shows_gui(&t) {
             return None;
         }
-        let member = s(&m, "id");
-        let same = self.conv.as_ref().filter(|c| Some(&c.project) == self.selected.as_ref() && c.member == member);
-        Some(ConvWant { member, session: same.and_then(|c| c.session.clone()), after: same.map_or(0, |c| c.seq) })
+        let thread = s(&t, "id");
+        let after = self.conv.as_ref().filter(|c| c.thread == thread).map_or(0, |c| c.seq);
+        Some(data::Want { thread, after })
     }
 
-    /// A fetched read, for the member it was asked for.
+    /// A fetched read, for the thread it was asked for.
     pub fn take_conv(&mut self, v: Value) {
-        let (Some(project), Some(member)) = (self.selected.clone(), v["member"].as_str().map(String::from)) else { return };
-        if self.member.as_deref() != Some(member.as_str()) {
+        let Some(thread) = v["thread"]["id"].as_str().map(String::from) else { return };
+        if self.thread.as_deref() != Some(thread.as_str()) {
             return;
         }
         match &mut self.conv {
-            Some(c) if c.project == project && c.member == member => c.merge(&v),
+            Some(c) if c.thread == thread => c.merge(&v),
             _ => {
-                let mut c = Conv::new(project, member);
+                let mut c = Conv::new(thread);
                 c.merge(&v);
                 self.conv = Some(c);
                 self.conv_open.clear();
@@ -234,19 +224,18 @@ impl LilaApp {
         }
     }
 
-    /// The cards the shown member waits on from the person (a permission), under its conversation.
+    /// The cards the shown thread waits on from the person (a permission), under its conversation.
     fn conv_asks(&self) -> Vec<String> {
-        let Some(member) = self.member.as_deref() else { return Vec::new() };
-        self.snap.inbox.iter().filter(|i| i["member"] == member && i["kind"] == "permission").map(|i| s(i, "id")).collect()
+        self.conv.as_ref().filter(|c| Some(&c.thread) == self.thread.as_ref()).map(|c| c.cards.iter().map(|k| s(k, "id")).collect()).unwrap_or_default()
     }
 
-    /// Brings the list in step with what is shown: another member or session starts it
+    /// Brings the list in step with what is shown: another thread or session starts it
     /// over; otherwise from the first row that is not the one it had, rows are replaced,
     /// and rows before it whose content changed are measured again. Following the end
     /// is the list's own: it stays there while the person is there.
     pub fn sync_conv(&mut self, cx: &mut Context<Self>) {
-        let conv = self.conv.as_ref().filter(|c| Some(&c.project) == self.selected.as_ref() && Some(&c.member) == self.member.as_ref());
-        let key = conv.map(|c| (c.project.clone(), c.member.clone(), c.session.clone()));
+        let conv = self.conv.as_ref().filter(|c| Some(&c.thread) == self.thread.as_ref());
+        let key = conv.map(|c| (c.thread.clone(), c.session.clone()));
         let rows = build_rows(conv, &self.conv_asks());
         let list = self.conv_list.clone();
         if key != self.conv_key {
@@ -315,10 +304,11 @@ impl LilaApp {
         cx.new(|cx| MessageScrollerState::new(0, cx))
     }
 
-    /// The center card's body for a member shown as its conversation.
-    pub fn conversation_view(&mut self, m: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let member = s(m, "id");
-        let composer = self.composer_view(m, window, cx);
+    /// The center card's body for a thread shown as its conversation.
+    pub fn conversation_view(&mut self, t: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let thread = s(t, "id");
+        let ask = self.terminal_ask(t, cx);
+        let composer = self.composer_view(t, ask, window, cx);
         self.sync_conv(cx);
         // The rows draw themselves out of the app's state, when the list asks for them.
         let app = cx.entity();
@@ -334,7 +324,7 @@ impl LilaApp {
             .min_h_0()
             // Files dropped anywhere on the conversation go with the next message.
             .drag_over::<ExternalPaths>(|d, _, _, _| d.bg(style::blue().opacity(0.06)))
-            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| this.add_files(&member, paths.paths().iter().cloned(), cx)))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| this.add_files(&thread, paths.paths().iter().cloned(), cx)))
             .child(div().flex_1().min_h_0().child(scroller))
             .child(composer)
             .into_any_element()
@@ -347,10 +337,14 @@ impl LilaApp {
             RowKind::Item(i) => self.item_row(*i, cx),
             RowKind::Steps(_) => Some(self.steps_row(row.span.clone(), window, cx)),
             RowKind::Writing => self.conv.as_ref().and_then(|c| c.writing.clone()).map(writing_row),
-            RowKind::Ask(id) => self.snap.inbox.iter().find(|i| i["id"] == id.as_str()).cloned().map(|item| {
-                let card = self.inbox_card(item, false, cx).into_any_element();
-                div().w_full().px_1().rounded(px(style::R_BLOCK)).border_1().border_color(style::yellow().opacity(0.35)).bg(style::yellow().opacity(0.06)).child(card).into_any_element()
-            }),
+            RowKind::Ask(id) => {
+                let thread = self.thread.clone().unwrap_or_default();
+                let found = self.conv.as_ref().and_then(|c| c.cards.iter().find(|k| k["id"] == id.as_str()).cloned());
+                found.map(|k| {
+                    let card = self.permission_card(&thread, &k, cx);
+                    div().w_full().px_1().rounded(px(style::R_BLOCK)).border_1().border_color(style::yellow().opacity(0.35)).bg(style::yellow().opacity(0.06)).child(card).into_any_element()
+                })
+            }
         };
         h_flex().w_full().justify_center().child(div().w_full().max_w(px(760.)).px_5().children(body)).into_any_element()
     }
@@ -360,7 +354,7 @@ impl LilaApp {
         let id = s(i, "id");
         let text = s(i, "text");
         Some(match i["kind"].as_str()? {
-            "user_message" if i["from"] == "lila" || i["from"] == "local" => self.lila_row(at, &id, &text, i["task"].as_str(), cx),
+            "user_message" if i["from"] == "lila" || i["from"] == "local" => self.lila_row(at, &id, &text, cx),
             "user_message" if i["from"] == "summary" => self.summary_row(at, &id, &text, cx),
             "user_message" => {
                 let (body, more) = self.folded(at, &id, &text, div().px_3().py_2().rounded(px(style::R_CTL)).bg(style::fill()).text_size(px(13.)).line_height(relative(1.55)), cx);
@@ -421,26 +415,11 @@ impl LilaApp {
         (body, more)
     }
 
-    /// Something Lila delivered: a task as its id and title (opens it), else the words, muted.
-    fn lila_row(&self, at: usize, id: &str, text: &str, task: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
+    /// Something the CLI itself printed (a slash command's result): the words, muted.
+    fn lila_row(&self, at: usize, id: &str, text: &str, cx: &mut Context<Self>) -> AnyElement {
         let inner: Vec<&str> = text.lines().filter(|l| !l.trim_start().starts_with("<lila") && !l.trim_start().starts_with("</lila")).filter(|l| !l.trim().is_empty()).collect();
-        match task {
-            Some(t) => {
-                let open = t.to_owned();
-                h_flex()
-                    .id(SharedString::from(format!("lila-{id}")))
-                    .gap_2()
-                    .cursor_pointer()
-                    .child(style::tag(style::blue(), t.to_owned()))
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).font_medium().child(inner.first().copied().unwrap_or_default().to_owned()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.show_task(open.clone(), cx)))
-                    .into_any_element()
-            }
-            None => {
-                let (body, more) = self.folded(at, id, &inner.join("\n"), div().w_full().text_xs().text_color(muted2()), cx);
-                v_flex().w_full().child(body).children(more).into_any_element()
-            }
-        }
+        let (body, more) = self.folded(at, id, &inner.join("\n"), div().w_full().text_xs().text_color(muted2()), cx);
+        v_flex().w_full().child(body).children(more).into_any_element()
     }
 
     /// What Claude Code wrote down when it compacted the context: a quiet mark, the whole text on asking.
@@ -625,7 +604,7 @@ fn sent_files(id: &str, list: &Value) -> Option<AnyElement> {
     )
 }
 
-/// A member's words as markdown; inline code as a quiet chip, not the accent color.
+/// A thread's words as markdown; inline code as a quiet chip, not the accent color.
 fn markdown(id: SharedString, text: String) -> TextView {
     TextView::markdown(id, text).inline_code_style(StyleRefinement::default().bg(style::fill()).text_color(style::fg()))
 }
@@ -702,7 +681,7 @@ mod tests {
     use serde_json::json;
 
     fn read(items: serde_json::Value) -> serde_json::Value {
-        json!({"session": "s", "seq": 1, "items": items})
+        json!({"thread": {"id": "t", "session": "s"}, "seq": 1, "items": items})
     }
 
     fn item(kind: &str, id: &str) -> serde_json::Value {
@@ -714,7 +693,7 @@ mod tests {
 
     #[test]
     fn a_run_of_steps_between_messages_is_one_row() {
-        let mut c = Conv::new("p".into(), "m".into());
+        let mut c = Conv::new("t".into());
         c.merge(&read(json!([item("user_message", "u"), item("thought", "t"), item("tool_call", "a"), item("tool_call", "b"), item("agent_message", "r"), item("tool_call", "c")])));
         let rows = build_rows(Some(&c), &["card".into()]);
         let shape: Vec<(RowKind, std::ops::Range<usize>)> = rows.into_iter().map(|r| (r.kind, r.span)).collect();
@@ -723,7 +702,7 @@ mod tests {
 
     #[test]
     fn a_row_is_measured_again_when_its_content_or_count_changes() {
-        let mut c = Conv::new("p".into(), "m".into());
+        let mut c = Conv::new("t".into());
         c.merge(&read(json!([item("user_message", "u"), item("tool_call", "a")])));
         let before = build_rows(Some(&c), &[]);
         // The call finishes: the same item, replaced.
@@ -740,9 +719,9 @@ mod tests {
         assert_eq!((grown[1].kind.clone(), grown[1].span.clone()), (RowKind::Steps(1), 1..3));
         assert_ne!(after[1].ver, grown[1].ver);
         // The reply being written, and a new session starting over.
-        c.merge(&json!({"session": "s", "seq": 3, "items": [], "writing": "Chec"}));
+        c.merge(&json!({"thread": {"id": "t", "session": "s"}, "seq": 3, "items": [], "writing": "Chec"}));
         assert_eq!(build_rows(Some(&c), &[]).last().map(|r| r.kind.clone()), Some(RowKind::Writing));
-        c.merge(&json!({"session": "s2", "seq": 1, "items": [item("agent_message", "x")]}));
+        c.merge(&json!({"thread": {"id": "t", "session": "s2"}, "seq": 1, "items": [item("agent_message", "x")]}));
         assert_eq!(c.items.len(), 1);
         assert_eq!(build_rows(Some(&c), &[]).len(), 1);
     }

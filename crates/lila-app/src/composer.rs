@@ -1,10 +1,14 @@
-//! The box under a member's conversation: the words, the files that go with them
+//! The box under a thread's conversation: the words, the files that go with them
 //! (picked, dropped, pasted, or pointed at with `@`), the commands and skills behind `/`,
-//! and the model and effort the session runs on. One per member, so a draft stays
-//! with the member it was written for.
+//! and the model and effort the session runs on. One per thread, so a draft stays
+//! with the thread it was written for.
 //!
-//! What it offers follows what the member's runtime can do: lilad says (`conversation.commands`,
-//! `conversation.files`, and `config` in `conversation.read`), and what is not there is not drawn.
+//! The same box starts a session: before the first message there is no thread, only a project
+//! (key `new:<project>`), and the tool row offers the engine, model, effort and permission
+//! tier to start it on. Sending makes the thread.
+//!
+//! What it offers follows what the thread's engine can do: lilad says (`thread.commands`,
+//! `thread.files`, and `config` in `thread.read`), and what is not there is not drawn.
 
 use crate::app::LilaApp;
 use crate::style::{self, muted, muted2};
@@ -28,10 +32,20 @@ const KEEP_PASTED_MS: u64 = 14 * 24 * 3600 * 1000;
 const MIN_ROWS: usize = 2;
 const MAX_ROWS: usize = 10;
 
+/// The key of the box that starts a session in `project`.
+pub fn new_key(project: &str) -> String {
+    format!("new:{project}")
+}
+
+/// The project a new-session box belongs to; none for a thread's box.
+pub fn new_project(key: &str) -> Option<&str> {
+    key.strip_prefix("new:")
+}
+
 /// What the menu in front of the box is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// `@`: a file of the member's folder.
+    /// `@`: a file of the thread's folder.
     File,
     /// `/` (Codex also `$`): a command or a skill.
     Command,
@@ -87,11 +101,10 @@ pub fn matches(query: &str, words: &[&str]) -> bool {
 pub enum Pick {
     /// Puts these words where the trigger was (a file's `@path`, a command's name); `send`: and sends.
     Put { text: String, send: bool },
-    /// Lila's own: starts the member over, stops it, shows its terminal.
-    NewSession,
+    /// Lila's own: stops the turn, shows the terminal.
     Stop,
     Terminal,
-    /// A request of the runtime's protocol instead of words (`conversation.run`).
+    /// A request of the runtime's protocol instead of words (`thread.run`).
     Run(String),
 }
 
@@ -130,18 +143,18 @@ pub struct Composer {
     _subs: Vec<Subscription>,
 }
 
-/// What the `/` menu of a member offers besides Lila's own actions, as lilad listed it.
+/// What the `/` menu of a thread offers besides Lila's own actions, as lilad listed it.
 pub type Commands = Vec<Value>;
 
 impl LilaApp {
-    /// The key a member's box is kept under.
-    pub fn composer_key(&self, member: &str) -> String {
-        format!("{}/{member}", self.selected.as_deref().unwrap_or_default())
+    /// The key a thread's box is kept under (a thread's id, or `new:<project>`).
+    pub fn composer_key(&self, thread: &str) -> String {
+        thread.to_owned()
     }
 
-    /// The member's box, made when first looked at.
-    pub fn composer(&mut self, member: &str, window: &mut Window, cx: &mut Context<Self>) -> &mut Composer {
-        let key = self.composer_key(member);
+    /// A thread's box, made when first looked at.
+    pub fn composer(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) -> &mut Composer {
+        let key = self.composer_key(target);
         if !self.composers.contains_key(&key) {
             let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(MIN_ROWS, MAX_ROWS).placeholder("消息…").submit_on_enter(true));
             let k1 = key.clone();
@@ -154,22 +167,31 @@ impl LilaApp {
         self.composers.get_mut(&key).expect("just made")
     }
 
-    /// `--features shots`: the shown member's box has the cursor.
+    /// `--features shots`: the shown thread's (or new session's) box has the cursor.
     #[cfg(feature = "shots")]
     pub fn conv_focus(&self, cx: &App) -> Option<FocusHandle> {
-        let member = self.member.as_deref()?;
-        self.composers.get(&self.composer_key(member)).map(|c| c.input.read(cx).focus_handle(cx))
+        let key = self.thread.clone().or_else(|| self.new_in.as_deref().map(new_key))?;
+        self.composers.get(&key).map(|c| c.input.read(cx).focus_handle(cx))
     }
 
     /// Does the runtime take `$name` for a skill (Codex)?
-    fn dollar(&self, member: &str) -> bool {
-        self.members().iter().any(|m| m["id"] == member && m["runtime"] == "codex")
+    fn dollar(&self, target: &str) -> bool {
+        match new_project(target) {
+            Some(p) => self.draft_of(p).is_some_and(|d| d.0 == "codex"),
+            None => self.snap.threads.iter().any(|m| m["id"] == target && m["engine"] == "codex"),
+        }
+    }
+
+    /// What a session started in `project` now would run: `(engine, model, effort, permission)`.
+    pub fn draft_of(&self, project: &str) -> Option<(String, String, String, String)> {
+        let p = self.project(project)?;
+        Some(self.drafts.get(project).cloned().unwrap_or_default().effective(&p))
     }
 
     /// The words or the cursor moved: opens, moves or closes the menu.
     fn composer_changed(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(member) = key.split_once('/').map(|(_, m)| m.to_owned()) else { return };
-        let dollar = self.dollar(&member);
+        let target = key.to_owned();
+        let dollar = self.dollar(&target);
         let Some(c) = self.composers.get_mut(key) else { return };
         let (text, cursor) = c.input.read_with(cx, |i, _| (i.value().to_string(), i.cursor()));
         // Typing after a recalled message makes it the person's own words again.
@@ -200,7 +222,7 @@ impl LilaApp {
                 // A new word: what it lists is read again (files change; commands come and go with plugins).
                 let kind = t.kind;
                 c.menu = Some(Menu { trigger: t, selected: 0, scroll: ScrollHandle::new(), forced: false });
-                self.fetch_menu(&member, kind, window, cx);
+                self.fetch_menu(&target, kind, window, cx);
             }
             (None, old) => c.menu = old.filter(|_| forced),
         }
@@ -208,13 +230,16 @@ impl LilaApp {
     }
 
     /// Reads what the menu lists from lilad: the files for `@`, the commands for `/`.
-    fn fetch_menu(&mut self, member: &str, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
-        let key = self.composer_key(member);
-        let method = match kind {
-            Kind::File => "conversation.files",
-            Kind::Command => "conversation.commands",
+    fn fetch_menu(&mut self, target: &str, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.composer_key(target);
+        let (method, params) = match (kind, new_project(target)) {
+            (Kind::File, Some(project)) => ("thread.files", json!({"project": project})),
+            // A session that is not started has no commands to list.
+            (Kind::Command, Some(_)) => return,
+            (Kind::File, None) => ("thread.files", json!({"thread": target})),
+            (Kind::Command, None) => ("thread.commands", json!({"thread": target})),
         };
-        self.request_result(method, json!({"member": member}), window, cx, move |this, r, _, cx| {
+        self.request_result(method, params, window, cx, move |this, r, _, cx| {
             if let Ok(v) = r {
                 match kind {
                     Kind::File => {
@@ -231,8 +256,8 @@ impl LilaApp {
     }
 
     /// The rows the menu shows for what was typed.
-    pub fn menu_rows(&self, member: &str, working: bool, tui: bool, menu: &Menu) -> Vec<Row> {
-        let key = self.composer_key(member);
+    pub fn menu_rows(&self, target: &str, working: bool, tui: bool, menu: &Menu) -> Vec<Row> {
+        let key = self.composer_key(target);
         let q = menu.trigger.query.as_str();
         match menu.trigger.kind {
             Kind::File => {
@@ -252,10 +277,9 @@ impl LilaApp {
                     .collect()
             }
             Kind::Command => {
-                let sigil = if self.dollar(member) { '$' } else { '/' };
+                let sigil = if self.dollar(target) { '$' } else { '/' };
                 let mut rows: Vec<Row> = Vec::new();
                 let own = [
-                    (Icon::new(IconName::RotateCw), "新会话", "", Pick::NewSession, true),
                     (Icon::new(IconName::Square), "停止", "", Pick::Stop, working),
                     (Icon::new(IconName::SquareTerminal), "终端", "", Pick::Terminal, tui),
                 ];
@@ -299,14 +323,14 @@ impl LilaApp {
     /// A key meant for the menu, when one is open: ↑ ↓ move, Enter and Tab choose, Esc closes.
     /// Without a menu, ↑ on an empty box brings back the last thing sent, ↓ goes forward again.
     /// Returns whether the key was used.
-    fn composer_key_press(&mut self, member: &str, key: MenuKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let ck = self.composer_key(member);
-        let (working, tui) = self.members().iter().find(|m| m["id"] == member).map(|m| (m["status"] == "working", m["caps"]["tui"] == true)).unwrap_or_default();
+    fn composer_key_press(&mut self, target: &str, key: MenuKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let ck = self.composer_key(target);
+        let (working, tui) = self.snap.threads.iter().find(|m| m["id"] == target).map(|m| (m["state"] == "running", m["caps"]["tui"] == true)).unwrap_or_default();
         let Some(c) = self.composers.get(&ck) else { return false };
         let Some(menu) = c.menu.as_ref() else {
-            return self.history_key(member, key, window, cx);
+            return self.history_key(target, key, window, cx);
         };
-        let rows = self.menu_rows(member, working, tui, menu);
+        let rows = self.menu_rows(target, working, tui, menu);
         match key {
             MenuKey::Up | MenuKey::Down => {
                 self.menu_move(&ck, rows.len(), key == MenuKey::Down);
@@ -315,7 +339,7 @@ impl LilaApp {
             MenuKey::Enter | MenuKey::Tab => {
                 let at = self.composers[&ck].menu.as_ref().map_or(0, |m| m.selected);
                 match rows.get(at) {
-                    Some(row) => self.pick(member, row.clone(), window, cx),
+                    Some(row) => self.pick(target, row.clone(), window, cx),
                     // Nothing matches: Enter is a plain Enter (sends), Tab does nothing.
                     None => return key == MenuKey::Tab,
                 }
@@ -333,8 +357,8 @@ impl LilaApp {
     }
 
     /// Does what a chosen row says.
-    fn pick(&mut self, member: &str, row: Row, window: &mut Window, cx: &mut Context<Self>) {
-        let ck = self.composer_key(member);
+    fn pick(&mut self, target: &str, row: Row, window: &mut Window, cx: &mut Context<Self>) {
+        let ck = self.composer_key(target);
         let Some(c) = self.composers.get_mut(&ck) else { return };
         let Some(menu) = c.menu.take() else { return };
         let input = c.input.clone();
@@ -349,17 +373,16 @@ impl LilaApp {
             Pick::Put { text, send } => {
                 put(&text, window, cx);
                 if send {
-                    self.send_to_member(member.to_owned(), window, cx);
+                    self.send_message(target.to_owned(), window, cx);
                 }
             }
             own => {
                 put("", window, cx);
-                let to = member.to_owned();
+                let to = target.to_owned();
                 match own {
-                    Pick::NewSession => self.request("member.restart", json!({"member": to}), cx, |this, _, _| this.refresh_now()),
-                    Pick::Stop => self.request("conversation.interrupt", json!({"member": to}), cx, |this, _, _| this.refresh_now()),
-                    Pick::Terminal => self.set_view(member, true, cx),
-                    Pick::Run(action) => self.request("conversation.run", json!({"member": to, "action": action}), cx, |this, _, _| this.refresh_now()),
+                    Pick::Stop => self.request("thread.interrupt", json!({"thread": to}), cx, |this, _, _| this.refresh_now()),
+                    Pick::Terminal => self.set_view(target, true, cx),
+                    Pick::Run(action) => self.request("thread.run", json!({"thread": to, "action": action}), cx, |this, _, _| this.refresh_now()),
                     Pick::Put { .. } => {}
                 }
             }
@@ -368,9 +391,9 @@ impl LilaApp {
     }
 
     /// ↑ on an empty box brings back what the person sent last; again, the one before. ↓ goes forward, and past the last, empty.
-    fn history_key(&mut self, member: &str, key: MenuKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn history_key(&mut self, target: &str, key: MenuKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let sent = self.sent_by_person();
-        let ck = self.composer_key(member);
+        let ck = self.composer_key(target);
         let Some(c) = self.composers.get_mut(&ck) else { return false };
         let empty = c.input.read(cx).value().is_empty();
         let back = c.back.as_ref().map(|(n, _)| *n);
@@ -404,10 +427,11 @@ impl LilaApp {
         c.items.iter().rev().filter(|i| i["kind"] == "user_message" && i["from"] == "person").map(|i| s(i, "text")).filter(|t| !t.is_empty()).collect()
     }
 
-    /// Sends the box's words and files to the member. They are cleared once it went; if it did not,
-    /// they stay and the box says why.
-    pub fn send_to_member(&mut self, member: String, window: &mut Window, cx: &mut Context<Self>) {
-        let ck = self.composer_key(&member);
+    /// Sends the box's words and files: to the thread, or, for a new session's box, as its first message
+    /// (which makes the thread, on the engine, model, effort and tier the box shows). They are cleared once
+    /// it went; if it did not, they stay and the box says why.
+    pub fn send_message(&mut self, target: String, window: &mut Window, cx: &mut Context<Self>) {
+        let ck = self.composer_key(&target);
         let Some(c) = self.composers.get_mut(&ck) else { return };
         let text = c.input.read(cx).value().trim().to_owned();
         let files: Vec<String> = c.files.iter().map(|f| f.to_string_lossy().to_string()).collect();
@@ -417,11 +441,26 @@ impl LilaApp {
         c.busy = true;
         c.error = None;
         let sent = files.len();
-        self.request_result("conversation.send", json!({"member": member, "text": text, "attachments": files}), window, cx, move |this, r, window, cx| {
+        let (method, params) = match new_project(&target) {
+            Some(project) => {
+                let (engine, model, effort, permission) = self.draft_of(project).unwrap_or_default();
+                let mut p = json!({"project": project, "text": text, "attachments": files, "engine": engine, "effort": effort, "permission": permission});
+                if !model.is_empty() {
+                    p["model"] = json!(model);
+                }
+                ("thread.new", p)
+            }
+            None => {
+                // An ended thread goes on with the words: they are the message it resumes with.
+                let ended = self.snap.threads.iter().any(|t| t["id"] == target.as_str() && t["state"] == "ended");
+                (if ended { "thread.resume" } else { "thread.send" }, json!({"thread": target, "text": text, "attachments": files}))
+            }
+        };
+        self.request_result(method, params, window, cx, move |this, r, window, cx| {
             let Some(c) = this.composers.get_mut(&ck) else { return };
             c.busy = false;
             match r {
-                Ok(_) => {
+                Ok(v) => {
                     // What was typed meanwhile stays.
                     let same = c.input.read(cx).value().trim() == text;
                     if same {
@@ -429,6 +468,14 @@ impl LilaApp {
                     }
                     c.files.drain(..sent.min(c.files.len()));
                     c.back = None;
+                    // The session is made: show it.
+                    if let Some(project) = new_project(&ck) {
+                        this.drafts.remove(project);
+                        if let Some(id) = v["id"].as_str() {
+                            this.just_made = Some(id.to_owned());
+                            this.show_thread(id.to_owned(), cx);
+                        }
+                    }
                     this.refresh_now();
                 }
                 Err(e) => c.error = Some(format!("{e:#}")),
@@ -449,9 +496,9 @@ pub enum MenuKey {
 }
 
 impl LilaApp {
-    /// Adds files to the member's next message (folders are not files).
-    pub fn add_files(&mut self, member: &str, paths: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
-        let key = self.composer_key(member);
+    /// Adds files to a thread's next message (folders are not files).
+    pub fn add_files(&mut self, target: &str, paths: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
+        let key = self.composer_key(target);
         let Some(c) = self.composers.get_mut(&key) else { return };
         for p in paths {
             if !p.is_file() {
@@ -463,8 +510,8 @@ impl LilaApp {
         cx.notify();
     }
 
-    fn remove_file(&mut self, member: &str, at: usize, cx: &mut Context<Self>) {
-        let key = self.composer_key(member);
+    fn remove_file(&mut self, target: &str, at: usize, cx: &mut Context<Self>) {
+        let key = self.composer_key(target);
         let pasted = self.paths().state.join("attachments");
         if let Some(c) = self.composers.get_mut(&key)
             && at < c.files.len()
@@ -479,23 +526,23 @@ impl LilaApp {
     }
 
     /// The system's open dialog; the files chosen go with the next message.
-    fn choose_files(&mut self, member: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_files(&mut self, target: String, window: &mut Window, cx: &mut Context<Self>) {
         let chosen = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = chosen.await {
-                let _ = this.update(cx, |this, cx| this.add_files(&member, paths, cx));
+                let _ = this.update(cx, |this, cx| this.add_files(&target, paths, cx));
             }
         })
         .detach();
     }
 
     /// A paste of pictures or copied files goes to the next message as files; words are left to the box.
-    /// A picture is kept as a file of Lila's own, under the state folder, by member.
-    fn paste_files(&mut self, member: &str, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
+    /// A picture is kept as a file of Lila's own, under the state folder, by target.
+    fn paste_files(&mut self, target: &str, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
         if item.entries.iter().any(|e| matches!(e, ClipboardEntry::String(_))) {
             return false;
         }
-        let dir = self.paths().state.join("attachments").join(self.composer_key(member));
+        let dir = self.paths().state.join("attachments").join(self.composer_key(target).replace(':', "-"));
         let mut files: Vec<PathBuf> = Vec::new();
         for e in &item.entries {
             match e {
@@ -508,7 +555,7 @@ impl LilaApp {
                         ImageFormat::Gif => "gif",
                         // The CLIs take these four.
                         _ => {
-                            if let Some(c) = self.composers.get_mut(&self.composer_key(member)) {
+                            if let Some(c) = self.composers.get_mut(&self.composer_key(target)) {
                                 c.error = Some("这种图片格式不能附加（用 PNG、JPEG、WebP 或 GIF）".into());
                             }
                             continue;
@@ -525,13 +572,13 @@ impl LilaApp {
         if files.is_empty() {
             return false;
         }
-        self.add_files(member, files, cx);
+        self.add_files(target, files, cx);
         true
     }
 
     /// Runs the model or effort the person chose from the box's menu, for this session.
-    fn set_session_model(&mut self, member: &str, model: Option<String>, effort: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        self.request_result("conversation.model", json!({"member": member, "model": model, "effort": effort}), window, cx, |this, r, _, cx| {
+    fn set_session_model(&mut self, target: &str, model: Option<String>, effort: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_result("thread.model", json!({"thread": target, "model": model, "effort": effort}), window, cx, |this, r, _, cx| {
             match r {
                 Ok(_) => this.refresh_now(),
                 Err(e) => this.notice = Some(format!("{e:#}")),
@@ -541,32 +588,34 @@ impl LilaApp {
     }
 
     /// The model and effort shown in the box's tool row: a menu where the runtime lets the session change them,
-    /// else the plain words. A yellow dot when they are not the role's.
-    fn model_control(&mut self, member: &str, cfg: &Value, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// else the plain words. A yellow dot when they are not the project's.
+    fn model_control(&mut self, target: &str, cfg: &Value, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let quiet = style::quiet(cx);
         let model = cfg["model"].as_str().filter(|m| !m.is_empty())?.to_owned();
         let effort = cfg["effort"].as_str().unwrap_or_default().to_owned();
         let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_owned();
         let label = if effort.is_empty() { short(&model) } else { format!("{} · {effort}", short(&model)) };
         let differs = differs(cfg);
         let dot = || div().size(px(6.)).flex_none().rounded_full().bg(style::yellow());
+        // Where the session can't change them, the title row already says what they are.
         if cfg["switch"] != true {
-            return Some(h_flex().h(px(28.)).px_2().gap(px(6.)).items_center().text_size(px(12.)).text_color(muted2()).when(differs, |d| d.child(dot())).child(label).into_any_element());
+            return None;
         }
         // The choices: omp lists its own; Codex takes the models and efforts the settings offer.
         let pairs = |list: &Value| -> Vec<(String, String)> { list.as_array().into_iter().flatten().map(|c| (s(c, "id"), s(c, "name"))).collect() };
         let (mut models, mut efforts) = (pairs(&cfg["models"]), pairs(&cfg["efforts"]));
         if models.is_empty() {
-            models = crate::settings::CODEX_MODELS.iter().map(|m| (m.to_string(), m.to_string())).collect();
+            models = crate::engines::models("codex").iter().map(|m| (m.to_string(), m.to_string())).collect();
             if !models.iter().any(|(id, _)| *id == model) {
                 models.insert(0, (model.clone(), model.clone()));
             }
         }
         if efforts.is_empty() {
-            efforts = crate::settings::EFFORTS.iter().map(|e| (e.to_string(), e.to_string())).collect();
+            efforts = crate::engines::EFFORTS.iter().map(|e| (e.to_string(), e.to_string())).collect();
         }
         let weak = cx.entity().downgrade();
-        let to = member.to_owned();
-        let button = Button::new("conv-model").ghost().xsmall().label(label).dropdown_caret(true).dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
+        let to = target.to_owned();
+        let button = Button::new("conv-model").custom(quiet).xsmall().label(label).dropdown_caret(true).dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
             for (id, name) in &models {
                 let (weak, to, id2) = (weak.clone(), to.clone(), id.clone());
                 menu = menu.item(PopupMenuItem::new(name.clone()).checked(*id == model).on_click(move |_, window, cx| {
@@ -585,24 +634,38 @@ impl LilaApp {
         Some(h_flex().gap(px(2.)).items_center().when(differs, |d| d.child(dot())).child(button).into_any_element())
     }
 
-    /// The box under a member's conversation.
-    pub fn composer_view(&mut self, m: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let member = s(m, "id");
-        let working = s(m, "status") == "working";
-        let tui = m["caps"]["tui"] == true;
-        self.composer(&member, window, cx);
-        let cfg = self.conv.as_ref().filter(|c| Some(&c.project) == self.selected.as_ref() && c.member == member).map(|c| c.config.clone()).unwrap_or(Value::Null);
-        let ck = self.composer_key(&member);
+    /// The box under a thread's conversation, on a bar of its own, with `ask` (the engine waits in its terminal) above it.
+    pub fn composer_view(&mut self, m: &Value, ask: Option<AnyElement>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let boxed = self.composer_box(&s(m, "id"), Some(m), window, cx);
+        h_flex().flex_none().justify_center().pb_3().pt_2().border_t_1().border_color(style::divider()).child(v_flex().w_full().max_w(px(760.)).px_5().gap_2().children(ask).child(boxed)).into_any_element()
+    }
+
+    /// The box that starts a session in `project`: the same box, with the choices a session starts on.
+    pub fn new_session_box(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.composer_box(&new_key(project), None, window, cx)
+    }
+
+    /// The rounded box: files, the words, and a row of tools. `m` is the thread it writes to; none for a new session's.
+    fn composer_box(&mut self, target: &str, m: Option<&Value>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let quiet = style::quiet(cx);
+        let target = target.to_owned();
+        let working = m.is_some_and(|m| s(m, "state") == "running");
+        let waiting = m.is_some_and(|m| m["state"] == "waiting");
+        let tui = m.is_some_and(|m| m["caps"]["tui"] == true);
+        self.composer(&target, window, cx);
+        let cfg = self.conv.as_ref().filter(|c| c.thread == target).map(|c| c.config.clone()).unwrap_or(Value::Null);
+        let ck = self.composer_key(&target);
         let (input, files, error, busy, has_menu) = {
             let c = &self.composers[&ck];
             (c.input.clone(), c.files.clone(), c.error.clone(), c.busy, c.menu.is_some())
         };
-        let can_send = !busy && (!input.read(cx).value().trim().is_empty() || !files.is_empty());
+        // Words to a thread that waits on a card or a dialog would answer it: lilad turns them down.
+        let can_send = !busy && !waiting && (!input.read(cx).value().trim().is_empty() || !files.is_empty());
         let menu = if has_menu {
             let menu = self.composers[&ck].menu.as_ref().expect("has one");
-            let rows = self.menu_rows(&member, working, tui, menu);
+            let rows = self.menu_rows(&target, working, tui, menu);
             let (selected, scroll) = (menu.selected.min(rows.len().saturating_sub(1)), menu.scroll.clone());
-            (!rows.is_empty()).then(|| self.menu_view(&member, rows, selected, scroll, cx))
+            (!rows.is_empty()).then(|| self.menu_view(&target, rows, selected, scroll, cx))
         } else {
             None
         };
@@ -612,7 +675,7 @@ impl LilaApp {
             AttachmentGroup::new("composer-files").gap_2().px_3().pt_3().children(files.iter().enumerate().map(|(ix, f)| {
                 let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 let image = lila_agent::image_mime(&f.to_string_lossy()).is_some();
-                let to = member.clone();
+                let to = target.clone();
                 let app = cx.entity();
                 let media = if image { AttachmentMedia::new().src(f.clone()) } else { AttachmentMedia::new().child(Icon::new(IconName::FileText).text_color(muted())) };
                 Attachment::new()
@@ -625,14 +688,14 @@ impl LilaApp {
             }))
         });
 
-        let paste_to = member.clone();
+        let paste_to = target.clone();
         let editor = div()
             .id("composer-input")
             .px_1()
             .pt_1()
             // The menu's keys come before the box's own: ↑ ↓ move, Enter and Tab choose, Esc closes.
             .capture_action(cx.listener({
-                let to = member.clone();
+                let to = target.clone();
                 move |this, _: &MoveUp, window, cx| {
                     if this.composer_key_press(&to, MenuKey::Up, window, cx) {
                         cx.stop_propagation();
@@ -640,7 +703,7 @@ impl LilaApp {
                 }
             }))
             .capture_action(cx.listener({
-                let to = member.clone();
+                let to = target.clone();
                 move |this, _: &MoveDown, window, cx| {
                     if this.composer_key_press(&to, MenuKey::Down, window, cx) {
                         cx.stop_propagation();
@@ -650,20 +713,20 @@ impl LilaApp {
             // Enter chooses what the menu shows, else sends (Shift+Enter breaks the line). Taken here, so the box
             // never adds a line for it; while an input method composes, its own keys do not arrive as Enter.
             .capture_action(cx.listener({
-                let to = member.clone();
+                let to = target.clone();
                 move |this, a: &Enter, window, cx| {
                     if a.shift {
                         return;
                     }
                     let menu = this.composers.get(&this.composer_key(&to)).is_some_and(|c| c.menu.is_some());
                     if !(menu && this.composer_key_press(&to, MenuKey::Enter, window, cx)) {
-                        this.send_to_member(to.clone(), window, cx);
+                        this.send_message(to.clone(), window, cx);
                     }
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener({
-                let to = member.clone();
+                let to = target.clone();
                 move |this, _: &IndentInline, window, cx| {
                     if this.composers.get(&this.composer_key(&to)).is_some_and(|c| c.menu.is_some()) && this.composer_key_press(&to, MenuKey::Tab, window, cx) {
                         cx.stop_propagation();
@@ -671,7 +734,7 @@ impl LilaApp {
                 }
             }))
             .capture_action(cx.listener({
-                let to = member.clone();
+                let to = target.clone();
                 move |this, _: &Escape, window, cx| {
                     if this.composers.get(&this.composer_key(&to)).is_some_and(|c| c.menu.is_some()) && this.composer_key_press(&to, MenuKey::Esc, window, cx) {
                         cx.stop_propagation();
@@ -692,70 +755,166 @@ impl LilaApp {
             .gap_1()
             .items_center()
             .child({
-                let to = member.clone();
-                Button::new("conv-attach").ghost().size(px(style::CTL_SM)).icon(style::icon("lila/paperclip.svg").text_color(muted())).tooltip("添加附件").on_click(cx.listener(move |this, _, window, cx| this.choose_files(to.clone(), window, cx)))
+                let to = target.clone();
+                Button::new("conv-attach").custom(quiet).size(px(style::CTL_SM)).icon(style::icon("lila/paperclip.svg").text_color(muted())).tooltip("添加附件").on_click(cx.listener(move |this, _, window, cx| this.choose_files(to.clone(), window, cx)))
             })
-            .child({
-                let to = member.clone();
-                Button::new("conv-commands").ghost().size(px(style::CTL_SM)).icon(style::icon("lila/square-slash.svg").text_color(muted())).tooltip("命令 (/)").on_click(cx.listener(move |this, _, window, cx| this.toggle_menu(&to, window, cx)))
+            .when(m.is_some(), |d| {
+                let to = target.clone();
+                d.child(Button::new("conv-commands").custom(quiet).size(px(style::CTL_SM)).icon(style::icon("lila/square-slash.svg").text_color(muted())).tooltip("命令 (/)").on_click(cx.listener(move |this, _, window, cx| this.toggle_menu(&to, window, cx))))
             })
-            .children(self.model_control(&member, &cfg, cx))
+            .when(m.is_some(), |d| d.children(self.model_control(&target, &cfg, cx)))
+            .when_some(new_project(&target).map(String::from), |d, project| d.children(self.start_controls(&project, cx)))
             .child(div().flex_1())
             .when(working, |d| {
-                let to = member.clone();
+                let to = target.clone();
                 d.child(
                     Button::new("conv-stop")
                         .secondary()
                         .size(px(style::CTL_SM))
                         .icon(IconName::Square)
                         .tooltip("停止")
-                        .on_click(cx.listener(move |this, _, _, cx| this.request("conversation.interrupt", json!({"member": to}), cx, |this, _, _| this.refresh_now()))),
+                        .on_click(cx.listener(move |this, _, _, cx| this.request("thread.interrupt", json!({"thread": to}), cx, |this, _, _| this.refresh_now()))),
                 )
             })
+            .when_some(new_project(&target).map(String::from), |d, project| d.children(self.tier_control(&project, cx)))
             .child({
-                let to = member.clone();
-                Button::new("conv-send").primary().size(px(style::CTL_SM)).icon(IconName::ArrowUp).disabled(!can_send).tooltip("发送 (↩)").on_click(cx.listener(move |this, _, window, cx| this.send_to_member(to.clone(), window, cx)))
+                let to = target.clone();
+                Button::new("conv-send").primary().size(px(style::CTL_SM)).icon(IconName::ArrowUp).disabled(!can_send).tooltip("发送 (↩)").on_click(cx.listener(move |this, _, window, cx| this.send_message(to.clone(), window, cx)))
             });
 
-        h_flex()
-            .flex_none()
-            .justify_center()
-            .pb_3()
-            .pt_2()
-            .border_t_1()
-            .border_color(style::divider())
-            .child(div().w_full().max_w(px(760.)).px_5().child(
-                v_flex()
-                    .relative()
-                    .w_full()
-                    .rounded(px(style::R_BLOCK))
-                    .bg(style::well())
-                    .border_1()
-                    .border_color(style::hairline())
-                    .children(menu)
-                    .children(cards)
-                    .child(editor)
-                    .when_some(error, |d, e| d.child(div().px_3().pb_1().text_size(px(12.)).text_color(style::tint(style::red(), 0.2)).truncate().child(e)))
-                    .child(tools),
-            ))
+        v_flex()
+            .relative()
+            .w_full()
+            .rounded(px(style::R_BLOCK))
+            .bg(style::well())
+            .border_1()
+            .border_color(style::hairline())
+            .children(menu)
+            .children(cards)
+            .child(editor)
+            .when_some(error, |d, e| d.child(div().px_3().pb_1().text_size(px(12.)).text_color(style::tint(style::red(), 0.2)).truncate().child(e)))
+            .child(tools)
+            .into_any_element()
+    }
+
+    /// The engine and the model and effort a new session starts on, as buttons that open their choices.
+    fn start_controls(&mut self, project: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let quiet = style::quiet(cx);
+        let Some((engine, model, effort, _)) = self.draft_of(project) else { return Vec::new() };
+        let weak = cx.entity().downgrade();
+        let button = |id: &'static str, label: String| Button::new(id).custom(quiet).xsmall().label(label);
+        // The engine.
+        let engine_button = {
+            let (weak, project, now) = (weak.clone(), project.to_owned(), engine.clone());
+            button("new-engine", crate::engines::engine_name(&engine).to_owned()).dropdown_caret(true).tooltip("引擎").dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
+                for (id, name) in crate::engines::ENGINES {
+                    let (weak, project) = (weak.clone(), project.clone());
+                    menu = menu.item(PopupMenuItem::new(name).checked(id == now).on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.drafts.entry(project.clone()).or_default().set_engine(id);
+                            cx.notify();
+                        });
+                    }));
+                }
+                menu
+            })
+        };
+        // The model and, where the engine takes one, the effort.
+        let models: Vec<String> = {
+            let mut m: Vec<String> = crate::engines::models(&engine).iter().map(|m| m.to_string()).collect();
+            if !model.is_empty() && !m.contains(&model) {
+                m.insert(0, model.clone());
+            }
+            m
+        };
+        let label = crate::engines::spec_label(&engine, &model, &effort);
+        let shown_model = if model.is_empty() { crate::engines::default_model(&engine).to_owned() } else { model.clone() };
+        let spec_button = if models.is_empty() && !crate::engines::has_effort(&engine) {
+            // omp chooses its own models once it runs.
+            h_flex().h(px(style::CTL_SM)).px_2().items_center().text_size(px(12.)).text_color(muted2()).child(label).into_any_element()
+        } else {
+            let (weak, project, engine) = (weak.clone(), project.to_owned(), engine.clone());
+            button("new-spec", label).dropdown_caret(true).tooltip("模型和努力程度").dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
+                for m in &models {
+                    let (weak, project, id) = (weak.clone(), project.clone(), m.clone());
+                    menu = menu.item(PopupMenuItem::new(crate::engines::short_model(m)).checked(*m == shown_model).on_click(move |_, _, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.drafts.entry(project.clone()).or_default().model = Some(id.clone());
+                            cx.notify();
+                        });
+                    }));
+                }
+                if crate::engines::has_effort(&engine) {
+                    if !models.is_empty() {
+                        menu = menu.separator();
+                    }
+                    for e in std::iter::once("").chain(crate::engines::EFFORTS) {
+                        let (weak, project) = (weak.clone(), project.clone());
+                        menu = menu.item(PopupMenuItem::new(if e.is_empty() { "默认" } else { e }).checked(e == effort).on_click(move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.drafts.entry(project.clone()).or_default().effort = Some(e.to_owned());
+                                cx.notify();
+                            });
+                        }));
+                    }
+                }
+                menu
+            })
+            .into_any_element()
+        };
+        vec![engine_button.into_any_element(), spec_button]
+    }
+
+    /// The permission tier a new session starts on.
+    fn tier_control(&mut self, project: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some((.., tier)) = self.draft_of(project) else { return Vec::new() };
+        vec![self.tier_button("new-tier", &tier, Anchor::BottomRight, cx, {
+            let (weak, project) = (cx.entity().downgrade(), project.to_owned());
+            move |key, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.drafts.entry(project.clone()).or_default().permission = Some(key.to_owned());
+                    cx.notify();
+                });
+            }
+        })]
+    }
+
+    /// A button showing a permission tier, and the three to choose from; `pick` gets the one chosen.
+    pub fn tier_button(&self, id: &'static str, tier: &str, anchor: Anchor, cx: &App, pick: impl Fn(&'static str, &mut App) + Clone + 'static) -> AnyElement {
+        let quiet = style::quiet(cx);
+        let now = tier.to_owned();
+        Button::new(id)
+            .custom(quiet)
+            .xsmall()
+            .icon(style::icon(crate::engines::tier_icon(tier)))
+            .label(crate::engines::tier_name(tier))
+            .dropdown_caret(true)
+            .tooltip("权限")
+            .dropdown_menu_with_anchor(anchor, move |mut menu, _, _| {
+                for (key, name, _) in crate::engines::TIERS {
+                    let pick = pick.clone();
+                    menu = menu.item(PopupMenuItem::new(name).checked(key == now).on_click(move |_, _, cx| pick(key, cx)));
+                }
+                menu
+            })
             .into_any_element()
     }
 
     /// The command button: the menu of commands, opened over the box, whatever is in it.
-    fn toggle_menu(&mut self, member: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let key = self.composer_key(member);
+    fn toggle_menu(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.composer_key(target);
         let Some(c) = self.composers.get_mut(&key) else { return };
         if c.menu.take().is_none() {
             c.menu = Some(Menu { trigger: Trigger { kind: Kind::Command, range: 0..0, query: String::new() }, selected: 0, scroll: ScrollHandle::new(), forced: true });
             let focus = c.input.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
-            self.fetch_menu(member, Kind::Command, window, cx);
+            self.fetch_menu(target, Kind::Command, window, cx);
         }
         cx.notify();
     }
 
     /// The rows over the box.
-    fn menu_view(&self, member: &str, rows: Vec<Row>, selected: usize, scroll: ScrollHandle, cx: &mut Context<Self>) -> AnyElement {
+    fn menu_view(&self, target: &str, rows: Vec<Row>, selected: usize, scroll: ScrollHandle, cx: &mut Context<Self>) -> AnyElement {
         div()
             .absolute()
             .bottom(relative(1.))
@@ -775,7 +934,7 @@ impl LilaApp {
                     .border_color(style::hairline())
                     .shadow_lg()
                     .children(rows.into_iter().enumerate().map(|(ix, row)| {
-                        let (to, picked) = (member.to_owned(), row.clone());
+                        let (to, picked) = (target.to_owned(), row.clone());
                         h_flex()
                             .id(SharedString::from(format!("menu-row-{ix}")))
                             .h(px(28.))
@@ -796,16 +955,16 @@ impl LilaApp {
             .into_any_element()
     }
 
-    /// `--features shots`: fills the shown member's box (`fill:<words>`), adds a file (`attach:<path>`), opens the command menu (`menu`) or shows another member (`show:<id>`).
+    /// `--features shots`: fills the shown thread's box (`fill:<words>`), adds a file (`attach:<path>`), opens the command menu (`menu`) or shows another thread (`show:<id>`).
     #[cfg(feature = "shots")]
     pub fn dev_composer(&mut self, step: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(to) = step.strip_prefix("show:") {
-            self.show_member(to.to_owned(), cx);
+            self.show_thread(to.to_owned(), cx);
             return;
         }
-        let Some(member) = self.member.clone() else { return };
-        self.composer(&member, window, cx);
-        let key = self.composer_key(&member);
+        let Some(target) = self.thread.clone().or_else(|| self.new_in.as_deref().map(new_key)) else { return };
+        self.composer(&target, window, cx);
+        let key = self.composer_key(&target);
         if let Some(words) = step.strip_prefix("fill:") {
             let input = self.composers[&key].input.clone();
             let words = words.replace('_', " ").replace("\\n", "\n");
@@ -814,14 +973,14 @@ impl LilaApp {
                 st.set_selected_range(words.len()..words.len(), cx);
             });
         } else if let Some(path) = step.strip_prefix("attach:") {
-            self.add_files(&member, [PathBuf::from(path)], cx);
+            self.add_files(&target, [PathBuf::from(path)], cx);
         } else if step == "menu" {
-            self.toggle_menu(&member, window, cx);
+            self.toggle_menu(&target, window, cx);
         }
     }
 }
 
-/// Is the model or effort not the role's? (Claude Code's model is read from its replies, as an id: only an id can differ for certain.)
+/// Is the model or effort not the project's? (Claude Code's model is read from its replies, as an id: only an id can differ for certain.)
 pub fn differs(cfg: &Value) -> bool {
     let (m, dm) = (cfg["model"].as_str().unwrap_or_default(), cfg["default_model"].as_str().unwrap_or_default());
     let (e, de) = (cfg["effort"].as_str().unwrap_or_default(), cfg["default_effort"].as_str().unwrap_or_default());
@@ -878,12 +1037,12 @@ mod tests {
     }
 
     #[test]
-    fn the_dot_marks_a_model_or_effort_that_is_not_the_roles() {
+    fn the_dot_marks_a_model_or_effort_that_is_not_the_projects() {
         let cfg = |model: &str, default: &str, effort: &str, switch: bool| json!({"model": model, "default_model": default, "effort": effort, "default_effort": "high", "switch": switch});
         assert!(!differs(&cfg("gpt-6.1-sol", "gpt-6.1-sol", "high", true)));
         assert!(differs(&cfg("gpt-6-luna", "gpt-6.1-sol", "high", true)));
         assert!(differs(&cfg("gpt-6.1-sol", "gpt-6.1-sol", "low", true)));
-        // Claude Code reports ids; a role that wrote an alias can't be compared.
+        // Claude Code reports ids; a project that wrote an alias can't be compared.
         assert!(differs(&cfg("claude-haiku-5-5", "claude-sonnet-5-5", "high", false)));
         assert!(!differs(&cfg("claude-haiku-5-5", "haiku", "high", false)));
     }

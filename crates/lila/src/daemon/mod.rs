@@ -1,35 +1,29 @@
-//! lilad: the only writer of Lila's state. Requests come from the CLI over a
-//! Unix socket, terminal facts from herdr-core's event stream; both are
-//! handled one at a time on one thread, so there is no locking.
+//! lilad: the only writer of Lila's state. Requests come from the CLI and the window over a
+//! Unix socket, terminal facts from herdr-core's event stream; both are handled one at a time
+//! on one thread, so there is no locking.
+//!
+//! The model is projects and their threads (docs/architecture-v4.md). A thread is a
+//! conversation with one agent; the agent runs in an hc terminal of its own, so a lilad restart
+//! does not end it.
 
 mod conversation;
-mod flows;
 mod hooks;
 mod host;
+mod permissions;
 mod requests;
-mod review;
 mod server;
-mod session;
-mod slots;
 mod sources;
-mod watch;
+mod threads;
 
 pub use server::serve;
 pub use sources::{PollJob, PostJob};
 
-use crate::check::{CheckJob, CheckResult};
-use crate::commit::{CommitJob, CommitResult};
 use crate::paths::{Paths, which};
-use crate::roles;
-use crate::sessions::{self, Contexts};
-use crate::usage::{Scanner, Sources};
+use crate::sessions;
+use crate::usage::Sources;
 use anyhow::{Context, Result, anyhow, bail};
-use lila_core::dispatch::{self, AgentStatus, MemberView, QueuedTask, StallAction};
-use lila_core::flow::{self, Flow, Next};
-use lila_core::message::StepHint;
-use lila_core::route::{self, DoneRoute};
-use lila_core::{Actor, Brief, Outcome, ProjectConfig, SourceSpec, Task, TaskState, Team, Transition, inbox, message, prompt, runtime};
-use lila_store::{NewTask, Run, RunState, SessionRow, Store};
+use lila_core::{AgentStatus, ProjectConfig, Runtime, Thread, ThreadState, Tier};
+use lila_store::Store;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -80,65 +74,39 @@ impl Terminals for HcTerminals {
     }
 }
 
+/// How long an engine may run without reporting a status before the thread says it waits for the
+/// person (Claude Code's "trust this folder?" and login dialogs report nothing).
+const STARTUP_MS: i64 = 20_000;
+
+/// What lilad knows of a thread's running engine that the database does not hold.
 #[derive(Debug, Clone)]
 struct Live {
-    terminal: Option<String>,
     status: AgentStatus,
     kind: Option<String>,
     msg: String,
     /// Has reported a status at least once since it started.
     reported: bool,
+    started_ms: i64,
+    /// When the engine last became free to take a message.
     free_since: i64,
-    started_ms: Option<i64>,
-    /// `Member::launch_key` of what it was started with (unknown for one
-    /// started before lilad was), to tell it runs on settings since changed.
-    launched: Option<u64>,
-    /// The chain (root task) of the last task this session was given; unknown
-    /// for a session started before lilad was.
-    chain: Option<String>,
-    /// The CLI session the terminal runs (the store's `sessions`), once known:
-    /// at start for Claude Code, when its rollout turns up for Codex.
-    session: Option<String>,
-    /// When it last started working (a turn began).
-    busy_since: i64,
-    /// The folder its CLI runs in: the project folder or a chain's worktree.
-    cwd: Option<PathBuf>,
-    /// The model and effort this session runs on, as the runtime reported them (nothing yet: the
-    /// role's own), with the choices it lists. Starts over with the session.
+    /// The model and effort this thread runs on, as the engine reported them (nothing yet: the stored ones),
+    /// with the choices it lists. Starts over with the engine.
     config: lila_agent::Config,
-    /// The slash commands an ACP agent declared for this session.
+    /// The slash commands an ACP agent declared for this thread.
     commands: Vec<lila_agent::SlashCommand>,
 }
 
-impl Default for Live {
-    fn default() -> Self {
-        Live {
-            terminal: None,
-            status: AgentStatus::Gone,
-            kind: None,
-            msg: String::new(),
-            reported: false,
-            free_since: 0,
-            started_ms: None,
-            launched: None,
-            chain: None,
-            session: None,
-            busy_since: 0,
-            cwd: None,
-            config: Default::default(),
-            commands: Vec::new(),
-        }
+impl Live {
+    fn new(status: AgentStatus, started_ms: i64) -> Live {
+        Live { status, kind: None, msg: String::new(), reported: false, started_ms, free_since: started_ms, config: Default::default(), commands: Vec::new() }
     }
 }
 
 struct Proj {
     cwd: PathBuf,
-    team: Team,
-    live: BTreeMap<String, Live>,
-    /// Worktree slots chains work in (`slots`); none: chains share `cwd`.
-    slots: Vec<slots::Slot>,
-    /// The repository has a commit for slots to start from (checked until it does).
-    based: bool,
+    config: ProjectConfig,
+    /// Why its `.lila/project.toml` could not be read (the folder is gone, the file is broken); the defaults stand in.
+    error: Option<String>,
 }
 
 pub struct Daemon<T: Terminals> {
@@ -146,80 +114,37 @@ pub struct Daemon<T: Terminals> {
     term: T,
     paths: Paths,
     projects: BTreeMap<String, Proj>,
-    /// PATH the members get (the CLI's PATH when it started the daemon).
+    /// Running threads' engines, by thread id.
+    live: HashMap<String, Live>,
+    /// PATH the engines get (the CLI's PATH when it started the daemon).
     path_env: String,
-    /// The `lila` binary, so members can run it.
+    /// The `lila` binary, so engines can run it (`lila hook`, `lila host`).
     lila_bin: PathBuf,
     pub log: Vec<String>,
-    /// The last delivery error per task, so a stuck delivery is logged once, not every tick.
+    /// The last delivery error per thread, so a stuck delivery is logged once, not every tick.
     failed_sends: BTreeMap<String, String>,
-    /// Goes up when what members are doing changes (status, words, terminals): not in the database.
+    /// Goes up when what threads are doing changes (status, words, terminals): not in the database.
     live_version: u64,
-    /// Checks to start (`take_checks`), and the runs whose check is under way.
-    checks: Vec<CheckJob>,
-    checking: BTreeSet<(String, String)>,
-    /// Commits of accepted chains to make (`take_commits`), and the chains whose commit is under way.
-    commits: Vec<CommitJob>,
-    committing: BTreeSet<(String, String)>,
-    /// Where the CLIs record their sessions, and the context sizes read from them.
+    /// Threads something changed in since the watchers were told (`take_dirty`).
+    dirty: BTreeSet<String>,
+    /// Projects that were added, changed or removed since the watchers were told.
+    dirty_projects: BTreeSet<String>,
+    /// Where the CLIs record their sessions.
     sources: Sources,
-    /// How far each member's transcript has been read (`conversation`), by (project, member).
-    tails: HashMap<(String, String), conversation::Tail>,
-    /// Attached hosts of protocol members (`host`), by (project, member): their command channel.
-    hosts: HashMap<(String, String), std::sync::mpsc::Sender<String>>,
-    /// Open permission cards (`host`), by (project, inbox id).
-    asking: HashMap<(String, String), host::Asking>,
-    /// Answers waiting for the Claude Code hook that asked (`hooks`), by request id: the option, or none (left to the terminal).
-    hook_answers: HashMap<String, Option<String>>,
+    /// How far each Claude thread's transcript has been read (`conversation`), by thread.
+    tails: HashMap<String, conversation::Tail>,
+    /// Attached hosts of protocol threads (`host`), by thread: their command channel.
+    hosts: HashMap<String, std::sync::mpsc::Sender<String>>,
+    /// Open permission cards (`permissions`): what a thread asks the person.
+    asking: Vec<permissions::Asking>,
+    next_card: u64,
+    /// Answers waiting for the Claude Code hook that asked (`hooks`), by request id: the option and a message for the agent, or none (left to the terminal).
+    hook_answers: HashMap<String, Option<(String, Option<String>)>>,
     next_hook: u64,
-    /// What Claude members are writing now (`MessageDisplay`), by (project, member): (message id, text so far).
-    writing: HashMap<(String, String), (String, String)>,
-    contexts: Contexts,
-    /// Token use per member and window, from the same records (budgets, quotas).
-    scanner: Scanner,
-    /// Per project: when Codex's quota was last read, and until when it is used up.
-    quota_checked: BTreeMap<String, i64>,
-    codex_paused: BTreeMap<String, i64>,
-    /// The reset time the person was told about: once per time Codex runs out.
-    quota_told: BTreeMap<String, i64>,
+    /// What Claude threads are writing now (`MessageDisplay`), by thread: (message id, text so far).
+    writing: HashMap<String, (String, String)>,
     /// magpie's command line, when it is installed (set by `serve`; tests leave it out).
     pub magpie: Option<PathBuf>,
-    /// Chains whose worktree could not be prepared, and when: tried again a minute later.
-    slot_failed: BTreeMap<(String, String), i64>,
-    /// The files a chain's accepted commit conflicted in, for the PM's task to resolve them.
-    conflicts: BTreeMap<(String, String), Vec<String>>,
-    /// The accepted task each commit under way is for (its summary is the commit's).
-    commit_task: BTreeMap<(String, String), String>,
-    /// Projects with a commit running: the next one waits for it.
-    merging: BTreeSet<String>,
-    /// Looks at sources to make (`take_polls`), those under way, and when each source last looked.
-    polls: Vec<PollJob>,
-    polling: BTreeSet<(String, usize)>,
-    last_poll: BTreeMap<(String, usize), i64>,
-    /// What went wrong at a source's last look (the person hears once per new error).
-    source_error: BTreeMap<(String, usize), String>,
-    /// Comments the person sent, to post (`take_posts`).
-    posts: Vec<PostJob>,
-}
-
-/// How a member gets work from another chain than its session's.
-#[derive(Debug, Clone, PartialEq)]
-enum Switch {
-    /// Its context is still small: the same session takes it.
-    Keep,
-    /// An earlier session of it did this chain: back to that one.
-    Resume(String),
-    /// A new, empty session.
-    Fresh,
-}
-
-/// The actor lilad writes as: it creates a flow's later steps.
-const LILAD: &str = "lilad";
-
-/// A duration ahead, for people: "in 3 days 4 h", "in 2 h 5 min", "in 12 min".
-fn capitalized(s: &str) -> String {
-    let mut c = s.chars();
-    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 fn now_ms() -> i64 {
@@ -234,30 +159,8 @@ fn req<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
     s(p, key).ok_or_else(|| anyhow!("missing {key}"))
 }
 
-fn strings(p: &Value, key: &str) -> Vec<String> {
-    p.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
-}
-
-pub fn load_team(cwd: &Path, roles_dir: &Path) -> Result<Team> {
-    let path = cwd.join(".lila").join("project.toml");
-    let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let cfg = ProjectConfig::parse(&text).map_err(anyhow::Error::msg)?;
-    let roles = roles::load(roles_dir)?;
-    let mut team = Team::build(&cfg, &roles).map_err(|e| anyhow!("{}: {e}", path.display()))?;
-    for spec in &cfg.members {
-        if let Some(file) = &spec.prompt_file {
-            let p = cwd.join(".lila").join(file);
-            let prompt = std::fs::read_to_string(&p).with_context(|| format!("member {}: read prompt {}", spec.id, p.display()))?;
-            team.set_prompt(spec, &prompt);
-        }
-    }
-    Ok(team)
-}
-
-fn terminal_name(project: &str, member: &str) -> String {
-    let mut n = format!("lila-{project}-{member}");
-    n.truncate(32);
-    n
+fn terminal_name(thread: &str) -> String {
+    format!("lila-{thread}")
 }
 
 impl<T: Terminals> Daemon<T> {
@@ -267,59 +170,55 @@ impl<T: Terminals> Daemon<T> {
             term,
             paths,
             projects: BTreeMap::new(),
+            live: HashMap::new(),
             path_env,
             lila_bin,
             log: Vec::new(),
             failed_sends: BTreeMap::new(),
             live_version: 0,
-            checks: Vec::new(),
-            checking: BTreeSet::new(),
-            commits: Vec::new(),
-            committing: BTreeSet::new(),
+            dirty: BTreeSet::new(),
+            dirty_projects: BTreeSet::new(),
             sources: Sources::from_env(),
             tails: HashMap::new(),
             hosts: HashMap::new(),
-            asking: HashMap::new(),
+            asking: Vec::new(),
+            next_card: 0,
             hook_answers: HashMap::new(),
             next_hook: 0,
             writing: HashMap::new(),
-            contexts: Contexts::default(),
-            scanner: Scanner::default(),
-            quota_checked: BTreeMap::new(),
-            codex_paused: BTreeMap::new(),
-            quota_told: BTreeMap::new(),
             magpie: None,
-            slot_failed: BTreeMap::new(),
-            conflicts: BTreeMap::new(),
-            commit_task: BTreeMap::new(),
-            merging: BTreeSet::new(),
-            polls: Vec::new(),
-            polling: BTreeSet::new(),
-            last_poll: BTreeMap::new(),
-            source_error: BTreeMap::new(),
-            posts: Vec::new(),
         };
-        let rows = d.store.projects().unwrap_or_default();
-        for p in rows {
-            if let Err(e) = d.load_project(&p.id, Path::new(&p.cwd), now_ms()) {
-                d.say(format!("project {}: not loaded: {e:#}", p.id));
-            }
+        for p in d.store.projects().unwrap_or_default() {
+            d.load_project(&p.id, Path::new(&p.cwd));
         }
-        // A check that was running when lilad stopped runs again.
-        let pids: Vec<String> = d.projects.keys().cloned().collect();
-        for pid in pids {
-            for run in d.store.runs(&pid).unwrap_or_default() {
-                if run.state == RunState::Checking {
-                    d.queue_check(&pid, &run.anchor);
-                }
-            }
+        // Threads that had a terminal when lilad last stopped: presumed alive until herdr-core's snapshot says otherwise.
+        let now = now_ms();
+        for t in d.store.live_threads().unwrap_or_default() {
+            d.live.insert(t.id, Live::new(AgentStatus::Unknown, now));
         }
         d
     }
 
-    /// Changes when anything a viewer shows changed: database writes or live member state.
+    /// Changes when anything a viewer shows changed: database writes or live thread state.
     pub fn fingerprint(&self) -> (u64, u64) {
         (self.store.total_changes(), self.live_version)
+    }
+
+    /// Threads and projects that changed since the last call (the server tells its watchers).
+    pub fn take_dirty(&mut self) -> (Vec<String>, Vec<String>) {
+        (std::mem::take(&mut self.dirty).into_iter().collect(), std::mem::take(&mut self.dirty_projects).into_iter().collect())
+    }
+
+    /// The push for a thread that changed: its state and how far its conversation goes (`None`: it is gone).
+    pub(super) fn thread_event(&self, tid: &str, seq: u64) -> Option<Value> {
+        let t = self.store.thread(tid).ok()??;
+        let (state, waiting) = self.state_of(&t, now_ms());
+        Some(json!({"event": "thread", "project": t.project, "thread": tid, "state": state.as_str(), "waiting": waiting, "items_seq": self.store.last_seq(tid).unwrap_or(0), "seq": seq}))
+    }
+
+    fn mark(&mut self, thread: &str) {
+        self.live_version += 1;
+        self.dirty.insert(thread.to_owned());
     }
 
     fn say(&mut self, line: String) {
@@ -330,85 +229,49 @@ impl<T: Terminals> Daemon<T> {
         }
     }
 
-    /// Reads a project's team. Members it no longer lists are stopped and their
-    /// open tasks cancelled (also when they left while lilad was not running).
-    fn load_project(&mut self, id: &str, cwd: &Path, now: i64) -> Result<Vec<String>> {
-        let team = load_team(cwd, &self.paths.roles())?;
-        if team.project != id {
-            bail!("project.toml now names it {:?}; it was registered as {id:?}", team.project);
+    /// Reads a project's `.lila/project.toml`. A project whose file cannot be read stays in the list with
+    /// the default settings and the reason.
+    fn load_project(&mut self, id: &str, cwd: &Path) {
+        let (config, error) = match crate::project::load(cwd) {
+            Ok(c) if c.name == id => (c, None),
+            Ok(c) => (ProjectConfig::new(id), Some(format!("project.toml now names it {:?}; it was registered as {id:?}", c.name))),
+            Err(e) => (ProjectConfig::new(id), Some(format!("{e:#}"))),
+        };
+        if let Some(e) = &error {
+            self.say(format!("project {id}: {e}"));
         }
-        // Reloading a running project keeps what we know about its terminals.
-        let mut live = self.projects.remove(id).map(|p| p.live).unwrap_or_default();
-        if live.is_empty() {
-            for m in self.store.members(id)? {
-                if team.member(&m.id).is_some() {
-                    // Until herdr-core's snapshot says otherwise, a recorded terminal is presumed alive.
-                    let status = if m.terminal.is_some() { AgentStatus::Unknown } else { AgentStatus::Gone };
-                    let chain = m.session.as_deref().and_then(|s| self.store.last_chain(id, s).ok().flatten());
-                    live.insert(m.id.clone(), Live { terminal: m.terminal, started_ms: m.started_ms, status, session: m.session, chain, ..Live::default() });
-                }
-            }
-        }
-        let in_team = |m: &str| team.member(m).is_some();
-        let mut terminals: BTreeMap<String, Option<String>> = live.iter().filter(|(m, _)| !in_team(m)).map(|(k, v)| (k.clone(), v.terminal.clone())).collect();
-        live.retain(|mid, _| in_team(mid));
-        for m in &team.members {
-            live.entry(m.id.clone()).or_default();
-        }
-        for row in self.store.members(id)? {
-            if !in_team(&row.id) {
-                let t = terminals.remove(&row.id).flatten().or(row.terminal);
-                terminals.insert(row.id, t);
-            }
-        }
-        for (t, _) in self.store.tasks(id)? {
-            if t.state.is_open() && !in_team(&t.to) {
-                terminals.entry(t.to).or_default();
-            }
-        }
-        let slots = self.read_slots(id, cwd, &team);
-        self.projects.insert(id.to_owned(), Proj { cwd: cwd.to_path_buf(), team, live, slots, based: false });
-        let removed: Vec<String> = terminals.keys().cloned().collect();
-        for (mid, terminal) in terminals {
-            self.member_removed(id, &mid, terminal, now);
-        }
-        if !removed.is_empty() {
-            self.pump(id, now);
-        }
-        Ok(removed)
+        self.projects.insert(id.to_owned(), Proj { cwd: cwd.to_path_buf(), config, error });
+        self.dirty_projects.insert(id.to_owned());
+        self.live_version += 1;
     }
 
     // ---------------- herdr-core facts ----------------
 
-    fn find_member(&self, terminal: &str) -> Option<(String, String)> {
-        self.projects.iter().find_map(|(pid, p)| p.live.iter().find(|(_, l)| l.terminal.as_deref() == Some(terminal)).map(|(m, _)| (pid.clone(), m.clone())))
+    fn find_thread(&self, terminal: &str) -> Option<String> {
+        self.store.live_threads().ok()?.into_iter().find(|t| t.terminal.as_deref() == Some(terminal)).map(|t| t.id)
     }
 
     /// A whole terminal record (snapshot, `created`, `restarted`).
     pub fn on_terminal(&mut self, rec: &Value, now: i64) {
-        let (Some(pid), Some(mid), Some(addr)) = (rec["labels"]["lila.project"].as_str(), rec["labels"]["lila.member"].as_str(), rec["address"].as_str()) else {
-            return;
-        };
-        let Some(live) = self.projects.get_mut(pid).and_then(|p| p.live.get_mut(mid)) else { return };
-        let (pid, mid) = (pid.to_owned(), mid.to_owned());
+        let (Some(tid), Some(addr)) = (rec["labels"]["lila.thread"].as_str(), rec["address"].as_str()) else { return };
+        let Ok(Some(t)) = self.store.thread(tid) else { return };
         if rec["state"] == "live" {
-            if let Some(c) = rec["cwd"].as_str() {
-                live.cwd = Some(PathBuf::from(c));
+            if t.terminal.as_deref() != Some(addr) {
+                // A terminal this thread was not known to run in (lilad was away when it started): take it.
+                if self.store.set_running(tid, addr, t.started_ms.unwrap_or(now)).is_err() {
+                    return;
+                }
+                self.mark(tid);
             }
-            if live.terminal.as_deref() != Some(addr) {
-                live.terminal = Some(addr.to_owned());
-                live.started_ms.get_or_insert(now);
-                self.live_version += 1;
-            }
-            let live = self.projects.get_mut(&pid).unwrap().live.get_mut(&mid).unwrap();
+            let live = self.live.entry(tid.to_owned()).or_insert_with(|| Live::new(AgentStatus::Unknown, now));
             live.reported |= rec["reported"].as_bool().unwrap_or(false);
             if live.status == AgentStatus::Gone {
                 live.status = AgentStatus::Unknown;
             }
             let status = rec.get("status").cloned().unwrap_or(Value::Null);
-            self.set_status(&pid, &mid, &status, now);
-        } else if live.terminal.as_deref() == Some(addr) {
-            self.member_gone(&pid, &mid, rec["reason"].as_str().unwrap_or("finished"), now, true);
+            self.set_status(tid, &status, now);
+        } else if t.terminal.as_deref() == Some(addr) {
+            self.thread_gone(tid, rec["reason"].as_str().unwrap_or("finished"), now);
         }
     }
 
@@ -426,18 +289,19 @@ impl<T: Terminals> Daemon<T> {
                 match p["type"].as_str() {
                     Some("created" | "restarted") => self.on_terminal(&p["data"], now),
                     Some("status") => {
-                        if let Some((pid, mid)) = self.find_member(terminal) {
-                            if p["data"]["reported"].as_bool() == Some(true) {
-                                self.projects.get_mut(&pid).unwrap().live.get_mut(&mid).unwrap().reported = true;
+                        if let Some(tid) = self.find_thread(terminal) {
+                            if p["data"]["reported"].as_bool() == Some(true)
+                                && let Some(l) = self.live.get_mut(&tid)
+                            {
+                                l.reported = true;
                             }
-                            self.set_status(&pid, &mid, &p["data"]["status"], now);
+                            self.set_status(&tid, &p["data"]["status"], now);
                         }
                     }
                     Some("finished" | "removed" | "lost") => {
-                        if let Some((pid, mid)) = self.find_member(terminal) {
+                        if let Some(tid) = self.find_thread(terminal) {
                             let why = p["data"]["reason"].as_str().unwrap_or("ended").to_owned();
-                            self.member_gone(&pid, &mid, &why, now, true);
-                            self.pump(&pid, now);
+                            self.thread_gone(&tid, &why, now);
                         }
                     }
                     _ => {}
@@ -447,8 +311,8 @@ impl<T: Terminals> Daemon<T> {
         }
     }
 
-    fn set_status(&mut self, pid: &str, mid: &str, status: &Value, now: i64) {
-        let live = self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap();
+    fn set_status(&mut self, tid: &str, status: &Value, now: i64) {
+        let Some(live) = self.live.get_mut(tid) else { return };
         let old = live.status;
         let new = if status.is_null() { AgentStatus::Unknown } else { AgentStatus::from_word(status["state"].as_str()) };
         let (kind, msg) = (status["kind"].as_str().map(String::from), status["msg"].as_str().unwrap_or_default().to_owned());
@@ -456,376 +320,144 @@ impl<T: Terminals> Daemon<T> {
         live.status = new;
         live.kind = kind;
         live.msg = msg;
-        if changed {
-            self.live_version += 1;
-        }
-        let live = self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap();
         if new.is_free() && !old.is_free() {
             live.free_since = now;
         }
-        if new == AgentStatus::Working && old != AgentStatus::Working {
-            live.busy_since = now;
-        }
-        let back_free = new.is_free() && !old.is_free();
         if new != AgentStatus::Unknown {
             live.reported = true;
         }
-        let (msg, kind, reported) = (live.msg.clone(), live.kind.clone(), live.reported);
-        if reported {
-            self.resolve_open(pid, "startup", mid, now);
-        }
-        if back_free {
-            self.resolve_open(pid, "runaway", mid, now);
-        }
-        // Waiting on a permission Lila already put to the person as a card: no second card.
-        let carded = !self.store.open_inbox_for(pid, "permission", mid).unwrap_or_default().is_empty();
-        if new == AgentStatus::Blocked && old != AgentStatus::Blocked && !carded && self.store.open_inbox_for(pid, "terminal", mid).map(|v| v.is_empty()).unwrap_or(false) {
-            let what = if msg.is_empty() { kind.as_deref().unwrap_or("input").to_owned() } else { msg };
-            let _ = self.store.add_inbox(pid, "terminal", Some(mid), None, &inbox::terminal(mid, &what), &[], now);
-        }
-        if old == AgentStatus::Blocked && new != AgentStatus::Blocked {
-            self.resolve_open(pid, "terminal", mid, now);
+        if changed {
+            self.mark(tid);
         }
         if old != new {
-            self.pump(pid, now);
+            self.pump(now);
         }
     }
 
-    fn resolve_open(&mut self, pid: &str, kind: &str, mid: &str, now: i64) {
-        for item in self.store.open_inbox_for(pid, kind, mid).unwrap_or_default() {
-            let _ = self.store.resolve_inbox(pid, &item.id, None, now);
-        }
-    }
-
-    fn member_gone(&mut self, pid: &str, mid: &str, why: &str, now: i64, unexpected: bool) {
-        let Some(live) = self.projects.get_mut(pid).and_then(|p| p.live.get_mut(mid)) else { return };
-        if live.status == AgentStatus::Gone && live.terminal.is_none() {
+    /// The engine of a thread is gone: its terminal ended, was killed, or is no longer there. The
+    /// thread stays, ended; its conversation is kept and it can be resumed.
+    fn thread_gone(&mut self, tid: &str, why: &str, now: i64) {
+        let Ok(Some(t)) = self.store.thread(tid) else { return };
+        if t.terminal.is_none() && !self.live.contains_key(tid) {
             return;
         }
-        let terminal = live.terminal.take();
-        live.status = AgentStatus::Gone;
-        self.live_version += 1;
-        let live = self.projects.get_mut(pid).unwrap().live.get_mut(mid).unwrap();
-        live.reported = false;
-        let role = self.projects[pid].team.member(mid).map(|m| m.role.id.clone()).unwrap_or_default();
-        let _ = self.store.set_member(pid, mid, &role, None, None);
-        self.resolve_open(pid, "terminal", mid, now);
-        self.resolve_open(pid, "startup", mid, now);
-        let mut requeued = Vec::new();
-        for (t, _) in self.store.tasks(pid).unwrap_or_default() {
-            if t.to == mid
-                && matches!(t.state, TaskState::Delivered | TaskState::InProgress)
-                && self.store.transition(pid, &t.id, Transition::Requeue, &Actor::Member("lilad".into()), &format!("{mid} ended: {why}"), now).is_ok()
-            {
-                requeued.push(t.id);
-            }
-        }
-        let _ = self.store.event(pid, None, "lilad", "member_gone", &format!("{mid} ({}): {why}", terminal.unwrap_or_default()), now);
-        self.say(format!("{pid}: {mid} ended ({why}); requeued {requeued:?}"));
-        if unexpected {
-            let tail = if requeued.is_empty() { String::new() } else { format!(" Its tasks {} went back to the queue.", requeued.join(", ")) };
-            let _ = self.store.add_inbox(pid, "lost", Some(mid), None, &inbox::lost(mid, why, &requeued), &[], now);
-            // The PM hears only when there is something for it to do (work to hand
-            // elsewhere): every note is a turn, and the person sees it in the PM's terminal.
-            let owner = self.projects[pid].team.owner.clone();
-            if owner != mid && !requeued.is_empty() {
-                let _ = self.store.push_outbox(pid, &owner, &message::note(mid, &format!("{mid} ended ({why}).{tail} The person was told.")), now);
-            }
-        }
+        let _ = self.store.set_ended(tid, now);
+        self.live.remove(tid);
+        self.hosts.remove(tid);
+        self.writing.remove(tid);
+        self.tails.remove(tid);
+        self.asking.retain(|a| a.thread != tid);
+        let _ = self.store.event(tid, "lilad", "ended", &format!("{} ({}): {why}", t.terminal.unwrap_or_default(), t.engine), now);
+        self.say(format!("{}: thread {tid} ended ({why})", t.project));
+        self.mark(tid);
     }
 
-    // ---------------- the pump: notes, deliveries, timeouts ----------------
-
-    /// Everything that can move now: pending notes, queued tasks.
-    pub fn pump(&mut self, pid: &str, now: i64) {
-        if !self.projects.contains_key(pid) {
-            return;
-        }
-        // Notes first: they are information the member should have before new work.
-        // A member's notes go out as one message: one turn when it is idle.
-        let mut ready: Vec<(String, Vec<lila_store::OutMessage>)> = Vec::new();
-        for msg in self.store.outbox(pid).unwrap_or_default() {
-            if !self.projects[pid].live.contains_key(&msg.member) {
-                let _ = self.store.pop_outbox(msg.id);
-                continue;
-            }
-            match ready.iter_mut().find(|(m, _)| *m == msg.member) {
-                Some((_, msgs)) => msgs.push(msg),
-                None => ready.push((msg.member.clone(), vec![msg])),
-            }
-        }
-        let mut noted: Vec<String> = Vec::new();
-        for (member, msgs) in ready {
-            let live = &self.projects[pid].live[&member];
-            let (Some(t), true) = (live.terminal.clone(), live.status.accepts_notes()) else { continue };
-            let text = msgs.iter().map(|m| m.text.as_str()).collect::<Vec<_>>().join("\n");
-            noted.push(member.clone());
-            match self.tell(pid, &member, &t, &text, None) {
-                Ok(()) => {
-                    for m in &msgs {
-                        let _ = self.store.pop_outbox(m.id);
-                    }
-                }
-                Err(e) => self.say(format!("{pid}: note to {member} not sent yet: {e:#}")),
-            }
-        }
-
-        if self.store.project(pid).ok().flatten().is_some_and(|p| p.paused) {
-            return;
-        }
-        let tasks = self.store.tasks(pid).unwrap_or_default();
-        // Chains without a place to work wait: a free worktree, or the shared folder.
-        let folder = if self.uses_slots(pid) { self.held_for_slots(pid, &tasks, now) } else { self.held_for_folder(pid, &tasks) };
-        let proj = &self.projects[pid];
-        let views: Vec<MemberView> = proj
-            .team
-            .members
-            .iter()
-            .map(|m| {
-                let held = |f: fn(TaskState) -> bool| tasks.iter().any(|(t, _)| t.to == m.id && f(t.state));
-                MemberView {
-                    id: m.id.clone(),
-                    is_owner: m.is_owner,
-                    status: proj.live[&m.id].status,
-                    holds_task: held(TaskState::is_active),
-                    busy: held(|s| matches!(s, TaskState::Delivered | TaskState::InProgress)),
-                    unstarted: held(|s| s == TaskState::Delivered),
-                }
-            })
-            .collect();
-        let codex_until = self.codex_paused.get(pid).copied().filter(|t| *t > now);
-        let queued: Vec<QueuedTask> = tasks
-            .iter()
-            .filter(|(t, _)| t.state == TaskState::Queued)
-            .filter(|(t, _)| !self.held_for_review(pid, t) && !folder.contains(&t.id))
-            .filter(|(t, _)| codex_until.is_none() || proj.team.member(&t.to).is_none_or(|m| m.role.file.runtime != lila_core::Runtime::Codex))
-            .map(|(t, meta)| QueuedTask { id: t.id.clone(), to: t.to.clone(), priority: t.priority, seq: meta.seq })
-            .collect();
-        let picks = dispatch::pick_deliveries(&views, &queued, proj.team.settings.max_working);
-        for (tid, mid) in picks {
-            let Some(task) = tasks.iter().find(|(t, _)| t.id == tid).map(|(t, _)| t.clone()) else { continue };
-            let live = self.projects[pid].live[&mid].clone();
-            let Some(terminal) = live.terminal.clone() else { continue };
-            let ancestors = self.store.ancestors(pid, &tid).unwrap_or_default();
-            let chain = ancestors.last().map(|t| t.id.clone()).unwrap_or_else(|| tid.clone());
-            let proj = &self.projects[pid];
-            let not_owner = proj.team.member(&mid).is_some_and(|m| !m.is_owner);
-            let fresh = proj.team.settings.fresh_session && not_owner;
-            // Work in another folder (a chain's worktree) needs its CLI started there.
-            let dir = self.member_dir(pid, &mid, Some(&chain));
-            let moved = not_owner && *live.cwd.as_ref().unwrap_or(&proj.cwd) != dir;
-            if moved || (fresh && live.chain.as_ref().is_some_and(|c| *c != chain)) {
-                let plan = self.switch_plan(pid, &mid, &live, &chain, &dir, moved);
-                if plan != Switch::Keep {
-                    // A note just typed would be lost with the session: wait until it is read.
-                    if !noted.contains(&mid) {
-                        self.new_session(pid, &mid, &tid, plan, now);
-                    }
-                    continue;
-                }
-            }
-            // The request the chain serves: the person's words from nearest the root,
-            // and every "done when" and "out of scope" set on the way down.
-            let origin = chain_brief(&ancestors);
-            let origin = origin.as_ref().map(|(ids, file, brief)| message::ChainBrief { id: ids, file, brief });
-            if dir != self.projects[pid].cwd {
-                // The task's file and its chain's, where the member reads them.
-                for t in std::iter::once(&task).chain(ancestors.iter()) {
-                    if let Err(e) = write_task_file(&dir, t) {
-                        self.say(format!("{pid}: task file {} in {}: {e:#}", t.id, dir.display()));
-                    }
-                }
-            }
-            let hint = self.step_hint(pid, &task);
-            let text = message::task_delivery(&task, &task_file_rel(&task.id), origin, hint.as_ref());
-            // Type only if it is still idle. hc's `if` knows `idle` and `working`
-            // only; `done` (finished while unseen) takes input like idle, unguarded.
-            let guard = (live.status == AgentStatus::Idle).then_some("idle");
-            match self.tell(pid, &mid, &terminal, &text, guard) {
-                Ok(()) => {
-                    self.failed_sends.remove(&tid);
-                    let _ = self.store.transition(pid, &tid, Transition::Deliver, &Actor::Member("lilad".into()), &format!("to {terminal}"), now);
-                    let live = self.projects.get_mut(pid).unwrap().live.get_mut(&mid).unwrap();
-                    live.free_since = now;
-                    live.chain = Some(chain.clone());
-                    if let Some(sid) = live.session.clone() {
-                        let _ = self.store.touch_chain(pid, &sid, &chain, now);
-                    }
-                    self.say(format!("{pid}: delivered {tid} to {mid}"));
-                }
-                Err(e) => {
-                    let e = format!("{e:#}");
-                    if self.failed_sends.get(&tid) != Some(&e) {
-                        self.say(format!("{pid}: {tid} not delivered to {mid} yet: {e}"));
-                        self.failed_sends.insert(tid.clone(), e);
-                    }
-                }
-            }
-        }
-    }
-
-}
-
-
-fn split_brief(brief: &str) -> (String, String) {
-    let brief = brief.trim();
-    let first = brief.lines().next().unwrap_or_default();
-    let title: String = first.chars().take(80).collect();
-    // A one-line brief is all title: the body would only say it again.
-    let body = if title == brief { String::new() } else { brief.to_owned() };
-    (title, body)
-}
-
-fn ensure_gitignore(root: &Path) -> Result<()> {
-    // Task files and the spool are run state; project.toml is configuration and stays tracked.
-    let path = root.join(".lila").join(".gitignore");
-    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-    let before = text.clone();
-    for line in ["tasks/", "spool/"] {
-        if !text.lines().any(|l| l.trim() == line) {
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(line);
-            text.push('\n');
-        }
-    }
-    if text != before {
-        std::fs::write(path, text)?;
-    }
-    Ok(())
-}
-
-/// `.lila/spool/` in a project: the file channel for sandboxed members (codex
-/// workspace-write) that may not open the lilad socket. `<id>.req.json` in,
-/// `<id>.reply.json` out; both written to a temporary name and renamed.
-pub fn spool_dir(root: &Path) -> PathBuf {
-    root.join(".lila").join("spool")
-}
-
-impl<T: Terminals> Daemon<T> {
-    /// Answers every pending spool request in every project.
-    pub fn process_spool(&mut self, now: i64) {
-        let pids: Vec<String> = self.projects.keys().cloned().collect();
-        let roots: Vec<PathBuf> = pids.iter().flat_map(|p| self.dirs(p)).collect();
-        for root in roots {
-            let dir = spool_dir(&root);
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            let mut reqs: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.to_string_lossy().ends_with(".req.json")).collect();
-            reqs.sort();
-            for path in reqs {
-                let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                let _ = std::fs::remove_file(&path);
-                let reply = match serde_json::from_str::<Value>(&text) {
-                    Ok(req) => {
-                        let method = req["method"].as_str().unwrap_or_default();
-                        if method == "stop" {
-                            json!({"error": "lilad can't be stopped through the spool"})
-                        } else {
-                            match self.handle(method, &req["params"], now) {
-                                Ok(v) => json!({"result": v}),
-                                Err(e) => json!({"error": format!("{e:#}")}),
-                            }
-                        }
-                    }
-                    Err(e) => json!({"error": format!("bad spool request: {e}")}),
-                };
-                let name = path.file_name().unwrap().to_string_lossy().replace(".req.json", "");
-                let tmp = dir.join(format!("{name}.reply.tmp"));
-                if std::fs::write(&tmp, reply.to_string()).is_ok() {
-                    let _ = std::fs::rename(&tmp, dir.join(format!("{name}.reply.json")));
-                }
-            }
-        }
-        self.follow_transcripts();
-    }
-}
-
-/// The brief a task's ancestors (nearest first) set: ids, the file of the words, the brief.
-fn chain_brief(ancestors: &[Task]) -> Option<(String, String, Brief)> {
-    let set: Vec<(String, Brief)> = ancestors.iter().rev().map(|a| (a.id.clone(), a.chain_brief())).filter(|(_, b)| !b.is_empty()).collect();
-    let (first, _) = set.first()?;
-    let mut merged = Brief::default();
-    let mut file = task_file_rel(first);
-    for (id, b) in &set {
-        if merged.quote.is_none() && b.quote.is_some() {
-            merged.quote = b.quote.clone();
-            file = task_file_rel(id);
-        }
-        for (into, from) in [(&mut merged.accept, &b.accept), (&mut merged.out_of_scope, &b.out_of_scope)] {
-            for item in from {
-                if !into.contains(item) {
-                    into.push(item.clone());
-                }
-            }
-        }
-    }
-    let ids = set.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>().join(", ");
-    Some((ids, file, merged))
-}
-
-pub fn task_file_rel(id: &str) -> String {
-    format!(".lila/tasks/{id}.md")
-}
-
-fn write_task_file(cwd: &Path, t: &Task) -> Result<()> {
-    let dir = cwd.join(".lila").join("tasks");
-    std::fs::create_dir_all(&dir)?;
-    let parent = t.parent.as_deref().map(|p| format!(" · parent {p}")).unwrap_or_default();
-    let mut text = format!("# {} · {}\n\nfrom {} → {}{parent}\n\n{}\n", t.id, t.title, t.from, t.to, t.body.trim());
-    let b = &t.brief;
-    if let Some(q) = b.quote.as_deref() {
-        text.push_str("\n## The person's words\n\n");
-        text.extend(q.lines().map(|l| format!("> {l}\n")));
-    }
-    for (head, items) in [("Done when", &b.accept), ("Out of scope", &b.out_of_scope)] {
-        if !items.is_empty() {
-            text.push_str(&format!("\n## {head}\n\n"));
-            text.extend(items.iter().map(|i| format!("- {i}\n")));
-        }
-    }
-    std::fs::write(dir.join(format!("{}.md", t.id)), text)?;
-    Ok(())
-}
-
-pub fn task_json(t: &Task) -> Value {
-    json!({
-        "id": t.id, "title": t.title, "body": t.body, "state": t.state.as_str(), "from": t.from.as_str(), "to": t.to,
-        "parent": t.parent, "priority": t.priority, "summary": t.summary, "block_reason": t.block_reason,
-        "created_ms": t.created_ms, "updated_ms": t.updated_ms,
-        "quote": t.brief.quote, "accept": t.brief.accept, "out_of_scope": t.brief.out_of_scope,
-        "decisions": t.outcome.decisions, "unverified": t.outcome.unverified,
-        "verdict": t.outcome.passed.map(|p| if p { "pass" } else { "fail" }),
-        "run": t.run.as_ref().map(|(a, _)| a), "run_step": t.run.as_ref().map(|(_, s)| s),
-    })
-}
-
-fn inbox_json(i: &lila_store::InboxItem) -> Value {
-    json!({
-        "id": i.id, "kind": i.kind, "member": i.member, "task": i.task, "text": i.text, "options": i.options,
-        "answer": i.answer, "created_ms": i.created_ms, "resolved_ms": i.resolved_ms,
-    })
-}
-
-impl<T: Terminals> Daemon<T> {
-    /// After a fresh snapshot: members pointing at terminals that no longer exist ended while we were away.
-    /// Members started after the snapshot was taken are not in it and are left alone.
+    /// After a fresh snapshot: threads pointing at terminals that no longer exist ended while we were away.
+    /// Threads started after the snapshot was taken are not in it and are left alone.
     pub fn reconcile(&mut self, live_terminals: &[String], taken_ms: i64, now: i64) {
-        let gone: Vec<(String, String)> = self
-            .projects
-            .iter()
-            .flat_map(|(pid, p)| {
-                p.live
-                    .iter()
-                    .filter(move |(_, l)| l.started_ms.is_none_or(|s| s < taken_ms - 2000))
-                    .filter(|(_, l)| l.terminal.as_ref().is_some_and(|t| !live_terminals.contains(t)))
-                    .map(move |(m, _)| (pid.clone(), m.clone()))
-            })
+        let gone: Vec<String> = self
+            .store
+            .live_threads()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.started_ms.is_none_or(|s| s < taken_ms - 2000))
+            .filter(|t| t.terminal.as_ref().is_some_and(|a| !live_terminals.contains(a)))
+            .map(|t| t.id)
             .collect();
-        for (pid, mid) in gone {
-            self.member_gone(&pid, &mid, "its terminal no longer exists", now, true);
-            self.pump(&pid, now);
+        for tid in gone {
+            self.thread_gone(&tid, "its terminal no longer exists", now);
         }
+    }
+
+    /// Every few seconds: startup timeouts, then the pump.
+    pub fn tick(&mut self, now: i64) {
+        let slow: Vec<String> = self.live.iter().filter(|(_, l)| !l.reported && l.status == AgentStatus::Unknown && now - l.started_ms >= STARTUP_MS && now - l.started_ms < STARTUP_MS + 6000).map(|(t, _)| t.clone()).collect();
+        for tid in slow {
+            self.say(format!("thread {tid} has not reported a status"));
+            self.mark(&tid);
+        }
+        self.pump(now);
+    }
+
+    // ---------------- what threads look like ----------------
+
+    /// The state a thread shows, and what it waits for (`card`: a permission card; `terminal`: a dialog in its terminal).
+    fn state_of(&self, t: &Thread, now: i64) -> (ThreadState, Option<&'static str>) {
+        let live = self.live.get(&t.id).filter(|_| t.terminal.is_some());
+        let status = live.map_or(AgentStatus::Gone, |l| l.status);
+        let card = self.asking.iter().any(|a| a.thread == t.id);
+        let mut state = status.thread_state(card);
+        let mut waiting = match state {
+            ThreadState::Waiting if card => Some("card"),
+            ThreadState::Waiting => Some("terminal"),
+            _ => None,
+        };
+        // No status for a while: a dialog in the terminal (trust the folder, sign in) is likely waiting.
+        if state == ThreadState::Starting && live.is_some_and(|l| !l.reported && now - l.started_ms >= STARTUP_MS) {
+            state = ThreadState::Waiting;
+            waiting = Some("terminal");
+        }
+        (state, waiting)
+    }
+
+    /// What a runtime offers the window.
+    pub(super) fn caps(engine: Runtime) -> lila_agent::Caps {
+        match engine {
+            Runtime::Claude => lila_agent::Caps { tui: true, gui: true, steer: true },
+            // Through `codex app-server` (`lila host codex`): no TUI to switch to.
+            Runtime::Codex => lila_agent::Caps { tui: false, gui: true, steer: true },
+            // Over ACP (`lila host omp`): words wait for the prompt under way.
+            Runtime::Omp => lila_agent::Caps { tui: false, gui: true, steer: false },
+        }
+    }
+
+    pub(super) fn thread_json(&self, t: &Thread, now: i64) -> Value {
+        let (state, waiting) = self.state_of(t, now);
+        let live = self.live.get(&t.id).filter(|_| t.terminal.is_some());
+        let cards = self.asking.iter().filter(|a| a.thread == t.id).count();
+        json!({
+            "id": t.id, "project": t.project, "title": t.title, "engine": t.engine.as_str(),
+            "model": live.and_then(|l| l.config.model.clone()).unwrap_or_else(|| t.model.clone()),
+            "effort": live.and_then(|l| l.config.effort.clone()).or_else(|| t.effort.clone()),
+            "permission": t.tier.as_str(), "cwd": t.cwd, "session": t.session,
+            "state": state.as_str(), "status": live.map_or("gone", |l| l.status.as_str()), "waiting": waiting, "cards": cards,
+            "msg": live.map(|l| l.msg.clone()).filter(|m| !m.is_empty()),
+            "terminal": t.terminal, "caps": Self::caps(t.engine),
+            "created_ms": t.created_ms, "active_ms": t.active_ms, "started_ms": t.started_ms, "ended_ms": t.ended_ms, "archived": t.archived,
+        })
+    }
+
+    /// The engine's program on PATH and the environment its terminal gets (PATH = lila's folder + the
+    /// PATH lilad was started with), including the account it runs on (`accounts`).
+    pub(super) fn engine_env(&self, engine: Runtime) -> Result<(PathBuf, BTreeMap<String, String>)> {
+        let lila_dir = self.lila_bin.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let path = format!("{lila_dir}:{}", self.path_env);
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        // Claude Code draws inline by default: its input box follows the output and the wheel scrolls
+        // the whole terminal. Full-screen (alternate screen, the wheel to Claude) keeps the input at the bottom.
+        if engine == Runtime::Claude {
+            env.insert("CLAUDE_CODE_NO_FLICKER".into(), "1".into());
+        }
+        let name = lila_core::runtime::cli(engine);
+        let program = which(name, &path).ok_or_else(|| anyhow!("{name:?} is not on PATH; install it and sign in"))?;
+        env.insert("PATH".into(), path);
+        if let Some((var, dir)) = self.account(engine).and_then(|a| a.env()) {
+            env.insert(var.into(), dir);
+        }
+        Ok((program, env))
+    }
+
+    /// A CLI's current subscription account (`~/.config/lila/accounts.toml`).
+    fn account(&self, r: Runtime) -> Option<crate::accounts::Account> {
+        let list = crate::accounts::load(&self.paths.accounts()).ok()?;
+        crate::accounts::current(&list, r).cloned()
+    }
+
+    /// Where the CLIs record sessions now: the current accounts' folders, or the
+    /// defaults (`sources`) for an account in the CLI's own folder.
+    fn live_sources(&self) -> Sources {
+        let pick = |r: Runtime, default: &PathBuf| self.account(r).and_then(|a| a.dir).unwrap_or_else(|| default.clone());
+        Sources { claude: pick(Runtime::Claude, &self.sources.claude), codex: pick(Runtime::Codex, &self.sources.codex) }
     }
 }
 

@@ -176,7 +176,7 @@ impl Acp {
             Command::SetModel { model } => self.set_config(&mut step, self.model_option.clone(), model),
             Command::SetEffort { effort } => self.set_config(&mut step, self.effort_option.clone(), effort),
             // The agent has `/compact` among its commands, sent as words.
-            Command::Compact => {}
+            Command::Compact | Command::SetPermission { .. } => {}
             Command::Interrupt => {
                 if let (Some(session), Some(_)) = (self.session.clone(), self.turn.as_ref()) {
                     step.send.push(json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session}}));
@@ -352,12 +352,33 @@ impl Acp {
                     acp::PermissionOptionKind::RejectAlways => "总是拒绝",
                     _ => o.name.as_str(),
                 };
-                PermOption { id: o.option_id.0.to_string(), label: label.to_owned() }
+                let kind = match o.kind {
+                    acp::PermissionOptionKind::AllowOnce => PermKind::Allow,
+                    acp::PermissionOptionKind::AllowAlways => PermKind::AllowAlways,
+                    acp::PermissionOptionKind::RejectOnce => PermKind::Reject,
+                    _ => PermKind::RejectAlways,
+                };
+                PermOption { id: o.option_id.0.to_string(), label: label.to_owned(), kind }
             })
             .collect();
         // The one to suggest first.
         options.sort_by_key(|o| if o.label == "允许" { 0 } else { 1 });
-        let request = PermissionRequest { id: format!("acp-{id}"), tool: f.kind.map(kind_of).unwrap_or(ToolKind::Other), title: unwrap_dollar(&title), detail: String::new(), options };
+        let raw = f.raw_input.clone().unwrap_or_default();
+        let command = raw["command"].as_str().map(unwrap_dollar);
+        let mut paths: Vec<String> = f.locations.iter().flatten().map(|l| l.path.to_string_lossy().to_string()).collect();
+        for key in ["path", "file_path", "filePath"] {
+            if let Some(p) = raw[key].as_str().map(String::from)
+                && !paths.contains(&p)
+            {
+                paths.push(p);
+            }
+        }
+        let request = PermissionRequest {
+            name: f.title.clone().unwrap_or_default(),
+            command,
+            paths,
+            ..PermissionRequest::new(format!("acp-{id}"), f.kind.map(kind_of).unwrap_or(ToolKind::Other), unwrap_dollar(&title), "", options)
+        };
         self.status = HostStatus::Blocked { why: request.title.clone() };
         self.approvals.push((request.id.clone(), id));
         step.events.push(AgentEvent::Permission { request });

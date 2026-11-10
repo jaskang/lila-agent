@@ -1,8 +1,6 @@
 # Lila
 
-一支编码 agent 团队。你只和 PM 说话，PM 拆任务、分派给团队；Lila 投递任务、传回结果，需要你的事放进收件箱。
-
-每个成员都是官方 CLI（`claude` / `codex`）的交互会话，用你的订阅登录，不需要 API key。
+一个有自己界面的 agent。在项目里开会话，agent 由官方引擎（Claude Code、Codex、ACP agent）跑，用你的订阅登录，不需要 API key。
 
 ![Lila](docs/images/window.png)
 
@@ -20,77 +18,50 @@ lila-app
 
 ## 使用
 
-点「新建项目」：选文件夹、勾团队、写一段要做什么。Lila 写好 `.lila/project.toml`，启动团队，把这段话作为第一个任务交给 PM。
+Lila 是一个有自己界面的 agent：在项目（一个文件夹）里开会话，会话由官方引擎跑（Claude Code、Codex、ACP agent），Lila 提供界面和权限。
 
-- 左边：项目和团队。PM 在界面上叫「助理」。
-- 中间：你的请求，按「下一步该谁动」分组：需要你、进行中、排队、已交付。点成员看它的对话：它被派了什么、说了什么、跑了哪些命令、改了哪些文件，底下可以直接给它发消息（⌘↩）。Claude Code 成员可以在标题行切到它自己的终端（⌘F 搜索，⌘点击打开链接）；Codex 和 omp 成员没有终端，右键菜单里有「原始日志」。⌘[ 回到列表。
-- 成员要做需要你同意的事（运行命令、改文件）时，出现「要你允许」卡片，在卡片上回答。
-- 右边：选中的请求。做完的工作会出现一张验收卡片：「通过」就合成一个提交落到当前分支，写意见就打回给助理。
-
-成员跑在三种 agent 上，由角色的 `runtime` 决定：
-- `claude`：Claude Code（订阅）。Lila 照跑它的终端，从会话记录和 hooks 画出对话。
-- `codex`：Codex（订阅），经 `codex app-server`。
-- `omp`：[oh-my-pi](https://github.com/can1357/oh-my-pi)，经 ACP（`omp acp`）。`model` 写 omp 认得的 `provider/model`（比如 DeepSeek、MiniMax），账号和 key 由 omp 自己管理（`~/.omp`），Lila 不碰。
-
-```toml
-# ~/.config/lila/roles/deep.toml（同名的 deep.md 是它的提示词）
-name = "DeepSeek 工程师"
-runtime = "omp"
-model = "deepseek/deepseek-v4"
-```
+- **添加项目**：侧栏「项目」旁的 `+`，选一个文件夹。
+- **新会话**：⌘N，或侧栏的「新会话」、项目旁的 `+`。直接出现输入框，光标已经在里面；发出第一条消息时才真正创建会话。发出之前可以在输入框下面改引擎、模型、努力程度和权限档，默认值是项目默认值。
+- **侧栏**：每个项目下是它的会话。转圈是在工作，整行红底是在等你（要你允许一个操作，或 Claude Code 卡在终端里的对话框，比如「信任这个文件夹」），灰字是已结束，其余是空闲。右键一个会话：重命名、结束或继续、归档。归档的会话默认不显示，有归档时「项目」旁多一个归档按钮，点开列出来，右键取消归档。
+- **对话**：消息、思考、工具调用，底下是输入框。权限确认以卡片出现在对话里，在卡片上选；Claude Code 卡在终端里时，输入框上方有「打开终端」。标题行右边：对话和终端的切换（Claude Code）、权限档、中断、结束或继续。
+- **权限档**：每个会话三档，随时切换：只读、改动前确认、全自动（默认）。全自动下，改工作区以外的文件、`git push`、对外发出的动作仍然会问。
+- **项目设置**：⇧⌘,（或项目右键「项目设置…」），设名称和新会话的默认引擎、模型、努力程度、权限档，存在项目的 `.lila/project.toml`。⌘, 是全局设置：用量和关于。
+- **通知**：窗口不在前面时，会话开始等你、或一轮跑完，发系统通知。
 
 | 快捷键 | |
 |---|---|
-| ⌘N | 新需求 |
-| ⌘[ | 从终端回到请求列表 |
-| ⌘1–9 | 切换项目 |
-| ⌘I | 右侧面板 |
-| ⌘, | 设置：角色、用量、关于 |
-| ⇧⌘, | 项目设置：通用、成员 |
+| ⌘N | 新会话（在当前项目里） |
+| ⌘1–9 | 切到第 n 个项目的最近会话（没有会话就是它的新会话） |
+| ⌘. | 中断正在跑的这一轮 |
+| ⌘[ | Claude Code 的终端切回对话 |
+| ⌘, / ⇧⌘, | 全局设置 / 项目设置 |
+| ↩ / ⇧↩ | 发送 / 换行（输入框里） |
+| ⌘F | 搜索（终端里） |
+| Esc | 关闭对话框 |
+
+输入框里：`@` 选项目里的文件，`/`（Codex 是 `$`）选命令和 skill，回形针、拖进来或粘贴来添加附件；框是空的时候 ↑ 取回上一条话。
+
+右侧的 diff、文件和 GitHub 面板是后面的阶段，还没有。接口见 [docs/architecture-v4.md](docs/architecture-v4.md)。
 
 ## 命令行
 
-窗口能做的，命令行都能做：
+窗口能做的，命令行都能做，走同一个 socket：
 
 ```sh
-lila init                       # 生成 .lila/project.toml
-lila up --brief "做一个登录页"    # 启动团队，把这句话交给 PM
-lila status                     # 谁在做什么
-lila requests                   # 每个请求现在该谁动
-lila inbox                      # 需要你的事
-lila answer Q3 "用 Stripe"       # 回答；不带文字表示忽略
-lila task ls --all              # 所有任务
-lila pause / resume / down
+lila up                                  # 启动 lilad，把当前文件夹加成项目
+lila thread new "做一个登录页" --engine codex --effort low
+lila thread list
+lila thread show t07b6b991               # 对话和待答的权限卡片
+lila thread send t07b6b991 "再加个测试"
+lila thread answer t07b6b991 p1 allow
+lila thread stop t07b6b991 / resume t07b6b991
+lila thread permission t07b6b991 confirm
+lila project set --engine claude --permission full
 ```
-
-成员用的协议：`lila --skill`。
 
 ## 配置
 
-- **角色**：`~/.config/lila/roles/<id>.toml` 加 `<id>.md`（提示词）。`lila roles init` 补齐缺的默认角色。
-
-  ```toml
-  name = "开发工程师"
-  runtime = "claude"          # claude | codex
-  model = "claude-sonnet-5-5"
-  effort = "high"
-  can_assign = ["tester"]
-  env = { PATH = "/opt/node/bin" }
-  ```
-
-- **项目**：`.lila/project.toml`，随仓库提交。成员（`[[members]]`，可以覆盖角色的 `runtime`、`model`、`effort`、`count`）、指派规则（`[assign]`）、自定义流程（`[flows.<名字>]`）和 `[settings]`（同时进行几件 `parallel`、检查命令 `check`、`max_rounds`、`stall_minutes` 等）。git 仓库里每件事在自己的 worktree 里做，验收后合成一个提交落到当前分支。
-- **GitHub 来源**：在 `.lila/project.toml` 里加一段，issue 会自己进来，助理分拣，你点「修」才开工，做完开 PR：
-
-  ```toml
-  [[sources]]
-  kind = "github"
-  query = "is:open label:bug"   # gh 的搜索语法
-  every = 10                    # 分钟
-  max_per_day = 5
-  ```
-
-  需要装好并登录 `gh`。
-
+- **项目**：`.lila/project.toml`，里面是项目的 id、标题和新会话的默认值（引擎、模型、努力程度、权限档）。
 - `LILA_HOME=<目录>` 把配置、数据库和 socket 都放进这个目录。
 
 ## 开发
@@ -102,14 +73,14 @@ cargo clippy --workspace --all-targets
 
 | crate | |
 |---|---|
-| `lila-core` | 角色、团队、任务状态机、流程、提示词、消息。不做 IO。 |
+| `lila-core` | 引擎、权限档、会话、项目默认值、启动参数。不做 IO。 |
 | `lila-store` | SQLite |
 | `lila` | CLI 和 lilad |
 | `hc-client` | herdr-core 客户端 |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图 |
 | `lila-app` | 桌面应用（GPUI） |
 
-架构见 [docs/architecture-v2.md](docs/architecture-v2.md)，界面见 [DESIGN.md](DESIGN.md)，接手开发先读 [docs/HANDOFF.md](docs/HANDOFF.md)。第三方代码见 [THIRD-PARTY.md](THIRD-PARTY.md)。
+架构见 [docs/architecture-v4.md](docs/architecture-v4.md)，界面见 [DESIGN.md](DESIGN.md)，接手开发先读 [docs/HANDOFF.md](docs/HANDOFF.md)。第三方代码见 [THIRD-PARTY.md](THIRD-PARTY.md)。
 
 ## 参考
 

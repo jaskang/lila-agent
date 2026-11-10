@@ -1,5 +1,0 @@
-name = "测试工程师"
-runtime = "codex"
-model = "gpt-6.1-sol"
-effort = "high"
-can_assign = ["engineer"]

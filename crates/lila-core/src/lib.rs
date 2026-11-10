@@ -1,17 +1,10 @@
-//! Lila's domain: roles, projects and teams, tasks and their state machine,
-//! assignment policy, prompts, launch commands and dispatch decisions.
-//! Nothing here does IO, so all of it is unit-tested.
+//! Lila's domain: the engines a thread can run on, permission tiers, the data a
+//! thread is made of, projects' defaults, and the commands that start each
+//! engine. Nothing here does IO, so all of it is unit-tested.
 
 pub mod config;
-pub mod dispatch;
-pub mod flow;
-pub mod inbox;
-pub mod message;
-pub mod prompt;
-pub mod request;
-pub mod route;
 pub mod runtime;
-pub mod task;
+pub mod thread;
 
-pub use config::{Member, ProjectConfig, Role, RoleFile, Runtime, Settings, SourceSpec, Team, Tools, expand_ids, validate_id};
-pub use task::{Actor, Brief, Outcome, Task, TaskState, Transition};
+pub use config::{Defaults, ProjectConfig, Runtime, model_source, validate_id};
+pub use thread::{AgentStatus, Thread, ThreadState, Tier, new_thread_id, valid_thread_id};

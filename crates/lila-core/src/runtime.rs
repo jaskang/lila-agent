@@ -1,8 +1,9 @@
-//! How each official CLI is started with a role's model, effort and system prompt.
-//! Verified in M0 (docs/spikes.md): claude `--append-system-prompt-file`,
-//! Codex goes through `lila host codex` (`codex app-server`, `developerInstructions`).
+//! How each official CLI is started for a thread: its model, effort, permission
+//! tier and the conversation to open. Claude Code runs as its TUI (Lila reads its
+//! transcript and hooks); Codex and ACP agents run through `lila host`.
 
-use crate::config::{Role, Runtime};
+use crate::config::Runtime;
+use crate::thread::Tier;
 
 /// The program to run. `argv[0]` is a bare name; the caller resolves it on PATH.
 #[derive(Debug, Clone, PartialEq)]
@@ -13,84 +14,98 @@ pub struct Launch {
 /// Which conversation the CLI opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Session {
-    /// A new one; Claude Code takes the id Lila picked (Codex picks its own).
+    /// A new one; Claude Code takes the id Lila picked (Codex and ACP agents pick their own).
     New(Option<String>),
-    /// An earlier one, by id: the member picks up where it left that work.
+    /// An earlier one, by id.
     Resume(String),
 }
 
-pub fn launch(role: &Role, prompt_path: &str, session: &Session) -> Launch {
-    let f = &role.file;
+/// What a thread is started with.
+#[derive(Debug, Clone)]
+pub struct Spec<'a> {
+    pub engine: Runtime,
+    pub model: &'a str,
+    pub effort: Option<&'a str>,
+    pub tier: Tier,
+    pub session: &'a Session,
+    /// A system prompt to append, when there is one.
+    pub prompt_file: Option<&'a str>,
+}
+
+/// The `(approval policy, sandbox)` Codex runs a tier under (`codex app-server`: `thread/start`, then each `turn/start`).
+///
+/// - read-only: the sandbox allows no writes; whatever it escalates is refused by lilad.
+/// - confirm: `untrusted` asks before anything but known-safe reads.
+/// - full: the sandbox allows writes in the workspace but no network and nothing outside it,
+///   and `on-request` lets Codex ask to go beyond: lilad answers those, and asks the person for the dangerous ones.
+pub fn codex_settings(tier: Tier) -> (&'static str, &'static str) {
+    match tier {
+        Tier::ReadOnly => ("on-request", "read-only"),
+        Tier::Confirm => ("untrusted", "workspace-write"),
+        Tier::Full => ("on-request", "workspace-write"),
+    }
+}
+
+/// Claude Code is always started in `manual` mode: everything it does not do on its own (edits,
+/// commands) asks, and the asking reaches lilad's `PermissionRequest` hook, which answers by the
+/// thread's tier. So a tier switch needs no restart, and the CLI's own default mode (the person's
+/// `auto`) does not matter.
+pub const CLAUDE_MODE: &str = "manual";
+
+pub fn launch(spec: &Spec) -> Launch {
     let mut argv: Vec<String> = Vec::new();
-    match f.runtime {
+    match spec.engine {
         Runtime::Claude => {
-            argv.extend(["claude".into(), "--model".into(), f.model.clone()]);
-            match session {
+            argv.extend(["claude".into()]);
+            if !spec.model.is_empty() {
+                argv.extend(["--model".into(), spec.model.into()]);
+            }
+            match spec.session {
                 Session::New(Some(id)) => argv.extend(["--session-id".into(), id.clone()]),
                 Session::Resume(id) => argv.extend(["--resume".into(), id.clone()]),
                 Session::New(None) => {}
             }
-            if let Some(e) = &f.effort {
-                argv.extend(["--effort".into(), e.clone()]);
+            if let Some(e) = spec.effort {
+                argv.extend(["--effort".into(), e.into()]);
             }
-            // Lists take several values; the next flag ends each one.
-            let t = &f.tools;
-            if !t.only.is_empty() {
-                argv.extend(["--tools".into(), t.only.join(",")]);
+            argv.extend(["--permission-mode".into(), CLAUDE_MODE.into()]);
+            if let Some(f) = spec.prompt_file {
+                argv.extend(["--append-system-prompt-file".into(), f.into()]);
             }
-            for (flag, rules) in [("--allowedTools", &t.allow), ("--disallowedTools", &t.deny)] {
-                if !rules.is_empty() {
-                    argv.push(flag.into());
-                    argv.extend(rules.iter().cloned());
-                }
-            }
-            // Allow rules mean "everything else asks": in auto mode (a person's
-            // default) nothing asks, and the PM could do the work itself.
-            if !t.allow.is_empty() {
-                argv.extend(["--permission-mode".into(), "manual".into()]);
-            }
-            argv.extend(["--append-system-prompt-file".into(), prompt_path.into()]);
         }
-        // Codex runs through `codex app-server`, driven by `lila host codex` in the
-        // member's terminal (architecture v3 §7.2); lilad adds `--program <codex>`.
+        // Driven by `lila host codex` in the thread's terminal; lilad adds `--program <codex>`.
         Runtime::Codex => {
-            argv.extend(["lila".into(), "host".into(), "codex".into(), "--model".into(), f.model.clone()]);
-            if let Some(e) = &f.effort {
-                argv.extend(["--effort".into(), e.clone()]);
+            let (approval, sandbox) = codex_settings(spec.tier);
+            argv.extend(["lila".into(), "host".into(), "codex".into(), "--model".into(), spec.model.into()]);
+            if let Some(e) = spec.effort {
+                argv.extend(["--effort".into(), e.into()]);
             }
-            if let Some(mode) = &f.tools.sandbox {
-                argv.extend(["--sandbox".into(), mode.clone()]);
+            argv.extend(["--sandbox".into(), sandbox.into(), "--approval".into(), approval.into()]);
+            if let Some(f) = spec.prompt_file {
+                argv.extend(["--prompt-file".into(), f.into()]);
             }
-            argv.extend(["--prompt-file".into(), prompt_path.into()]);
-            if let Session::Resume(id) = session {
+            if let Session::Resume(id) = spec.session {
                 argv.extend(["--thread".into(), id.clone()]);
             }
-            if !f.extra_args.is_empty() {
-                argv.push("--".into());
-                argv.extend(f.extra_args.iter().cloned());
-            }
-            return Launch { argv };
         }
-        // omp over ACP (`omp acp`), driven by `lila host omp`; its model is any omp
-        // knows (`provider/model`), its account is omp's own (~/.omp).
         Runtime::Omp => {
-            argv.extend(["lila".into(), "host".into(), "omp".into(), "--model".into(), f.model.clone(), "--prompt-file".into(), prompt_path.into()]);
-            if let Session::Resume(id) = session {
+            argv.extend(["lila".into(), "host".into(), "omp".into()]);
+            if !spec.model.is_empty() {
+                argv.extend(["--model".into(), spec.model.into()]);
+            }
+            if let Some(f) = spec.prompt_file {
+                argv.extend(["--prompt-file".into(), f.into()]);
+            }
+            if let Session::Resume(id) = spec.session {
                 argv.extend(["--session".into(), id.clone()]);
             }
-            if !f.extra_args.is_empty() {
-                argv.push("--".into());
-                argv.extend(f.extra_args.iter().cloned());
-            }
-            return Launch { argv };
         }
     }
-    argv.extend(f.extra_args.iter().cloned());
     Launch { argv }
 }
 
 /// The CLI a runtime needs on PATH.
-pub fn cli(runtime: crate::config::Runtime) -> &'static str {
+pub fn cli(runtime: Runtime) -> &'static str {
     match runtime {
         Runtime::Claude => "claude",
         Runtime::Codex => "codex",
@@ -101,86 +116,38 @@ pub fn cli(runtime: crate::config::Runtime) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RoleFile;
-    use std::collections::BTreeMap;
 
-    fn role(runtime: Runtime, effort: Option<&str>) -> Role {
-        Role {
-            id: "x".into(),
-            file: RoleFile {
-                name: "x".into(),
-                runtime,
-                model: "the-model".into(),
-                effort: effort.map(Into::into),
-                extra_args: vec!["--foo".into()],
-                env: BTreeMap::new(),
-                can_assign: vec![],
-                prompt_file: None,
-                tools: Default::default(),
-            },
-            prompt: String::new(),
+    fn spec(engine: Runtime, tier: Tier, session: &Session) -> Spec<'_> {
+        Spec { engine, model: "the-model", effort: Some("low"), tier, session, prompt_file: None }
+    }
+
+    #[test]
+    fn claude_always_asks_and_lilad_answers() {
+        let new = Session::New(Some("abc".into()));
+        for tier in [Tier::ReadOnly, Tier::Confirm, Tier::Full] {
+            let l = launch(&spec(Runtime::Claude, tier, &new));
+            assert_eq!(l.argv, ["claude", "--model", "the-model", "--session-id", "abc", "--effort", "low", "--permission-mode", "manual"]);
         }
-    }
-
-    #[test]
-    fn claude() {
-        let l = launch(&role(Runtime::Claude, Some("high")), "/p.md", &Session::New(None));
-        assert_eq!(l.argv, ["claude", "--model", "the-model", "--effort", "high", "--append-system-prompt-file", "/p.md", "--foo"]);
-    }
-
-    #[test]
-    fn codex_runs_through_the_host() {
-        let l = launch(&role(Runtime::Codex, Some("high")), "/p.md", &Session::New(None));
-        assert_eq!(l.argv, ["lila", "host", "codex", "--model", "the-model", "--effort", "high", "--prompt-file", "/p.md", "--", "--foo"]);
-    }
-
-    #[test]
-    fn omp_runs_through_the_host() {
-        let mut r = role(Runtime::Omp, None);
-        r.file.model = "deepseek/deepseek-v4".into();
-        let l = launch(&r, "/p.md", &Session::Resume("s9".into()));
-        assert_eq!(l.argv, ["lila", "host", "omp", "--model", "deepseek/deepseek-v4", "--prompt-file", "/p.md", "--session", "s9", "--", "--foo"]);
-        assert_eq!(cli(Runtime::Omp), "omp");
-    }
-
-    #[test]
-    fn tools_become_flags_the_cli_enforces() {
-        let mut r = role(Runtime::Claude, None);
-        r.file.tools.only = vec!["Read".into(), "Bash".into()];
-        r.file.tools.allow = vec!["Bash(lila:*)".into(), "Bash(git log:*)".into()];
-        r.file.tools.deny = vec!["Edit".into()];
-        r.file.tools.sandbox = Some("read-only".into());
-        let l = launch(&r, "/p.md", &Session::New(None));
-        assert_eq!(
-            l.argv,
-            [
-                "claude", "--model", "the-model", "--tools", "Read,Bash", "--allowedTools", "Bash(lila:*)", "Bash(git log:*)",
-                "--disallowedTools", "Edit", "--permission-mode", "manual", "--append-system-prompt-file", "/p.md", "--foo"
-            ],
-            "the sandbox is codex's"
-        );
-        r.file.runtime = Runtime::Codex;
-        let l = launch(&r, "/p.md", &Session::New(None));
-        assert_eq!(l.argv[5..7], ["--sandbox", "read-only"]);
-        assert!(!l.argv.iter().any(|a| a == "--tools"), "claude's lists are not codex flags");
-    }
-
-    #[test]
-    fn sessions_are_new_with_an_id_or_resumed() {
-        let r = role(Runtime::Claude, None);
-        let l = launch(&r, "/p", &Session::New(Some("abc".into())));
-        assert_eq!(l.argv[3..5], ["--session-id", "abc"]);
-        let l = launch(&r, "/p", &Session::Resume("abc".into()));
+        let l = launch(&spec(Runtime::Claude, Tier::Full, &Session::Resume("abc".into())));
         assert_eq!(l.argv[3..5], ["--resume", "abc"]);
-        let c = role(Runtime::Codex, None);
-        let l = launch(&c, "/p", &Session::New(Some("ignored".into())));
-        assert!(!l.argv.contains(&"ignored".to_string()), "codex picks its own id");
-        let l = launch(&c, "/p", &Session::Resume("r1".into()));
-        assert!(l.argv.windows(2).any(|w| w == ["--thread", "r1"]), "{:?}", l.argv);
     }
 
     #[test]
-    fn effort_is_optional() {
-        assert!(!launch(&role(Runtime::Claude, None), "/p", &Session::New(None)).argv.contains(&"--effort".to_string()));
+    fn codex_gets_a_sandbox_and_an_approval_policy_per_tier() {
+        let new = Session::New(None);
+        let argv = |t| launch(&spec(Runtime::Codex, t, &new)).argv;
+        assert_eq!(argv(Tier::Full), ["lila", "host", "codex", "--model", "the-model", "--effort", "low", "--sandbox", "workspace-write", "--approval", "on-request"]);
+        assert_eq!(argv(Tier::Confirm)[7..], ["--sandbox", "workspace-write", "--approval", "untrusted"]);
+        assert_eq!(argv(Tier::ReadOnly)[7..], ["--sandbox", "read-only", "--approval", "on-request"]);
+        let l = launch(&spec(Runtime::Codex, Tier::Full, &Session::Resume("th1".into())));
+        assert!(l.argv.windows(2).any(|w| w == ["--thread", "th1"]), "{:?}", l.argv);
+        assert!(!launch(&spec(Runtime::Codex, Tier::Full, &Session::New(Some("ignored".into())))).argv.contains(&"ignored".to_string()), "codex picks its own id");
+    }
+
+    #[test]
+    fn acp_agents_run_through_the_host() {
+        let l = launch(&Spec { prompt_file: Some("/p.md"), ..spec(Runtime::Omp, Tier::Full, &Session::Resume("s9".into())) });
+        assert_eq!(l.argv, ["lila", "host", "omp", "--model", "the-model", "--prompt-file", "/p.md", "--session", "s9"]);
+        assert_eq!(cli(Runtime::Omp), "omp");
     }
 }

@@ -251,6 +251,21 @@ pub fn describe(name: &str, input: &Value) -> (ToolKind, String) {
     (kind, if title.is_empty() { name.to_owned() } else { title })
 }
 
+/// A `PermissionRequest` hook's payload as a permission request: the tool, what it runs or changes, and where.
+pub fn permission_request(id: &str, payload: &Value, options: Vec<crate::model::PermOption>) -> crate::model::PermissionRequest {
+    let name = payload["tool_name"].as_str().unwrap_or("tool");
+    let input = &payload["tool_input"];
+    let (tool, title) = describe(name, input);
+    let paths: Vec<String> = ["file_path", "notebook_path", "path"].iter().filter_map(|k| input[*k].as_str().map(String::from)).collect();
+    crate::model::PermissionRequest {
+        name: name.to_owned(),
+        command: (name == "Bash").then(|| input["command"].as_str().unwrap_or_default().to_owned()),
+        paths,
+        cwd: payload["cwd"].as_str().map(String::from),
+        ..crate::model::PermissionRequest::new(id, tool, title, input["description"].as_str().unwrap_or_default(), options)
+    }
+}
+
 /// A tool_result's content: a string, or text blocks.
 fn text_of(v: &Value) -> String {
     match v {

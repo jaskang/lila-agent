@@ -151,12 +151,58 @@ pub struct PermissionRequest {
     pub detail: String,
     /// The answers it takes, first the one to suggest.
     pub options: Vec<PermOption>,
+    /// The tool's own name (`Bash`, `Edit`, `mcp__github__create_pull_request`); empty when the runtime gives none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// The shell command, when the tool is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The files it changes or deletes, as the runtime names them (absolute, or relative to `cwd`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// The folder the command or tool runs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl PermissionRequest {
+    /// The option that lets it go ahead (`allow`) or refuses it, the one-time kind before the lasting one.
+    pub fn pick(&self, allow: bool) -> Option<&PermOption> {
+        let (once, always) = if allow { (PermKind::Allow, PermKind::AllowAlways) } else { (PermKind::Reject, PermKind::RejectAlways) };
+        self.options.iter().find(|o| o.kind == once).or_else(|| self.options.iter().find(|o| o.kind == always))
+    }
+
+    /// A request with only what every runtime gives; the rest is filled in with struct update syntax.
+    pub fn new(id: impl Into<String>, tool: ToolKind, title: impl Into<String>, detail: impl Into<String>, options: Vec<PermOption>) -> Self {
+        PermissionRequest { id: id.into(), tool, title: title.into(), detail: detail.into(), options, name: String::new(), command: None, paths: Vec::new(), cwd: None }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermOption {
     pub id: String,
     pub label: String,
+    /// What choosing it means; lilad answers by the kind, not the runtime's ids.
+    #[serde(default)]
+    pub kind: PermKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermKind {
+    /// Let this one go ahead.
+    #[default]
+    Allow,
+    /// Let this and the like of it go ahead from now on.
+    AllowAlways,
+    Reject,
+    RejectAlways,
+}
+
+impl PermKind {
+    pub fn allows(self) -> bool {
+        matches!(self, PermKind::Allow | PermKind::AllowAlways)
+    }
 }
 
 /// A host (`lila host <runtime>`) → lilad. One JSON line each.
@@ -270,6 +316,9 @@ pub enum Command {
     SetEffort { effort: String },
     /// Compact the context (Codex: `thread/compact/start`; the others take `/compact` as words).
     Compact,
+    /// The thread's permission tier changed: for a runtime that sets approvals and a sandbox itself
+    /// (Codex, from its next turn on). The others decide per request in lilad and ignore it.
+    SetPermission { approval: String, sandbox: String },
 }
 
 /// What a host reports to hc (OSC 7501), and so lilad's dispatch sees.

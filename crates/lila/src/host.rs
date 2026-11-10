@@ -1,6 +1,6 @@
-//! `lila host <runtime>`: runs a member's agent through its protocol (Codex's
+//! `lila host <runtime>`: runs a thread's agent through its protocol (Codex's
 //! app-server, ACP for omp) inside the
-//! member's hc terminal (architecture v3 §4 D1). It starts the agent, attaches
+//! thread's hc terminal (architecture v3 §4 D1). It starts the agent, attaches
 //! to lilad over its socket (events out, commands in; reattaching when lilad
 //! comes back), reports its status to hc with OSC 7501 like any program, and
 //! prints a readable log: what the terminal shows.
@@ -128,12 +128,11 @@ pub struct Agent {
 
 /// Runs a member's agent until it exits, translating with `proto`.
 pub fn run<P: Protocol>(paths: &Paths, agent: Agent, mut server: P) -> Result<()> {
-    let project = std::env::var("LILA_PROJECT").context("LILA_PROJECT is not set: lilad starts hosts")?;
-    let member = std::env::var("LILA_MEMBER").context("LILA_MEMBER is not set: lilad starts hosts")?;
+    let thread = std::env::var("LILA_THREAD").context("LILA_THREAD is not set: lilad starts hosts")?;
     let (tx, rx) = mpsc::channel::<In>();
-    let mut child = spawn_agent(paths, &agent, &project, &member, &tx)?;
+    let mut child = spawn_agent(paths, &agent, &thread, &tx)?;
     let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin for {}", agent.program.display()))?;
-    attach_loop(paths.clone(), project, member, tx.clone());
+    attach_loop(paths.clone(), thread, tx.clone());
 
     let mut kept = Kept::default();
     let mut lilad: Option<UnixStream> = None;
@@ -192,11 +191,11 @@ pub fn run<P: Protocol>(paths: &Paths, agent: Agent, mut server: P) -> Result<()
     Ok(())
 }
 
-fn spawn_agent(paths: &Paths, agent: &Agent, project: &str, member: &str, tx: &mpsc::Sender<In>) -> Result<Child> {
-    // The server's own log goes to a file: the terminal shows what the member does.
+fn spawn_agent(paths: &Paths, agent: &Agent, thread: &str, tx: &mpsc::Sender<In>) -> Result<Child> {
+    // The server's own log goes to a file: the terminal shows what the agent does.
     let logs = paths.state.join("hosts");
     std::fs::create_dir_all(&logs)?;
-    let log = std::fs::File::create(logs.join(format!("{project}.{member}.log")))?;
+    let log = std::fs::File::create(logs.join(format!("{thread}.log")))?;
     let mut child = std::process::Command::new(&agent.program)
         .args(&agent.args)
         .current_dir(&agent.cwd)
@@ -219,13 +218,13 @@ fn spawn_agent(paths: &Paths, agent: &Agent, project: &str, member: &str, tx: &m
 }
 
 /// Keeps a connection to lilad: attaches, reads commands, and tries again when it drops.
-fn attach_loop(paths: Paths, project: String, member: String, tx: mpsc::Sender<In>) {
+fn attach_loop(paths: Paths, thread: String, tx: mpsc::Sender<In>) {
     std::thread::spawn(move || {
         loop {
             if let Ok(sock) = paths.socket()
                 && let Ok(mut conn) = UnixStream::connect(&sock)
             {
-                let hello = json!({"method": "host.attach", "params": {"project": project, "member": member}});
+                let hello = json!({"method": "host.attach", "params": {"thread": thread}});
                 if writeln!(conn, "{hello}").is_ok()
                     && let Ok(read) = conn.try_clone()
                 {
@@ -287,6 +286,7 @@ fn log_command(c: &Command) {
         Command::SetModel { model } => println!("» model {model}"),
         Command::SetEffort { effort } => println!("» effort {effort}"),
         Command::Compact => println!("» compact"),
+        Command::SetPermission { approval, sandbox } => println!("» permission {approval} / {sandbox}"),
         Command::Answer { permission, option } => println!("» {permission}: {option}"),
     }
 }
