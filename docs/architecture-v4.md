@@ -69,7 +69,11 @@
 
 unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/state/lila/lilad.sock`；路径太长时落在临时目录，`lila_core`/`Paths::socket()` 给准）。每行一个 JSON。
 
-请求：`{"method": "thread.list", "params": {...}}`；回复：`{"result": ...}` 或 `{"error": "文字"}`。一条连接可以连着发多个请求。窗口用 `lila::client::request(paths, method, params, autostart)`；`autostart` 为真时 lilad 没跑就先在 hc 里启动它。
+请求：`{"method": "thread.list", "params": {...}}`；回复：`{"result": ...}` 或 `{"error": "文字"}`。一条连接可以连着发多个请求，回复按请求的顺序一行一行回来。窗口用 `lila::client::request(paths, method, params, autostart)`；`autostart` 为真时 lilad 没跑就先在 hc 里启动它。
+
+**请求 id**（可选）：请求里可以带 `"id"`（任意 JSON 字符串或数字），lilad 原样放进这条请求的回复：`{"id": "a-1", "result": ...}`、`{"id": 7, "error": "…"}`，`subscribe` 和 `host.attach` 的第一条回复也带。不带 id 的请求，回复和以前一模一样。`id` 是别的类型（对象、数组、布尔）回 `{"error": "bad request: id must be a string or a number"}`；`null` 当作没带；整行不是 JSON 时没有 id 可回。这只是给以后的远程客户端留的：lilad 不做多路复用，回复仍然按顺序，不会乱序。`lila::client` 现在不发 id。
+
+**版本握手**：`lila::PROTOCOL`（`crates/lila/src/lib.rs`）是 socket 协议的版本号，方法、参数、回复有不兼容的改动就加一。`ping` 和 `status` 都带 `version`（`CARGO_PKG_VERSION`）和 `protocol`。窗口和命令行用 `lila::client::daemon_version` 比较：协议一样、不一样（带两边的数字；还没有这套握手的旧 lilad 不报协议，算不一样）、没有运行、连不上。重装或重新编译后，旧 lilad 会一直跑着（会话在各自的终端里，重启 lilad 是安全的），所以窗口和 `lila daemon status` 会提示，`lila daemon restart` 或窗口里的按钮重启它。
 
 `params` 里 `project` 可以省略，改传 `cwd`（任意文件夹，lilad 往上找已注册的项目）。
 
@@ -106,7 +110,7 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 | `thread.list` | `project?`｜`cwd?`, `archived?` | 会话数组，`active_ms` 倒序；不给项目就是所有项目的；`archived: true` 含归档的 |
 | `thread.show` | `thread` | 会话 |
 | `thread.read` | `thread`, `after?`, `limit?`(400) | 见下 |
-| `thread.send` | `thread`, `text`, `attachments?` | `{sent: true, thread}`。`attachments` 是绝对路径数组。引擎还不能收（starting）就排队；`waiting`（有卡片或终端对话框）时拒绝，因为话会变成对它的回答；`ended` 时拒绝，要先 resume |
+| `thread.send` | `thread`, `text`, `attachments?` | `{sent: true, thread}`。`attachments` 是绝对路径数组，在对话里显示成卡片。Codex、omp 没有自己的 `@`：话里 `@相对路径` 指到的（文件夹里存在的）文件，lilad 也当文件交给引擎（`thread.new` 同样），但对话里只显示在话里，不再多一张卡片（`lila_agent::Attachment::is_mentioned_in`：引擎翻译成条目时去掉话里用 `@` 点了名的文件；窗口画条目时同样去掉，所以以前存下的重复也不显示了）。引擎还不能收（starting）就排队；`waiting`（有卡片或终端对话框）时拒绝，因为话会变成对它的回答；`ended` 时拒绝，要先 resume |
 | `thread.interrupt` | `thread` | `{interrupted: true}`。只在 `running` 时；Codex、omp 发协议的中断，Claude 在终端按 Esc |
 | `thread.stop` | `thread` | 会话。杀终端，状态变 `ended`，对话保留 |
 | `thread.resume` | `thread`, `text?`, `attachments?`, `model?`, `effort?`, `permission?` | 会话。在原来的 session 上重新启动引擎（Claude `--resume`；Codex `thread/resume`；ACP `session/load`）。Claude 会话在第一条消息前就结束了的，用同一个 id 新开。`text` 作为续接后的第一条消息 |
@@ -193,8 +197,8 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 
 | 方法 | 说明 |
 |---|---|
-| `ping` | `{pong, pid}` |
-| `status` | `{pid, projects, threads: {state: 数量}, cards, magpie}` |
+| `ping` | `{pong, pid, version, protocol}` |
+| `status` | `{pid, version, protocol, projects, threads: {state: 数量}, cards, magpie}` |
 | `stop` | 停 lilad。会话照样运行（只有 socket 请求能发，spool 已经没有了） |
 | `subscribe` | 见 §5 |
 | `host.attach` `{thread}` | `lila host` 用：这条连接变成事件进、命令出的通道（`lila_agent::AgentEvent` / `Command`），窗口不要碰 |
@@ -267,7 +271,7 @@ lila thread diff <id> [路径]          # 改动的 diff（一个文件或全部
 lila thread commit <id>              # 让 agent 提交（它写信息，不推送）
 lila thread merge <id>               # worktree 会话合并回起点分支，删 worktree，归档
 lila thread log <id>
-lila daemon run|stop|status
+lila daemon run|stop|status|restart  # status：协议和窗口的不一样时说怎么办，退出码 3 没有运行、4 协议不一样；restart：停、等 socket 没了、再启动（会话不断）
 lila usage [--days N]                # 按会话统计 token（用数据库里的 session id 对会话记录文件）
 lila accounts                        # 订阅账号和额度
 lila --json …                        # 任何命令都能输出原始 JSON
@@ -304,6 +308,7 @@ lila --json …                        # 任何命令都能输出原始 JSON
 | 引擎卡在终端对话框 | `thread.show` 的 `waiting == "terminal"`：输入框上方出现「打开终端」，切到 Claude 的 hc 终端（窗口直接连 hc） |
 | 标题行：权限档、中断、结束、继续 | `thread.permission`、`thread.interrupt`、`thread.stop`、`thread.resume` |
 | 会话右键：重命名、结束或继续、归档或取消归档 | `thread.rename`、`thread.stop`/`resume`、`thread.archive`/`unarchive` |
+| 旧 lilad 提示（侧栏最后一行，设置按钮右边） | `ping` 的 `version`/`protocol`（每次刷新都取）；协议和窗口的不一样时出一行「lilad 版本不符」加「重启」按钮：在后台线程里 `lila::client::restart_daemon`（`stop`、等 socket 没了、`start_daemon`），然后重取。重启后还不一样（磁盘上的 `lila` 本身是旧的）就改成「lila 命令需要重装」，不再给按钮。全局设置 → 关于的 lilad 一行写版本和协议 |
 | 项目设置（⇧⌘,） | `project.set {project, title, defaults}`；`model`/`effort` 传空字符串表示清掉 |
 | 输入框的 `/` 菜单、会话内换模型 | `thread.commands`、`thread.run`、`thread.model` |
 | 移除项目 | `project.remove` |

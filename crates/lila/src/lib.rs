@@ -1,6 +1,10 @@
 //! Lila's CLI and daemon as a library, so the desktop app (lila-app) talks to
 //! lilad the same way the `lila` command does.
 
+/// The version of lilad's socket protocol. Bump it whenever a method, its parameters or its reply change in a way an older window or `lila`
+/// (or an older lilad) would get wrong; `ping` and `status` report it so a stale lilad is noticed (`client::daemon_version`).
+pub const PROTOCOL: u32 = 1;
+
 pub mod accounts;
 pub mod check;
 pub mod changes;

@@ -62,12 +62,46 @@ pub fn tilde(path: &str) -> String {
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub daemon: bool,
+    /// What the running lilad says of itself (`ping`): its version and protocol.
+    pub daemon_info: Option<lila::client::DaemonInfo>,
     pub projects: Vec<Project>,
     /// `thread.list` of every project, archived ones too: each thread with its state.
     pub threads: Vec<Value>,
     /// `thread.read` of the shown thread, when it is shown as its conversation.
     pub conversation: Option<Value>,
     pub error: Option<String>,
+}
+
+impl Snapshot {
+    /// A running lilad that speaks another protocol than this window (or none that it can say): older or newer than the `lila` this window was built with.
+    pub fn protocol_differs(&self) -> bool {
+        self.daemon_info.as_ref().is_some_and(|i| !i.is_current())
+    }
+}
+
+/// What the 关于 page says of lilad.
+pub fn daemon_line(snap: &Snapshot) -> String {
+    let Some(i) = snap.daemon_info.as_ref().filter(|_| snap.daemon) else { return "没有运行".into() };
+    let mut line = format!("运行中 · {}", i.version.as_deref().unwrap_or("版本未知"));
+    match i.protocol {
+        Some(p) => line.push_str(&format!(" · 协议 {p}")),
+        None => line.push_str(" · 协议未知"),
+    }
+    if !i.is_current() {
+        line.push_str(&format!("（窗口 {}）", lila::PROTOCOL));
+    }
+    line
+}
+
+/// Restarts lilad in the background (its sessions keep running), then says whether it still speaks another protocol than this window:
+/// then the `lila` on disk is the old one.
+pub fn restart_daemon(paths: &Paths) -> anyhow::Result<bool> {
+    #[cfg(feature = "shots")]
+    if let Some(still) = fake_restart() {
+        return Ok(still);
+    }
+    lila::client::restart_daemon(paths)?;
+    Ok(!matches!(lila::client::daemon_version(paths), lila::client::DaemonVersion::Current(_)))
 }
 
 /// What the next fetch reads of the shown thread's conversation.
@@ -81,7 +115,11 @@ pub fn fetch(paths: &Paths, want: Option<&Want>) -> Snapshot {
     if let Some(snap) = fake(want) {
         return snap;
     }
-    let mut snap = Snapshot { daemon: lila::client::is_running(paths), ..Default::default() };
+    let mut snap = Snapshot::default();
+    if let lila::client::DaemonVersion::Current(i) | lila::client::DaemonVersion::Different(i) = lila::client::daemon_version(paths) {
+        snap.daemon = true;
+        snap.daemon_info = Some(i);
+    }
     if !snap.daemon {
         return snap;
     }
@@ -294,7 +332,27 @@ fn fake(want: Option<&Want>) -> Option<Snapshot> {
         read["thread"] = threads.iter().find(|t| t["id"] == w.thread.as_str())?.clone();
         Some(read)
     });
-    Some(Snapshot { daemon: true, projects: list("projects").iter().map(Project::of).collect(), threads, conversation, error: None })
+    // `daemon`: what `ping` says (the version and protocol; without it, a current lilad). `restart`: `"fixed"` makes the window's restart button
+    // work (the next look finds a current lilad); else the restart leaves the old one, as when the `lila` on disk is itself old.
+    let daemon_info = match v.get("daemon") {
+        Some(d) if !(FAKE_RESTARTED.load(std::sync::atomic::Ordering::Relaxed) && v["restart"] == "fixed") => lila::client::DaemonInfo::from_ping(d),
+        _ => lila::client::DaemonInfo { pid: Some(1), version: Some(env!("CARGO_PKG_VERSION").into()), protocol: Some(lila::PROTOCOL) },
+    };
+    Some(Snapshot { daemon: true, daemon_info: Some(daemon_info), projects: list("projects").iter().map(Project::of).collect(), threads, conversation, error: None })
+}
+
+#[cfg(feature = "shots")]
+static FAKE_RESTARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--features shots` with `LILA_APP_FAKE`: the restart button takes `LILA_APP_FAKE_SEND_MS` (at least a moment) and touches no lilad;
+/// the answer is whether lilad still differs after it (the file's `restart`, see [`fake`]).
+#[cfg(feature = "shots")]
+fn fake_restart() -> Option<bool> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(std::env::var("LILA_APP_FAKE").ok()?).ok()?).ok()?;
+    std::thread::sleep(std::time::Duration::from_millis(std::env::var("LILA_APP_FAKE_SEND_MS").ok().and_then(|m| m.parse().ok()).unwrap_or(800)));
+    let fixed = v["restart"] == "fixed";
+    FAKE_RESTARTED.store(fixed, std::sync::atomic::Ordering::Relaxed);
+    Some(!fixed)
 }
 
 #[cfg(test)]
@@ -311,6 +369,22 @@ mod tests {
         // Whether the folder can have worktrees is lilad's word; not said, no.
         assert!(!bare.repo);
         assert!(Project::of(&json!({"id": "a", "cwd": "/a", "repo": true})).repo);
+    }
+
+    #[test]
+    fn the_about_page_says_which_lilad_runs() {
+        let snap = |info: Option<lila::client::DaemonInfo>| Snapshot { daemon: info.is_some(), daemon_info: info, ..Default::default() };
+        let info = |protocol| lila::client::DaemonInfo { pid: Some(1), version: Some("0.1.0".into()), protocol };
+        assert_eq!(daemon_line(&snap(None)), "没有运行");
+        let current = snap(Some(info(Some(lila::PROTOCOL))));
+        assert_eq!((daemon_line(&current), current.protocol_differs()), (format!("运行中 · 0.1.0 · 协议 {}", lila::PROTOCOL), false));
+        let other = snap(Some(info(Some(lila::PROTOCOL + 1))));
+        assert_eq!((daemon_line(&other), other.protocol_differs()), (format!("运行中 · 0.1.0 · 协议 {}（窗口 {}）", lila::PROTOCOL + 1, lila::PROTOCOL), true));
+        // A lilad from before the handshake says nothing, which counts as different.
+        let old = snap(Some(lila::client::DaemonInfo { pid: Some(1), ..Default::default() }));
+        assert_eq!((daemon_line(&old), old.protocol_differs()), (format!("运行中 · 版本未知 · 协议未知（窗口 {}）", lila::PROTOCOL), true));
+        // No lilad is not "a different one".
+        assert!(!snap(None).protocol_differs());
     }
 
     #[test]

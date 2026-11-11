@@ -54,6 +54,17 @@ fn what_to_say(was: Option<&str>, state: &str, terminal: bool, recently: bool) -
     }
 }
 
+/// Where the restart of a lilad that speaks another protocol stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Restart {
+    #[default]
+    Idle,
+    /// Running in the background.
+    Running,
+    /// Done, and lilad still differs: the `lila` on disk is the old one, so another restart changes nothing.
+    StillOld,
+}
+
 /// The rename dialog.
 pub struct Rename {
     pub thread: String,
@@ -67,6 +78,8 @@ pub struct LilaApp {
     /// or ⌘, and the other shortcuts would go nowhere.
     focus: FocusHandle,
     pub snap: Snapshot,
+    /// The restart of a lilad of another protocol (the sidebar's notice).
+    pub restart: Restart,
     /// The thread shown, or none.
     pub thread: Option<String>,
     /// While no thread is shown: the project whose new-session box is (`composer` key `new:<project>`).
@@ -229,6 +242,7 @@ impl LilaApp {
             focus: cx.focus_handle(),
             usage: Default::default(),
             snap: Snapshot::default(),
+            restart: Restart::Idle,
             thread: None,
             new_in: None,
             drafts: HashMap::new(),
@@ -285,8 +299,39 @@ impl LilaApp {
         app
     }
 
+    /// Restarts lilad (its sessions keep running) off the UI thread, then looks again.
+    pub fn restart_lilad(&mut self, cx: &mut Context<Self>) {
+        if self.restart == Restart::Running {
+            return;
+        }
+        self.restart = Restart::Running;
+        self.notice = None;
+        let paths = self.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { data::restart_daemon(&paths) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.restart = match r {
+                    Ok(true) => Restart::StillOld,
+                    Ok(false) => Restart::Idle,
+                    Err(e) => {
+                        this.notice = Some(format!("重启不了 lilad：{e:#}"));
+                        Restart::Idle
+                    }
+                };
+                this.refresh_now();
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn apply(&mut self, snap: Snapshot, cx: &mut Context<Self>) {
         let mut snap = snap;
+        // A lilad that matches again ends "the `lila` on disk is old".
+        if self.restart == Restart::StillOld && !snap.protocol_differs() {
+            self.restart = Restart::Idle;
+        }
         // Lilad is not there (starting, or restarting): keep what is shown.
         if !snap.daemon {
             self.snap.daemon = false;

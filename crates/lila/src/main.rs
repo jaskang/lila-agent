@@ -2,7 +2,7 @@
 //! their threads (the window does the same through the same socket); the engines
 //! use it for their hooks and hosts.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use lila::client;
 use lila::paths::Paths;
@@ -247,8 +247,10 @@ enum DaemonCmd {
     Run,
     /// Stop the running daemon. Threads keep running.
     Stop,
-    /// Whether it is running.
+    /// Whether it is running, and whether it speaks this `lila`'s protocol.
     Status,
+    /// Stop it, wait until its socket is gone, start it again from this `lila`. Threads keep running.
+    Restart,
 }
 
 fn main() {
@@ -353,15 +355,52 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Daemon { cmd: DaemonCmd::Status } => {
-            if client::daemon_state(&paths)? {
-                println!("lilad is running ({})", paths.socket()?.display());
+            let state = client::daemon_version(&paths);
+            if cli.json {
+                println!("{}", daemon_status_json(&state));
             } else {
-                println!("lilad is not running");
-                std::process::exit(3);
+                println!("{}", daemon_status_text(&state, &paths.socket()?.display().to_string()));
             }
+            match state {
+                client::DaemonVersion::Current(_) => {}
+                client::DaemonVersion::NotRunning => std::process::exit(3),
+                client::DaemonVersion::Different(_) => std::process::exit(4),
+                client::DaemonVersion::Unreachable(e) => bail!("{e}"),
+            }
+        }
+        Cmd::Daemon { cmd: DaemonCmd::Restart } => {
+            client::restart_daemon(&paths)?;
+            println!("lilad restarted; threads keep running");
         }
     }
     Ok(())
+}
+
+/// The words of `lila daemon status`.
+fn daemon_status_text(state: &client::DaemonVersion, socket: &str) -> String {
+    use client::DaemonVersion::*;
+    let ours = lila::PROTOCOL;
+    let who = |i: &client::DaemonInfo| format!("{socket}, version {}, protocol {}", i.version.as_deref().unwrap_or("unknown"), i.protocol.map_or("unknown".into(), |p| p.to_string()));
+    match state {
+        Current(i) => format!("lilad is running ({})", who(i)),
+        Different(i) => format!(
+            "lilad is running ({}), but this lila speaks protocol {ours}: it is an older or newer lilad.\nRestart it with `lila daemon restart`, or `lila daemon stop` (any lila command starts it again). Threads keep running.\nIf it differs again, the `lila` on disk is the old one: `cargo install --path crates/lila`.",
+            who(i)
+        ),
+        NotRunning => "lilad is not running".into(),
+        Unreachable(e) => format!("lilad is not reachable: {e}"),
+    }
+}
+
+fn daemon_status_json(state: &client::DaemonVersion) -> Value {
+    use client::DaemonVersion::*;
+    let info = |i: &client::DaemonInfo| json!({"pid": i.pid, "version": i.version, "protocol": i.protocol});
+    match state {
+        Current(i) => json!({"running": true, "current": true, "daemon": info(i), "protocol": lila::PROTOCOL}),
+        Different(i) => json!({"running": true, "current": false, "daemon": info(i), "protocol": lila::PROTOCOL}),
+        NotRunning => json!({"running": false}),
+        Unreachable(e) => json!({"running": null, "error": e}),
+    }
 }
 
 type Out<'a> = dyn Fn(Value, &dyn Fn(&Value) -> String) + 'a;
@@ -691,5 +730,15 @@ mod tests {
         assert_eq!(d, "--- a.txt [modified]\n@@ -1 +1 @@\n-a\n+b\n… cut here\n--- p.bin [added]\nBinary file");
         let line = thread_line(&json!({"id": "t1", "state": "idle", "engine": "codex", "model": "m", "permission": "full", "title": "T", "worktree": true, "base_branch": "main", "changes": {"files": 2, "add": 5, "del": 1}}));
         assert!(line.ends_with("T  [worktree of main]  2 file(s) +5 -1"), "{line}");
+    }
+    #[test]
+    fn daemon_status_says_how_to_fix_a_different_protocol() {
+        let info = |protocol| client::DaemonInfo { pid: Some(1), version: Some("0.1.0".into()), protocol };
+        let ok = daemon_status_text(&client::DaemonVersion::Current(info(Some(lila::PROTOCOL))), "/s");
+        assert_eq!(ok, format!("lilad is running (/s, version 0.1.0, protocol {})", lila::PROTOCOL));
+        let old = daemon_status_text(&client::DaemonVersion::Different(info(None)), "/s");
+        assert!(old.contains("protocol unknown") && old.contains("lila daemon restart") && old.contains("lila daemon stop") && old.contains("cargo install"), "{old}");
+        assert_eq!(daemon_status_json(&client::DaemonVersion::Different(info(Some(0)))), json!({"running": true, "current": false, "daemon": {"pid": 1, "version": "0.1.0", "protocol": 0}, "protocol": lila::PROTOCOL}));
+        assert_eq!(daemon_status_json(&client::DaemonVersion::NotRunning), json!({"running": false}));
     }
 }

@@ -475,7 +475,7 @@ fn item_of(i: &Value, turn: Option<String>, now_ms: i64) -> Option<Item> {
         "userMessage" => {
             let text = strings(&i["content"]);
             let text = text.trim();
-            // What went with the words: images by path, files as mentions (a skill is in the words as `$name`).
+            // What went with the words: images by path, files as mentions (a skill is in the words as `$name`, a file named with `@` too).
             let attachments: Vec<Attachment> = i["content"]
                 .as_array()
                 .into_iter()
@@ -488,6 +488,8 @@ fn item_of(i: &Value, turn: Option<String>, now_ms: i64) -> Option<Item> {
                         _ => None,
                     }
                 })
+                // A file the words name with `@` is in the words (lilad sent it as a mention too: Codex has no `@` of its own).
+                .filter(|a| !a.is_mentioned_in(text))
                 .collect();
             if text.is_empty() && attachments.is_empty() {
                 return None;
@@ -664,6 +666,24 @@ mod tests {
         let said = s2.on_message(&json!({"method": "item/completed", "params": {"item": {"type": "userMessage", "id": "u9", "content": [{"type": "text", "text": "look"}, {"type": "localImage", "path": "/r/shot.png"}, {"type": "mention", "name": "notes.md", "path": "/r/notes.md"}, {"type": "skill", "name": "tdd", "path": "/s"}]}}}), 5);
         let AgentEvent::Item { item } = &said.events[0] else { panic!("{said:?}") };
         assert!(matches!(&item.kind, ItemKind::UserMessage { text, attachments, .. } if text == "look" && attachments.len() == 2 && attachments[0].kind == AttachmentKind::Image && attachments[1].name == "notes.md"));
+    }
+
+    #[test]
+    fn a_file_named_with_at_is_shown_in_the_words_only() {
+        // lilad sent `@notes.md` along as a mention (Codex has no `@`); the echo has it, but the words show it already.
+        let mut s = idle();
+        let sent = s.command(Command::Prompt { text: "read @notes.md and look".into(), attachments: vec![Attachment { name: "notes.md".into(), ..Attachment::file("/r/notes.md") }, Attachment::file("/r/shot.png")] });
+        assert_eq!(sent.send[0]["params"]["input"][1], json!({"type": "mention", "name": "notes.md", "path": "/r/notes.md"}), "Codex still gets the file");
+        let echo = json!({"method": "item/completed", "params": {"item": {"type": "userMessage", "id": "u1", "content": [
+            {"type": "text", "text": "read @notes.md and look"}, {"type": "mention", "name": "notes.md", "path": "/r/notes.md"}, {"type": "localImage", "path": "/r/shot.png"}]}}});
+        let said = s.on_message(&echo, 5);
+        let AgentEvent::Item { item } = &said.events[0] else { panic!("{said:?}") };
+        let ItemKind::UserMessage { attachments, .. } = &item.kind else { panic!("{item:?}") };
+        assert_eq!(attachments, &[Attachment::file("/r/shot.png")]);
+        // One attached by hand, the words not naming it, keeps its card.
+        let said = s.on_message(&json!({"method": "item/completed", "params": {"item": {"type": "userMessage", "id": "u2", "content": [{"type": "text", "text": "read this"}, {"type": "mention", "name": "notes.md", "path": "/r/notes.md"}]}}}), 6);
+        let AgentEvent::Item { item } = &said.events[0] else { panic!("{said:?}") };
+        assert!(matches!(&item.kind, ItemKind::UserMessage { attachments, .. } if attachments.len() == 1));
     }
 
     #[test]

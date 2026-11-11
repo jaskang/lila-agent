@@ -42,25 +42,7 @@ pub fn project_files(cwd: &Path) -> Vec<String> {
 /// The files `@relative/path` points at in the words (those that exist in `cwd`), as attachments.
 pub(super) fn mentioned(text: &str, cwd: &Path) -> Vec<Attachment> {
     let mut out: Vec<Attachment> = Vec::new();
-    // `@"a path with spaces"` and `@plain/path`.
-    let mut words: Vec<&str> = Vec::new();
-    let mut rest = text;
-    while let Some(at) = rest.find('@') {
-        rest = &rest[at..];
-        match rest.strip_prefix("@\"").and_then(|r| r.split_once('"')) {
-            Some((quoted, after)) => {
-                words.push(quoted);
-                rest = after;
-            }
-            None => {
-                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-                words.push(&rest[1..end]);
-                rest = &rest[end..];
-            }
-        }
-    }
-    for word in words {
-        let rel = word.trim_end_matches([',', '.', ';', ':', ')', '?', '!']);
+    for rel in lila_agent::at_mentions(text) {
         let path = cwd.join(rel);
         if !rel.is_empty() && !rel.starts_with('/') && !rel.contains("..") && path.is_file() {
             let a = Attachment { name: rel.to_owned(), ..Attachment::file(&path.to_string_lossy()) };

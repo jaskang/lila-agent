@@ -142,8 +142,10 @@ impl Acp {
         self.status = HostStatus::Working;
         step.events.push(AgentEvent::TurnStarted { turn: turn.clone() });
         // ACP doesn't echo the prompt back: it is the turn's first item.
+        // A file the words name with `@` is in the words; the cards are the files that were put on.
         let said = text.trim().to_owned();
-        let item = Item { id: format!("{turn}-said"), turn: Some(turn), at_ms: self.clock, state: ItemState::Done, kind: ItemKind::UserMessage { origin: origin(&said), text: said, attachments: files } };
+        let attachments = files.into_iter().filter(|f| !f.is_mentioned_in(&said)).collect();
+        let item = Item { id: format!("{turn}-said"), turn: Some(turn), at_ms: self.clock, state: ItemState::Done, kind: ItemKind::UserMessage { origin: origin(&said), text: said, attachments } };
         step.events.push(AgentEvent::Item { item });
     }
 
@@ -684,6 +686,16 @@ mod tests {
         let sent = plain.command(Command::Prompt { text: "look".into(), attachments: files[..1].to_vec() }, 5);
         assert_eq!(sent.send[0]["params"]["prompt"][1]["type"], "resource_link");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_named_with_at_is_shown_in_the_words_only() {
+        let (mut a, _) = open_session(true);
+        let (named, attached) = (Attachment { name: "notes.md".into(), ..Attachment::file("/r/notes.md") }, Attachment::file("/r/other.md"));
+        let sent = a.command(Command::Prompt { text: "read @notes.md".into(), attachments: vec![named, attached.clone()] }, 5);
+        assert_eq!(sent.send[0]["params"]["prompt"].as_array().unwrap().len(), 3, "the agent still gets both files");
+        let said = sent.events.iter().find_map(|e| match e { AgentEvent::Item { item } => Some(item), _ => None }).unwrap();
+        assert!(matches!(&said.kind, ItemKind::UserMessage { attachments, .. } if *attachments == [attached.clone()]), "{said:?}");
     }
 
     #[test]

@@ -18,7 +18,7 @@ impl<T: Terminals> Daemon<T> {
     /// Every request that needs no job.
     pub(super) fn dispatch(&mut self, method: &str, params: &Value, now: i64) -> Result<Value> {
         match method {
-            "ping" => Ok(json!({"pong": true, "pid": std::process::id()})),
+            "ping" => Ok(json!({"pong": true, "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"), "protocol": crate::PROTOCOL})),
             "status" => self.status(now),
             "project.list" => Ok(Value::Array(self.projects.keys().map(|id| self.project_json(id, now)).collect::<Result<Vec<_>>>()?)),
             "project.show" => {
@@ -64,6 +64,6 @@ impl<T: Terminals> Daemon<T> {
                 *states.entry(self.state_of(&t, now).0.as_str()).or_default() += 1;
             }
         }
-        Ok(json!({"pid": std::process::id(), "projects": self.projects.len(), "threads": states, "cards": self.asking.len(), "magpie": self.magpie.is_some()}))
+        Ok(json!({"pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"), "protocol": crate::PROTOCOL, "projects": self.projects.len(), "threads": states, "cards": self.asking.len(), "magpie": self.magpie.is_some()}))
     }
 }

@@ -35,7 +35,7 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 | P0 | 提交旧实现，打标签 `v3-final` | ✅ |
 | P1 | 删掉 PM 和流程；会话模型；窗口改成项目 → 会话；三种引擎；三档权限 | ✅ 2026-11-10，等用户亲手试（见下） |
 | P2 | 右侧的改动文件、diff、提交；独立 worktree 以及合并回来 | 后端 ✅ 2026-11-11（lilad、命令行、数据模型，`architecture-v4.md` §4 和 §10；测试和 clippy 过，真引擎没跑）；窗口 ✅ 2026-11-11（`panel.rs`：右面板的文件、改动，提交和合并按钮，新会话的 worktree 开关，已合并会话的标识；`--features shots` 截图和假数据看过，没接真 lilad 点过） |
-| A0 | 收口：提交 P2；协议加请求 id 和版本握手；修 `@文件` 重复显示 | **下一步** |
+| A0 | 收口：提交 P2；协议加请求 id 和版本握手；修 `@文件` 重复显示 | 代码 ✅ 2026-11-11，未提交（等用户看）。请求 id：回复原样带回，原始 socket 实测过 ping/status/错误/subscribe/host.attach；版本握手：`lila::PROTOCOL`、`ping`/`status`、`lila daemon status/restart`、侧栏最后一行的提示和重启按钮、关于页，在隔离的 `LILA_HOME` 里用真旧 lilad（装在 `~/.cargo/bin` 的）加真窗口点过按钮（`--features shots`，没有鼠标）；`@文件`：Codex 回显和 ACP 条目、窗口画条目都不再多一张卡片，单元测试，没有真引擎跑过 |
 | A1 | 安全网：每轮的 git 检查点和回退；Claude 用 `PreToolUse` 加自带沙箱 | |
 | A2 | 等你闭环：提问卡片、卡片不过期、本会话总是允许、窗口里回答信任、原生通知 | |
 | — | 从这里开始自用，之后每个阶段都在 Lila 里做 | |
@@ -72,7 +72,7 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 ```sh
 git clone git@github.com:jaskang/lila-agent.git && cd lila-agent   # 或 git pull
 # libghostty-vt 预编译在 crates/ghostty-sys/libghostty-vt（目前只有 Apple Silicon）
-cargo test --workspace                            # 应该是 199 个测试全过
+cargo test --workspace                            # 应该是 218 个测试全过
 lila daemon stop                                  # 如果有旧版 lilad 在跑
 cargo install --path crates/lila                  # 窗口通过 lila 命令启动 lilad
 cargo run -p lila-app                             # 或者：cargo install --path crates/lila-app
@@ -150,7 +150,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 这一台的 shell 没有屏幕录制权限，也不能真的点击窗口，但 `--features shots` 的窗口可以截自己、也可以收模拟的键盘和鼠标事件（经过窗口自己的事件分发）。`cargo build -p lila-app --features shots` 之后：
 
 - `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG（2882 × 1802，不含红绿灯，也截不到真实的毛玻璃）。
-- `LILA_APP_FAKE=/path.json`：**不起 lilad**，用造好的数据画界面。JSON 是 `{projects, threads, conversations}`：前两个和 `project.list`、`thread.list` 的返回一样，`conversations` 是会话 id 到 `thread.read` 返回的 `items`、`permissions`、`writing`、`config`。任何状态（在等你、归档、已结束、权限卡片、终端里的对话框……）都能这样造；这时窗口里的操作发不出去（没有 lilad）。
+- `LILA_APP_FAKE=/path.json`：**不起 lilad**，用造好的数据画界面。JSON 是 `{projects, threads, conversations}`（可选 `daemon`：造 `ping` 的 `{version, protocol}`，协议不是 `lila::PROTOCOL` 或没有就出现「lilad 版本不符」和重启按钮；`restart: "fixed"`：点了重启后恢复正常，否则变成「lila 命令需要重装」，点击不碰真 lilad）：前两个和 `project.list`、`thread.list` 的返回一样，`conversations` 是会话 id 到 `thread.read` 返回的 `items`、`permissions`、`writing`、`config`。任何状态（在等你、归档、已结束、权限卡片、终端里的对话框……）都能这样造；这时窗口里的操作发不出去（没有 lilad）。
 - `LILA_APP_THREAD=<id>`：显示这个会话；`LILA_APP_SIZE=1000x680`：窗口这么大（看窄窗口）；右面板的状态在 `<LILA_HOME>/state/app-panel.json`（`{"open":true,"view":"changes","width":380}`）；假数据文件里还可以有 `changes`、`diffs`、`file`、`commit`、`merge`、`log`、`new`（见 `data::fake_act`），`LILA_APP_FAKE_READ_MS` 让面板的读变慢；`LILA_APP_NEW=<项目>,engine=codex,model=…,effort=…,permission=confirm`：打开新会话的输入框并选好；`LILA_APP_ADD=<文件夹>`：像选了文件夹那样新建工作区。
 - `LILA_APP_CLICK="x,y;right:x,y;move:x,y;keys:cmd-n h i enter;wait:ms"`：启动 3 秒后依次点击（窗口里的点，不是截图的像素：截图是 2 倍，再缩放过的话自己换算）、右击、移动、按键（打字也行）、等待。点下拉菜单、右键菜单、对话框里的控件都靠它；真的 lilad 加它可以走完「新会话 → 发消息 → 回答 → 结束」。
 - `LILA_APP_KEYS="cmd-, cmd-shift-,"`：启动后 1.5 秒按这些键，用来验证快捷键。

@@ -70,6 +70,64 @@ pub fn daemon_state(paths: &Paths) -> Result<bool> {
     }
 }
 
+/// What a running lilad says about itself (`ping`). A lilad from before the version handshake says nothing: `protocol` is `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonInfo {
+    pub pid: Option<u64>,
+    pub version: Option<String>,
+    pub protocol: Option<u32>,
+}
+
+impl DaemonInfo {
+    /// Whether it speaks this build's protocol (`lila::PROTOCOL`).
+    pub fn is_current(&self) -> bool {
+        self.protocol == Some(crate::PROTOCOL)
+    }
+
+    pub fn from_ping(v: &Value) -> DaemonInfo {
+        DaemonInfo { pid: v["pid"].as_u64(), version: v["version"].as_str().map(String::from), protocol: v["protocol"].as_u64().and_then(|p| u32::try_from(p).ok()) }
+    }
+}
+
+/// Whether lilad is there, and whether it speaks this build's protocol (`lila::PROTOCOL`).
+#[derive(Debug)]
+pub enum DaemonVersion {
+    /// Running, same protocol.
+    Current(DaemonInfo),
+    /// Running, another protocol (or too old to report one).
+    Different(DaemonInfo),
+    NotRunning,
+    /// Something answers, or fails, in a way that is not "not running" (the reason).
+    Unreachable(String),
+}
+
+pub fn daemon_version(paths: &Paths) -> DaemonVersion {
+    match try_request(paths, "ping", &json!({})) {
+        Ok(v) => match DaemonInfo::from_ping(&v) {
+            info if info.is_current() => DaemonVersion::Current(info),
+            info => DaemonVersion::Different(info),
+        },
+        Err((true, _)) => DaemonVersion::NotRunning,
+        Err((false, e)) => DaemonVersion::Unreachable(format!("{e:#}")),
+    }
+}
+
+/// Stops lilad if it runs (its threads keep running: each is in a terminal of its own), waits until the socket is gone, and starts it again from
+/// the `lila` on disk. Blocks for a few seconds: not for a UI thread.
+pub fn restart_daemon(paths: &Paths) -> Result<()> {
+    if daemon_state(paths)? {
+        request(paths, "stop", json!({}), false)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while is_running(paths) || paths.socket().is_ok_and(|s| s.exists()) {
+            if Instant::now() > deadline {
+                bail!("lilad did not stop within 10 s");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    start_daemon(paths)
+}
+
 /// The `lila` program: this one, a `lila` beside this program (lila-app in the
 /// same folder), or `lila` on PATH. lilad and every member run it.
 pub fn lila_bin() -> Result<PathBuf> {
@@ -170,4 +228,71 @@ pub fn hook(paths: &Paths, event: &str) -> Result<()> {
         println!("{out}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// A stand-in lilad that answers every request with `reply`.
+    fn stand_in(paths: &Paths, reply: Value) {
+        let listener = UnixListener::bind(paths.socket().unwrap()).unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let mut line = String::new();
+                BufReader::new(&conn).read_line(&mut line).unwrap();
+                writeln!(&conn, "{reply}").unwrap();
+            }
+        });
+    }
+
+    fn paths_in(root: &std::path::Path) -> Paths {
+        let paths = Paths { config: root.join("config"), data: root.join("data"), state: root.join("state"), isolated: true };
+        paths.ensure().unwrap();
+        paths
+    }
+
+    #[test]
+    fn the_protocol_of_a_running_lilad_is_compared_with_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        assert!(matches!(daemon_version(&paths), DaemonVersion::NotRunning));
+        stand_in(&paths, json!({"result": {"pong": true, "pid": 9, "version": "1.2.3", "protocol": crate::PROTOCOL}}));
+        match daemon_version(&paths) {
+            DaemonVersion::Current(i) => assert_eq!(i, DaemonInfo { pid: Some(9), version: Some("1.2.3".into()), protocol: Some(crate::PROTOCOL) }),
+            other => panic!("{other:?}"),
+        }
+        assert!(is_running(&paths) && daemon_state(&paths).unwrap());
+    }
+
+    #[test]
+    fn another_protocol_and_a_lilad_too_old_to_say_both_differ() {
+        for (reply, protocol) in [(json!({"pong": true, "pid": 9}), None), (json!({"pong": true, "pid": 9, "version": "0.0.1", "protocol": crate::PROTOCOL + 1}), Some(crate::PROTOCOL + 1))] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = paths_in(tmp.path());
+            stand_in(&paths, json!({"result": reply}));
+            match daemon_version(&paths) {
+                DaemonVersion::Different(i) => assert_eq!(i.protocol, protocol),
+                other => panic!("{other:?}"),
+            }
+            // The callers that only ask "is it there" are not bothered.
+            assert!(is_running(&paths));
+        }
+    }
+
+    #[test]
+    fn a_garbled_answer_is_unreachable_not_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let listener = UnixListener::bind(paths.socket().unwrap()).unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let mut line = String::new();
+                BufReader::new(&conn).read_line(&mut line).unwrap();
+                writeln!(&conn, "not json").unwrap();
+            }
+        });
+        assert!(matches!(daemon_version(&paths), DaemonVersion::Unreachable(_)));
+    }
 }

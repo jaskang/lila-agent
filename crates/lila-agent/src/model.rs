@@ -51,6 +51,34 @@ impl Attachment {
     pub fn label(&self) -> String {
         if self.name.is_empty() { file_name(&self.path) } else { self.name.clone() }
     }
+
+    /// Whether the words already point at this file with `@` (a file lilad took from a mention, named as written in them): they show
+    /// it, so it is not shown a second time as a card. A file the person attached is named by its own name, which a mention
+    /// of the same file also is: its card stays only when the words do not say it.
+    pub fn is_mentioned_in(&self, text: &str) -> bool {
+        self.kind == AttachmentKind::File && !self.name.is_empty() && at_mentions(text).contains(&self.name.as_str())
+    }
+}
+
+/// What the words point at with `@`: `@src/main.rs`, `@"a path with spaces.md"`, as written, without the punctuation that ends a sentence.
+pub fn at_mentions(text: &str) -> Vec<&str> {
+    let mut words: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        rest = &rest[at..];
+        match rest.strip_prefix("@\"").and_then(|r| r.split_once('"')) {
+            Some((quoted, after)) => {
+                words.push(quoted);
+                rest = after;
+            }
+            None => {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                words.push(&rest[1..end]);
+                rest = &rest[end..];
+            }
+        }
+    }
+    words.into_iter().map(|w| w.trim_end_matches([',', '.', ';', ':', ')', '?', '!'])).collect()
 }
 
 fn file_name(path: &str) -> String {
@@ -413,6 +441,20 @@ pub fn clip(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_words_point_at_files_with_at() {
+        assert_eq!(at_mentions("read @README.md, then @\"my notes.md\" and @src/a.rs."), ["README.md", "my notes.md", "src/a.rs"]);
+        assert!(at_mentions("no mention here").is_empty());
+        // A card is for a file the words do not already name.
+        let mentioned = Attachment { name: "src/a.rs".into(), ..Attachment::file("/r/src/a.rs") };
+        assert!(mentioned.is_mentioned_in("look at @src/a.rs") && !mentioned.is_mentioned_in("look at src/a.rs"));
+        assert!(Attachment::file("/x/notes.md").is_mentioned_in("see @notes.md") && !Attachment::file("/x/notes.md").is_mentioned_in("see @other.md"));
+        // A picture or a skill is never "in the words".
+        assert!(!Attachment::file("/x/p.png").is_mentioned_in("@p.png"));
+        let skill = Attachment { path: "/s".into(), name: "tdd".into(), kind: AttachmentKind::Skill };
+        assert!(!skill.is_mentioned_in("@tdd"));
+    }
 
     #[test]
     fn items_serialize_flat_for_the_window() {

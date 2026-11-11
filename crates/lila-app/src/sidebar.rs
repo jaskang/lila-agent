@@ -236,18 +236,53 @@ impl LilaApp {
                     .child(Button::new("add-project").custom(quiet).xsmall().icon(style::icon("lila/folder-plus.svg")).tooltip("新建工作区").on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))),
             )
             .child(v_flex().id("thread-tree").flex_1().min_h_0().overflow_y_scrollbar().pb_2().children(rows))
-            // The last row: Lila's own settings.
+            // The last row: Lila's own settings, and a lilad that needs restarting (it has the room, so nothing moves).
             .child(
                 h_flex()
                     .flex_none()
                     .h(px(BAR))
                     .px(px(10.))
+                    .gap_2()
                     .border_t_1()
                     .border_color(style::divider())
-                    .child(Button::new("prefs").custom(quiet).xsmall().icon(IconName::Settings).tooltip("设置 (⌘,)").on_click(cx.listener(|this, _, _, cx| this.open_prefs(crate::prefs::PrefPage::Usage, cx)))),
+                    .child(Button::new("prefs").custom(quiet).xsmall().icon(IconName::Settings).tooltip("设置 (⌘,)").on_click(cx.listener(|this, _, _, cx| this.open_prefs(crate::prefs::PrefPage::Usage, cx))))
+                    .children(self.daemon_notice(cx)),
             );
 
         v_flex().size_full().text_color(style::fg()).child(body)
+    }
+
+    /// One line in the sidebar's last row when the running lilad speaks another protocol than this window: restart it. If it
+    /// still does after that, the `lila` on disk is old and restarting is no use, so the line says so and has no button.
+    fn daemon_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::app::Restart;
+        if !self.snap.protocol_differs() {
+            return None;
+        }
+        let reinstall = self.restart == Restart::StillOld;
+        let info = self.snap.daemon_info.clone().unwrap_or_default();
+        let words = if reinstall { "lila 命令需要重装" } else { "lilad 版本不符" };
+        let detail = format!(
+            "lilad {} 协议 {}，窗口协议 {}{}",
+            info.version.as_deref().unwrap_or("?"),
+            info.protocol.map_or("?".into(), |p| p.to_string()),
+            lila::PROTOCOL,
+            if reinstall { "。重启后仍不符：在仓库里运行 cargo install --path crates/lila，再重启" } else { "。重启不影响会话" }
+        );
+        Some(
+            h_flex()
+                .id("lilad-notice")
+                .flex_1()
+                .min_w_0()
+                .gap_2()
+                .child(Icon::new(IconName::TriangleAlert).size(px(14.)).text_color(style::yellow()))
+                .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(muted()).child(words))
+                // The button turns into the sidebar's own spinner while it restarts (a label-only button has no icon to turn).
+                .when(self.restart == Restart::Running, |d| d.child(div().flex_none().w(px(40.)).flex().justify_center().child(Spinner::new().xsmall().color(style::blue()))))
+                .when(self.restart == Restart::Idle, |d| d.child(Button::new("lilad-restart").small().small_button().label("重启").on_click(cx.listener(|this, _, _, cx| this.restart_lilad(cx)))))
+                .tooltip(move |window, cx| gpui::component::tooltip::Tooltip::new(detail.clone()).build(window, cx))
+                .into_any_element(),
+        )
     }
 
     /// Asks for a folder, and adds it as a workspace.

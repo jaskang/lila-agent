@@ -303,6 +303,27 @@ fn a_claude_thread_starts_hooked_and_asks_in_manual_mode() {
 }
 
 #[test]
+fn files_named_with_at_go_to_a_hosted_engine_as_files() {
+    let mut w = world();
+    w.project();
+    std::fs::write(w.repo.join("README.md"), "# shop").unwrap();
+    let path = w.repo.join("README.md").to_string_lossy().to_string();
+    let attached = |c: &Command| match c {
+        Command::Prompt { attachments, .. } => attachments.iter().map(|a| (a.path.clone(), a.name.clone())).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    for engine in ["codex", "omp"] {
+        // The first message and a later one: the mentioned file that exists goes along, the one that does not stays words.
+        let tid = w.new_thread(json!({"engine": engine, "text": "read @README.md and @nothing.md"}));
+        w.status(&tid, "idle");
+        w.ok("thread.send", json!({"thread": tid, "text": "again @README.md"}));
+        let got: Vec<_> = w.commands(&tid).iter().filter(|c| matches!(c, Command::Prompt { .. })).map(attached).collect();
+        let file = vec![(path.clone(), "README.md".to_owned())];
+        assert_eq!(got, [file.clone(), file], "{engine}");
+    }
+}
+
+#[test]
 fn a_codex_thread_runs_through_its_host_under_the_tiers_sandbox() {
     let mut w = world();
     w.project();
@@ -694,6 +715,16 @@ fn unknown_requests_and_threads_are_errors() {
     assert!(w.d.term.runs.is_empty(), "nothing was started");
     let status = w.ok("status", json!({}));
     assert_eq!(status["projects"], 1);
+}
+
+#[test]
+fn ping_and_status_report_the_version_and_protocol() {
+    let mut w = world();
+    for method in ["ping", "status"] {
+        let r = w.ok(method, json!({}));
+        assert_eq!((r["version"].as_str(), r["protocol"].as_u64()), (Some(env!("CARGO_PKG_VERSION")), Some(u64::from(crate::PROTOCOL))), "{method}: {r}");
+    }
+    assert_eq!(w.ok("ping", json!({}))["pong"], true);
 }
 
 // ---------------- worktrees, changes, commit, merge (P2) ----------------
