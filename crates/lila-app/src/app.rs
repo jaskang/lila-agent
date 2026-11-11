@@ -113,6 +113,8 @@ pub struct LilaApp {
     notified: HashMap<String, i64>,
     /// The right panel: files and changes of the shown thread.
     pub panel: crate::panel::Panel,
+    /// Going back to a message: the question being asked, and what is under way.
+    pub restore: crate::restore::Restore,
     /// The global settings (usage, about), while open.
     pub prefs: Option<crate::prefs::Prefs>,
     /// The 用量 section: accounts and their windows, read in the background.
@@ -260,6 +262,7 @@ impl LilaApp {
             just_made: None,
             notified: HashMap::new(),
             panel,
+            restore: Default::default(),
             prefs: None,
             dialog_offset: Point::default(),
             dialog_drag: None,
@@ -599,7 +602,7 @@ impl LilaApp {
 
 impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dialog = self.prefs_dialog(cx).or_else(|| self.settings_dialog(cx)).or_else(|| self.rename_dialog(cx)).or_else(|| self.remove_dialog(cx)).or_else(|| self.merge_dialog(cx));
+        let dialog = self.prefs_dialog(cx).or_else(|| self.settings_dialog(cx)).or_else(|| self.rename_dialog(cx)).or_else(|| self.remove_dialog(cx)).or_else(|| self.merge_dialog(cx)).or_else(|| self.restore_dialog(cx));
         let pad = px(crate::style::GAP);
         if window.focused(cx).is_none() {
             let focus = self.focus.clone();
@@ -647,12 +650,12 @@ pub fn gutter() -> gpui::base::ResizeHandleRenderer {
 impl LilaApp {
     /// A dialog is open over the window.
     fn modal(&self) -> bool {
-        self.prefs.is_some() || self.settings.is_some() || self.renaming.is_some() || self.removing.is_some() || self.panel.merge_confirm.is_some()
+        self.prefs.is_some() || self.settings.is_some() || self.renaming.is_some() || self.removing.is_some() || self.panel.merge_confirm.is_some() || self.restore.ask.is_some()
     }
 
     /// Closes the topmost dialog; false when none is open.
     fn close_dialog(&mut self) -> bool {
-        if self.panel.merge_confirm.take().is_some() || self.removing.take().is_some() || self.renaming.take().is_some() || self.settings.take().is_some() || self.prefs.take().is_some() {
+        if self.restore.ask.take().is_some() || self.panel.merge_confirm.take().is_some() || self.removing.take().is_some() || self.renaming.take().is_some() || self.settings.take().is_some() || self.prefs.take().is_some() {
             return true;
         }
         false

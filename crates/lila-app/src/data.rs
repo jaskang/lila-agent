@@ -254,7 +254,9 @@ pub fn clock_ms() -> String {
 /// (`LILA_APP_FAKE_SEND_MS` takes that long, `LILA_APP_FAKE_READ_MS` for the panel's reads, `LILA_APP_FAKE_SEND_ERR=<words>` fails with them). In the file:
 /// `files` and `commands` (the menus; `files` is also the file tree), `changes` (a thread's id to what `thread.changes`
 /// says), `diffs` (a thread's id to its path to the `thread.diff` item), `file` (a path to what `thread.file` says),
-/// `commit` and `merge` (what those answer, or `{"error": "…"}`, after `LILA_APP_FAKE_SEND_MS`); every other request is left to fail.
+/// `commit` and `merge` (what those answer, or `{"error": "…"}`, after `LILA_APP_FAKE_SEND_MS`), `restore` (`{"dry_run": …, "restore": …}`,
+/// the replies of `thread.restore` with and without `dry_run`, or `{"error": "…"}`; under a checkpoint's number, `{"7": {"dry_run": …}}`, for that
+/// checkpoint alone); every other request is left to fail.
 #[cfg(feature = "shots")]
 fn fake_act(method: &str, params: &Value) -> Option<anyhow::Result<Value>> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(std::env::var("LILA_APP_FAKE").ok()?).ok()?).ok()?;
@@ -296,6 +298,17 @@ fn fake_act(method: &str, params: &Value) -> Option<anyhow::Result<Value>> {
         "thread.commit" | "thread.merge" => {
             slow();
             Some(answer(&v[method.trim_start_matches("thread.")]))
+        }
+        "thread.restore" => {
+            // What a dry run and a restore answer (`dry_run`, `restore`), for any checkpoint or, under its number, for that one;
+            // the dry run takes `LILA_APP_FAKE_READ_MS`, the restore `LILA_APP_FAKE_SEND_MS`.
+            let key = if params["dry_run"] == true { "dry_run" } else { "restore" };
+            if key == "dry_run" { read() } else { slow() }
+            let by_number = &v["restore"][params["checkpoint"].as_i64().unwrap_or_default().to_string()][key];
+            Some(match if by_number.is_null() { &v["restore"][key] } else { by_number } {
+                Value::Null => Err(anyhow::anyhow!("no fake {key} for {thread}")),
+                a => answer(a),
+            })
         }
         "thread.log" => Some(Ok(v["log"][thread].clone())),
         "thread.new" if v["new"].is_object() => {

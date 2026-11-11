@@ -324,7 +324,7 @@ lila --json …                        # 任何命令都能输出原始 JSON
 | 移除项目 | `project.remove` |
 | 右面板：文件、改动（P2） | 标题行按钮和 ⇧⌘E / ⇧⌘G 开关，宽度、视图记在 `state/app-panel.json`。文件树 `thread.files`，预览 `thread.file`；改动 `thread.changes`、点开一行 `thread.diff {path}`；提交 `thread.commit`，合并 `thread.merge`（确认后；成功就离开会话）。重新读的时机：打开、切视图、换会话、推送里该会话的 `changes` 摘要或 `state` 变了、提交或合并之后 |
 | 新会话选独立 worktree | `project.list` 的 `repo` 为真才有开关；发出时 `thread.new {…, worktree: true}`（回复要等 worktree 建好，窗口在后台等，发送按钮转圈） |
-| 每轮的「回到这里」（A1） | `thread.read` 的 `checkpoints`（`item` 对上用户消息）；点了先 `thread.restore {dry_run: true}` 拿到文件清单放进确认框，确认后 `thread.restore`（后台线程里调，回复可能要几秒）；`thread.restore` 失败的文字原样显示（会话在跑、有排队的话……）。条目 `from: "restored"` 画成「已回到这里」，带「撤销」按钮就是 `thread.restore {checkpoint: undo}`。重读的时机同改动面板：回复之后、推送里该会话的 `state` 变了 |
+| 每轮的「回到这里」（A1，`restore.rs`） | `thread.read` 的 `checkpoints`（窗口每次读都整份换掉，按 `item` 对上用户消息）。一条 `from: person` 的消息有按钮，要同时：有 `kind: turn`、`item` 对得上、`restorable` 为真的检查点；会话 `idle`/`ended`、没在合并或回退、没合并过；`ping` 的 `protocol` ≥ 2。点了先 `thread.restore {dry_run: true}`（后台线程，按钮转圈），回复的 `counts`、清单、`truncated`、`head_moved` 放进确认框；全是 0 就只说「文件已经是这个样子」，没有可确认的。确认后 `thread.restore`（后台线程；窗口记在 `restore.going`，lilad 的 `restoring` 也算，这期间对话末尾转圈、输入框不发送）；回复后不论成败都 `refresh_now` 并重读右面板（失败也读：可能做到一半）。失败的文字原样放进窗口顶部的红色提示条（和别处操作失败一样，可关）。条目 `from: "restored"` 画成「已回到这里」一行；`undo` 对应的检查点还在列表里且 `restorable` 时带「撤销」，走同一条 dry run、确认、回退的路。窗口不调 `thread.checkpoints`，也不读 `can_restore`/`why_not`（`thread.read` 里没有；每行的 `restorable` 够用） |
 | 已合并的会话 | `merged_ms` 有值：输入框换成「已合并到 <base_branch> · <sha>」，sha 从 `thread.log` 里 `merged` 那条的 `detail`（`… as f898670`）取 |
 
 - 窗口记着：上次显示的会话和项目、哪些会话切成了终端视图（`state/app-tabs.json`、`app-views.json`）。折叠的项目、归档开关不记。

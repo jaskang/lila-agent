@@ -213,7 +213,7 @@ fn tree_items(files: &[String], expanded: &HashSet<SharedString>) -> Vec<TreeIte
 }
 
 /// The letter and color a change is marked with.
-fn mark(status: &str) -> (&'static str, Hsla) {
+pub(crate) fn mark(status: &str) -> (&'static str, Hsla) {
     match status {
         "added" => ("A", style::green()),
         "untracked" => ("U", style::green()),

@@ -38,11 +38,14 @@ pub struct Conv {
     pub config: Value,
     /// The permission cards it waits on (`thread.read`'s `permissions`).
     pub cards: Vec<Value>,
+    /// The folder's checkpoints, newest first (`thread.read`'s `checkpoints`): a message of the person's
+    /// is the one whose `item` is its id. Whole in every read, so each read replaces them.
+    pub checkpoints: Vec<Value>,
 }
 
 impl Conv {
     pub fn new(thread: String) -> Self {
-        Conv { thread, session: None, seq: 0, items: Vec::new(), ver: Vec::new(), writing: None, config: Value::Null, cards: Vec::new() }
+        Conv { thread, session: None, seq: 0, items: Vec::new(), ver: Vec::new(), writing: None, config: Value::Null, cards: Vec::new(), checkpoints: Vec::new() }
     }
 
     /// Folds a `thread.read` reply in: a new session starts over; items
@@ -71,6 +74,7 @@ impl Conv {
         self.writing = v["writing"].as_str().map(String::from);
         self.config = v["config"].clone();
         self.cards = v["permissions"].as_array().cloned().unwrap_or_default();
+        self.checkpoints = v["checkpoints"].as_array().cloned().unwrap_or_default();
     }
 }
 
@@ -316,7 +320,8 @@ impl LilaApp {
         let key = conv.map(|c| (c.thread.clone(), c.session.clone()));
         let shown = self.thread.as_deref().unwrap_or_default();
         let pending: Vec<&Pending> = self.pending.iter().filter(|p| p.thread == shown).collect();
-        let running = self.shown_thread().is_some_and(|t| matches!(t["state"].as_str(), Some("running" | "starting")));
+        // The thread works, or its files are being put back: the end of the conversation turns.
+        let running = self.shown_thread().is_some_and(|t| crate::restore::turning(&t, self.restore.going.contains(&s(&t, "id"))));
         let rows = build_rows(conv, &pending, running, &self.conv_asks());
         let list = self.conv_list.clone();
         if key != self.conv_key {
@@ -440,10 +445,32 @@ impl LilaApp {
             "user_message" if i["from"] == "lila" || i["from"] == "local" => self.lila_row(at, &id, &text, cx),
             "user_message" if i["from"] == "summary" => self.summary_row(at, &id, &text, cx),
             "user_message" if i["from"] == "interrupted" => interrupted_row(),
+            "user_message" if i["from"] == "restored" => self.restored_row(&id, i["undo"].as_i64(), cx),
             "user_message" => {
                 let (body, more) = self.folded(at, &id, &text, div().px_3().py_2().rounded(px(style::R_CTL)).bg(style::fill()).text_size(px(13.)).line_height(relative(1.55)), cx);
                 let files = sent_files(&id, &i["attachments"]);
-                h_flex().w_full().justify_end().child(v_flex().max_w(relative(0.8)).items_end().gap_1().children(files).when(!text.is_empty(), |d| d.child(body)).children(more)).into_any_element()
+                let column = v_flex().max_w(relative(0.8)).items_end().gap_1().children(files).when(!text.is_empty(), |d| d.child(body)).children(more);
+                // Only the person's own words can be gone back to. The button has its place beside the bubble from the start (it is only
+                // seen on hovering the row), so nothing moves when it shows.
+                let back = (i["from"] == "person").then(|| self.restore_target(&id)).flatten();
+                match back {
+                    Some(n) => {
+                        let thread = self.conv.as_ref().map(|c| c.thread.clone()).unwrap_or_default();
+                        let group = SharedString::from(format!("said-{id}"));
+                        let button = self.restore_button(&id, &thread, n, cx);
+                        let shown = self.restore.checking.as_ref().is_some_and(|(t, c)| *t == thread && *c == n);
+                        h_flex()
+                            .group(group.clone())
+                            .w_full()
+                            .justify_end()
+                            .items_start()
+                            .gap_1()
+                            .child(div().flex_none().mt(px(6.)).opacity(if shown { 1. } else { 0. }).group_hover(group, |d| d.opacity(1.)).child(button))
+                            .child(column)
+                            .into_any_element()
+                    }
+                    None => h_flex().w_full().justify_end().child(column).into_any_element(),
+                }
             }
             "agent_message" => {
                 let group = SharedString::from(format!("reply-{id}"));
@@ -876,6 +903,25 @@ mod tests {
         c.merge(&json!({"thread": {"id": "t", "session": "s2"}, "seq": 1, "items": [item("agent_message", "x")]}));
         assert_eq!(c.items.len(), 1);
         assert_eq!(build_rows(Some(&c), &[], false, &[]).len(), 1);
+    }
+
+    #[test]
+    fn the_checkpoints_of_each_read_replace_the_last_and_a_restored_mark_is_a_row_of_its_own() {
+        let mut c = Conv::new("t".into());
+        let mut r = read(json!([said("u1", "go", "person", 1), {"id": "restored-1-9", "kind": "user_message", "from": "restored", "checkpoint": 1, "undo": 4, "text": "x", "at_ms": 9, "state": "done"}]));
+        r["checkpoints"] = json!([{"id": 4, "kind": "restore", "item": "", "restorable": true}, {"id": 1, "kind": "turn", "item": "u1", "restorable": true}]);
+        c.merge(&r);
+        assert_eq!(c.checkpoints.len(), 2);
+        // The mark is not a message of the person's, and not a run of steps: a row of its own, after the message.
+        let rows = build_rows(Some(&c), &[], false, &[]);
+        assert_eq!(rows.into_iter().map(|r| r.kind).collect::<Vec<_>>(), [RowKind::Item(0), RowKind::Item(1)]);
+        // A read without checkpoints (an older lilad) leaves none.
+        c.merge(&read(json!([])));
+        assert!(c.checkpoints.is_empty());
+        // The end of the conversation turns while the files are put back, as while the thread works.
+        let busy = |running| build_rows(Some(&c), &[], running, &[]).last().map(|r| r.kind.clone());
+        assert_eq!(busy(true), Some(RowKind::Busy));
+        assert_eq!(busy(false), Some(RowKind::Item(1)));
     }
 
     #[test]

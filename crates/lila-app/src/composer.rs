@@ -545,10 +545,12 @@ impl LilaApp {
     /// box keeps them until it is made.
     pub fn send_message(&mut self, target: String, window: &mut Window, cx: &mut Context<Self>) {
         let ck = self.composer_key(&target);
+        // Its files are being put back: the words stay in the box.
+        let restoring = self.restoring(&target);
         let Some(c) = self.composers.get_mut(&ck) else { return };
         let text = c.input.read(cx).value().trim().to_owned();
         let files: Vec<String> = c.files.iter().map(|f| f.to_string_lossy().to_string()).collect();
-        if (text.is_empty() && files.is_empty()) || c.busy {
+        if (text.is_empty() && files.is_empty()) || c.busy || restoring {
             return;
         }
         c.busy = true;
@@ -824,7 +826,9 @@ impl LilaApp {
         };
         // Words to a thread that waits on a card or a dialog would answer it: lilad turns them down.
         let has_content = !input.read(cx).value().trim().is_empty() || !files.is_empty();
-        let can_send = !busy && !waiting && has_content;
+        // Its files are being put back: nothing is sent until they are (lilad turns the words down too).
+        let restoring = m.is_some() && self.restoring(&target);
+        let can_send = !busy && !waiting && !restoring && has_content;
         let menu = if has_menu {
             let menu = self.composers[&ck].menu.as_ref().expect("has one");
             let rows = self.menu_rows(&target, working, tui, menu);

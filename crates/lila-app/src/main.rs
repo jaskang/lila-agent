@@ -9,6 +9,7 @@ mod dialog;
 mod engines;
 mod panel;
 mod prefs;
+mod restore;
 mod settings;
 mod sidebar;
 mod style;
