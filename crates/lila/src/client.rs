@@ -191,16 +191,34 @@ pub fn start_daemon(paths: &Paths) -> Result<()> {
 /// question to the terminal (under the hook's own 600 s, `daemon::hooks`).
 pub const HOOK_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(570);
 
+/// What a `PreToolUse` hook prints for lilad's reply (`{verdict, reason?}`): Claude Code's
+/// `permissionDecision` of allow, deny or ask.
+fn pre_tool_use_output(reply: &Value) -> Option<Value> {
+    let verdict = reply["verdict"].as_str()?;
+    let mut out = json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": verdict}});
+    if let Some(reason) = reply["reason"].as_str() {
+        out["hookSpecificOutput"]["permissionDecisionReason"] = json!(reason);
+    }
+    Some(out)
+}
+
 /// `lila hook <event>`: a Claude Code hook in a thread's session. Hands the event
 /// (its JSON on stdin) to lilad; for a permission request, waits for the person's
-/// answer and prints the decision. Never fails the session: with lilad away, or no
-/// answer in time, it prints nothing and Claude Code asks in its terminal.
+/// answer and prints the decision; for a tool call about to run (`PreToolUse`), prints lilad's
+/// verdict. Never fails the session: with lilad away, or no answer in time, it prints nothing and
+/// Claude Code decides alone (asks in its terminal).
 pub fn hook(paths: &Paths, event: &str) -> Result<()> {
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
     let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
     let Some(thread) = std::env::var("LILA_THREAD").ok().filter(|t| !t.is_empty()) else { return Ok(()) };
     let Ok(r) = request(paths, "hook", json!({"thread": thread, "event": event, "payload": payload}), false) else { return Ok(()) };
+    if event == "PreToolUse" {
+        if let Some(out) = pre_tool_use_output(&r) {
+            println!("{out}");
+        }
+        return Ok(());
+    }
     if event != "PermissionRequest" {
         return Ok(());
     }
@@ -251,6 +269,16 @@ mod tests {
         let paths = Paths { config: root.join("config"), data: root.join("data"), state: root.join("state"), isolated: true };
         paths.ensure().unwrap();
         paths
+    }
+
+    #[test]
+    fn a_pre_tool_use_hook_prints_the_verdict_in_claude_codes_words() {
+        assert_eq!(
+            pre_tool_use_output(&json!({"verdict": "deny", "reason": "read-only"})),
+            Some(json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "read-only"}}))
+        );
+        assert_eq!(pre_tool_use_output(&json!({"verdict": "allow"})), Some(json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}})));
+        assert_eq!(pre_tool_use_output(&json!({})), None, "a reply without a verdict leaves Claude Code to decide");
     }
 
     #[test]

@@ -83,16 +83,25 @@ pub fn decide(tier: Tier, workspace: &Path, req: &PermissionRequest) -> Verdict 
     }
 }
 
+/// Claude Code's own tools that touch neither files nor the shell nor the network: its to-do
+/// list, asking the person, looking up tools, reading what a background command printed.
+/// `PreToolUse` sees every call, including those Claude Code never asks about; these must not
+/// be refused or asked about by a tier.
+const INERT: &[&str] = &[
+    "Task", "Agent", "TodoWrite", "Skill", "ExitPlanMode", "EnterPlanMode", "AskUserQuestion", "ToolSearch", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop", "BashOutput", "KillShell",
+    "LSP", "ListMcpResourcesTool", "ReadMcpResourceTool",
+];
+
 /// Tools that only look: reading, searching, thinking, fetching a page; Claude Code's own helpers
 /// (a subagent, its to-do list) whose requests are judged on their own.
-fn reads(req: &PermissionRequest) -> bool {
+pub fn reads(req: &PermissionRequest) -> bool {
     match req.tool {
         ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch => true,
         ToolKind::Other => {
             if let Some(tool) = mcp_tool(&req.name) {
                 return !MCP_WRITE.is_match(tool);
             }
-            matches!(req.name.as_str(), "Task" | "Agent" | "TodoWrite" | "Skill" | "ExitPlanMode" | "EnterPlanMode")
+            INERT.contains(&req.name.as_str())
         }
         _ => false,
     }
@@ -411,7 +420,7 @@ mod tests {
     fn read_only_refuses_changes_and_confirm_asks_for_them() {
         let ro = |r: &PermissionRequest| decide(Tier::ReadOnly, Path::new("/work/shop"), r);
         let confirm = |r: &PermissionRequest| decide(Tier::Confirm, Path::new("/work/shop"), r);
-        for r in [req(ToolKind::Read, "Read", None, &["/work/shop/a"]), req(ToolKind::Search, "Grep", None, &[]), req(ToolKind::Fetch, "WebFetch", None, &[]), req(ToolKind::Other, "Task", None, &[]), req(ToolKind::Other, "mcp__github__list_issues", None, &[])] {
+        for r in [req(ToolKind::Read, "Read", None, &["/work/shop/a"]), req(ToolKind::Search, "Grep", None, &[]), req(ToolKind::Fetch, "WebFetch", None, &[]), req(ToolKind::Other, "Task", None, &[]), req(ToolKind::Other, "mcp__github__list_issues", None, &[]), req(ToolKind::Other, "AskUserQuestion", None, &[]), req(ToolKind::Other, "TaskUpdate", None, &[]), req(ToolKind::Other, "ToolSearch", None, &[])] {
             assert_eq!((ro(&r), confirm(&r)), (Verdict::Allow, Verdict::Allow), "{}", r.name);
         }
         for r in [bash("touch a"), bash("ls"), req(ToolKind::Edit, "Edit", None, &["/work/shop/a"]), req(ToolKind::Delete, "rm", None, &[]), req(ToolKind::Other, "mcp__github__create_issue", None, &[]), req(ToolKind::Other, "SomethingNew", None, &[])] {

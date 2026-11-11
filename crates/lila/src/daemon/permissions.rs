@@ -40,31 +40,39 @@ impl<T: Terminals> Daemon<T> {
     pub(super) fn ask_permission(&mut self, tid: &str, request: PermissionRequest, now: i64) -> Result<Decided> {
         let t = self.store.thread(tid)?.ok_or_else(|| anyhow!("no thread {tid}"))?;
         let verdict = policy::decide(t.tier, Path::new(&t.cwd), &request);
-        let what = format!("{}: {}", request.name_or_tool(), request.title.lines().next().unwrap_or_default());
-        let (why, danger) = match verdict {
+        match verdict {
             Verdict::Allow => {
                 if let Some(o) = request.pick(true) {
-                    self.store.event(tid, "lilad", "auto_allowed", &format!("{} · {what}", t.tier.as_str()), now)?;
+                    self.auto_event(tid, t.tier, "auto_allowed", &request, now)?;
                     return Ok(Decided::Answer { option: o.id.clone(), message: None });
                 }
-                ("没有可用的自动回答".to_owned(), None)
+                self.open_card(tid, request, "没有可用的自动回答".to_owned(), None, now)
             }
             Verdict::Deny(message) => {
                 if let Some(o) = request.pick(false) {
-                    self.store.event(tid, "lilad", "auto_denied", &format!("{} · {what}", t.tier.as_str()), now)?;
+                    self.auto_event(tid, t.tier, "auto_denied", &request, now)?;
                     return Ok(Decided::Answer { option: o.id.clone(), message: Some(message) });
                 }
-                ("没有可用的自动回答".to_owned(), None)
+                self.open_card(tid, request, "没有可用的自动回答".to_owned(), None, now)
             }
-            Verdict::Ask { why, danger } => (why, danger),
-        };
+            Verdict::Ask { why, danger } => self.open_card(tid, request, why, danger, now),
+        }
+    }
+
+    /// What a thread's tier answered by itself, for `thread.log`.
+    pub(super) fn auto_event(&self, tid: &str, tier: Tier, kind: &str, request: &PermissionRequest, now: i64) -> Result<()> {
+        self.store.event(tid, "lilad", kind, &format!("{} · {}", tier.as_str(), what(request)), now)
+    }
+
+    /// Opens a card on the thread for the person to answer.
+    pub(super) fn open_card(&mut self, tid: &str, request: PermissionRequest, why: String, danger: Option<Danger>, now: i64) -> Result<Decided> {
         // Asked again (lilad came back, the host repeated it): the card already open.
         if let Some(a) = self.asking.iter_mut().find(|a| a.thread == tid && a.request.id == request.id) {
             a.request = request;
         } else {
             self.next_card += 1;
-            let card = Asking { id: format!("p{}", self.next_card), thread: tid.to_owned(), request, why: why.clone(), danger, at_ms: now };
-            self.store.event(tid, "lilad", "asked", &format!("{what} · {why}"), now)?;
+            self.store.event(tid, "lilad", "asked", &format!("{} · {why}", what(&request)), now)?;
+            let card = Asking { id: format!("p{}", self.next_card), thread: tid.to_owned(), request, why, danger, at_ms: now };
             self.asking.push(card);
         }
         self.mark(tid);
@@ -118,6 +126,11 @@ impl<T: Terminals> Daemon<T> {
             self.mark(tid);
         }
     }
+}
+
+/// "Bash: cargo test": the tool and what it does, on one line.
+fn what(request: &PermissionRequest) -> String {
+    format!("{}: {}", request.name_or_tool(), request.title.lines().next().unwrap_or_default())
 }
 
 trait Named {

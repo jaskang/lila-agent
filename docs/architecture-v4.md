@@ -59,7 +59,7 @@
 - 终端名 `lila-<会话 id>`，标签 `lila.project`、`lila.thread`，环境变量 `LILA_PROJECT`、`LILA_THREAD`、`LILA_ROOT`（文件夹）、`LILA_HOME`（若设了）。
 - 状态由程序自己用 OSC 7501 报给 hc（Claude Code 自带；`lila host` 替 Codex 和 ACP 报），lilad 订阅 hc 的事件。lilad 重启后：数据库里有终端的会话先当作活着，hc 的快照到了，快照里没有的标成 `ended`；快照里有的按标签对回会话。
 - 启动命令：
-  - Claude：`claude --model M [--session-id UUID | --resume ID] [--effort E] --permission-mode manual --settings <state>/threads/<id>/settings.json`。settings 里五个 hook（PermissionRequest、MessageDisplay、UserPromptSubmit、Stop、StopFailure）都跑 `lila hook <事件>`。
+  - Claude：`claude --model M [--session-id UUID | --resume ID] [--effort E] --permission-mode manual --settings <state>/threads/<id>/settings.json`。settings 里六个 hook（PreToolUse、PermissionRequest、MessageDisplay、UserPromptSubmit、Stop、StopFailure）都跑 `lila hook <事件>`，matcher 都是 `*`。settings 在会话启动或恢复时写，**已经在跑的会话保持旧的 settings（没有 `PreToolUse`），要结束再恢复才换**。
   - Codex：`lila host codex --program <codex> --model M [--effort E] --sandbox S --approval A [--thread ID]`。
   - omp：`lila host omp --program <omp> [--model M] [--session ID]`。
   - `lila host` 的 `--prompt-file` 可选（现在不带系统提示词）。
@@ -232,9 +232,9 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 | `confirm` | 读可以；其余（改文件、运行命令、写操作的 MCP 工具）都出卡片问人 |
 | `full` | 都不问，除了四类（下）出卡片 |
 
-**判定**（`crates/lila/src/policy.rs`，纯函数，有测试）：三种引擎的权限请求都转成 `PermissionRequest`（工具种类、名字、命令行、路径、工作目录、选项），lilad 先按会话的档位回答（`daemon/permissions.rs::ask_permission`），回答不了的才变成卡片；每次自动回答和开卡片都记进 `thread_events`。
+**判定**（`crates/lila/src/policy.rs`，纯函数，有测试）：三种引擎的权限请求都转成 `PermissionRequest`（工具种类、名字、命令行、路径、工作目录、选项），lilad 先按会话的档位回答（`daemon/permissions.rs::ask_permission`；Claude 的每个工具调用在 `PreToolUse` 里就判，见下），回答不了的才变成卡片；每次自动回答和开卡片都记进 `thread_events`。
 
-全自动档下仍要问的四类，以及**能识别到什么程度**（识别靠请求里的文字，不是沙箱）：
+全自动档下仍要问的四类，以及**能识别到什么程度**（识别靠请求里的文字，不是沙箱；Claude 线程现在没有沙箱，Codex 线程有）：
 
 1. **改动或删除工作区以外的文件**：编辑类请求（Claude 的 Edit/Write/NotebookEdit 的 `file_path`，Codex 的 apply_patch 的文件列表，ACP 的 `locations`）按路径判断，路径会展开 `~`、`..`、符号链接，临时目录（`/tmp`、`/var/folders`、`$TMPDIR`、`/dev/null`）不算。命令行：看重定向（`> >>`）、`rm mv touch mkdir tee chmod chown ln truncate…`、`cp rsync install` 的目的地、`sed -i`，跟着 `cd`，进 `sh -c '…'`。**识别不了的**：变量拼出来的路径、脚本或程序内部写的文件（`python x.py` 里写 `/etc`）、`find -delete`、`xargs rm`、`dd of=`、`git checkout/clean` 对工作区外的仓库、通过别名或函数。
 2. **`git push`、强制推送、删分支**：命令行里的 `git [-C dir|-c k=v …] push`、`git branch -d/-D/--delete`（包括 `bash -c`、`;`、`&&`、括号里的）。**识别不了的**：用变量、别名、`git` 的包装脚本、`GIT_SSH` 之类绕过；以及不是 `git` 命令的推送（`jj git push`、`gh repo sync`）。
@@ -243,7 +243,15 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 
 ### 各引擎怎么落实
 
-- **Claude Code**：始终以 `--permission-mode manual` 启动，凡是它自己不放行的（改文件、跑命令）都会问，问就走 `PermissionRequest` hook 到 lilad；档位由 lilad 逐个请求判定，所以切档不用重启。hook 的答复是 allow 或 deny（deny 带文字）；要人答的请求，hook 每 0.5 秒问一次 `hook.answer`，最多 570 秒；卡片被 `dismiss`、lilad 重启丢了请求、超时：hook 什么都不输出，Claude Code 在终端里问（会话变 `waiting`/`terminal`）。**缺口**：用户自己的 `~/.claude/settings.json` 里的 allow 规则会让某些命令不问，lilad 看不到；`read_only` 档靠 lilad 拒绝，不靠 Claude 的 plan 模式。lilad 没起来时 hook 立即退出，由终端问。
+- **Claude Code**：始终以 `--permission-mode manual` 启动，**每个工具调用在跑之前**先走 `PreToolUse` hook（`daemon/hooks.rs::pre_tool_use`），lilad 按会话的档位（`policy::decide`）判定，所以切档不用重启（实测：`lila thread permission` 之后的下一个工具调用就按新档位）：
+  - **allow**：Claude Code 不再问。这个 allow 也盖过 Claude Code 的「命令里有变量，没法事先检查」之类的确认，但盖不过它对「工作目录以外的路径」的检查（那个框照样弹，到 `PermissionRequest`，见下）。
+  - **deny**（带文字）：工具不跑，文字回到 agent（Claude Code 在对话里把它显示成「PreToolUse:Bash hook error: …」）。
+  - **ask**：Claude Code 弹自己的确认框，弹框触发 `PermissionRequest` hook，lilad 在那里开卡片；人的回答走原来的 `hook.answer`（hook 每 0.5 秒问一次，最多 570 秒；卡片被 `dismiss`、lilad 重启丢了请求、超时：hook 什么都不输出，Claude Code 在终端里问，会话变 `waiting`/`terminal`）。`PreToolUse` 里不等人。
+  - 用户自己配的 allow 规则（实测：项目 `.claude/settings.json` 里的 `Bash(touch:*)`、`Edit`、`Write`）**不再绕过 lilad**：hook 的 deny 和 ask 都压过 allow 规则（`read_only` 档里 `touch x` 被拒；`confirm` 档里照样出卡片）。在手写 hook 加开着沙箱的会话里也验证过 ask、deny 压过 `autoAllowBashIfSandboxed`。
+  - 两个 hook 的负载（2.1.322 实测）：`PreToolUse` 有 `session_id, transcript_path, cwd, scratchpad_dir, prompt_id, permission_mode, effort, hook_event_name, tool_name, tool_input, tool_use_id`；`PermissionRequest` 有同样的，**没有 `tool_use_id`**，而且 `permission_suggestions` 有时有（空数组）有时没有。所以两个 hook 靠 `tool_name` 加 `tool_input` 的哈希对上：`PreToolUse` 把判定记下（每个会话最近 64 个、10 分钟内），后到的 `PermissionRequest` 取走：判定是 ask 就直接开卡片（不再按档位判一次，日志里只有一条 `asked`）；判定是 allow（Claude Code 自己还要问，比如工作目录以外的路径）就再放行一次，不再记日志；对不上（没有 `PreToolUse`：旧会话、lilad 当时没起来；输入被别的 hook 改过）就照旧按档位判，行为和以前一样。
+  - 日志（`thread_events`）：看东西的工具（`policy::reads`：读、搜索、取网页，Claude 自己的待办、提问、`ToolSearch` 这类 `INERT` 里的）放行不记；其他自动回答每个调用记一条（`auto_allowed`/`auto_denied`），出卡片时记 `asked`。`PreToolUse` 看得到所有调用，包括 Claude Code 本来不问的，所以 `confirm` 档下不在 `reads` 里的新工具会出卡片、`read_only` 档下会被拒；Claude Code 新增了无害的内部工具时，要加进 `policy::INERT`。
+  - 速度：`lila hook PreToolUse` 一次往返（含起进程）约 4.6 毫秒，`lila --version` 本身 3.7 毫秒；200 KB 的 Write 约 8 毫秒。lilad 这一侧没有 git、没有读盘，只查一次会话、必要时写一条日志。
+  - lilad 没起来或者回复读不了：hook 什么都不输出、退出码 0，Claude Code 自己决定（这时用户的 allow 规则又起作用）。
 - **Codex**（`codex app-server`）：按档位给 `thread/start` 的 `approvalPolicy` 和 `sandbox`，每次 `turn/start` 也带上（所以切档在下一轮生效，运行中的这一轮不变）：
 
   | 档 | approvalPolicy | sandbox |
@@ -254,6 +262,18 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 
   `full` 的做法：沙箱本身不让写工作区外、不让联网，所以 `git push`、`gh pr create` 这些要靠「请求越出沙箱」才能执行，请求到 lilad 手里按上面四类判定（实测：`git push` 出卡片）。代价是装依赖、拉代码这类联网命令也会多一轮「请求越出沙箱」，由 lilad 自动允许。Codex 的 `item/permissions/requestApproval`（模型主动申请额外权限）目前直接回「不支持」，不问人。
 - **ACP（omp）**：omp 对执行、编辑、删除、移动类工具发 `session/request_permission`，全部到 lilad，按档位判定，切档立即生效；读类不问。
+
+### Claude Code 自带的沙箱（A1 调查，2026-11-11，**没有启用**）
+
+打算给 Claude 线程开它的 Bash 沙箱（写只限会话文件夹和临时文件夹，网络不限）。对着 2.1.322 实测的结果：**「网络不限」用设置表达不了，所以停在这里，没有改代码**。下面的实验用的是手写的 hook 脚本（记负载、按文件回判定）和手写的 `--settings`，不是 lilad 的 hook；用的是临时 git 项目和 Haiku。
+
+- 设置：`--settings` 文件里 `sandbox.enabled: true` 生效（`claude --settings f sandbox status` 能看到，不花额度）。文件系统规则（`sandbox.filesystem.allowWrite`）和代理端口**只在会话启动时读**，改了文件对运行中的会话不起作用（所以「运行中的线程保持旧设置」成立）。
+- **网络**：沙箱里的命令走 Claude Code 自己的出口代理，按域名放行。`sandbox.network` 里没有「全部放开」的开关（键只有 `allowedDomains`、`deniedDomains`、`strictAllowlist`、`allowManagedDomainsOnly`、`allowUnixSockets`、`allowAllUnixSockets`、`allowLocalBinding`、`allowMachLookup`、`httpProxyPort`、`socksProxyPort`、`tlsTerminate` 等）。`allowedDomains` 不接受 `*`、`*.com` 这类过宽的写法（二进制里的校验文字：「Overly broad patterns like "*.com" or "*" are not allowed」；实测 `["*"]` 和 `["*.org","*.com","*.io"]` 都不起作用，也不报错），`permissions.allow` 里的 `WebFetch`、`WebFetch(domain:*)` 同样不行。没列出的域名第一次访问时，Claude Code 在终端里弹「Network request outside of sandbox」框（选「是」「是并且不再问这个域名」「否」）。**这个框不是工具权限框，不触发 `PermissionRequest` hook**，lilad 看不到：会话变成 `blocked`，窗口只会显示「在终端里等你」。
+- 实测唯一做到网络不限的办法：`sandbox.network.httpProxyPort` 指向一个自己跑的、放行一切的本地 HTTP 代理（会话启动时读）。之后不再弹框，`curl`、`cargo build`（取 index.crates.io、static.crates.io）都通。代价：lilad 要自己托管一个代理进程和端口，这是新增的组件，也是个本机上谁都能用的开放代理，所以没有做。其他选择：列一个域名清单（不是「不限」）；沙箱只管写文件，联网的命令走 `excludedCommands`；不启用沙箱。等用户定。
+- 文件：沙箱开着、没有别的配置时，Bash 只能写会话文件夹和 `$TMPDIR`（`/tmp/claude-501`）；`/tmp` 本身和 HOME 下别处写入被拒（`Operation not permitted`）。`allowWrite: ["/tmp","/private/tmp",…]` 重启后 `/tmp` 可写；`CARGO_HOME=/tmp/x cargo build` 取依赖并编译一个带依赖的 hello-world 通过（取依赖要代理放行）。worktree 里的 `git commit` **不用额外放行主仓库的 `.git`**（Claude Code 自己认得 worktree），提交到了主仓库。
+- **Edit/Write 工具不经过 OS 沙箱**：手写 hook 放行时，`Write` 写会话文件夹以外的文件成功。所以这类写入只靠 lilad 的路径规则（全自动档出 `outside_workspace` 卡片，用 lilad 实测过）。
+- 沙箱和 hook：`PreToolUse` 的 ask、deny 都压过 `autoAllowBashIfSandboxed`（默认 true）；allow 让沙箱里的命令不再有任何确认框。
+- 沙箱拦下命令后：Claude 先在沙箱里跑，得到 `Operation not permitted`；要它「被拦就关沙箱重试」时，它用 `dangerouslyDisableSandbox: true` 再调一次 Bash（没这么说时它只是告诉人被拦了，不自己重试）。`PreToolUse` 看得到这个字段（在 `tool_input` 里，和 `command`、`description` 并列）。**即使 `PreToolUse` 回 allow，Claude Code 照样弹确认框**（触发 `PermissionRequest`），所以人的答复能走现有的卡片；答 allow 之后命令在沙箱外跑成功，答 deny 走的是和别的请求一样的通道（没有单独验证）。
 
 ## 7. 命令行
 

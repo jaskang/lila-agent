@@ -147,6 +147,8 @@ pub struct Daemon<T: Terminals> {
     /// Answers waiting for the Claude Code hook that asked (`hooks`), by request id: the option and a message for the agent, or none (left to the terminal).
     hook_answers: HashMap<String, Option<(String, Option<String>)>>,
     next_hook: u64,
+    /// What `PreToolUse` decided about recent tool calls (`hooks`), by thread, for the `PermissionRequest` that may follow.
+    judged: HashMap<String, std::collections::VecDeque<hooks::Judged>>,
     /// What Claude threads are writing now (`MessageDisplay`), by thread: (message id, text so far).
     writing: HashMap<String, (String, String)>,
     /// magpie's command line, when it is installed (set by `serve`; tests leave it out).
@@ -206,6 +208,7 @@ impl<T: Terminals> Daemon<T> {
             next_card: 0,
             hook_answers: HashMap::new(),
             next_hook: 0,
+            judged: HashMap::new(),
             writing: HashMap::new(),
             magpie: None,
             jobs: Vec::new(),

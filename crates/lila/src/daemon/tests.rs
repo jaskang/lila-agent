@@ -310,6 +310,8 @@ fn a_claude_thread_starts_hooked_and_asks_in_manual_mode() {
     let settings: Value = serde_json::from_str(&std::fs::read_to_string(&args[at + 1]).unwrap()).unwrap();
     assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], "'/opt/lila/bin/lila' hook PermissionRequest");
     assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 600);
+    assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "*", "every tool call is judged");
+    assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/opt/lila/bin/lila' hook PreToolUse");
 
     // Starting: the first message waits for the prompt, and goes where it is idle.
     assert_eq!(w.state(&tid), "starting");
@@ -545,6 +547,128 @@ fn claude_requests_are_answered_by_the_threads_tier() {
     assert!(w.call("thread.permission", json!({"thread": tid, "permission": "yolo"})).is_err());
     let log = w.events(&tid);
     assert!(log.iter().any(|e| e.starts_with("auto_denied read_only")) && log.iter().any(|e| e.starts_with("permission full → read_only")) && log.iter().any(|e| e.starts_with("asked ")), "{log:?}");
+}
+
+/// What Claude Code sends `PreToolUse` for a tool call (`PermissionRequest` has the same, without `tool_use_id`).
+fn pre(w: &mut World, tid: &str, tool: &str, input: Value) -> Value {
+    w.hook(tid, "PreToolUse", json!({"tool_name": tool, "tool_input": input, "tool_use_id": "toolu_1", "cwd": w.repo.to_string_lossy()}))
+}
+
+#[test]
+fn every_tool_call_is_judged_before_it_runs_by_the_threads_tier() {
+    let mut w = world();
+    w.project();
+    let repo = w.repo.to_string_lossy().to_string();
+    let tid = w.new_thread(json!({}));
+    w.status(&tid, "idle");
+    let logged = |w: &mut World| w.events(&tid).into_iter().filter(|e| e.starts_with("auto_") || e.starts_with("asked")).collect::<Vec<_>>();
+
+    // Full auto: ordinary work is let through and logged once; looking at files is let through without a word.
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "cargo test"})), json!({"verdict": "allow"}));
+    assert_eq!(pre(&mut w, &tid, "Write", json!({"file_path": format!("{repo}/a.rs"), "content": "x"})), json!({"verdict": "allow"}));
+    for (tool, input) in [("Read", json!({"file_path": "/etc/hosts"})), ("Grep", json!({"pattern": "x"})), ("Glob", json!({"pattern": "*.rs"})), ("TaskCreate", json!({})), ("AskUserQuestion", json!({}))] {
+        assert_eq!(pre(&mut w, &tid, tool, input), json!({"verdict": "allow"}), "{tool}");
+    }
+    assert_eq!(logged(&mut w), ["auto_allowed full · Bash: cargo test".to_owned(), format!("auto_allowed full · Write: {repo}/a.rs")]);
+    // The dangerous four are asked, not answered: no card yet (the dialog that follows opens it), nothing logged.
+    for (tool, input) in [("Bash", json!({"command": "git push origin main"})), ("Write", json!({"file_path": "/etc/hosts"})), ("Bash", json!({"command": "gh pr create --title x"}))] {
+        let r = pre(&mut w, &tid, tool, input);
+        assert_eq!(r["verdict"], "ask");
+        assert!(r["reason"].as_str().unwrap().starts_with("全自动档仍需确认"), "{r}");
+    }
+    assert_eq!(logged(&mut w).len(), 2);
+    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty(), "nothing waits inside PreToolUse");
+    assert_eq!(w.state(&tid), "idle");
+
+    // Read-only: reads go, the rest is refused with the reason the agent is told, logged once.
+    w.ok("thread.permission", json!({"thread": tid, "permission": "read_only"}));
+    assert_eq!(pre(&mut w, &tid, "Read", json!({"file_path": "x"})), json!({"verdict": "allow"}));
+    let r = pre(&mut w, &tid, "Bash", json!({"command": "touch x"}));
+    assert_eq!(r["verdict"], "deny");
+    assert!(r["reason"].as_str().unwrap().contains("read-only"), "{r}");
+    assert_eq!(pre(&mut w, &tid, "Edit", json!({"file_path": format!("{repo}/a.rs")}))["verdict"], "deny");
+    assert_eq!(pre(&mut w, &tid, "SomethingNew", json!({}))["verdict"], "deny");
+    assert_eq!(logged(&mut w).iter().filter(|e| e.starts_with("auto_denied read_only")).count(), 3);
+
+    // Confirm: reads go, everything else is asked.
+    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
+    assert_eq!(pre(&mut w, &tid, "Grep", json!({"pattern": "x"})), json!({"verdict": "allow"}));
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "ls"})), json!({"verdict": "ask", "reason": "改动前确认"}));
+}
+
+#[test]
+fn an_ask_from_pre_tool_use_becomes_the_card_of_the_permission_request_that_follows_without_being_judged_twice() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({}));
+    w.status(&tid, "idle");
+    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
+    let input = json!({"command": "touch x", "description": "make x"});
+    let asked = |w: &mut World| w.events(&tid).into_iter().filter(|e| e.starts_with("asked") || e.starts_with("auto_")).collect::<Vec<_>>();
+
+    // Asked by PreToolUse; Claude Code shows its dialog although a rule of the person's would allow the call.
+    assert_eq!(pre(&mut w, &tid, "Bash", input.clone())["verdict"], "ask");
+    let r = claude_ask(&mut w, &tid, "Bash", input.clone());
+    let id = r["wait"].as_str().expect("the card opens at once").to_owned();
+    assert_eq!(asked(&mut w), ["asked Bash: touch x · 改动前确认"], "logged once");
+    let read = w.ok("thread.read", json!({"thread": tid}));
+    let card = &read["permissions"][0];
+    assert_eq!((card["why"].as_str(), card["danger"].is_null()), (Some("改动前确认"), true));
+    assert_eq!(w.state(&tid), "waiting");
+    // Both answers travel the hook.answer path as before.
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": true}));
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id}))["decision"], "allow");
+
+    // Full auto: a push is asked by PreToolUse and keeps its danger on the card; the person says no.
+    w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
+    let push = json!({"command": "git push"});
+    assert_eq!(pre(&mut w, &tid, "Bash", push.clone())["verdict"], "ask");
+    let id = claude_ask(&mut w, &tid, "Bash", push)["wait"].as_str().unwrap().to_owned();
+    let card = w.ok("thread.read", json!({"thread": tid}))["permissions"][0].clone();
+    assert_eq!(card["danger"], "git_push");
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": false}));
+    let a = w.ok("hook.answer", json!({"thread": tid, "id": id}));
+    assert_eq!((a["decision"].as_str(), a["message"].is_string()), (Some("deny"), true));
+
+    // The verdict is used once: a second dialog for the same call is judged on its own, by the tier.
+    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
+    assert_eq!(pre(&mut w, &tid, "Bash", input.clone())["verdict"], "ask");
+    assert!(claude_ask(&mut w, &tid, "Bash", input.clone())["wait"].is_string());
+    let card = w.ok("thread.read", json!({"thread": tid}))["permissions"][0]["id"].clone();
+    w.ok("thread.answer", json!({"thread": tid, "card": card, "dismiss": true}));
+    let before = asked(&mut w).len();
+    w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
+    assert_eq!(claude_ask(&mut w, &tid, "Bash", input.clone())["decision"], "allow", "no verdict kept: today's behaviour");
+    assert_eq!(asked(&mut w).len(), before + 1, "and logged by the permission request itself");
+
+    // A call PreToolUse let through that Claude Code still asks about (it has checks of its own): let through again, not logged again.
+    let outside = json!({"command": "ls /etc"});
+    assert_eq!(pre(&mut w, &tid, "Bash", outside.clone()), json!({"verdict": "allow"}));
+    let n = asked(&mut w).len();
+    assert_eq!(claude_ask(&mut w, &tid, "Bash", outside)["decision"], "allow");
+    assert_eq!(asked(&mut w).len(), n, "judged once");
+
+    // A different call is not mistaken for it: the same tool with other input is judged again.
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "ls"})), json!({"verdict": "allow"}));
+    w.ok("thread.permission", json!({"thread": tid, "permission": "read_only"}));
+    assert_eq!(claude_ask(&mut w, &tid, "Bash", json!({"command": "ls -la"}))["decision"], "deny");
+}
+
+#[test]
+fn the_verdicts_kept_for_permission_requests_are_few_and_expire() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({}));
+    w.status(&tid, "idle");
+    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
+    for i in 0..100 {
+        pre(&mut w, &tid, "Bash", json!({"command": format!("touch {i}")}));
+    }
+    assert_eq!(w.d.judged[&tid].len(), 64);
+    // A verdict of long ago is gone, and the request is judged on its own (still asked, logged once).
+    w.now += 700_000;
+    pre(&mut w, &tid, "Bash", json!({"command": "touch late"}));
+    assert_eq!(w.d.judged[&tid].len(), 1);
 }
 
 #[test]
