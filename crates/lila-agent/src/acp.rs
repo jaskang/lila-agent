@@ -143,7 +143,7 @@ impl Acp {
         step.events.push(AgentEvent::TurnStarted { turn: turn.clone() });
         // ACP doesn't echo the prompt back: it is the turn's first item.
         // A file the words name with `@` is in the words; the cards are the files that were put on.
-        let said = text.trim().to_owned();
+        let said = without_notes(text.trim()).to_owned();
         let attachments = files.into_iter().filter(|f| !f.is_mentioned_in(&said)).collect();
         let item = Item { id: format!("{turn}-said"), turn: Some(turn), at_ms: self.clock, state: ItemState::Done, kind: ItemKind::UserMessage { origin: origin(&said), text: said, attachments } };
         step.events.push(AgentEvent::Item { item });
@@ -501,7 +501,10 @@ fn stream_item(s: &Stream, turn: Option<String>, state: ItemState) -> Item {
     let kind = match s.kind {
         StreamKind::Reply => ItemKind::AgentMessage { text },
         StreamKind::Thought => ItemKind::Thought { text },
-        StreamKind::User => ItemKind::UserMessage { origin: origin(&text), text, attachments: Vec::new() },
+        StreamKind::User => {
+            let text = without_notes(&text).to_owned();
+            ItemKind::UserMessage { origin: origin(&text), text, attachments: Vec::new() }
+        }
     };
     Item { id: s.id.clone(), turn, at_ms: s.at_ms, state, kind }
 }
@@ -696,6 +699,16 @@ mod tests {
         assert_eq!(sent.send[0]["params"]["prompt"].as_array().unwrap().len(), 3, "the agent still gets both files");
         let said = sent.events.iter().find_map(|e| match e { AgentEvent::Item { item } => Some(item), _ => None }).unwrap();
         assert!(matches!(&said.kind, ItemKind::UserMessage { attachments, .. } if *attachments == [attached.clone()]), "{said:?}");
+    }
+
+    #[test]
+    fn a_note_in_front_of_the_words_goes_to_the_agent_but_is_not_shown_as_the_persons() {
+        let (mut a, _) = open_session(true);
+        let text = "<lila note about=\"restore\">\nFiles were put back.\n</lila>\n\nfix it";
+        let sent = a.command(Command::Prompt { text: text.into(), attachments: vec![] }, 5);
+        assert_eq!(sent.send[0]["params"]["prompt"][0], json!({"type": "text", "text": text}));
+        let said = sent.events.iter().find_map(|e| match e { AgentEvent::Item { item } => Some(item), _ => None }).unwrap();
+        assert!(matches!(&said.kind, ItemKind::UserMessage { text, origin: Origin::Person, .. } if text == "fix it"), "{said:?}");
     }
 
     #[test]

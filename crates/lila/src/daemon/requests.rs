@@ -50,6 +50,7 @@ impl<T: Terminals> Daemon<T> {
             "thread.files" => self.thread_files(params),
             "thread.file" => self.thread_file(params),
             "thread.log" => self.thread_log(params),
+            "thread.checkpoints" => self.thread_checkpoints(params, now),
             "hook" => self.hook(params, now),
             "hook.answer" => self.hook_answer(params),
             other => Err(anyhow!("unknown request {other}")),

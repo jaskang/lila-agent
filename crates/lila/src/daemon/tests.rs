@@ -83,7 +83,26 @@ fn world() -> World {
 impl World {
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.now += 1000;
-        self.d.handle(method, &params, self.now)
+        let r = self.d.handle(method, &params, self.now);
+        self.settle_checkpoints();
+        r
+    }
+
+    /// The checkpoint jobs lilad queued run now, and the words of a hosted thread that waited for one go (lilad's server runs them at once);
+    /// the other jobs stay queued for `settle`.
+    fn settle_checkpoints(&mut self) {
+        loop {
+            let (mine, other): (Vec<_>, Vec<_>) = self.d.take_jobs().into_iter().partition(|j| j.is_checkpoint());
+            self.d.jobs.extend(other);
+            if mine.is_empty() {
+                return;
+            }
+            for job in mine {
+                self.now += 10;
+                let result = job.run();
+                let _ = self.d.finish(job, result, self.now);
+            }
+        }
     }
 
     fn ok(&mut self, method: &str, params: Value) -> Value {
@@ -130,6 +149,12 @@ impl World {
     }
 
     fn status(&mut self, tid: &str, word: &str) {
+        self.status_raw(tid, word);
+        self.settle_checkpoints();
+    }
+
+    /// The same, without running the checkpoint jobs it may queue.
+    fn status_raw(&mut self, tid: &str, word: &str) {
         self.now += 1000;
         self.attach(tid);
         let t = self.terminal(tid);
@@ -734,7 +759,7 @@ mod p2 {
     use crate::worktree::tests::{repo, sh};
 
     /// The project `shop` in a git repository on `main` (its `.lila/project.toml` committed).
-    fn git_world() -> World {
+    pub(super) fn git_world() -> World {
         let mut w = world();
         // The engines are the fake ones; git is the real one.
         w.d.path_env = format!("{}:{}", w.d.path_env, std::env::var("PATH").unwrap_or_default());
@@ -744,24 +769,24 @@ mod p2 {
     }
 
     /// A Codex thread (it reports through a host, so tests can make it idle), in a worktree.
-    fn in_worktree(w: &mut World) -> String {
+    pub(super) fn in_worktree(w: &mut World) -> String {
         let tid = w.new_thread(json!({"engine": "codex", "worktree": true, "text": "start"}));
         w.status(&tid, "idle");
         tid
     }
 
-    fn worktree_of(w: &World, tid: &str) -> PathBuf {
+    pub(super) fn worktree_of(w: &World, tid: &str) -> PathBuf {
         PathBuf::from(w.d.store.thread(tid).unwrap().unwrap().cwd)
     }
 
-    fn write(dir: &Path, name: &str, text: &str) {
+    pub(super) fn write(dir: &Path, name: &str, text: &str) {
         let p = dir.join(name);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, text).unwrap();
     }
 
     /// A commit in a worktree, as the agent would make one.
-    fn commit(dir: &Path, file: &str, text: &str, message: &str) {
+    pub(super) fn commit(dir: &Path, file: &str, text: &str, message: &str) {
         write(dir, file, text);
         sh(dir, &["add", "-A"]);
         sh(dir, &["commit", "-q", "-m", message]);
@@ -1165,5 +1190,369 @@ mod p2 {
         }
         let t = d.store.thread(&tid).unwrap().unwrap();
         assert_eq!(d.thread_json(&t, 6)["changes"], json!({"files": 1, "add": 1, "del": 0}));
+    }
+}
+
+// ---------------- checkpoints and going back (A1) ----------------
+
+mod a1 {
+    use super::p2::{commit, git_world, in_worktree, write};
+    use super::*;
+    use crate::worktree::tests::sh;
+    use lila_agent::{Origin, model::without_notes};
+
+    /// 2026-11-10T01:00:00Z: transcripts carry real dates, so the world's clock is set near them.
+    const T0: i64 = 1_794_272_400_000;
+
+    fn checkpoints(w: &mut World, tid: &str) -> Vec<Value> {
+        w.ok("thread.checkpoints", json!({"thread": tid}))["checkpoints"].as_array().unwrap().clone()
+    }
+
+    fn user_item(id: &str, text: &str, at_ms: i64) -> AgentEvent {
+        AgentEvent::Item { item: Item { id: id.into(), turn: Some("tu".into()), at_ms, state: ItemState::Done, kind: ItemKind::UserMessage { text: text.into(), origin: Origin::Person, attachments: vec![] } } }
+    }
+
+    fn refs(w: &World) -> String {
+        sh(&w.repo, &["for-each-ref", "--format=%(refname)", "refs/lila"])
+    }
+
+    /// A Codex thread in the project folder, idle, whose first message ("go") has been delivered and its turn is over.
+    fn after_first_turn(w: &mut World) -> String {
+        let tid = w.new_thread(json!({"engine": "codex", "text": "go"}));
+        w.status(&tid, "idle");
+        w.status(&tid, "working");
+        w.status(&tid, "idle");
+        tid
+    }
+
+    #[test]
+    fn a_hosted_turn_waits_for_its_checkpoint_which_holds_the_folder_as_it_was() {
+        let mut w = git_world();
+        write(&w.repo, "a.txt", "mine, before the turn\n");
+        write(&w.repo, "fresh.txt", "untracked\n");
+        let tid = w.new_thread(json!({"engine": "codex", "text": "hello"}));
+        w.status_raw(&tid, "idle");
+        // The words are held while the folder is saved; lilad's loop is not the one that runs git.
+        assert!(w.sends_to(&tid).is_empty(), "the engine has not been given the words");
+        assert!(w.d.snapshotting.contains(&tid));
+        assert_eq!(w.d.store.outbox(&tid).unwrap().len(), 1);
+        w.settle_checkpoints();
+        assert_eq!(w.sends_to(&tid), ["hello"]);
+        assert!(w.d.store.outbox(&tid).unwrap().is_empty() && w.d.snapshotting.is_empty());
+        // What the engine does next is not in it.
+        write(&w.repo, "a.txt", "the agent's edit\n");
+        let rows = checkpoints(&mut w, &tid);
+        assert_eq!(rows.len(), 1);
+        let (c, sha) = (&rows[0], w.d.store.checkpoint(&tid, 1).unwrap().unwrap().sha);
+        assert_eq!((c["id"].clone(), c["kind"].clone(), c["title"].clone(), c["item"].clone(), c["restorable"].clone(), c["branch"].clone()), (json!(1), json!("turn"), json!("hello"), Value::Null, json!(true), json!("main")));
+        assert_eq!(sh(&w.repo, &["show", &format!("{sha}:a.txt")]), "mine, before the turn");
+        assert_eq!(sh(&w.repo, &["show", &format!("{sha}:fresh.txt")]), "untracked");
+        assert_eq!(c["head"], sh(&w.repo, &["rev-parse", "--short=7", "HEAD"]).as_str());
+        assert_eq!(sh(&w.repo, &["rev-parse", &format!("refs/lila/checkpoints/{tid}/1")]), sha, "kept alive by a ref");
+    }
+
+    #[test]
+    fn a_hosted_checkpoint_is_attached_to_the_message_the_engine_echoes() {
+        let mut w = git_world();
+        let tid = after_first_turn(&mut w);
+        // The engine has not echoed the message yet: the checkpoint has no item.
+        assert_eq!(checkpoints(&mut w, &tid)[0]["item"], Value::Null);
+        let t = w.now;
+        w.host_event(&tid, user_item("u1", "go", t + 500));
+        w.host_event(&tid, AgentEvent::TurnEnded { turn: "tu".into(), failed: None });
+        // Two messages with the same words, two turns: each finds its own.
+        w.ok("thread.send", json!({"thread": tid, "text": "go"}));
+        w.settle_checkpoints();
+        let t = w.now;
+        w.host_event(&tid, user_item("u2", "go", t + 500));
+        let read = w.ok("thread.read", json!({"thread": tid}));
+        let list: Vec<(i64, Option<&str>)> = read["checkpoints"].as_array().unwrap().iter().map(|c| (c["id"].as_i64().unwrap(), c["item"].as_str())).collect();
+        assert_eq!(list, [(2, Some("u2")), (1, Some("u1"))], "newest first, in thread.read as in thread.checkpoints");
+        assert_eq!(checkpoints(&mut w, &tid), read["checkpoints"].as_array().unwrap().clone());
+        // It is remembered in the row.
+        assert_eq!(w.d.store.checkpoint(&tid, 1).unwrap().unwrap().item.as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn a_message_that_joins_a_turn_under_way_has_no_checkpoint_and_omp_waits_for_its_prompt() {
+        let mut w = git_world();
+        let tid = after_first_turn(&mut w);
+        w.ok("thread.send", json!({"thread": tid, "text": "second"}));
+        w.settle_checkpoints();
+        w.status(&tid, "working");
+        let before = checkpoints(&mut w, &tid).len();
+        w.ok("thread.send", json!({"thread": tid, "text": "also this"}));
+        w.settle_checkpoints();
+        assert_eq!(w.sends_to(&tid), ["go", "second", "also this"], "Codex takes it into the turn at once");
+        assert_eq!(checkpoints(&mut w, &tid).len(), before, "it begins no turn");
+        // omp takes no words while it works: they wait in lilad, and go with their checkpoint when it is free.
+        let omp = w.new_thread(json!({"engine": "omp", "text": "one"}));
+        w.status(&omp, "idle");
+        w.status(&omp, "working");
+        w.ok("thread.send", json!({"thread": omp, "text": "two"}));
+        assert_eq!(w.sends_to(&omp), ["one"]);
+        assert_eq!(w.d.store.outbox(&omp).unwrap().len(), 1);
+        assert_eq!(checkpoints(&mut w, &omp).len(), 1);
+        w.status_raw(&omp, "idle");
+        assert_eq!(w.sends_to(&omp), ["one"], "not before the folder is saved");
+        w.settle_checkpoints();
+        assert_eq!(w.sends_to(&omp), ["one", "two"]);
+        assert_eq!(checkpoints(&mut w, &omp).len(), 2);
+    }
+
+    #[test]
+    fn a_claude_turn_is_saved_by_its_hook_and_finds_its_message_in_the_transcript() {
+        let mut w = git_world();
+        w.now = T0 - 5000;
+        let tid = w.new_thread(json!({"text": "make a.txt"}));
+        w.status(&tid, "idle");
+        // The words are typed at once: delivery takes no checkpoint for Claude Code, its hook does.
+        assert_eq!(w.sends_to(&tid), ["make a.txt"]);
+        assert!(checkpoints(&mut w, &tid).is_empty());
+        let session = w.d.store.thread(&tid).unwrap().unwrap().session.unwrap();
+        let file = sessions::claude_file(&w.d.live_sources(), &w.repo.to_string_lossy(), &session);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let line = |v: Value| v.to_string() + "\n";
+        let say = |uuid: &str, text: &str, ms: i64| line(json!({"type": "user", "uuid": uuid, "timestamp": format!("2026-11-10T01:{:02}:{:02}.{:03}Z", ms / 60_000, ms / 1000 % 60, ms % 1000), "message": {"role": "user", "content": text}}));
+        let append = |text: &str| std::io::Write::write_all(&mut std::fs::OpenOptions::new().create(true).append(true).open(&file).unwrap(), text.as_bytes()).unwrap();
+
+        // Turn 1: the hook comes first, and the answer waits for the checkpoint.
+        write(&w.repo, "a.txt", "before turn one\n");
+        w.now = T0;
+        let Begin::Job(job) = w.d.begin("hook", &json!({"thread": tid, "event": "UserPromptSubmit", "payload": {"prompt": "make a.txt"}}), w.now).unwrap() else { panic!("the hook waits for the checkpoint") };
+        assert!(job.is_checkpoint());
+        let result = job.run();
+        write(&w.repo, "a.txt", "the agent's edit\n");
+        assert_eq!(w.d.finish(job, result, w.now).unwrap(), json!({}));
+        let sha = w.d.store.checkpoint(&tid, 1).unwrap().unwrap().sha;
+        assert_eq!(sh(&w.repo, &["show", &format!("{sha}:a.txt")]), "before turn one", "of the folder before the turn, not after");
+        assert_eq!(checkpoints(&mut w, &tid)[0]["item"], Value::Null, "the transcript has no message yet");
+        // The transcript catches up, 300 ms later.
+        append(&say("u1", "make a.txt", 300));
+        w.d.follow_transcripts();
+        assert_eq!(checkpoints(&mut w, &tid)[0]["item"], "u1");
+
+        // Turn 2: the same words again, with a file after them (as Lila types it), and a slash command that has no checkpoint.
+        w.now = T0 + 60_000;
+        w.hook(&tid, "UserPromptSubmit", json!({"prompt": "make a.txt @/tmp/x.png"}));
+        append(&say("u-compact", "/compact", 60_100));
+        append(&say("u2", "make a.txt", 60_300));
+        w.d.follow_transcripts();
+        let rows = checkpoints(&mut w, &tid);
+        assert_eq!(rows.iter().map(|c| (c["id"].as_i64().unwrap(), c["item"].as_str().unwrap_or("-").to_owned())).collect::<Vec<_>>(), [(2, "u2".to_owned()), (1, "u1".to_owned())]);
+        // Nothing changed between them: the same commit under two refs, each turn restorable.
+        assert_eq!(refs(&w).lines().count(), 2);
+        // A hook for a message that never became an item is given up on when a later one has found its own.
+        w.now = T0 + 120_000;
+        w.hook(&tid, "UserPromptSubmit", json!({"prompt": "rejected by Claude"}));
+        w.now = T0 + 180_000;
+        w.hook(&tid, "UserPromptSubmit", json!({"prompt": "third"}));
+        append(&say("u3", "third", 180_400));
+        w.d.follow_transcripts();
+        let rows = checkpoints(&mut w, &tid);
+        assert_eq!(rows.iter().map(|c| c["item"].as_str().map(String::from)).collect::<Vec<_>>(), [Some("u3".to_owned()), None, Some("u2".to_owned()), Some("u1".to_owned())]);
+        assert_eq!(w.d.store.checkpoint(&tid, 3).unwrap().unwrap().item.as_deref(), Some(""), "known to have no message");
+    }
+
+    #[test]
+    fn at_most_fifty_checkpoints_are_kept_and_a_failure_never_stops_the_message() {
+        let mut w = git_world();
+        let tid = w.new_thread(json!({}));
+        w.status(&tid, "idle");
+        for i in 1..=52 {
+            write(&w.repo, "f.txt", &format!("{i}\n"));
+            w.hook(&tid, "UserPromptSubmit", json!({"prompt": format!("turn {i}")}));
+        }
+        let rows = checkpoints(&mut w, &tid);
+        assert_eq!((rows.len(), rows[0]["id"].clone(), rows[49]["id"].clone()), (50, json!(52), json!(3)));
+        assert_eq!(refs(&w).lines().count(), 50);
+        assert!(w.d.store.checkpoint(&tid, 2).unwrap().is_none());
+
+        // git cannot be run: recorded, and the words go.
+        let codex = w.new_thread(json!({"engine": "codex"}));
+        w.status(&codex, "idle");
+        w.d.path_env = String::new();
+        w.ok("thread.send", json!({"thread": codex, "text": "still goes"}));
+        assert_eq!(w.sends_to(&codex), ["still goes"]);
+        assert!(checkpoints(&mut w, &codex).is_empty());
+        assert!(w.events(&codex).iter().any(|e| e.starts_with("checkpoint_failed ")), "{:?}", w.events(&codex));
+        // And the Claude hook answers all the same.
+        assert_eq!(w.hook(&tid, "UserPromptSubmit", json!({"prompt": "x"})), json!({}));
+    }
+
+    #[test]
+    fn a_folder_outside_git_has_no_checkpoints() {
+        let mut w = world();
+        w.project();
+        let tid = w.new_thread(json!({"engine": "codex", "text": "hi"}));
+        w.status_raw(&tid, "idle");
+        assert_eq!(w.sends_to(&tid), ["hi"], "no job, no wait");
+        assert!(w.d.take_jobs().iter().all(|j| !j.is_checkpoint()));
+        assert_eq!(w.ok("thread.checkpoints", json!({"thread": tid}))["checkpoints"], json!([]));
+        let err = format!("{:#}", w.call("thread.restore", json!({"thread": tid, "checkpoint": 1})).unwrap_err());
+        assert!(err.contains("no checkpoint 1"), "{err}");
+    }
+
+    #[test]
+    fn putting_the_files_back_changes_them_and_the_conversation_gets_a_mark_but_starts_no_turn() {
+        let mut w = git_world();
+        write(&w.repo, "keep.txt", "keep\n");
+        write(&w.repo, "gone.txt", "gone\n");
+        sh(&w.repo, &["add", "-A"]);
+        sh(&w.repo, &["commit", "-q", "-m", "files"]);
+        write(&w.repo, "a.txt", "a, before\n");
+        let tid = after_first_turn(&mut w);
+        // The agent's turn.
+        write(&w.repo, "a.txt", "broken\n");
+        std::fs::remove_file(w.repo.join("gone.txt")).unwrap();
+        write(&w.repo, "new/file.txt", "made by the agent\n");
+        write(&w.repo, "target/cache", "ignored\n");
+        let t = w.now;
+        w.host_event(&tid, user_item("u1", "go", t + 100));
+        w.settle();
+        let head = sh(&w.repo, &["rev-parse", "HEAD"]);
+        let files = |w: &World| ["a.txt", "gone.txt", "new/file.txt", "target/cache"].map(|f| std::fs::read_to_string(w.repo.join(f)).ok());
+        let broken = files(&w);
+
+        // A dry run changes nothing.
+        let seq = w.d.store.last_seq(&tid).unwrap();
+        let (log, rows, refs_before, status) = (w.events(&tid), checkpoints(&mut w, &tid).len(), refs(&w), sh(&w.repo, &["status", "--porcelain=v2"]));
+        let dry = w.ok("thread.restore", json!({"thread": tid, "checkpoint": 1, "dry_run": true}));
+        assert_eq!(
+            dry,
+            json!({"thread": tid, "checkpoint": 1, "dry_run": true, "restored": false, "undo": null, "head_moved": false,
+                   "head": {"then": &head[..7], "now": &head[..7]},
+                   "changed": ["a.txt"], "recreated": ["gone.txt"], "deleted": ["new/file.txt"],
+                   "counts": {"changed": 1, "recreated": 1, "deleted": 1}, "truncated": false})
+        );
+        assert_eq!((files(&w), w.d.store.last_seq(&tid).unwrap(), w.events(&tid), checkpoints(&mut w, &tid).len(), refs(&w), sh(&w.repo, &["status", "--porcelain=v2"])), (broken.clone(), seq, log, rows, refs_before, status));
+        assert!(w.d.store.outbox(&tid).unwrap().is_empty());
+
+        // The real one.
+        let sends = w.sends_to(&tid).len();
+        let r = w.ok("thread.restore", json!({"thread": tid, "checkpoint": 1}));
+        let undo = r["undo"].as_i64().expect("the way back");
+        assert_eq!((r["restored"].clone(), r["dry_run"].clone(), r["counts"].clone(), r["head_moved"].clone()), (json!(true), json!(false), dry["counts"].clone(), json!(false)));
+        assert_eq!(files(&w), [Some("a, before\n".into()), Some("gone\n".into()), None, Some("ignored\n".into())], "ignored files are left alone");
+        assert!(!w.repo.join("new").exists());
+        assert_eq!(sh(&w.repo, &["rev-parse", "HEAD"]), head);
+        // It is recorded; the conversation has its mark; the agent is told with the next message, and no turn begins.
+        assert!(w.events(&tid).iter().any(|e| e.starts_with("restored checkpoint 1 (go): 1 put back, 1 made again, 1 deleted; undo is checkpoint")), "{:?}", w.events(&tid));
+        let read = w.ok("thread.read", json!({"thread": tid}));
+        let mark = read["items"].as_array().unwrap().iter().find(|i| i["from"] == "restored").expect("a mark in the conversation").clone();
+        assert_eq!((mark["kind"].clone(), mark["checkpoint"].clone(), mark["undo"].clone(), mark["state"].clone()), (json!("user_message"), json!(1), json!(undo), json!("done")));
+        let rows = read["checkpoints"].as_array().unwrap();
+        assert_eq!((rows[0]["id"].clone(), rows[0]["kind"].clone(), rows[0]["item"].clone()), (json!(undo), json!("restore"), Value::Null));
+        w.now += 60_000;
+        w.d.tick(w.now);
+        w.settle_checkpoints();
+        assert_eq!(w.sends_to(&tid).len(), sends, "a restore sends the engine nothing by itself");
+        assert_eq!(w.state(&tid), "idle");
+        let held = w.d.store.outbox(&tid).unwrap();
+        assert!(held.len() == 1 && held[0].hold && held[0].text.starts_with("<lila note about=\"restore\">") && held[0].text.contains("go") && held[0].text.contains("read a file again"), "{held:?}");
+        // The summary of changes is counted again.
+        assert!(w.d.take_jobs().iter().any(|j| j.serial()));
+        // The next message takes the note along, in front of it, in one message and one turn.
+        w.ok("thread.send", json!({"thread": tid, "text": "try again"}));
+        let sent = w.sends_to(&tid);
+        assert_eq!(sent.len(), sends + 1);
+        assert!(sent.last().unwrap().starts_with("<lila note about=\"restore\">"), "{sent:?}");
+        assert_eq!(without_notes(sent.last().unwrap()), "try again");
+        assert!(w.d.store.outbox(&tid).unwrap().is_empty());
+        // That turn has its checkpoint, and the way back works: the state before the restore.
+        write(&w.repo, "a.txt", "worse\n");
+        w.ok("thread.restore", json!({"thread": tid, "checkpoint": undo}));
+        assert_eq!(files(&w), broken, "as broken as it was, ignored files and all");
+        // It all survives lilad starting again.
+        let store = Store::open(&w.d.paths.db()).unwrap();
+        let mut d = Daemon::new(store, Fake::default(), w.d.paths.clone(), w.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
+        let read = d.handle("thread.read", &json!({"thread": tid}), w.now + 1000).unwrap();
+        assert!(read["items"].as_array().unwrap().iter().filter(|i| i["from"] == "restored").count() == 2 && read["checkpoints"].as_array().unwrap().len() >= 4);
+    }
+
+    #[test]
+    fn commits_since_the_checkpoint_are_reported_and_stay() {
+        let mut w = git_world();
+        let tid = after_first_turn(&mut w);
+        let before = sh(&w.repo, &["rev-parse", "HEAD"]);
+        commit(&w.repo, "b.txt", "committed by the agent\n", "agent work");
+        let head = sh(&w.repo, &["rev-parse", "HEAD"]);
+        let r = w.ok("thread.restore", json!({"thread": tid, "checkpoint": 1}));
+        assert_eq!((r["head_moved"].clone(), r["head"].clone()), (json!(true), json!({"then": &before[..7], "now": &head[..7]})));
+        assert_eq!(r["deleted"], json!(["b.txt"]), "the files go back; the commit does not");
+        assert_eq!(sh(&w.repo, &["rev-parse", "HEAD"]), head);
+        assert_eq!(sh(&w.repo, &["status", "--porcelain"]), "D b.txt", "the panel shows it as a change");
+        let note = &w.d.store.outbox(&tid).unwrap()[0].text;
+        assert!(note.contains("Commits made since then were not undone"), "{note}");
+    }
+
+    #[test]
+    fn a_restore_is_refused_while_anything_could_still_change_the_files() {
+        let mut w = git_world();
+        let tid = after_first_turn(&mut w);
+        let other = w.new_thread(json!({"engine": "codex"}));
+        w.status(&other, "idle");
+        let refused = |w: &mut World, tid: &str, expect: &str| {
+            for dry_run in [true, false] {
+                let err = format!("{:#}", w.call("thread.restore", json!({"thread": tid, "checkpoint": 1, "dry_run": dry_run})).unwrap_err());
+                assert!(err.contains(expect), "{err}");
+            }
+            let c = w.ok("thread.checkpoints", json!({"thread": tid}));
+            assert_eq!((c["can_restore"].clone(), c["checkpoints"][0]["restorable"].clone()), (json!(false), json!(false)));
+            assert!(c["why_not"].as_str().unwrap().contains(expect));
+        };
+        // Working; waiting for an answer.
+        w.status(&tid, "working");
+        refused(&mut w, &tid, "working now");
+        w.status(&tid, "blocked");
+        refused(&mut w, &tid, "waiting for an answer");
+        w.status(&tid, "idle");
+        // Another thread working in the same folder.
+        w.status(&other, "working");
+        refused(&mut w, &tid, &format!("{other} is working in the same folder"));
+        w.status(&other, "idle");
+        // Words not taken yet.
+        w.d.hosts.remove(&tid);
+        w.ok("thread.send", json!({"thread": tid, "text": "queued"}));
+        refused(&mut w, &tid, "message waiting");
+        // No checkpoint of that number; and not while it is being restored (what the loop sees in between).
+        w.d.store.pop_outbox(w.d.store.outbox(&tid).unwrap()[0].id).unwrap();
+        let err = format!("{:#}", w.call("thread.restore", json!({"thread": tid, "checkpoint": 99})).unwrap_err());
+        assert!(err.contains("no checkpoint 99"), "{err}");
+        w.now += 1000;
+        let Begin::Job(job) = w.d.begin("thread.restore", &json!({"thread": tid, "checkpoint": 1}), w.now).unwrap() else { panic!("a restore is a job") };
+        assert_eq!(w.ok("thread.show", json!({"thread": tid}))["restoring"], true);
+        refused(&mut w, &tid, "being restored");
+        assert!(w.call("thread.send", json!({"thread": tid, "text": "x"})).is_err());
+        let result = job.run();
+        w.d.finish(job, result, w.now).unwrap();
+        assert_eq!(w.ok("thread.show", json!({"thread": tid}))["restoring"], false);
+        // An ended thread can be restored; one whose repository is gone says so and changes nothing.
+        w.ok("thread.stop", json!({"thread": tid}));
+        w.ok("thread.restore", json!({"thread": tid, "checkpoint": 1, "dry_run": true}));
+        std::fs::rename(w.repo.join(".git"), w.repo.join(".git.away")).unwrap();
+        let err = format!("{:#}", w.call("thread.restore", json!({"thread": tid, "checkpoint": 1})).unwrap_err());
+        assert!(err.contains("not in a git repository"), "{err}");
+        assert!(w.events(&tid).iter().any(|e| e.starts_with("restore_failed ")));
+        assert_eq!(w.ok("thread.show", json!({"thread": tid}))["restoring"], false);
+    }
+
+    #[test]
+    fn a_threads_refs_go_when_its_worktree_is_merged_and_when_its_project_is_removed() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        w.ok("thread.send", json!({"thread": tid, "text": "more"}));
+        commit(&PathBuf::from(w.d.store.thread(&tid).unwrap().unwrap().cwd), "w.txt", "w\n", "work");
+        let plain = after_first_turn(&mut w);
+        assert!(refs(&w).contains(&format!("checkpoints/{tid}/")) && refs(&w).contains(&format!("checkpoints/{plain}/")), "{}", refs(&w));
+        w.ok("thread.merge", json!({"thread": tid}));
+        w.settle();
+        assert!(!refs(&w).contains(&tid) && refs(&w).contains(&plain), "only the merged thread's refs go:\n{}", refs(&w));
+        assert!(w.d.store.checkpoints(&tid).unwrap().is_empty());
+        assert!(format!("{:#}", w.call("thread.restore", json!({"thread": tid, "checkpoint": 1})).unwrap_err()).contains("was merged"));
+        w.ok("project.remove", json!({"project": "shop"}));
+        w.settle();
+        assert_eq!(refs(&w), "");
+        assert!(w.d.store.checkpoints(&plain).unwrap().is_empty());
     }
 }

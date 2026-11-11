@@ -3,11 +3,12 @@
 
 /// The version of lilad's socket protocol. Bump it whenever a method, its parameters or its reply change in a way an older window or `lila`
 /// (or an older lilad) would get wrong; `ping` and `status` report it so a stale lilad is noticed (`client::daemon_version`).
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 pub mod accounts;
 pub mod check;
 pub mod changes;
+pub mod checkpoint;
 pub mod client;
 pub mod commands;
 pub mod daemon;

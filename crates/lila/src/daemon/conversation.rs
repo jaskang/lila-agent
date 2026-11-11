@@ -114,7 +114,7 @@ impl<T: Terminals> Daemon<T> {
         let cards: Vec<Value> = self.asking.iter().filter(|a| a.thread == t.id).map(super::permissions::card_json).collect();
         Ok(json!({
             "thread": self.thread_json(&t, now), "seq": seq, "items": items, "permissions": cards,
-            "writing": self.writing_of(&t.id), "config": self.config_json(&t),
+            "writing": self.writing_of(&t.id), "config": self.config_json(&t), "checkpoints": self.checkpoint_rows(&t, now)?,
         }))
     }
 
@@ -154,6 +154,9 @@ impl<T: Terminals> Daemon<T> {
         };
         if self.merging.contains(&t.id) {
             bail!("{} is being merged", t.id);
+        }
+        if self.restoring.contains(&t.id) {
+            bail!("{} is having its files put back", t.id);
         }
         match live.status {
             AgentStatus::Blocked => bail!("{} is waiting for an answer (its card, or its terminal): give it first", t.id),

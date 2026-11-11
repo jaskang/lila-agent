@@ -1,14 +1,16 @@
 //! Work that blocks, so lilad does it off its loop: what git does for a thread (a worktree made, its
-//! changes and diffs, a merge with its commit hooks). A request that needs one answers when it is done:
+//! changes and diffs, a merge with its commit hooks, a checkpoint of its folder and putting its files
+//! back). A request that needs one answers when it is done:
 //! `begin` says what to run, the server runs it on a thread of its own, and `finish` (back on the loop)
 //! turns its result into the answer and does what follows from it. The summaries of changes that threads
 //! show are refreshed the same way, without anyone asking (`refresh_changes`), one at a time.
 
 use super::*;
 use crate::changes::{self, Summary};
+use crate::checkpoint::{self, Prev, Restored, Taken};
 use crate::{merge, worktree};
 use lila_agent::Attachment;
-use lila_store::{Base, NewThread};
+use lila_store::{Base, Checkpoint, NewThread};
 
 /// What a request comes to: its answer, or work to run first.
 pub enum Begin {
@@ -23,7 +25,7 @@ pub(super) struct Plan {
     pub files: Vec<Attachment>,
 }
 
-enum Work {
+pub(super) enum Work {
     /// `thread.new` with a worktree: make it, then start the thread.
     Worktree { plan: Plan, main: PathBuf, path: PathBuf, branch: String },
     /// A thread's changes. `quiet`: lilad asked, for the summary, not a request.
@@ -34,6 +36,12 @@ enum Work {
     Merge { thread: String, job: merge::Job },
     /// A merged thread's worktree and branch, or those of a thread that did not start.
     Remove { thread: String, main: PathBuf, path: PathBuf, branch: String },
+    /// A checkpoint of the folder before a turn (`daemon/checkpoints.rs`). `deliver`: the thread's words wait for it and go when it is done.
+    Checkpoint { thread: String, n: i64, cwd: PathBuf, text: String, prev: Option<Prev>, at_ms: i64, deliver: bool },
+    /// `thread.restore`: the folder's files go back to `target` (a dry run only says what would be done).
+    Restore { thread: String, cwd: PathBuf, target: Box<Checkpoint>, undo_n: i64, prev: Option<Prev>, dry_run: bool },
+    /// The checkpoint refs of threads that are gone, in the repository `dir` is in.
+    DropRefs { dir: PathBuf, threads: Vec<String> },
 }
 
 /// Work to run off the loop. `run` blocks; `Daemon::finish` takes what it gives.
@@ -49,6 +57,10 @@ pub enum Output {
     Dirty { repo: bool, dirty: bool },
     Merged(merge::Merged),
     Removed,
+    /// `None`: the folder is not in a git repository.
+    Checkpoint(Option<Taken>),
+    Restored(Restored),
+    Dropped,
 }
 
 impl Job {
@@ -63,7 +75,19 @@ impl Job {
             Work::CommitCheck { cwd, .. } => changes::changes(cwd, env, None).map(|c| Output::Dirty { repo: c.repo, dirty: c.count > 0 }).map_err(words),
             Work::Merge { job, .. } => merge::run(job).map(Output::Merged).map_err(words),
             Work::Remove { main, path, branch, .. } => worktree::remove(main, path, branch, env).map(|_| Output::Removed).map_err(words),
+            Work::Checkpoint { thread, n, cwd, prev, .. } => checkpoint::take(cwd, env, &checkpoint::Spec { thread, n: *n, prev: prev.as_ref(), keep_below: n - checkpoint::KEEP }).map(Output::Checkpoint).map_err(words),
+            Work::Restore { thread, cwd, target, undo_n, prev, dry_run } => {
+                let goal = checkpoint::Target { sha: &target.sha, tree: &target.tree, head: target.head.as_deref() };
+                let undo = checkpoint::Spec { thread, n: *undo_n, prev: prev.as_ref(), keep_below: undo_n - checkpoint::KEEP };
+                checkpoint::restore(cwd, env, &goal, (!dry_run).then_some(&undo)).map(Output::Restored).map_err(words)
+            }
+            Work::DropRefs { dir, threads } => threads.iter().try_for_each(|t| checkpoint::drop_all(dir, env, t).map(|_| ())).map(|_| Output::Dropped).map_err(words),
         }
+    }
+
+    /// Takes a checkpoint (tests settle these first, as lilad's server runs them at once).
+    pub fn is_checkpoint(&self) -> bool {
+        matches!(*self.work, Work::Checkpoint { .. })
     }
 
     /// Runs on the one thread that counts changes for the summaries, not on a thread of its own: many at once (a restart) would be too much git.
@@ -90,11 +114,14 @@ impl<T: Terminals> Daemon<T> {
             }
             "thread.commit" => self.commit_begin(params, now),
             "thread.merge" => self.merge_begin(params, now),
+            "thread.restore" => self.restore_begin(params, now),
+            // The turn is not let begin before its checkpoint is taken: the hook waits for the job.
+            "hook" if s(params, "event") == Some("UserPromptSubmit") => self.prompt_begin(params, now),
             other => Ok(Begin::Done(self.dispatch(other, params, now)?)),
         }
     }
 
-    fn job(&self, work: Work) -> Job {
+    pub(super) fn job(&self, work: Work) -> Job {
         Job { work: Box::new(work), path_env: self.path_env.clone() }
     }
 
@@ -183,6 +210,7 @@ impl<T: Terminals> Daemon<T> {
                         self.store.event(&thread, "lilad", "merged", &detail, now)?;
                         self.say(format!("{thread}: merged, {detail}"));
                         self.remove_later(&thread, merge_job.main.clone(), merge_job.worktree.clone(), merge_job.branch.clone());
+                        self.drop_checkpoints_later(std::slice::from_ref(&thread), merge_job.main.clone())?;
                         self.set_summary(&thread, None);
                         self.mark(&thread);
                         let t = self.store.thread(&thread)?.ok_or_else(|| anyhow!("no thread {thread}"))?;
@@ -195,6 +223,14 @@ impl<T: Terminals> Daemon<T> {
                     }
                     Ok(_) => unreachable!("a merge job gives a merge"),
                 }
+            }
+            Work::Checkpoint { thread, n, cwd, text, at_ms, deliver, .. } => self.checkpoint_done(&thread, n, cwd, text, at_ms, deliver, result, now),
+            Work::Restore { thread, target, undo_n, dry_run, .. } => self.restore_done(&thread, *target, undo_n, dry_run, result, now),
+            Work::DropRefs { threads, .. } => {
+                if let Err(e) = result {
+                    self.say(format!("could not delete the checkpoints of {}: {e}", threads.join(", ")));
+                }
+                Ok(Value::Null)
             }
             Work::Remove { thread, .. } => {
                 if let Err(e) = result {
@@ -222,9 +258,12 @@ impl<T: Terminals> Daemon<T> {
     }
 
     /// Nothing is going on in the thread: its agent is idle (`or_ended`: or gone, which a merge does not mind; a commit needs the agent).
-    fn check_free(&self, t: &Thread, or_ended: bool, now: i64) -> Result<()> {
+    pub(super) fn check_free(&self, t: &Thread, or_ended: bool, now: i64) -> Result<()> {
         if self.merging.contains(&t.id) {
             bail!("{} is being merged", t.id);
+        }
+        if self.restoring.contains(&t.id) {
+            bail!("{} is being restored", t.id);
         }
         match self.state_of(t, now).0 {
             ThreadState::Idle => Ok(()),
@@ -257,7 +296,7 @@ impl<T: Terminals> Daemon<T> {
         }
         self.check_free(&t, true, now)?;
         // Words an agent that is still up has not taken yet go to it first; an ended one will never take them.
-        if self.state_of(&t, now).0 != ThreadState::Ended && !self.store.outbox(&t.id)?.is_empty() {
+        if self.state_of(&t, now).0 != ThreadState::Ended && self.has_words_waiting(&t.id)? {
             bail!("{} has a message waiting for its agent; let it be taken first", t.id);
         }
         let main = self.projects.get(&t.project).map(|p| p.cwd.clone()).ok_or_else(|| anyhow!("unknown project {}", t.project))?;

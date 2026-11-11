@@ -125,7 +125,7 @@ pub struct ChangeDiff {
 }
 
 /// A throwaway copy of the folder's index, removed when dropped.
-struct TempIndex(PathBuf);
+pub(crate) struct TempIndex(pub(crate) PathBuf);
 
 impl Drop for TempIndex {
     fn drop(&mut self) {
@@ -134,14 +134,15 @@ impl Drop for TempIndex {
 }
 
 /// The git command line for one folder: never takes the person's index lock (`status` would, to refresh it).
-struct Git<'a> {
-    cwd: &'a Path,
-    path_env: &'a str,
-    index: Option<&'a Path>,
+pub(crate) struct Git<'a> {
+    pub(crate) cwd: &'a Path,
+    pub(crate) path_env: &'a str,
+    /// Work on this index instead of the person's (`GIT_INDEX_FILE`).
+    pub(crate) index: Option<&'a Path>,
 }
 
 impl Git<'_> {
-    fn command(&self, args: &[&str]) -> Command {
+    pub(crate) fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new("git");
         c.args(["-c", "core.quotepath=false"]).args(args).current_dir(self.cwd).env("PATH", self.path_env).env("GIT_OPTIONAL_LOCKS", "0").stdin(Stdio::null());
         if let Some(i) = self.index {
@@ -150,7 +151,7 @@ impl Git<'_> {
         c
     }
 
-    fn bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
+    pub(crate) fn bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
         let o = self.command(args).output().with_context(|| format!("git {}", args.join(" ")))?;
         if !o.status.success() {
             bail!("git {}: {}", args.join(" "), said(&o));
@@ -158,7 +159,7 @@ impl Git<'_> {
         Ok(o.stdout)
     }
 
-    fn text(&self, args: &[&str]) -> Result<String> {
+    pub(crate) fn text(&self, args: &[&str]) -> Result<String> {
         Ok(String::from_utf8_lossy(&self.bytes(args)?).trim().to_owned())
     }
 
@@ -188,8 +189,8 @@ fn head(g: &Git) -> String {
     }
 }
 
-/// A copy of the index with the files git does not know yet entered as intent-to-add.
-fn temp_index(g: &Git) -> Result<TempIndex> {
+/// A copy of the person's index, to work on instead of it: the stat information in it is reused, so git does not read every file again.
+pub(crate) fn copy_index(g: &Git) -> Result<TempIndex> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let real = g.text(&["rev-parse", "--git-path", "index"])?;
     let real = if Path::new(&real).is_absolute() { PathBuf::from(real) } else { g.cwd.join(real) };
@@ -198,7 +199,12 @@ fn temp_index(g: &Git) -> Result<TempIndex> {
     if real.is_file() {
         std::fs::copy(&real, &copy).with_context(|| format!("copy {}", real.display()))?;
     }
-    let index = TempIndex(copy);
+    Ok(TempIndex(copy))
+}
+
+/// A copy of the index with the files git does not know yet entered as intent-to-add.
+fn temp_index(g: &Git) -> Result<TempIndex> {
+    let index = copy_index(g)?;
     Git { index: Some(&index.0), ..*g }.bytes(&["add", "-N", "-A"])?;
     Ok(index)
 }

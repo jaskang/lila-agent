@@ -1,6 +1,6 @@
 # Lila 架构 v4：项目与会话（lilad 的 socket 接口）
 
-> 2026-11-10 · P1a（后端）和 P1b（窗口，见 §9）；2026-11-11 · P2 后端（worktree、改动、提交、合并，见 §4、§10）。需求见 `product-v4.md`；引擎驱动和对话事件模型见 `architecture-v3.md`（继续有效）。
+> 2026-11-10 · P1a（后端）和 P1b（窗口，见 §9）；2026-11-11 · P2 后端（worktree、改动、提交、合并，见 §4、§10）；2026-11-11 · A1 后端（每轮检查点和回退，协议版本 2，见 §11）。需求见 `product-v4.md`；引擎驱动和对话事件模型见 `architecture-v3.md`（继续有效）。
 > 本文和代码一致，窗口只看这份就能接。旧实现（任务、成员、请求）在标签 `v3-final`。
 
 ## 1. 模型
@@ -49,7 +49,7 @@
 
   另有 `status`：终端报的原始词（`idle`/`working`/`blocked`/`done`/`error`/`unknown`/`gone`）。
 
-- **数据库**（`lila-store`，SQLite，`PRAGMA user_version = 5`）：`projects`、`threads`、`conv_items`（按会话递增的 `seq`）、`outbox`（引擎还不能收时排队的话）、`thread_events`（lilad 自己做过的事）。**v3 的库不迁移**：打开 v3 的库（没有版本号、有 `tasks` 表）时，文件改名为 `lila.db.v3.bak`，新库从空开始。**v4 的库平滑升级**：版本 5 给 `threads` 加了 `worktree`（默认 0）、`base_branch`、`base_commit`、`merged_ms` 四列；`migrate` 每次打开都按 `pragma_table_info` 查缺哪列就 `ALTER TABLE ADD COLUMN`，已有会话变成「不是 worktree」，再打开不变。以后只加列的改动照这样加到 `ADDED_COLUMNS`。
+- **数据库**（`lila-store`，SQLite，`PRAGMA user_version = 6`）：`projects`、`threads`、`conv_items`（按会话递增的 `seq`）、`outbox`（引擎还不能收时排队的话；`hold = 1` 的是「随下一条消息一起发的备注」，自己不会被发出）、`thread_events`（lilad 自己做过的事）、`checkpoints`（§11：`thread, n, kind(turn|restore), at_ms, sha, tree, head, branch, text, item`，主键 `(thread, n)`）。**v3 的库不迁移**：打开 v3 的库（没有版本号、有 `tasks` 表）时，文件改名为 `lila.db.v3.bak`，新库从空开始。**v4 的库平滑升级**：版本 5 给 `threads` 加了 `worktree`（默认 0）、`base_branch`、`base_commit`、`merged_ms` 四列；`migrate` 每次打开都按 `pragma_table_info` 查缺哪列就 `ALTER TABLE ADD COLUMN`，已有会话变成「不是 worktree」，再打开不变。以后只加列的改动照这样加到 `ADDED_COLUMNS`（现在是 `(表, 列, 定义)`，版本 6 加了 `outbox.hold`；新表用 `CREATE TABLE IF NOT EXISTS`，版本 6 加了 `checkpoints`）。旧库打开后原有的会话、排队的话都照旧。
 - `changes` 摘要**不进数据库**：lilad 在内存里记，启动时给每个没归档的会话数一遍（后台一个一个数）。
 
 ## 2. 进程与终端
@@ -72,6 +72,8 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 请求：`{"method": "thread.list", "params": {...}}`；回复：`{"result": ...}` 或 `{"error": "文字"}`。一条连接可以连着发多个请求，回复按请求的顺序一行一行回来。窗口用 `lila::client::request(paths, method, params, autostart)`；`autostart` 为真时 lilad 没跑就先在 hc 里启动它。
 
 **请求 id**（可选）：请求里可以带 `"id"`（任意 JSON 字符串或数字），lilad 原样放进这条请求的回复：`{"id": "a-1", "result": ...}`、`{"id": 7, "error": "…"}`，`subscribe` 和 `host.attach` 的第一条回复也带。不带 id 的请求，回复和以前一模一样。`id` 是别的类型（对象、数组、布尔）回 `{"error": "bad request: id must be a string or a number"}`；`null` 当作没带；整行不是 JSON 时没有 id 可回。这只是给以后的远程客户端留的：lilad 不做多路复用，回复仍然按顺序，不会乱序。`lila::client` 现在不发 id。
+
+**协议版本 2**（A1）：加了 `thread.checkpoints`、`thread.restore`，`thread.read` 多了 `checkpoints`，会话多了 `restoring`，条目多了 `from: "restored"`。窗口用这些就要求 `protocol >= 2`。
 
 **版本握手**：`lila::PROTOCOL`（`crates/lila/src/lib.rs`）是 socket 协议的版本号，方法、参数、回复有不兼容的改动就加一。`ping` 和 `status` 都带 `version`（`CARGO_PKG_VERSION`）和 `protocol`。窗口和命令行用 `lila::client::daemon_version` 比较：协议一样、不一样（带两边的数字；还没有这套握手的旧 lilad 不报协议，算不一样）、没有运行、连不上。重装或重新编译后，旧 lilad 会一直跑着（会话在各自的终端里，重启 lilad 是安全的），所以窗口和 `lila daemon status` 会提示，`lila daemon restart` 或窗口里的按钮重启它。
 
@@ -127,6 +129,8 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 | `thread.file` | `thread`, `path` | `{path, text?, binary?, too_large?, size}`，见下 |
 | `thread.commit` | `thread` | `{sent: true, thread}`。让 agent 提交，见下 |
 | `thread.merge` | `thread` | 把 worktree 会话的工作合并回 `base_branch`，见下 |
+| `thread.checkpoints` | `thread` | 每轮开始前的文件夹快照，新到旧，见 §11 |
+| `thread.restore` | `thread`, `checkpoint`, `dry_run?` | 把文件夹里的文件放回到某个检查点，见 §11 |
 | `thread.log` | `thread`, `limit?`(50) | `[{at_ms, actor, kind, detail}]`：lilad 自己做过的事，见下 |
 
 会话：
@@ -137,7 +141,7 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
  "state": "idle", "status": "idle", "waiting": null, "cards": 0, "msg": null,
  "terminal": "t78"|null, "caps": {"tui": false, "gui": true, "steer": true},
  "created_ms": 0, "active_ms": 0, "started_ms": 0, "ended_ms": null, "archived": false,
- "worktree": false, "base_branch": null, "base_commit": null, "merged_ms": null, "merging": false,
+ "worktree": false, "base_branch": null, "base_commit": null, "merged_ms": null, "merging": false, "restoring": false,
  "changes": {"files": 3, "add": 40, "del": 2}|null}
 ```
 
@@ -146,11 +150,13 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 `thread.read`：
 
 ```json
-{"thread": {会话}, "seq": 12, "items": [...], "permissions": [卡片], "writing": "正在写的回复"|null,
+{"thread": {会话}, "seq": 12, "items": [...], "permissions": [卡片], "writing": "正在写的回复"|null, "checkpoints": [检查点],
  "config": {"model": "…", "effort": "…", "default_model": "…", "default_effort": "…", "switch": true, "models": [{id,name}], "efforts": [{id,name}]}}
 ```
 
 - `items`：`seq` 大于 `after` 的条目，旧到新；超过 `limit` 取最新的。同一个 `id` 的条目更新时整条覆盖并拿到新的 `seq`，所以客户端按 `id` 替换。`seq` 是返回的最大序号，下次当 `after`。条目格式是 `lila_agent::Item`：`{id, turn?, at_ms, state: running｜done｜failed, kind: user_message｜agent_message｜thought｜tool_call, …}`，用户消息带 `from: person｜local｜summary`，工具调用带 `tool`（`execute/read/edit/search/fetch/delete/…`）、`name`、`title`、`output?`、`diffs?`。
+- `checkpoints`：和 `thread.checkpoints` 的 `checkpoints` 一样（§11）。窗口用其中的 `item` 把「回到这里」挂到对应的用户消息上；因为 `item` 可能比消息晚才有，窗口每次读都按这份列表重新挂，不要只看新来的条目。
+- `from: "restored"` 的条目：回退留下的安静标记，`{id: "restored-<检查点>-<毫秒>", kind: "user_message", from: "restored", checkpoint: 3, undo: 7, text: "…", at_ms}`；窗口自己画「已回到这里」，`undo` 是回退前状态的检查点（可以再回退一次来撤销）。
 - `writing`：Claude 的 `MessageDisplay` 增量攒出的「正在写」，会话记录里有了回复就清掉。
 - `permissions`：待答的卡片：
 
@@ -191,7 +197,7 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 
 **改动摘要**（`changes` 字段）不是实时的：lilad 在这些时候重新数，**变了才**推送（`thread` 事件，`changes` 字段也带在事件里）：每一轮结束（Claude 的 Stop 和 StopFailure hook、终端状态从工作中/被拦转为空闲，Codex、omp 的 turn 结束）、`thread.commit` 发出后、`thread.merge` 之后、会话建好时、取消归档时、lilad 启动时（所有没归档的会话）。一轮进行当中不数，更不是每 100ms 跑 git；用户自己在 worktree 里改文件要等下一次触发才反映，窗口要最新的就调 `thread.changes`（它也会更新摘要）。摘要在后台一个一个数，同一个会话数的时候又被要求就在数完后再数一次。
 
-`thread.log` 的 `kind`：`started`、`ended`、`resumed`、`auto_allowed`、`auto_denied`、`asked`（开了卡片）、`answered`、`dismissed`、`permission`（档位切换）、`turn_failed`、`notice`、`limit`、`commit`（要 agent 提交）、`merged`（`detail`：`2 commit(s) into main as f898670`）、`merge_failed`。`auto_allowed`/`auto_denied` 记着档位和请求，是审计「lilad 替你答了什么」的地方。
+`thread.log` 的 `kind`：`checkpoint_failed`（这一轮没打成检查点，`detail` 是原因，轮照常进行）、`restored`（`detail`：`checkpoint 3 (首行): 1 put back, 1 made again, 1 deleted; undo is checkpoint 7`）、`restore_failed`、`started`、`ended`、`resumed`、`auto_allowed`、`auto_denied`、`asked`（开了卡片）、`answered`、`dismissed`、`permission`（档位切换）、`turn_failed`、`notice`、`limit`、`commit`（要 agent 提交）、`merged`（`detail`：`2 commit(s) into main as f898670`）、`merge_failed`。`auto_allowed`/`auto_denied` 记着档位和请求，是审计「lilad 替你答了什么」的地方。
 
 ### 其他
 
@@ -270,6 +276,8 @@ lila thread changes <id>             # 分支、提交（worktree）、改动的
 lila thread diff <id> [路径]          # 改动的 diff（一个文件或全部）
 lila thread commit <id>              # 让 agent 提交（它写信息，不推送）
 lila thread merge <id>               # worktree 会话合并回起点分支，删 worktree，归档
+lila thread checkpoints <id>         # 检查点：编号、时间、HEAD、它之前那条消息的首行
+lila thread restore <id> <编号> [--dry-run]   # 文件放回到那个检查点；--dry-run 只列出会改哪些文件
 lila thread log <id>
 lila daemon run|stop|status|restart  # status：协议和窗口的不一样时说怎么办，退出码 3 没有运行、4 协议不一样；restart：停、等 socket 没了、再启动（会话不断）
 lila usage [--days N]                # 按会话统计 token（用数据库里的 session id 对会话记录文件）
@@ -291,6 +299,8 @@ lila --json …                        # 任何命令都能输出原始 JSON
 | `lila/src/worktree.rs` | 会话的 worktree：建（`create`）、删（`remove`）、git 命令行的小工具 |
 | `lila/src/changes.rs` | 改动列表、diff、读文件（`thread.changes/diff/file`） |
 | `lila/src/merge.rs` | squash、放到起点分支最新提交之上、项目文件夹 `--ff-only`（`thread.merge`） |
+| `lila/src/checkpoint.rs` | 检查点的 git 工作（§11）：打快照、放回、删 ref |
+| `lila/src/daemon/checkpoints.rs` | 什么时候打、检查点怎么对上对话里的消息、回退的前置条件和后续 |
 | `lila/src/policy.rs` | 档位判定（§6） |
 | `lila/src/project.rs` | project.toml 的读写 |
 | 留着、没人调用的 | `github.rs`、`daemon/sources.rs`（P4）；它们不依赖任务和流程，能独立编译、有测试 |
@@ -314,6 +324,7 @@ lila --json …                        # 任何命令都能输出原始 JSON
 | 移除项目 | `project.remove` |
 | 右面板：文件、改动（P2） | 标题行按钮和 ⇧⌘E / ⇧⌘G 开关，宽度、视图记在 `state/app-panel.json`。文件树 `thread.files`，预览 `thread.file`；改动 `thread.changes`、点开一行 `thread.diff {path}`；提交 `thread.commit`，合并 `thread.merge`（确认后；成功就离开会话）。重新读的时机：打开、切视图、换会话、推送里该会话的 `changes` 摘要或 `state` 变了、提交或合并之后 |
 | 新会话选独立 worktree | `project.list` 的 `repo` 为真才有开关；发出时 `thread.new {…, worktree: true}`（回复要等 worktree 建好，窗口在后台等，发送按钮转圈） |
+| 每轮的「回到这里」（A1） | `thread.read` 的 `checkpoints`（`item` 对上用户消息）；点了先 `thread.restore {dry_run: true}` 拿到文件清单放进确认框，确认后 `thread.restore`（后台线程里调，回复可能要几秒）；`thread.restore` 失败的文字原样显示（会话在跑、有排队的话……）。条目 `from: "restored"` 画成「已回到这里」，带「撤销」按钮就是 `thread.restore {checkpoint: undo}`。重读的时机同改动面板：回复之后、推送里该会话的 `state` 变了 |
 | 已合并的会话 | `merged_ms` 有值：输入框换成「已合并到 <base_branch> · <sha>」，sha 从 `thread.log` 里 `merged` 那条的 `detail`（`… as f898670`）取 |
 
 - 窗口记着：上次显示的会话和项目、哪些会话切成了终端视图（`state/app-tabs.json`、`app-views.json`）。折叠的项目、归档开关不记。
@@ -326,3 +337,69 @@ lila --json …                        # 任何命令都能输出原始 JSON
 - **留**：归档、结束（`thread.stop`）都不动 worktree；`thread.resume` 在同一个 worktree 里继续（worktree 的文件夹被手工删了会报错）。项目被移除（`project.remove`）也**不**删它的 worktree 和分支。没有单独删 worktree 的入口，`thread.merge` 是唯一会删的地方。
 - **合并**（`merge::run`，在主循环外）：分支上相对 `base_branch` 的全部提交（`base_branch..HEAD`）压成一个提交——只有一个提交就原样用它；多个就用会话标题当第一行、正文逐条列各提交的标题（`- 标题`）——放到 `base_branch` 最新提交之上（`git rebase`），再在项目文件夹里 `git merge --ff-only`，所以项目文件夹的分支只是向前移动；然后会话的引擎结束、会话归档并记 `merged_ms`，worktree 和分支由另一个后台 job 删掉（失败记 `notice`，不影响合并的结果）。`git commit`（压缩时）和 rebase 照常跑用户的 hook 和 git 配置。开始改动 worktree 之前先查完所有会失败的条件（见 `thread.merge`）；rebase 冲突、commit hook 拒绝、ff 失败时 `git reset --hard` 回合并前的提交、`rebase --abort`，worktree 的分支和项目文件夹都是原样。ff 时 `base_branch` 刚好又前进了就重新 rebase 再试（最多重试 3 次）。
 - **已知的局限**：worktree 里只有 git 跟踪的文件，被忽略的（`.env`、`node_modules/`、`target/`）不会带过去，引擎在里面可能跑不起来，目前不处理；Claude Code 对每个新文件夹会先问「信任这个文件夹」（和 P1 留下的问题一样，`waiting: terminal`）；`.lila/project.toml` 没提交的话 worktree 里没有它。
+
+## 11. 检查点和回退（A1）
+
+用户定的：**只有文件回去，对话不动**（不去回滚引擎的会话）。会话默认全自动，agent 改坏了要有退路。
+
+### 怎么打
+
+快照是一次不动用户仓库状态的提交（`checkpoint.rs`，git 命令行，不用 libgit2）：把用户的 index 复制一份（`GIT_INDEX_FILE`，复制是为了沿用它的 stat 缓存，大仓库快）→ 在副本上 `git add -A -- .` → `git write-tree` → `git commit-tree`（父提交是 HEAD，还没有提交就没有父提交；作者固定 `Lila <lila@localhost>`，关掉签名）→ `git update-ref refs/lila/checkpoints/<会话>/<n>` 留住它。**HEAD、分支、用户的 index、stash、工作区都不动**（测试里比较了 `git status --porcelain=v2`、HEAD、分支、stash、index 文件的字节）。
+
+- **范围是会话的 `cwd`，不是整个仓库**：`cwd` 在大仓库的子文件夹里时，只存、也只回退那个子文件夹（`git add -A -- .`；回退时 `diff-tree --relative`）。理由：`cwd` 是权限判定的「工作区」，回退会删文件，不能越出它。树里 `cwd` 以外的部分是用户 index 里原有的，不会被回退碰。
+- 内容：已跟踪文件当前的样子（含未提交、已暂存的改动）、没被忽略的新文件；已删除的不在里面。`.gitignore`（含全局的）忽略的文件不进快照，回退也不碰。
+- 没有变化：和该会话上一个检查点的树、HEAD 都一样，就用上一个的提交；文件夹正好等于 HEAD 的树，就用 HEAD 本身（不写任何对象）。每一轮仍各有一行记录和各自的 ref，所以每轮都能回。
+- `cwd` 不在 git 仓库里（或会话已合并）：不打，不记录，不拖慢（`maybe_repo` 往上找 `.git`，不起进程，没有就跳过）。
+- **什么时候打**（要求：在引擎对这一轮的消息动文件之前；lilad 主循环不被 git 卡住；打不成不拦消息）：
+  - **Claude Code：在 `UserPromptSubmit` hook 里**（`hooks.rs` → `prompt_begin`）。Claude Code 会等 hook 返回才开始这一轮，所以快照一定在它动文件之前；窗口发的、Lila 自己发的（提交的备注），或用户在 Claude 自己的终端里打的，都走同一个点，不会打两次。`deliver` 对 Claude 不打。hook 的答复要等 job 做完才回（和 `thread.merge` 一样，job 在线程里跑）；hook 超时从 10 秒改成 30 秒（只对新启动或 `resume` 的会话生效，旧会话的 settings 文件里仍是 10 秒，超时了 Claude 照常往下走，快照可能含这一轮开头的一点改动）。
+  - **Codex、omp：在 `deliver` 里**，话发给 host 之前：话留在 outbox 里，job 做完才发（`snapshotting`）。只在引擎空闲（`idle`/`done`）、这些话会开始新一轮时打；Codex 在跑的时候发的话进当前这一轮（steer），不打。omp 运行中收不了话，所以 omp 的话现在留在 lilad 的 outbox 里，等它空闲再发（以前是先交给 host 排队），好让快照是下一轮之前的。
+  - 失败（git 不能跑、index 有未解决的冲突……）：记 `thread_events`（`checkpoint_failed`），消息照发。
+- 数量：每个会话保留编号在「最新编号 − 50」之后的，更老的删 ref **也删记录**（编号不重用）。会话合并后（worktree 删掉时）、项目被移除时，删它们所有的 ref（一个后台 job；ref 在共享的 `.git` 里，worktree 会话的也由主仓库的路径删）和记录。
+
+### 检查点和对话里的消息怎么对上
+
+引擎给条目的 id 各不相同，Claude 的还要等 0.4 秒后从会话记录里读到，所以检查点一开始没有 `item`。lilad 在每次 `thread.read` / `thread.checkpoints` 时（`resolve_checkpoints`）给还没对上的检查点找消息：按编号从旧到新，取**从它的时间（宽限 3 秒）起、还没被别的检查点用掉、说的话一样的第一条** `from` 为 `person` 或 `lila` 的用户消息；对上就写进记录，之后不变。「话一样」比较的是去掉 `<lila note>` 和粘贴包装、压缩空白之后的开头（Claude 会把附件当 `@路径` 加在后面，所以允许一边是另一边的开头）。同样的话说两遍，各自对上各自的。一个检查点的消息一直没出现（Claude 拒绝了那条、`/` 命令），等后面的检查点对上之后它就被放弃（`item` 记成空，对外是 `null`），它仍然能回退。窗口永远是拿 `thread.read` 里的 `checkpoints` 列表按 `item` 去对条目，不是在条目上找。
+
+检查点的一行（`thread.checkpoints` 的 `checkpoints` 和 `thread.read` 的 `checkpoints` 一样）：
+
+```json
+{"id": 3, "kind": "turn"|"restore", "at_ms": 0, "title": "它之前那条消息的首行（100 字内）", "item": "u7"|null,
+ "restorable": true, "head": "847b0c2"|null, "branch": "main"|null}
+```
+
+`kind: "restore"` 是回退之前自动存的当时状态，没有消息（`title` 是一句英文说明）。`restorable` 是「现在提交 `thread.restore` 会不会被接受」（和会话的状态有关，同一时刻每行一样）。
+
+`thread.checkpoints {thread}` → `{"checkpoints": [...新到旧], "can_restore": true, "why_not": null|"文字"}`。
+
+### 回退
+
+`thread.restore {thread, checkpoint, dry_run?}`。只在会话 `idle` 或 `ended` 时，其余（在跑、等回答、正在启动、正在合并或回退、已合并）拒绝；没有排队没发的话（`ended` 的不看这条）；没有一条消息正等着快照；同一个文件夹里没有别的会话在跑（或在等权限卡片）——两个会话共用一个文件夹时，回退会连带撤销另一个会话的改动，所以先用 `dry_run` 看文件清单，别的不处理。`dry_run` 同样先过这些检查。
+
+回复（`dry_run` 和真回退同一个形状；`dry_run` 时 `restored: false`、`undo: null`）：
+
+```json
+{"thread": "t…", "checkpoint": 3, "dry_run": false, "restored": true, "undo": 7,
+ "head_moved": false, "head": {"then": "847b0c2", "now": "847b0c2"},
+ "changed": ["src/a.rs"], "recreated": ["b.txt"], "deleted": ["new.txt"],
+ "counts": {"changed": 1, "recreated": 1, "deleted": 1}, "truncated": false}
+```
+
+`changed`：现在和检查点里内容不同的文件，会放回去；`recreated`：检查点里有、现在没有的，会重新做出来；`deleted`：现在有、检查点里没有（且没被忽略）的，会删掉。路径相对 `cwd`；每个清单最多 500 个，`counts` 是全部，超出 `truncated: true`。`head_moved`：HEAD 和检查点那时不同（其间有提交）：**文件照样放回去，HEAD、分支、index 一律不动**，所以面板里这些提交的内容会显示成未提交的改动（暂时接受）。
+
+真回退的步骤（job，在主循环外）：先给**现在的状态**打一个检查点（`kind: "restore"`，编号在 `undo` 里；这一步失败就整个不做）→ 删「现在有、检查点里没有」的文件，再删因此空了的文件夹（到 `cwd` 为止；里面还有被忽略的文件的文件夹留着；是仓库里的另一个仓库的文件夹不删）→ 用一份临时 index（`read-tree` 检查点的树）加 `git checkout-index -f` 把其余文件写回（权限位、符号链接、用户的换行设置都和 git 检出一样；用户的 index 不参与）。中途失败：报错说明「做到一半，检查点 N 是回退之前的状态」。之后（在主循环）：
+
+1. `thread_events` 记 `restored`；
+2. 对话里加一条标记条目（`from: "restored"`，存在 `conv_items`，lilad 重启后还在）；
+3. 给 agent 排一条英文备注（`outbox` 里 `hold = 1`）：哪一轮之后的改动被撤销了、几个文件、HEAD 没动，让它再改文件前先重新读。**不开新的一轮，不花 token**：`hold` 的备注自己不会被发出，等人的下一条消息时放在它前面合成一条消息发出（`deliver_with`）。文件和检查点一模一样（没有差别）时不排备注。备注+人的话在引擎的回显里会被各个翻译器（Claude 会话记录、Codex、ACP）认出来，只显示人的话：`lila_agent::without_notes`；
+4. 重新数改动摘要。
+
+### 已知的局限
+
+- 只管文件：对话、引擎的内部状态、已经执行过的命令的副作用（装的依赖、数据库、网络请求）都不回。
+- 被忽略的文件不管：`node_modules/`、`target/`、`.env` 这类如果被 agent 改了，不会回来。一个文件在检查点时没被忽略、现在被忽略了（`.gitignore` 变了），会被检查点里的内容覆盖。
+- 范围是会话的 `cwd`；`cwd` 以外的改动不回。仓库里嵌套的仓库（子模块、自己有 `.git` 的文件夹）在快照里只是一条记录，里面的文件不管。
+- 打快照是 `git add -A`：大仓库首次要几秒（之后沿用 index 的 stat 缓存）；没被忽略的巨大文件夹（几 GB 的 `node_modules` 没写进 `.gitignore`）会变慢并占对象库。没有大小上限。
+- `refs/lila/checkpoints/*` 会出现在 `git log --all`、gitk 里；`git push --mirror` 会把它们一起推（`git push`、`--all` 不会）。
+- 回退只更新工作区的文件，**不更新用户的 index**：回退之前暂存的内容、回退后 index 里还是原来那份。
+- Claude 的 hook 超时 30 秒（旧会话 10 秒）：快照超时时 Claude 不等，这一轮可能已经开始动文件。Claude 运行中排队的消息会不会也触发 `UserPromptSubmit` 没有验证；如果会，那只是多一个检查点（无害，没变化就复用同一个提交）。
+- 回退进行中（几秒）用户在 Claude 自己的终端里提交了消息，这一轮不打检查点（记 `checkpoint_failed`）。

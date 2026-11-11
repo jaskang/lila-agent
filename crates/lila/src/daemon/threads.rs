@@ -74,6 +74,10 @@ impl<T: Terminals> Daemon<T> {
             self.tails.remove(&t.id);
             self.failed_sends.remove(&t.id);
         }
+        // Their checkpoints' refs are in the project's repository (a worktree's too: the refs are shared).
+        let ids: Vec<String> = self.store.threads(&pid, true)?.into_iter().map(|t| t.id).collect();
+        let dir = self.projects[&pid].cwd.clone();
+        self.drop_checkpoints_later(&ids, dir)?;
         self.store.remove_project(&pid)?;
         self.projects.remove(&pid);
         self.dirty_projects.insert(pid.clone());
@@ -267,6 +271,9 @@ impl<T: Terminals> Daemon<T> {
         if self.merging.contains(&t.id) {
             bail!("{} is being merged", t.id);
         }
+        if self.restoring.contains(&t.id) {
+            bail!("{} is having its files put back", t.id);
+        }
         if let Some(p) = self.projects.get(&t.project)
             && !p.cwd.is_dir()
         {
@@ -383,6 +390,11 @@ impl<T: Terminals> Daemon<T> {
 
     /// The words waiting for a thread, as one message, once its engine takes input.
     fn deliver(&mut self, tid: &str, now: i64) {
+        self.deliver_with(tid, now, false);
+    }
+
+    /// `checkpointed`: the checkpoint for the turn these words begin has just been taken (`checkpoints`).
+    pub(super) fn deliver_with(&mut self, tid: &str, now: i64, checkpointed: bool) {
         let Ok(Some(t)) = self.store.thread(tid) else {
             for m in self.store.outbox(tid).unwrap_or_default() {
                 let _ = self.store.pop_outbox(m.id);
@@ -390,17 +402,35 @@ impl<T: Terminals> Daemon<T> {
             return;
         };
         let (Some(terminal), Some(live)) = (t.terminal.clone(), self.live.get(tid)) else { return };
-        if self.merging.contains(tid) || !live.status.accepts_input() || (t.engine.hosted() && !self.hosts.contains_key(tid)) {
+        let status = live.status;
+        if self.merging.contains(tid) || self.restoring.contains(tid) || self.snapshotting.contains(tid) || !status.accepts_input() || (t.engine.hosted() && !self.hosts.contains_key(tid)) {
             return;
         }
         let msgs = self.store.outbox(tid).unwrap_or_default();
-        if msgs.is_empty() {
+        // Notes that wait for a message go in front of it; they never go alone.
+        let (notes, words): (Vec<_>, Vec<_>) = msgs.iter().partition(|m| m.hold);
+        if words.is_empty() {
             return;
         }
-        let text = msgs.iter().map(|m| m.text.as_str()).filter(|x| !x.is_empty()).collect::<Vec<_>>().join("\n\n");
-        let files: Vec<lila_agent::Attachment> = msgs.iter().flat_map(|m| serde_json::from_str::<Vec<lila_agent::Attachment>>(&m.attachments).unwrap_or_default()).collect();
+        // A host that cannot take words while it works (omp) gets them when it is free: that is when their turn begins.
+        if t.engine.hosted() && !Self::caps(t.engine).steer && !status.is_free() {
+            return;
+        }
+        let said = words.iter().map(|m| m.text.as_str()).filter(|x| !x.is_empty()).collect::<Vec<_>>().join("\n\n");
+        // These words begin a turn: the folder is saved first, and they go when that is done. (Claude Code's turns are saved by its hook.)
+        if !checkpointed
+            && t.engine.hosted()
+            && status.is_free()
+            && let Some(job) = self.checkpoint_job(&t, said.clone(), true, now)
+        {
+            self.snapshotting.insert(tid.to_owned());
+            self.jobs.push(job);
+            return;
+        }
+        let text = notes.iter().map(|m| m.text.as_str()).chain(std::iter::once(said.as_str())).filter(|x| !x.is_empty()).collect::<Vec<_>>().join("\n\n");
+        let files: Vec<lila_agent::Attachment> = words.iter().flat_map(|m| serde_json::from_str::<Vec<lila_agent::Attachment>>(&m.attachments).unwrap_or_default()).collect();
         // Type only if it is still idle. hc's `if` knows `idle` and `working` only; `done` (finished while unseen) takes input like idle, unguarded.
-        let guard = (live.status == AgentStatus::Idle && !t.engine.hosted()).then_some("idle");
+        let guard = (status == AgentStatus::Idle && !t.engine.hosted()).then_some("idle");
         match self.tell_with(&t, &terminal, &text, &files, guard) {
             Ok(()) => {
                 for m in &msgs {

@@ -474,7 +474,7 @@ fn item_of(i: &Value, turn: Option<String>, now_ms: i64) -> Option<Item> {
     let (kind, state) = match i["type"].as_str()? {
         "userMessage" => {
             let text = strings(&i["content"]);
-            let text = text.trim();
+            let text = without_notes(text.trim());
             // What went with the words: images by path, files as mentions (a skill is in the words as `$name`, a file named with `@` too).
             let attachments: Vec<Attachment> = i["content"]
                 .as_array()
@@ -666,6 +666,15 @@ mod tests {
         let said = s2.on_message(&json!({"method": "item/completed", "params": {"item": {"type": "userMessage", "id": "u9", "content": [{"type": "text", "text": "look"}, {"type": "localImage", "path": "/r/shot.png"}, {"type": "mention", "name": "notes.md", "path": "/r/notes.md"}, {"type": "skill", "name": "tdd", "path": "/s"}]}}}), 5);
         let AgentEvent::Item { item } = &said.events[0] else { panic!("{said:?}") };
         assert!(matches!(&item.kind, ItemKind::UserMessage { text, attachments, .. } if text == "look" && attachments.len() == 2 && attachments[0].kind == AttachmentKind::Image && attachments[1].name == "notes.md"));
+    }
+
+    #[test]
+    fn a_note_of_lila_in_front_of_the_words_is_not_shown_as_part_of_the_persons_message() {
+        let mut s = idle();
+        let text = "<lila note about=\"restore\">\nFiles were put back.\n</lila>\n\nfix it";
+        let said = s.on_message(&json!({"method": "item/completed", "params": {"item": {"type": "userMessage", "id": "u1", "content": [{"type": "text", "text": text}]}}}), 5);
+        let AgentEvent::Item { item } = &said.events[0] else { panic!("{said:?}") };
+        assert!(matches!(&item.kind, ItemKind::UserMessage { text, origin: Origin::Person, .. } if text == "fix it"), "{item:?}");
     }
 
     #[test]

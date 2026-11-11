@@ -10,14 +10,16 @@ use std::path::Path;
 /// and tables of tasks and members: it is moved aside and a new one starts empty. Later changes
 /// only add columns (`ADDED_COLUMNS`), which `migrate` adds to a table that lacks them.
 /// 5: threads got `worktree`, `base_branch`, `base_commit`, `merged_ms`.
-const VERSION: i64 = 5;
+/// 6: the `checkpoints` table, and `outbox.hold` (a note that goes out only with a message).
+const VERSION: i64 = 6;
 
-/// Columns added to `threads` after version 4: a v4 database gets them by `ALTER TABLE`.
-const ADDED_COLUMNS: [(&str, &str); 4] = [
-    ("worktree", "INTEGER NOT NULL DEFAULT 0"),
-    ("base_branch", "TEXT"),
-    ("base_commit", "TEXT"),
-    ("merged_ms", "INTEGER"),
+/// Columns added to a table after it first existed: an older database gets them by `ALTER TABLE`.
+const ADDED_COLUMNS: [(&str, &str, &str); 5] = [
+    ("threads", "worktree", "INTEGER NOT NULL DEFAULT 0"),
+    ("threads", "base_branch", "TEXT"),
+    ("threads", "base_commit", "TEXT"),
+    ("threads", "merged_ms", "INTEGER"),
+    ("outbox", "hold", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 const SCHEMA: &str = r#"
@@ -62,7 +64,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     thread TEXT NOT NULL,
     text TEXT NOT NULL,
     attachments TEXT NOT NULL DEFAULT '[]',
-    created_ms INTEGER NOT NULL
+    created_ms INTEGER NOT NULL,
+    hold INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS thread_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +76,19 @@ CREATE TABLE IF NOT EXISTS thread_events (
     detail TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS thread_events_thread ON thread_events (thread, id);
+CREATE TABLE IF NOT EXISTS checkpoints (
+    thread TEXT NOT NULL,
+    n INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    at_ms INTEGER NOT NULL,
+    sha TEXT NOT NULL,
+    tree TEXT NOT NULL,
+    head TEXT,
+    branch TEXT,
+    text TEXT NOT NULL DEFAULT '',
+    item TEXT,
+    PRIMARY KEY (thread, n)
+);
 "#;
 
 pub struct Store {
@@ -117,6 +133,53 @@ pub struct OutMessage {
     pub text: String,
     /// The `lila_agent::Attachment`s, as JSON.
     pub attachments: String,
+    /// A note for the agent that goes out with the next message, never by itself.
+    pub hold: bool,
+}
+
+/// What a checkpoint was taken for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointKind {
+    /// Before a turn began.
+    Turn,
+    /// Before files were put back to an earlier checkpoint: what that restore is undone by.
+    Restore,
+}
+
+impl CheckpointKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckpointKind::Turn => "turn",
+            CheckpointKind::Restore => "restore",
+        }
+    }
+}
+
+/// A snapshot of a thread's folder, kept alive by a ref in its repository (`lila::checkpoint`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Checkpoint {
+    pub thread: String,
+    /// The thread's own count, from 1; never used twice.
+    pub n: i64,
+    pub kind: CheckpointKind,
+    pub at_ms: i64,
+    /// The snapshot's commit, and its tree.
+    pub sha: String,
+    pub tree: String,
+    /// The folder's HEAD and branch then (none: no commit yet, detached HEAD).
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    /// The words of the message the turn began with (for a restore: what it was done to).
+    pub text: String,
+    /// The conversation item of that message: none until it is found, empty once it is known to have none.
+    pub item: Option<String>,
+}
+
+impl Checkpoint {
+    /// The item this checkpoint is attached to, once found.
+    pub fn matched_item(&self) -> Option<&str> {
+        self.item.as_deref().filter(|i| !i.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,10 +201,10 @@ fn open_db(path: &Path) -> Result<Connection> {
 fn migrate(db: &Connection) -> Result<()> {
     db.execute_batch(SCHEMA)?;
     // A table made by an earlier version has fewer columns: add what is missing, whatever the version said.
-    let have: Vec<String> = db.prepare("SELECT name FROM pragma_table_info('threads')")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    for (name, ddl) in ADDED_COLUMNS {
+    for (table, name, ddl) in ADDED_COLUMNS {
+        let have: Vec<String> = db.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         if !have.iter().any(|c| c == name) {
-            db.execute_batch(&format!("ALTER TABLE threads ADD COLUMN {name} {ddl}"))?;
+            db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {ddl}"))?;
         }
     }
     db.pragma_update(None, "user_version", VERSION)?;
@@ -264,7 +327,7 @@ impl Store {
     /// Forgets a project and everything Lila recorded for it. Its folder is not touched.
     pub fn remove_project(&self, project: &str) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        for table in ["conv_items", "outbox", "thread_events"] {
+        for table in ["conv_items", "outbox", "thread_events", "checkpoints"] {
             tx.execute(&format!("DELETE FROM {table} WHERE thread IN (SELECT id FROM threads WHERE project = ?1)"), [project])?;
         }
         tx.execute("DELETE FROM threads WHERE project = ?1", [project])?;
@@ -353,7 +416,7 @@ impl Store {
 
     pub fn remove_thread(&self, id: &str) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        for table in ["conv_items", "outbox", "thread_events"] {
+        for table in ["conv_items", "outbox", "thread_events", "checkpoints"] {
             tx.execute(&format!("DELETE FROM {table} WHERE thread = ?1"), [id])?;
         }
         tx.execute("DELETE FROM threads WHERE id = ?1", [id])?;
@@ -415,6 +478,72 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    // ---------- checkpoints ----------
+
+    /// The latest number a thread's checkpoints reached (0: none yet); numbers are not used again.
+    pub fn last_checkpoint(&self, thread: &str) -> Result<i64> {
+        Ok(self.db.query_row("SELECT COALESCE(MAX(n), 0) FROM checkpoints WHERE thread = ?1", [thread], |r| r.get(0))?)
+    }
+
+    pub fn add_checkpoint(&self, c: &Checkpoint) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO checkpoints (thread, n, kind, at_ms, sha, tree, head, branch, text, item) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![c.thread, c.n, c.kind.as_str(), c.at_ms, c.sha, c.tree, c.head, c.branch, c.text, c.item],
+        )?;
+        Ok(())
+    }
+
+    fn checkpoint_from(r: &Row) -> rusqlite::Result<Checkpoint> {
+        let kind: String = r.get(2)?;
+        Ok(Checkpoint {
+            thread: r.get(0)?,
+            n: r.get(1)?,
+            kind: if kind == "restore" { CheckpointKind::Restore } else { CheckpointKind::Turn },
+            at_ms: r.get(3)?,
+            sha: r.get(4)?,
+            tree: r.get(5)?,
+            head: r.get(6)?,
+            branch: r.get(7)?,
+            text: r.get(8)?,
+            item: r.get(9)?,
+        })
+    }
+
+    const CHECKPOINT_COLS: &'static str = "thread, n, kind, at_ms, sha, tree, head, branch, text, item";
+
+    pub fn checkpoint(&self, thread: &str, n: i64) -> Result<Option<Checkpoint>> {
+        Ok(self.db.query_row(&format!("SELECT {} FROM checkpoints WHERE thread = ?1 AND n = ?2", Self::CHECKPOINT_COLS), params![thread, n], Self::checkpoint_from).optional()?)
+    }
+
+    /// A thread's checkpoints, the newest first.
+    pub fn checkpoints(&self, thread: &str) -> Result<Vec<Checkpoint>> {
+        let mut st = self.db.prepare(&format!("SELECT {} FROM checkpoints WHERE thread = ?1 ORDER BY n DESC", Self::CHECKPOINT_COLS))?;
+        Ok(st.query_map([thread], Self::checkpoint_from)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The checkpoint found its item (empty: its message never became one).
+    pub fn set_checkpoint_item(&self, thread: &str, n: i64, item: &str) -> Result<()> {
+        self.db.execute("UPDATE checkpoints SET item = ?3 WHERE thread = ?1 AND n = ?2", params![thread, n, item])?;
+        Ok(())
+    }
+
+    /// Forgets the checkpoints numbered `n` or lower (their refs are deleted by the caller).
+    pub fn remove_checkpoints_up_to(&self, thread: &str, n: i64) -> Result<()> {
+        self.db.execute("DELETE FROM checkpoints WHERE thread = ?1 AND n <= ?2", params![thread, n])?;
+        Ok(())
+    }
+
+    pub fn remove_checkpoints(&self, thread: &str) -> Result<()> {
+        self.db.execute("DELETE FROM checkpoints WHERE thread = ?1", [thread])?;
+        Ok(())
+    }
+
+    /// The thread's user-message-like items from `since_ms` on, oldest first: `(item id, at_ms, body)`.
+    pub fn items_since(&self, thread: &str, since_ms: i64) -> Result<Vec<(String, i64, String)>> {
+        let mut st = self.db.prepare("SELECT item, at_ms, body FROM conv_items WHERE thread = ?1 AND at_ms >= ?2 AND body LIKE '%\"kind\":\"user_message\"%' ORDER BY at_ms, seq")?;
+        Ok(st.query_map(params![thread, since_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?)
+    }
+
     // ---------- outbox: words waiting for their thread to accept input ----------
 
     pub fn push_outbox(&self, thread: &str, text: &str, attachments: &str, now: i64) -> Result<()> {
@@ -422,14 +551,20 @@ impl Store {
         Ok(())
     }
 
-    pub fn outbox(&self, thread: &str) -> Result<Vec<OutMessage>> {
-        let mut st = self.db.prepare("SELECT id, thread, text, attachments FROM outbox WHERE thread = ?1 ORDER BY id")?;
-        Ok(st.query_map([thread], |r| Ok(OutMessage { id: r.get(0)?, thread: r.get(1)?, text: r.get(2)?, attachments: r.get(3)? }))?.collect::<rusqlite::Result<_>>()?)
+    /// A note for the agent that waits for the person's next message and goes out with it (never starts a turn by itself).
+    pub fn push_note(&self, thread: &str, text: &str, now: i64) -> Result<()> {
+        self.db.execute("INSERT INTO outbox (thread, text, attachments, created_ms, hold) VALUES (?1, ?2, '[]', ?3, 1)", params![thread, text, now])?;
+        Ok(())
     }
 
-    /// Every thread that has words waiting.
+    pub fn outbox(&self, thread: &str) -> Result<Vec<OutMessage>> {
+        let mut st = self.db.prepare("SELECT id, thread, text, attachments, hold FROM outbox WHERE thread = ?1 ORDER BY id")?;
+        Ok(st.query_map([thread], |r| Ok(OutMessage { id: r.get(0)?, thread: r.get(1)?, text: r.get(2)?, attachments: r.get(3)?, hold: r.get::<_, i64>(4)? != 0 }))?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every thread that has words waiting (a held note alone is not words).
     pub fn outbox_threads(&self) -> Result<Vec<String>> {
-        let mut st = self.db.prepare("SELECT DISTINCT thread FROM outbox ORDER BY thread")?;
+        let mut st = self.db.prepare("SELECT DISTINCT thread FROM outbox WHERE hold = 0 ORDER BY thread")?;
         Ok(st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -559,6 +694,69 @@ mod tests {
         drop(s);
         let s = Store::open(&path).unwrap();
         assert_eq!(s.thread("t00000002").unwrap().unwrap().base_branch.as_deref(), Some("main"), "opening it again changes nothing");
+        assert_eq!(s.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), VERSION);
+    }
+
+    fn checkpoint(n: i64) -> Checkpoint {
+        Checkpoint { thread: "t00000001".into(), n, kind: CheckpointKind::Turn, at_ms: n * 10, sha: format!("sha{n}"), tree: format!("tree{n}"), head: Some("h".into()), branch: Some("main".into()), text: format!("turn {n}"), item: None }
+    }
+
+    #[test]
+    fn checkpoints_are_numbered_per_thread_found_by_item_and_dropped_with_the_thread() {
+        let s = store();
+        s.create_thread(new("t00000001"), 1).unwrap();
+        assert_eq!(s.last_checkpoint("t00000001").unwrap(), 0);
+        for n in 1..=4 {
+            s.add_checkpoint(&checkpoint(n)).unwrap();
+        }
+        assert!(s.add_checkpoint(&checkpoint(2)).is_err(), "a number is used once");
+        assert_eq!(s.checkpoints("t00000001").unwrap().iter().map(|c| c.n).collect::<Vec<_>>(), [4, 3, 2, 1], "newest first");
+        s.set_checkpoint_item("t00000001", 2, "u2").unwrap();
+        s.set_checkpoint_item("t00000001", 3, "").unwrap();
+        let (two, three) = (s.checkpoint("t00000001", 2).unwrap().unwrap(), s.checkpoint("t00000001", 3).unwrap().unwrap());
+        assert_eq!((two.matched_item(), three.item.as_deref(), three.matched_item()), (Some("u2"), Some(""), None));
+        // Dropping the old ones keeps the numbers going up.
+        s.remove_checkpoints_up_to("t00000001", 2).unwrap();
+        assert_eq!(s.checkpoints("t00000001").unwrap().len(), 2);
+        s.remove_checkpoints_up_to("t00000001", 9).unwrap();
+        assert_eq!(s.last_checkpoint("t00000001").unwrap(), 0);
+        // The user messages of a thread, from a time on.
+        let row = |i: &str, at, body: &str| (i.to_owned(), at, body.to_owned());
+        s.put_items("t00000001", &[row("a", 5, r#"{"id":"a","kind":"user_message","text":"x"}"#), row("b", 9, r#"{"id":"b","kind":"agent_message","text":"y"}"#), row("c", 12, r#"{"id":"c","kind":"user_message","text":"z"}"#)]).unwrap();
+        assert_eq!(s.items_since("t00000001", 6).unwrap().iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["c"]);
+        s.add_checkpoint(&checkpoint(1)).unwrap();
+        s.remove_thread("t00000001").unwrap();
+        assert!(s.checkpoints("t00000001").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_held_note_is_not_words_and_a_version_5_database_gains_what_checkpoints_need() {
+        let s = store();
+        s.push_note("t1", "note", 1).unwrap();
+        assert!(s.outbox_threads().unwrap().is_empty(), "a note alone is not delivered");
+        s.push_outbox("t1", "words", "[]", 2).unwrap();
+        assert_eq!(s.outbox_threads().unwrap(), ["t1"]);
+        assert_eq!(s.outbox("t1").unwrap().iter().map(|m| (m.text.as_str(), m.hold)).collect::<Vec<_>>(), [("note", true), ("words", false)]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lila.db");
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, cwd TEXT NOT NULL UNIQUE, created_ms INTEGER NOT NULL);
+                 CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, thread TEXT NOT NULL, text TEXT NOT NULL, attachments TEXT NOT NULL DEFAULT '[]', created_ms INTEGER NOT NULL);
+                 INSERT INTO outbox (thread, text, created_ms) VALUES ('t1', 'waiting', 1);
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let q = s.outbox("t1").unwrap();
+        assert_eq!((q.len(), q[0].hold), (1, false), "the old words are words");
+        s.add_checkpoint(&checkpoint(1)).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.checkpoints("t00000001").unwrap().len(), 1, "opening it again changes nothing");
         assert_eq!(s.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), VERSION);
     }
 

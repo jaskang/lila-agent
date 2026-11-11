@@ -8,7 +8,7 @@ use super::*;
 use lila_agent::{PermKind, PermOption};
 
 /// The events Lila hooks, and how long Claude Code waits for each (seconds).
-pub const HOOKED: [(&str, u64); 5] = [("PermissionRequest", 600), ("MessageDisplay", 10), ("UserPromptSubmit", 10), ("Stop", 10), ("StopFailure", 10)];
+pub const HOOKED: [(&str, u64); 5] = [("PermissionRequest", 600), ("MessageDisplay", 10), ("UserPromptSubmit", 30), ("Stop", 10), ("StopFailure", 10)];
 
 /// The settings file that hooks a Claude thread's session: each event runs `lila hook <event>`.
 pub fn settings(lila_bin: &Path) -> Value {

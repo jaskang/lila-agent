@@ -100,6 +100,8 @@ impl Transcript {
             Some(call) => (call.as_str(), Vec::new()),
             None => split_attachments(unwrap_paste(text.trim())),
         };
+        // Lila's notes that went out in front of the person's words are not part of them.
+        let text = without_notes(text);
         if !text.is_empty() && !uuid.is_empty() {
             // After a compaction the CLI records its summary as a user message, flagged `isCompactSummary`
             // (checked on real transcripts: every such message has it). It starts no turn.
@@ -196,7 +198,7 @@ impl Transcript {
 
 /// Text that arrived as a paste (hc types Lila's deliveries that way) is recorded as
 /// `<pasted_content id="…">…</pasted_content id="…">`: the words inside it.
-fn unwrap_paste(text: &str) -> &str {
+pub fn unwrap_paste(text: &str) -> &str {
     let Some(rest) = text.strip_prefix("<pasted_content") else { return text };
     let Some(open) = rest.find('>') else { return text };
     let inner = &rest[open + 1..];
@@ -310,6 +312,14 @@ mod tests {
 
     fn line(v: Value) -> String {
         v.to_string()
+    }
+
+    #[test]
+    fn a_note_in_front_of_the_persons_words_is_not_part_of_their_message() {
+        let note = "<lila note about=\"restore\">\nFiles were put back.\n</lila>";
+        let mut t = Transcript::new();
+        let got = t.feed(&serde_json::json!({"type": "user", "uuid": "u1", "timestamp": "2026-11-10T01:00:00.000Z", "message": {"role": "user", "content": format!("<pasted_content id=\"1\">{note}\n\nfix it</pasted_content id=\"1\">")}}).to_string());
+        assert_eq!(got[0].kind, ItemKind::UserMessage { text: "fix it".into(), origin: Origin::Person, attachments: vec![] });
     }
 
     #[test]

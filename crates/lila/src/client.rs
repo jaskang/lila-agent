@@ -15,8 +15,8 @@ pub fn hc_bin() -> String {
 fn try_request(paths: &Paths, method: &str, params: &Value) -> Result<Value, (bool, anyhow::Error)> {
     let sock = paths.socket().map_err(|e| (false, e))?;
     let mut conn = UnixStream::connect(&sock).map_err(|e| (true, anyhow!("cannot reach lilad at {}: {e}", sock.display())))?;
-    // A merge runs the person's commit hooks, and a worktree is a checkout: these may take a while.
-    let wait = if matches!(method, "thread.merge" | "thread.new") { 900 } else { 120 };
+    // A merge runs the person's commit hooks, a worktree is a checkout, and a restore reads and writes the whole folder: these may take a while.
+    let wait = if matches!(method, "thread.merge" | "thread.new" | "thread.restore") { 900 } else { 120 };
     conn.set_read_timeout(Some(Duration::from_secs(wait))).ok();
     let line = json!({"method": method, "params": params});
     writeln!(conn, "{line}").map_err(|e| (false, e.into()))?;

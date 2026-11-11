@@ -16,6 +16,13 @@ pub enum Origin {
     Local,
     /// Claude Code's mark that the person stopped the turn (`[Request interrupted by user]`): a note, not a message.
     Interrupted,
+    /// Lila put the folder's files back to a checkpoint here (written by lilad, not by an engine): a quiet mark, not a message.
+    /// `undo` is the checkpoint of the state before, which a restore to it would undo this with.
+    Restored {
+        checkpoint: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        undo: Option<i64>,
+    },
 }
 
 /// What kind of file the person put on a message.
@@ -423,6 +430,18 @@ pub fn origin(text: &str) -> Origin {
     Origin::Lila { task }
 }
 
+/// The person's words, when Lila's notes were queued in front of them and went out in the same message (`<lila note …>…</lila>`,
+/// such as the one after a restore of the files): the notes are for the agent, the message is the person's. A text that is
+/// only notes is left as it is.
+pub fn without_notes(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    while rest.starts_with("<lila note") {
+        let Some(end) = rest.find("</lila>") else { return text };
+        rest = rest[end + "</lila>".len()..].trim_start();
+    }
+    if rest.is_empty() { text } else { rest }
+}
+
 /// Longest tool output kept on an item; the rest is in the CLI's own record.
 pub const MAX_OUTPUT: usize = 8000;
 
@@ -491,6 +510,21 @@ mod tests {
         let mut again = Config::default();
         again.apply(&c.event());
         assert_eq!(again, c);
+    }
+
+    #[test]
+    fn notes_in_front_of_the_persons_words_are_not_part_of_them() {
+        let note = "<lila note about=\"restore\">\nFiles were put back.\n</lila>";
+        assert_eq!(without_notes(&format!("{note}\n\nfix the test")), "fix the test");
+        assert_eq!(origin(without_notes(&format!("{note}\n\nfix the test"))), Origin::Person);
+        assert_eq!(without_notes(&format!("{note}\n\n{note}\n\nagain")), "again");
+        // A note on its own stays Lila's, and so does anything else Lila delivers.
+        assert_eq!(without_notes(note), note);
+        assert_eq!(without_notes("<lila task=\"T1\">\ndo it\n</lila>"), "<lila task=\"T1\">\ndo it\n</lila>");
+        assert_eq!(without_notes("<lila note\nbroken"), "<lila note\nbroken");
+        assert_eq!(without_notes("plain"), "plain");
+        let marker = Item { id: "restored-1".into(), turn: None, at_ms: 5, state: ItemState::Done, kind: ItemKind::UserMessage { text: "x".into(), origin: Origin::Restored { checkpoint: 3, undo: Some(7) }, attachments: Vec::new() } };
+        assert_eq!(serde_json::to_value(&marker).unwrap(), serde_json::json!({"id": "restored-1", "at_ms": 5, "state": "done", "kind": "user_message", "text": "x", "from": "restored", "checkpoint": 3, "undo": 7}));
     }
 
     #[test]

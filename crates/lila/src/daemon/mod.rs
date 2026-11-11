@@ -6,6 +6,7 @@
 //! conversation with one agent; the agent runs in an hc terminal of its own, so a lilad restart
 //! does not end it.
 
+mod checkpoints;
 mod conversation;
 mod hooks;
 mod host;
@@ -159,6 +160,12 @@ pub struct Daemon<T: Terminals> {
     refresh_again: BTreeSet<String>,
     /// Threads being merged: nothing is sent to them or started in them until it is done.
     merging: BTreeSet<String>,
+    /// Threads whose files are being put back (`checkpoints`): the same.
+    restoring: BTreeSet<String>,
+    /// Threads whose words wait for the checkpoint taken before they go (`checkpoints`).
+    snapshotting: BTreeSet<String>,
+    /// The latest checkpoint number given out per thread, for those whose job has not finished (so none is given twice).
+    checkpoint_numbers: HashMap<String, i64>,
 }
 
 fn now_ms() -> i64 {
@@ -206,6 +213,9 @@ impl<T: Terminals> Daemon<T> {
             refreshing: BTreeSet::new(),
             refresh_again: BTreeSet::new(),
             merging: BTreeSet::new(),
+            restoring: BTreeSet::new(),
+            snapshotting: BTreeSet::new(),
+            checkpoint_numbers: HashMap::new(),
         };
         for p in d.store.projects().unwrap_or_default() {
             d.load_project(&p.id, Path::new(&p.cwd));
@@ -456,7 +466,7 @@ impl<T: Terminals> Daemon<T> {
             "terminal": t.terminal, "caps": Self::caps(t.engine),
             "created_ms": t.created_ms, "active_ms": t.active_ms, "started_ms": t.started_ms, "ended_ms": t.ended_ms, "archived": t.archived,
             "worktree": t.worktree, "base_branch": t.base_branch, "base_commit": t.base_commit, "merged_ms": t.merged_ms,
-            "merging": self.merging.contains(&t.id), "changes": self.summary_of(&t.id).map(|c| c.json()),
+            "merging": self.merging.contains(&t.id), "restoring": self.restoring.contains(&t.id), "changes": self.summary_of(&t.id).map(|c| c.json()),
         })
     }
 

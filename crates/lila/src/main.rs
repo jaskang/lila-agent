@@ -233,6 +233,17 @@ enum ThreadCmd {
     Commit { thread: String },
     /// A worktree thread's work becomes one commit on the branch it started from; the worktree goes and the thread is archived.
     Merge { thread: String },
+    /// The snapshots of the thread's folder lilad took before its turns (newest first), with the message each came before.
+    Checkpoints { thread: String },
+    /// Put the thread's files back to how they were before a turn (the conversation stays; the agent is told with your next message).
+    Restore {
+        thread: String,
+        /// A number from `lila thread checkpoints`.
+        checkpoint: i64,
+        /// Only say which files would be put back, made again or deleted.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// What lilad did for a thread on its own: starts, ends, answers by the tier, cards.
     Log {
         thread: String,
@@ -467,6 +478,8 @@ fn thread(cmd: ThreadCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out
                 v["commit"].as_str().unwrap_or("?")
             )
         }),
+        ThreadCmd::Checkpoints { thread } => out(call("thread.checkpoints", json!({"thread": thread}))?, &fmt_checkpoints),
+        ThreadCmd::Restore { thread, checkpoint, dry_run } => out(call("thread.restore", json!({"thread": thread, "checkpoint": checkpoint, "dry_run": dry_run}))?, &fmt_restore),
         ThreadCmd::Log { thread, limit } => out(call("thread.log", json!({"thread": thread, "limit": limit}))?, &fmt_log),
     }
     Ok(())
@@ -697,6 +710,56 @@ fn fmt_conversation(v: &Value) -> String {
     s
 }
 
+fn fmt_checkpoints(v: &Value) -> String {
+    let rows = v["checkpoints"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return "no checkpoints".into();
+    }
+    let mut s: Vec<String> = rows
+        .iter()
+        .map(|c| {
+            let title = match c["kind"].as_str() {
+                Some("restore") => "(the state before a restore)".to_owned(),
+                _ if c["title"].as_str().unwrap_or("").is_empty() => "(no words)".to_owned(),
+                _ => c["title"].as_str().unwrap_or("").to_owned(),
+            };
+            let at = if c["item"].is_null() && c["kind"] == "turn" { "  [message not in the conversation]" } else { "" };
+            format!("#{:<4} {}  {} {}{at}", c["id"], clock(c["at_ms"].as_i64().unwrap_or(0)), c["head"].as_str().unwrap_or("-"), title)
+        })
+        .collect();
+    if let Some(why) = v["why_not"].as_str() {
+        s.push(format!("cannot restore now: {why}"));
+    }
+    s.join("\n")
+}
+
+fn fmt_restore(v: &Value) -> String {
+    let c = &v["counts"];
+    let mut s = format!(
+        "{} checkpoint {}: {} file(s) put back, {} made again, {} deleted",
+        if v["dry_run"] == true { "would restore" } else { "restored" },
+        v["checkpoint"],
+        c["changed"],
+        c["recreated"],
+        c["deleted"]
+    );
+    for (mark, key) in [("M", "changed"), ("+", "recreated"), ("-", "deleted")] {
+        for f in v[key].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            s.push_str(&format!("\n  {mark} {f}"));
+        }
+    }
+    if v["truncated"] == true {
+        s.push_str("\n  … more files than are listed");
+    }
+    if v["head_moved"] == true {
+        s.push_str(&format!("\nHEAD moved since ({} then, {} now); it stays, so commits made since show as changes", v["head"]["then"].as_str().unwrap_or("none"), v["head"]["now"].as_str().unwrap_or("none")));
+    }
+    if let Some(u) = v["undo"].as_i64() {
+        s.push_str(&format!("\nthe state before is checkpoint {u}: `lila thread restore <thread> {u}` undoes this"));
+    }
+    s
+}
+
 fn fmt_log(v: &Value) -> String {
     v.as_array()
         .into_iter()
@@ -731,6 +794,16 @@ mod tests {
         let line = thread_line(&json!({"id": "t1", "state": "idle", "engine": "codex", "model": "m", "permission": "full", "title": "T", "worktree": true, "base_branch": "main", "changes": {"files": 2, "add": 5, "del": 1}}));
         assert!(line.ends_with("T  [worktree of main]  2 file(s) +5 -1"), "{line}");
     }
+    #[test]
+    fn checkpoints_and_restores_read_as_a_list_of_files() {
+        let v = json!({"checkpoints": [{"id": 2, "kind": "restore", "at_ms": 0, "title": "x", "item": null, "head": "abc1234"}, {"id": 1, "kind": "turn", "at_ms": 0, "title": "fix the test", "item": null, "head": null}], "why_not": "t1 is working now"});
+        let text = fmt_checkpoints(&v);
+        assert!(text.contains("(the state before a restore)") && text.contains("fix the test  [message not in the conversation]") && text.ends_with("cannot restore now: t1 is working now"), "{text}");
+        assert_eq!(fmt_checkpoints(&json!({"checkpoints": []})), "no checkpoints");
+        let r = fmt_restore(&json!({"dry_run": true, "checkpoint": 3, "counts": {"changed": 1, "recreated": 0, "deleted": 1}, "changed": ["a.rs"], "recreated": [], "deleted": ["b.rs"], "head_moved": true, "head": {"then": "abc", "now": null}, "undo": null}));
+        assert_eq!(r, "would restore checkpoint 3: 1 file(s) put back, 0 made again, 1 deleted\n  M a.rs\n  - b.rs\nHEAD moved since (abc then, none now); it stays, so commits made since show as changes");
+    }
+
     #[test]
     fn daemon_status_says_how_to_fix_a_different_protocol() {
         let info = |protocol| client::DaemonInfo { pid: Some(1), version: Some("0.1.0".into()), protocol };

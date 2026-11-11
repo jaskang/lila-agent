@@ -36,7 +36,8 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 | P1 | 删掉 PM 和流程；会话模型；窗口改成项目 → 会话；三种引擎；三档权限 | ✅ 2026-11-10，等用户亲手试（见下） |
 | P2 | 右侧的改动文件、diff、提交；独立 worktree 以及合并回来 | 后端 ✅ 2026-11-11（lilad、命令行、数据模型，`architecture-v4.md` §4 和 §10；测试和 clippy 过，真引擎没跑）；窗口 ✅ 2026-11-11（`panel.rs`：右面板的文件、改动，提交和合并按钮，新会话的 worktree 开关，已合并会话的标识；`--features shots` 截图和假数据看过，没接真 lilad 点过） |
 | A0 | 收口：提交 P2；协议加请求 id 和版本握手；修 `@文件` 重复显示 | 代码 ✅ 2026-11-11，未提交（等用户看）。请求 id：回复原样带回，原始 socket 实测过 ping/status/错误/subscribe/host.attach；版本握手：`lila::PROTOCOL`、`ping`/`status`、`lila daemon status/restart`、侧栏最后一行的提示和重启按钮、关于页，在隔离的 `LILA_HOME` 里用真旧 lilad（装在 `~/.cargo/bin` 的）加真窗口点过按钮（`--features shots`，没有鼠标）；`@文件`：Codex 回显和 ACP 条目、窗口画条目都不再多一张卡片，单元测试，没有真引擎跑过 |
-| A1 | 安全网：每轮的 git 检查点和回退；Claude 用 `PreToolUse` 加自带沙箱 | |
+| A1 | 安全网：每轮的 git 检查点和回退；Claude 用 `PreToolUse` 加自带沙箱 | **检查点和回退的后端 ✅ 2026-11-11，未提交**（`architecture-v4.md` §11，协议版本 2）：每轮开始前用 git 打快照（Claude 在 `UserPromptSubmit` hook，Codex/omp 在 `deliver`），`thread.checkpoints`、`thread.restore {dry_run?}`、`lila thread checkpoints/restore`，对话里的 `restored` 标记，给 agent 的备注随下一条消息发出。验证过：`cargo test --workspace` 243 个全过、clippy 零警告；用临时 git 仓库测了快照不动 index/HEAD/分支/stash（比字节）、被忽略的文件不碰、子文件夹、中日文和空格路径、没有提交的仓库、dry run 什么都不改、各种拒绝、合并/移除项目后 ref 清掉、50 个上限、Claude 和 Codex/omp 的条目对应；隔离的 `LILA_HOME` 里用真 lilad 加假 `claude`（`sleep`）和真 `lila hook UserPromptSubmit`、命令行走了一遍。**没验证**：真 Claude Code 的 `UserPromptSubmit` 里 `prompt` 的实际样子（粘贴多行、带附件时和会话记录里的是否一致；对不上时检查点的 `item` 会是 `null`，仍可回退）、运行中排队的消息会不会也触发这个 hook、hook 等 job 做完这段时间 Claude 是否真的不开始；真 Codex/omp 的回显；窗口还没做。**窗口那一半要做的**见下 |
+| A1 窗口 | 对话里每条用户消息的「回到这里」、确认框（dry run 的文件清单）、`restored` 标记「已回到这里」加「撤销」 | |
 | A2 | 等你闭环：提问卡片、卡片不过期、本会话总是允许、窗口里回答信任、原生通知 | |
 | — | 从这里开始自用，之后每个阶段都在 Lila 里做 | |
 | A3 | 可观测：subagent、待办和计划、上下文占用、往前翻页、自动标题 | |
@@ -50,6 +51,12 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 - 用户要求：**编码交给 subagent，用 Sonnet 5.5、努力程度 high**；主会话负责拆任务、写清楚要求、检查结果（重跑编译、测试、clippy，看截图）、向用户汇报。P1 就是这样分成后端和窗口两步做的。
 - P2 开工前先听用户试用 P1 的反馈，有问题先改。
 - P2 后端已经做完：会话有 `worktree`/`base_branch`/`base_commit`/`merged_ms`/`changes`；`thread.new {worktree}`、`thread.changes/diff/file/commit/merge`；每轮结束重新数改动摘要并推送。窗口那步只调这些，细节和返回格式在 `architecture-v4.md` §4（「改动、diff、文件、提交、合并」）。窗口要注意：`thread.merge` 和带 `worktree` 的 `thread.new` 可能要几秒到几十秒才回复，要在后台线程里调；`changes` 摘要是 `null` 时（还没数过、不在 git 仓库）不要显示「0 个改动」。
+- **A1 后端留给窗口的**（细节和返回格式在 `architecture-v4.md` §11）：
+  - 每个用户消息条目的「回到这里」：用 `thread.read` 的 `checkpoints`（`item` 是条目 id）去对，不要在条目上找（`item` 可能比条目晚几百毫秒才有，条目不会因此重发）。`item: null` 的检查点没有对应的消息，不显示按钮。`from: "lila"`（比如提交的备注）的条目也可能有检查点，要不要给按钮由窗口定。
+  - 点了先 `thread.restore {thread, checkpoint, dry_run: true}`，用返回的 `changed`/`recreated`/`deleted`（和 `counts`）做确认框；`head_moved: true` 时说明中间有提交（文件会回去，提交不会，面板里会显示成未提交的改动）；两个会话共用一个文件夹时这份清单也会含对方的改动。确认后 `thread.restore` 不带 `dry_run`，在后台线程里调（要几秒），回复里的 `undo` 是撤销用的检查点编号。
+  - 被拒绝时错误文字就是原因（在跑、等回答、有排队的话、同一文件夹里别的会话在跑、已合并），也可以先看 `thread.checkpoints` 的 `can_restore`/`why_not`，或每行的 `restorable`，把按钮置灰。
+  - 条目 `from: "restored"`（带 `checkpoint`、`undo`）画成安静的一行「已回到这里」，`undo` 有值就给「撤销」。旧的窗口会把它当成人说的话画成气泡，所以窗口要认 `protocol >= 2`。
+  - `thread` 的 `restoring: true` 期间不能发消息。回退后给 agent 的备注排在 outbox 里，下一条消息发出时在它前面一起出去；回显里备注已被去掉，对话里不会多出一条。
 - P2 后端留下的：没有单独删除 worktree 的入口（只有合并会删），项目被移除也不删它的 worktree；worktree 里没有 `.env`、`node_modules/` 这类被忽略的文件，引擎进去可能跑不起来；worktree 里的 Codex 沙箱（`workspace-write`）写不了主仓库的 `.git`，提交可能要走「越出沙箱」的请求，由 lilad 按档位放行——这两条都没有真跑过。
 
 ## 硬性约束和用户的偏好
@@ -72,7 +79,7 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 ```sh
 git clone git@github.com:jaskang/lila-agent.git && cd lila-agent   # 或 git pull
 # libghostty-vt 预编译在 crates/ghostty-sys/libghostty-vt（目前只有 Apple Silicon）
-cargo test --workspace                            # 应该是 218 个测试全过
+cargo test --workspace                            # 应该是 243 个测试全过
 lila daemon stop                                  # 如果有旧版 lilad 在跑
 cargo install --path crates/lila                  # 窗口通过 lila 命令启动 lilad
 cargo run -p lila-app                             # 或者：cargo install --path crates/lila-app
@@ -106,7 +113,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | `lila-store` | SQLite：`projects`、`threads`、`conv_items`、`outbox`、`thread_events` |
 | `lila-agent` | 对话事件模型和三个驱动的协议翻译：`model.rs`、`claude.rs`（读会话记录）、`codex.rs`（app-server）、`acp.rs`（ACP，用官方类型 crate `agent-client-protocol-schema`） |
 | `hc-client` | herdr-core JSON-RPC 客户端 |
-| `lila` | 命令行和 lilad。`daemon/`：`mod.rs`（状态、hc 事件）、`threads.rs`（项目和会话的生命周期）、`permissions.rs`（权限卡片）、`conversation.rs`（读对话、发消息、`/` 和 `@` 菜单、`thread.file`）、`host.rs`、`hooks.rs`、`requests.rs`（方法分派）、`jobs.rs`（放在主循环外跑的 git 活：建 worktree、改动、diff、提交检查、合并，以及改动摘要的刷新）、`server.rs`（socket、推送、跑 job 的线程）、`tests.rs`（用假终端；`p2` 模块用临时 git 仓库）。`worktree.rs`（会话的 worktree）、`changes.rs`（改动列表、diff、读文件）、`merge.rs`（squash 并合并回起点分支）：都用 git 命令行，有真 git 的测试。`policy.rs`：档位判定。`project.rs`：project.toml 读写。`host.rs`：`lila host codex|omp`。`accounts.rs`、`signin.rs`、`magpie.rs`、`usage.rs`、`sessions.rs`、`commands.rs`。留着没人调用的：`github.rs`、`daemon/sources.rs`（P4） |
+| `lila` | 命令行和 lilad。`daemon/`：`mod.rs`（状态、hc 事件）、`threads.rs`（项目和会话的生命周期）、`permissions.rs`（权限卡片）、`conversation.rs`（读对话、发消息、`/` 和 `@` 菜单、`thread.file`）、`host.rs`、`hooks.rs`、`requests.rs`（方法分派）、`jobs.rs`（放在主循环外跑的 git 活：建 worktree、改动、diff、提交检查、合并，以及改动摘要的刷新）、`server.rs`（socket、推送、跑 job 的线程）、`tests.rs`（用假终端；`p2` 模块用临时 git 仓库）。`checkpoint.rs`（每轮的 git 快照、放回、删 ref）、`daemon/checkpoints.rs`（什么时候打、对上消息、回退的前置条件和后续）、`worktree.rs`（会话的 worktree）、`changes.rs`（改动列表、diff、读文件）、`merge.rs`（squash 并合并回起点分支）：都用 git 命令行，有真 git 的测试。`policy.rs`：档位判定。`project.rs`：project.toml 读写。`host.rs`：`lila host codex|omp`。`accounts.rs`、`signin.rs`、`magpie.rs`、`usage.rs`、`sessions.rs`、`commands.rs`。留着没人调用的：`github.rs`、`daemon/sources.rs`（P4） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app） |
 | `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、选中的会话或新会话、系统通知。`sidebar.rs`：侧栏。`ui.rs`：标题行（`header_actions`）、中间卡片、权限卡片、终端对话框的提示。`composer.rs`：输入区。`panel.rs`：右面板（文件树和预览、改动和 diff、提交和合并、合并确认框）。`conversation.rs`：对话视图、对话/终端切换。`settings.rs`：工作区设置。`prefs.rs`、`usage.rs`：全局设置。`dialog.rs`、`engines.rs`、`style.rs`、`data.rs` |
 
