@@ -1,6 +1,6 @@
 # 交接说明（给接手的模型）
 
-更新于 2026-11-10。用户用中文交流，回复也用中文。用户在两台电脑上轮流工作，另一台电脑上没有这一台的 Claude 记忆，所以该知道的都写在这里。
+更新于 2026-11-11。用户用中文交流，回复也用中文。用户在两台电脑上轮流工作，另一台电脑上没有这一台的 Claude 记忆，所以该知道的都写在这里。
 
 先读这份。需要细节时再读：
 - `docs/product-v4.md`：**现在的产品方案**。定位、12 个已定的决定、路线图 P0–P8、还没定的小问题（§9，用户已说「都按建议」，即按括号里的默认做法）。
@@ -19,8 +19,9 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 - 先给用户自己和开发者用；编程为主。
 - **只做官方引擎的外壳**：Claude Code、Codex、ACP agent（现在内置 omp）。不自己写 agent loop；DeepSeek Harness、pi 只当普通 ACP agent，不特别依赖。
 - Claude Code 保持「跑它的终端，从会话记录和 hooks 画出对话」，不换 Agent SDK。
-- Lila 托管一套现成的 MCP server，注入每个会话，所有引擎共用（浏览器、GitHub 等）。
-- GitHub、Asana：agent 的工具加界面面板，从一条 issue 或任务开会话；不自动触发。
+- Lila 登记一份现成的 MCP server 清单，开会话时注入，所有引擎共用；只给没有命令行的能力用（浏览器），按项目开关，不默认注入每个会话（2026-11-11 修订）。
+- GitHub：agent 直接用 `gh`，**不接 GitHub MCP**（2026-11-11 用户定）；面板也用 `gh`，从一条 issue 开会话；不自动触发。Asana 不单独做，归入「添加任意 MCP server」。
+- **computer use 不做**，除非自用时证明非常必要（2026-11-11 用户定）。
 - 会话默认在项目文件夹原地工作，新建时可选独立 worktree。
 - subagent：显示引擎自带的；Lila 另外提供跨引擎的「委派」工具。
 - 权限：每个会话三档（只读、改动前确认、全自动），**默认全自动**，四类危险操作仍然问。
@@ -33,15 +34,23 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 |---|---|---|
 | P0 | 提交旧实现，打标签 `v3-final` | ✅ |
 | P1 | 删掉 PM 和流程；会话模型；窗口改成项目 → 会话；三种引擎；三档权限 | ✅ 2026-11-10，等用户亲手试（见下） |
-| P2 | 右侧的改动文件、diff、提交；独立 worktree 以及合并回来 | **下一步** |
-| P3 | lilad 托管 MCP 并注入三种引擎；浏览器工具；对话里显示截图 | |
-| P4 | GitHub MCP 和面板；从 issue 开会话；提 PR | |
-| — | 以上是第一版，之后自用一周，只修用出来的问题 | |
-| P5 起 | 跨引擎委派、Asana、computer use 和定时任务、远程访问和手机端 | |
+| P2 | 右侧的改动文件、diff、提交；独立 worktree 以及合并回来 | 后端 ✅ 2026-11-11（lilad、命令行、数据模型，`architecture-v4.md` §4 和 §10；测试和 clippy 过，真引擎没跑）；窗口 ✅ 2026-11-11（`panel.rs`：右面板的文件、改动，提交和合并按钮，新会话的 worktree 开关，已合并会话的标识；`--features shots` 截图和假数据看过，没接真 lilad 点过） |
+| A0 | 收口：提交 P2；协议加请求 id 和版本握手；修 `@文件` 重复显示 | **下一步** |
+| A1 | 安全网：每轮的 git 检查点和回退；Claude 用 `PreToolUse` 加自带沙箱 | |
+| A2 | 等你闭环：提问卡片、卡片不过期、本会话总是允许、窗口里回答信任、原生通知 | |
+| — | 从这里开始自用，之后每个阶段都在 Lila 里做 | |
+| A3 | 可观测：subagent、待办和计划、上下文占用、往前翻页、自动标题 | |
+| P3 | MCP 清单和注入；Codex 的 MCP 审批；浏览器工具；图片条目 | |
+| A4 | worktree 补全：`.worktreeinclude` 和 setup、丢弃和清理、diff 行内意见 | |
+| P4 | GitHub 面板（`gh`，不接 MCP）；从 issue 开会话；提 PR | |
+| P5 起 | 只读委派、定时任务、远程访问和手机端、任意 MCP server | |
+
+2026-11-11 做了一次产品和 harness 的评审，路线图按它重排：P3 之前插入 A0–A3，每个阶段的内容、完成标志和不排顺序的 A5（回放测试、CLI 版本检查、`lila doctor`、Codex 卡住的根因）在 `product-v4.md` §8。A1、P5 里标了「先核实」的几条是凭对引擎的了解写的，没有对着装的版本验证过。
 
 - 用户要求：**编码交给 subagent，用 Sonnet 5.5、努力程度 high**；主会话负责拆任务、写清楚要求、检查结果（重跑编译、测试、clippy，看截图）、向用户汇报。P1 就是这样分成后端和窗口两步做的。
 - P2 开工前先听用户试用 P1 的反馈，有问题先改。
-- P2 可以复用的：`crates/lila/src/worktree.rs`、`commit.rs`（现在还是「一条链一个槽」的接口，没人调用，要改成「一个会话一个可选的 worktree」）。会话的 `cwd` 字段就是为它留的。
+- P2 后端已经做完：会话有 `worktree`/`base_branch`/`base_commit`/`merged_ms`/`changes`；`thread.new {worktree}`、`thread.changes/diff/file/commit/merge`；每轮结束重新数改动摘要并推送。窗口那步只调这些，细节和返回格式在 `architecture-v4.md` §4（「改动、diff、文件、提交、合并」）。窗口要注意：`thread.merge` 和带 `worktree` 的 `thread.new` 可能要几秒到几十秒才回复，要在后台线程里调；`changes` 摘要是 `null` 时（还没数过、不在 git 仓库）不要显示「0 个改动」。
+- P2 后端留下的：没有单独删除 worktree 的入口（只有合并会删），项目被移除也不删它的 worktree；worktree 里没有 `.env`、`node_modules/` 这类被忽略的文件，引擎进去可能跑不起来；worktree 里的 Codex 沙箱（`workspace-write`）写不了主仓库的 `.git`，提交可能要走「越出沙箱」的请求，由 lilad 按档位放行——这两条都没有真跑过。
 
 ## 硬性约束和用户的偏好
 
@@ -63,7 +72,7 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 ```sh
 git clone git@github.com:jaskang/lila-agent.git && cd lila-agent   # 或 git pull
 # libghostty-vt 预编译在 crates/ghostty-sys/libghostty-vt（目前只有 Apple Silicon）
-cargo test --workspace                            # 应该是 164 个测试全过
+cargo test --workspace                            # 应该是 199 个测试全过
 lila daemon stop                                  # 如果有旧版 lilad 在跑
 cargo install --path crates/lila                  # 窗口通过 lila 命令启动 lilad
 cargo run -p lila-app                             # 或者：cargo install --path crates/lila-app
@@ -97,9 +106,9 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | `lila-store` | SQLite：`projects`、`threads`、`conv_items`、`outbox`、`thread_events` |
 | `lila-agent` | 对话事件模型和三个驱动的协议翻译：`model.rs`、`claude.rs`（读会话记录）、`codex.rs`（app-server）、`acp.rs`（ACP，用官方类型 crate `agent-client-protocol-schema`） |
 | `hc-client` | herdr-core JSON-RPC 客户端 |
-| `lila` | 命令行和 lilad。`daemon/`：`mod.rs`（状态、hc 事件）、`threads.rs`（项目和会话的生命周期）、`permissions.rs`（权限卡片）、`conversation.rs`（读对话、发消息、`/` 和 `@` 菜单）、`host.rs`、`hooks.rs`、`requests.rs`（方法分派）、`server.rs`（socket、推送）、`tests.rs`（用假终端）。`policy.rs`：档位判定。`project.rs`：project.toml 读写。`host.rs`：`lila host codex|omp`。`accounts.rs`、`signin.rs`、`magpie.rs`、`usage.rs`、`sessions.rs`、`commands.rs`。留着没人调用的：`worktree.rs`、`commit.rs`（P2）、`github.rs`、`daemon/sources.rs`（P4） |
+| `lila` | 命令行和 lilad。`daemon/`：`mod.rs`（状态、hc 事件）、`threads.rs`（项目和会话的生命周期）、`permissions.rs`（权限卡片）、`conversation.rs`（读对话、发消息、`/` 和 `@` 菜单、`thread.file`）、`host.rs`、`hooks.rs`、`requests.rs`（方法分派）、`jobs.rs`（放在主循环外跑的 git 活：建 worktree、改动、diff、提交检查、合并，以及改动摘要的刷新）、`server.rs`（socket、推送、跑 job 的线程）、`tests.rs`（用假终端；`p2` 模块用临时 git 仓库）。`worktree.rs`（会话的 worktree）、`changes.rs`（改动列表、diff、读文件）、`merge.rs`（squash 并合并回起点分支）：都用 git 命令行，有真 git 的测试。`policy.rs`：档位判定。`project.rs`：project.toml 读写。`host.rs`：`lila host codex|omp`。`accounts.rs`、`signin.rs`、`magpie.rs`、`usage.rs`、`sessions.rs`、`commands.rs`。留着没人调用的：`github.rs`、`daemon/sources.rs`（P4） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app） |
-| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、选中的会话或新会话、系统通知。`sidebar.rs`：侧栏。`ui.rs`：标题行（`header_actions`）、中间卡片、权限卡片、终端对话框的提示。`composer.rs`：输入区。`conversation.rs`：对话视图、对话/终端切换。`settings.rs`：工作区设置。`prefs.rs`、`usage.rs`：全局设置。`dialog.rs`、`engines.rs`、`style.rs`、`data.rs` |
+| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、选中的会话或新会话、系统通知。`sidebar.rs`：侧栏。`ui.rs`：标题行（`header_actions`）、中间卡片、权限卡片、终端对话框的提示。`composer.rs`：输入区。`panel.rs`：右面板（文件树和预览、改动和 diff、提交和合并、合并确认框）。`conversation.rs`：对话视图、对话/终端切换。`settings.rs`：工作区设置。`prefs.rs`、`usage.rs`：全局设置。`dialog.rs`、`engines.rs`、`style.rs`、`data.rs` |
 
 ## 关键机制
 
@@ -129,7 +138,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 规范在 `DESIGN.md`（它是唯一的界面规范），接口在 `docs/architecture-v4.md` §9。这里只记怎么接手：
 
-- **结构**：左边侧栏（新会话按钮、工作区、会话，状态一眼能看出：转圈在工作、红点在等你；⌘B 收起），中间标题行（会话标题和「引擎 · 模型 · 努力程度」，右端是在访达中显示等按钮，之后的文件、改动按钮加在 `ui::header_actions`）加对话（Claude Code 会话可切到它的终端）或新会话的输入框；右边的 diff、文件、GitHub 面板是后面的阶段，现在没有。
+- **结构**：左边侧栏（新会话按钮、工作区、会话，状态一眼能看出：转圈在工作、红点在等你；⌘B 收起），中间标题行（会话标题和「引擎 · 模型 · 努力程度」，右端是在访达中显示等按钮，之后的文件、改动按钮加在 `ui::header_actions`）加对话（Claude Code 会话可切到它的终端）或新会话的输入框；右边的面板（`panel.rs`）：文件、改动，从标题行的两个按钮或 ⇧⌘E、⇧⌘G 打开；GitHub 面板是 P4。
 - **新会话**：没有会话被选中时，中间就是新会话的输入框（composer 的 key 是 `new:<项目>`），发出第一条消息才 `thread.new`。引擎、模型、努力程度、权限档的选择在 `app::Draft`，默认值取工作区的 `defaults`。输入框工具条：`+`、权限档、「模型 · 引擎 努力程度」、发送（在跑且框空时是停止）。
 - **设置**：全局设置（⌘,）：用量、关于；工作区设置（⇧⌘,）：名称和新会话的默认值（`project.set`）。
 - **快捷键**：⌘N 新会话、⌘B 收起或展开侧栏、⌘1–9 第 n 个工作区的最近会话、⌘, 全局设置、⇧⌘, 工作区设置、⌘. 中断、⌘[ 终端切回对话、Esc 关对话框。
@@ -142,7 +151,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 - `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG（2882 × 1802，不含红绿灯，也截不到真实的毛玻璃）。
 - `LILA_APP_FAKE=/path.json`：**不起 lilad**，用造好的数据画界面。JSON 是 `{projects, threads, conversations}`：前两个和 `project.list`、`thread.list` 的返回一样，`conversations` 是会话 id 到 `thread.read` 返回的 `items`、`permissions`、`writing`、`config`。任何状态（在等你、归档、已结束、权限卡片、终端里的对话框……）都能这样造；这时窗口里的操作发不出去（没有 lilad）。
-- `LILA_APP_THREAD=<id>`：显示这个会话；`LILA_APP_NEW=<项目>,engine=codex,model=…,effort=…,permission=confirm`：打开新会话的输入框并选好；`LILA_APP_ADD=<文件夹>`：像选了文件夹那样新建工作区。
+- `LILA_APP_THREAD=<id>`：显示这个会话；`LILA_APP_SIZE=1000x680`：窗口这么大（看窄窗口）；右面板的状态在 `<LILA_HOME>/state/app-panel.json`（`{"open":true,"view":"changes","width":380}`）；假数据文件里还可以有 `changes`、`diffs`、`file`、`commit`、`merge`、`log`、`new`（见 `data::fake_act`），`LILA_APP_FAKE_READ_MS` 让面板的读变慢；`LILA_APP_NEW=<项目>,engine=codex,model=…,effort=…,permission=confirm`：打开新会话的输入框并选好；`LILA_APP_ADD=<文件夹>`：像选了文件夹那样新建工作区。
 - `LILA_APP_CLICK="x,y;right:x,y;move:x,y;keys:cmd-n h i enter;wait:ms"`：启动 3 秒后依次点击（窗口里的点，不是截图的像素：截图是 2 倍，再缩放过的话自己换算）、右击、移动、按键（打字也行）、等待。点下拉菜单、右键菜单、对话框里的控件都靠它；真的 lilad 加它可以走完「新会话 → 发消息 → 回答 → 结束」。
 - `LILA_APP_KEYS="cmd-, cmd-shift-,"`：启动后 1.5 秒按这些键，用来验证快捷键。
 - `LILA_APP_INACTIVE=1` 加 `LILA_APP_NOTIFY_LOG=<文件>`：窗口当作不在前面，通知写进文件而不是真的发。

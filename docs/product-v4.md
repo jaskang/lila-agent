@@ -2,6 +2,7 @@
 
 > 2026-11-10 · 取代 `product-v3.md` 和 `review-2026-11-10.md` 的定位。
 > v3 的「以请求为中心的 agent 团队」不再是需求：PM、流程、验收卡片、成员树全部废除。
+> 2026-11-11 修订：GitHub 改走 `gh`、不接 MCP；computer use 不做；路线图在 P3 之前插入 A0–A5 并重排（§5、§8）。
 
 ## 1. 定位
 
@@ -19,13 +20,14 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。你在项目里开�
 | 2 | 核心场景 | 编程为主，其他为辅 |
 | 3 | 引擎 | 只做官方引擎的外壳：Claude Code、Codex、ACP agent。不自己写 agent loop，不特别依赖 dsh 或 pi（它们可以作为普通 ACP agent 接入） |
 | 4 | 手机端 | 桌面版稳定后再做。现在只守一条：所有功能都走 lilad 的 socket |
-| 5 | 工具层 | Lila 托管一套 MCP，注入每个会话，所有引擎共用。用现成的 MCP server，不自己写 |
-| 6 | GitHub、Asana | agent 的工具，加界面上的面板；从一条 issue 或任务开会话。不自动触发 |
+| 5 | 工具层 | Lila 登记一份 MCP server 清单，开会话时注入引擎，所有引擎共用。用现成的 MCP server，不自己写。只给没有命令行的能力用（浏览器）；按项目开关，不默认注入每个会话（2026-11-11 修订） |
+| 6 | GitHub、Asana | GitHub：agent 直接用 `gh`，**不接 GitHub MCP**（2026-11-11 修订）；界面面板也用 `gh`；从一条 issue 开会话。Asana 不单独做，归入「添加任意 MCP server」。都不自动触发 |
 | 7 | 工作区 | 会话默认在项目文件夹原地工作，新建时可选独立 worktree |
 | 8 | Claude Code 的驱动 | 保持终端加 hooks，不换 Agent SDK |
 | 9 | subagent | 显示引擎自带的 subagent；Lila 另外提供跨引擎的「委派」工具 |
 | 10 | 权限 | 每个会话三档：只读、改动前确认、全自动。**默认全自动**，只有危险操作才问 |
-| 11 | 第一版范围 | 基础（项目和会话、对话、三种引擎、权限）加：diff 和文件面板、GitHub 面板和工具、浏览器工具、独立 worktree |
+| 11 | 第一版范围 | 基础（项目和会话、对话、三种引擎、权限）加：diff 和文件面板、GitHub 面板（`gh`）、浏览器工具、独立 worktree |
+| 13 | computer use | 不做，除非自用时证明非常必要（2026-11-11） |
 | 12 | 旧代码 | 先提交现状并打标签，再在 `main` 上原地删改 |
 
 ## 3. 模型：项目 → 会话
@@ -57,17 +59,23 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。你在项目里开�
 
 ## 5. 工具层
 
-lilad 启动并管理一组 MCP server，开会话时注入引擎（Claude 的 `--mcp-config`、Codex 的 app-server 配置、ACP 的 `session/new`）。
+lilad 维护一份 MCP server 的清单，开会话时写进引擎的配置（Claude 的 `--mcp-config`、Codex 的 app-server 配置、ACP 的 `session/new`）。stdio 的 server 由引擎按会话自己启动，lilad 不管它们的进程；只有 Lila 自己的工具（委派）由 `lila mcp` 连回 lilad，和 `lila hook`、`lila host` 同一个模式。
 
 | 工具 | 方案 | 阶段 |
 |---|---|---|
-| 浏览器 | 现成的浏览器 MCP（`chrome-devtools-mcp` 或 Playwright MCP，实测后选一个） | 第一版 |
-| GitHub | 官方 `github-mcp-server`；界面面板用现有的 `github.rs`（`gh`） | 第一版 |
-| 委派 | Lila 自己的 MCP 工具：把一个子任务交给另一种引擎，在子会话里跑，只把结果带回来 | 第一版之后的第一项 |
-| Asana | 官方 MCP，加面板 | 之后 |
-| computer use | 待调研 macOS 上成熟的方案 | 之后 |
+| 浏览器 | 现成的浏览器 MCP（`chrome-devtools-mcp` 或 Playwright MCP，实测后选一个） | P3 |
+| GitHub | 不接 MCP。agent 用 `gh`（`policy.rs` 已经识别它的写操作）；界面面板用现有的 `github.rs`（`gh`） | P4 |
+| 委派 | Lila 自己的 MCP 工具：把一个子任务交给另一种引擎，在子会话里跑，只把结果带回来。第一版只读 | P5 |
+| 任意 MCP server | 设置里添加，Asana 是其中一个；面板等自用时确实需要再做 | 最后 |
+| computer use | 不做（决定 #13） | — |
 
-引擎自带的同类工具不主动屏蔽；如果实测发现 agent 选错，再按引擎关掉重复的。
+规则：
+
+- **不默认注入每个会话**：每个 server 的工具定义都占上下文。按项目开关，新会话可以临时勾选；浏览器默认关。
+- **和用户自己配的去重**：Claude 和 Codex 会继承用户全局配置里的 MCP server，清单里同名的不再注入。
+- **读写判断用 MCP 自带的标注**：登记时调一次 `tools/list`，按 `readOnlyHint`、`destructiveHint` 建表，工具名前缀的正则只做兜底。
+- **Codex 的 MCP 审批是前置**：现在直接拒绝，要先接成权限卡片。
+- 引擎自带的同类工具不主动屏蔽；如果实测发现 agent 选错，再按引擎关掉重复的。
 
 ## 6. 权限
 
@@ -78,8 +86,8 @@ lilad 启动并管理一组 MCP server，开会话时注入引擎（Claude 的 `
 - **全自动**（默认）：不问。以下操作仍然问：
   - 改动或删除工作区以外的文件
   - `git push`、强制推送、删除分支
-  - 对外发出的动作：提 PR、发评论、操作 Asana
-  - computer use
+  - 对外发出的动作：提 PR、发评论、写类的 MCP 工具
+  - computer use（Lila 自己不提供；用户自己加的这类工具仍然问）
 
 实现沿用 architecture-v3 的 D4：三种引擎的权限请求先转成同一种 `PermissionRequest`，lilad 按这个会话的档位自动回答，剩下的才显示给人。
 
@@ -110,13 +118,20 @@ lilad 启动并管理一组 MCP server，开会话时注入引擎（Claude 的 `
 | P0 基线 | 提交当前未提交的改动，打标签 `v3-final` | 可以随时回看旧实现 |
 | P1 骨架 | 删掉 PM 和流程；`threads` 数据模型；窗口改成项目 → 会话；新建会话时选引擎；三档权限 | 三种引擎各开一个会话，能对话、续接、回答权限确认 |
 | P2 编程面板 | 右侧的改动文件、diff、提交；独立 worktree 以及合并回来 | 两个会话同时在一个项目里干活互不干扰 |
-| P3 工具层 | lilad 托管 MCP 并注入三种引擎；浏览器工具；对话里显示截图 | 三种引擎都能打开网页并截图 |
-| P4 GitHub | GitHub MCP；面板列出 issue 和 PR；从 issue 开会话；提 PR | 从一条 issue 到一个 PR 全程在 Lila 里完成 |
-| — | **以上是第一版。自用一周，只修用出来的问题** | |
-| P5 | 跨引擎委派 | Claude 会话让 Codex 审一遍并拿回结论 |
-| P6 | Asana 工具和面板 | |
-| P7 | computer use；定时任务 | |
-| P8 | 远程访问和手机端（参考 t3code：服务端拥有执行，客户端只走 RPC，中继加配对码） | |
+| A0 收口 | 提交 P2；协议加请求 id 和版本握手（`ping` 带版本，窗口发现不一致就提示重启 lilad）；修 Codex 会话里 `@文件` 同时显示附件卡片和文字气泡 | 工作区干净；旧 lilad 能被发现 |
+| A1 安全网 | 每轮开始前用隐藏的 git ref 打检查点（t3code 的做法，纯 git 命令），对话里每轮可以「回到这里」；Claude 的档位判定改用 `PreToolUse` hook 并启用它自带的沙箱（两条都要先对着装的版本核实） | 全自动档改坏了能一键回退 |
+| A2 等你闭环 | agent 的提问成为卡片（三种引擎归一成一种）；权限卡片不过期（现在 570 秒后退回终端）；确认档有「本会话总是允许这类」；「信任此文件夹」在窗口里回答；通知由 lilad 判断、窗口只显示，换成原生通知，点击跳到会话 | 一个会话从头到尾不用切终端 |
+| — | **从这里开始自用：之后每个阶段都在 Lila 里做，只修用出来的问题** | |
+| A3 可观测 | Claude 的 subagent 折叠显示（组件给 P5 的子会话留好位置）；待办和计划固定在输入框上方；标题行显示上下文占用和 token；对话往前翻页（现在只有最新 400 条）；自动标题；侧栏会话行标出引擎和 worktree | 不开终端也知道它在干什么、还剩多少上下文 |
+| P3 工具层 | MCP 清单和注入三种引擎（§5 的规则）；Codex 的 MCP 审批；浏览器工具；工具结果里的图片落成文件、条目里存引用；取文件和上传附件的 socket 方法（远程客户端也用） | 三种引擎都能打开网页并截图；Codex 上写类 MCP 工具出卡片 |
+| A4 worktree 补全 | `.worktreeinclude` 和项目的 setup 命令（把 `.env`、依赖带进 worktree）；丢弃 worktree、清理孤儿；diff 行内意见发回 agent、还原单个文件 | 两个会话同时在一个真实项目里干活互不干扰 |
+| P4 GitHub | 面板列出 issue 和 PR（`gh`）；从 issue 开会话（默认 worktree）；提 PR 是 worktree 会话在「合并到起点分支」之外的第二个出口，worktree 留到 PR 合并 | 从一条 issue 到一个 PR 全程在 Lila 里完成 |
+| P5 委派 | 只读委派：`lila mcp` 的工具，子会话带 `parent`、不进侧栏、显示在父会话里，卡片冒到父会话，档位不高于父会话，用量算在父会话上，只允许一层；工具调用的超时要先核实（调大，或拆成发起和取结果）。「换引擎就新开会话并带上摘要」（§4）用同一套机制 | Claude 会话让 Codex 审一遍并拿回结论 |
+| P6 定时任务 | lilad 按时开会话。无人值守的规则：卡片没人答就超时拒绝并通知；默认在 worktree 里跑；能发现额度用完（Claude 的现在发现不了，要先修） | 一个每天跑的任务连续几天不用人管 |
+| P7 远程 | 远程访问和手机端（参考 t3code：服务端拥有执行，客户端只走 RPC，中继加配对码）。还剩的例外：Claude 的终端视图由窗口直接连 hc | |
+| P8 任意 MCP | 设置里添加任意 MCP server（含 Asana） | |
+
+A5（不排顺序，从自用开始随暴露的问题加）：录下真实的会话记录和 app-server 流做回放测试；启动时检查 CLI 版本；`lila doctor` 检查 `hc`、`claude`、`codex` 是否装好并登录；查 Codex「停在工具结果后不收尾」的根因。
 
 每个阶段照旧：真跑用 Haiku 和 Codex low，放在单独的 `LILA_HOME`；界面用 `--features shots` 自查，并列出需要亲手点的地方。
 
@@ -132,5 +147,5 @@ lilad 启动并管理一组 MCP server，开会话时注入引擎（Claude 的 `
 ## 10. 参考
 
 - t3code（`pingdotgg/t3code`）：同一类产品，结构可以借鉴：适配器边界、按会话注入 MCP 桥、隐藏 Git ref 做检查点、远程连接。
-- DeepSeek Harness：功能清单的参照（subagent、浏览器、computer use、定时任务）。
+- DeepSeek Harness：功能清单的参照（subagent、浏览器、定时任务）。
 - `architecture-v3.md`：引擎驱动和对话事件模型，继续有效。`architecture-v2.md`、`product-v3.md`：只作历史记录。
