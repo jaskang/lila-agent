@@ -160,7 +160,7 @@ impl LilaApp {
             Shell {
                 id: "project-settings",
                 nav: Vec::new(),
-                title: "项目设置".into(),
+                title: "工作区设置".into(),
                 body,
                 note,
                 saving,

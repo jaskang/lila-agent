@@ -14,6 +14,8 @@ pub enum Origin {
     Summary,
     /// What a slash command printed in the CLI itself (`/compact`'s "Not enough messages"): a note, not a message.
     Local,
+    /// Claude Code's mark that the person stopped the turn (`[Request interrupted by user]`): a note, not a message.
+    Interrupted,
 }
 
 /// What kind of file the person put on a message.

@@ -1,4 +1,4 @@
-//! The main window: projects and their threads on the left; the shown thread in the
+//! The main window: workspaces (projects) and their threads on the left; the shown thread in the
 //! middle (its conversation, or Claude Code's terminal). The window talks to lilad only
 //! through its socket (docs/architecture-v4.md); nothing here decides anything.
 
@@ -82,8 +82,11 @@ pub struct LilaApp {
     /// Projects folded in the sidebar, and those showing every thread instead of the latest few.
     pub folded: std::collections::HashSet<String>,
     pub unfolded: std::collections::HashSet<String>,
-    /// The sidebar lists archived threads too.
-    pub show_archived: bool,
+    /// Workspaces whose archived threads the sidebar lists too (their right-click menu).
+    pub archived_shown: std::collections::HashSet<String>,
+    /// The sidebar is folded away (kept across launches); its width is kept in `sidebar_size`.
+    pub sidebar_hidden: bool,
+    pub sidebar_size: Entity<gpui::base::ResizableState>,
     /// The window is the one in front (notifications are for when it is not).
     active: bool,
     /// Each thread's state at the last look, to tell what changed; none before the first look.
@@ -114,6 +117,9 @@ pub struct LilaApp {
     pub tui: std::collections::HashSet<String>,
     /// The shown thread's conversation, as far as it was read.
     pub conv: Option<crate::conversation::Conv>,
+    /// Messages just sent to a thread that its record does not show yet.
+    pub pending: Vec<crate::conversation::Pending>,
+    pub next_pending: u64,
     /// Tool calls opened to show their output.
     pub conv_open: std::collections::HashSet<String>,
     /// The conversation's virtual list, and what it was last told it holds (`conversation::sync_conv`).
@@ -212,6 +218,7 @@ impl LilaApp {
         })
         .detach();
         let tui = data::load_views(&paths);
+        let sidebar_hidden = data::load_sidebar_hidden(&paths);
         let mut app = LilaApp {
             paths,
             focus: cx.focus_handle(),
@@ -226,7 +233,9 @@ impl LilaApp {
             renaming: None,
             folded: Default::default(),
             unfolded: Default::default(),
-            show_archived: false,
+            archived_shown: Default::default(),
+            sidebar_hidden,
+            sidebar_size: cx.new(|_| Default::default()),
             active: true,
             seen: None,
             just_made: None,
@@ -242,6 +251,8 @@ impl LilaApp {
             removing: None,
             tui,
             conv: None,
+            pending: Vec::new(),
+            next_pending: 0,
             conv_open: Default::default(),
             conv_list: Self::conv_list_state(cx),
             conv_rows: Vec::new(),
@@ -298,10 +309,10 @@ impl LilaApp {
             self.thread = None;
             self.conv = None;
         }
-        // The shown thread was archived (and archived ones are not listed): its project's new session instead.
-        if !self.show_archived
-            && let Some(t) = self.thread.as_ref().and_then(|id| snap.threads.iter().find(|t| t["id"] == id.as_str()))
+        // The shown thread was archived (and its workspace does not list archived ones): the workspace's new session instead.
+        if let Some(t) = self.thread.as_ref().and_then(|id| snap.threads.iter().find(|t| t["id"] == id.as_str()))
             && t["archived"] == true
+            && !t["project"].as_str().is_some_and(|p| self.archived_shown.contains(p))
         {
             self.new_in = t["project"].as_str().map(String::from);
             self.thread = None;
@@ -371,6 +382,13 @@ impl LilaApp {
         let input = self.composer(&key, window, cx).input.clone();
         self.new_in = Some(project);
         window.focus(&input.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Folds the sidebar away, or brings it back; the choice is kept.
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        data::save_sidebar_hidden(&self.paths, self.sidebar_hidden);
         cx.notify();
     }
 
@@ -523,15 +541,18 @@ impl Render for LilaApp {
             .text_color(crate::style::fg())
             .text_size(px(13.))
             .on_key_down(cx.listener(Self::shortcut))
-            .child(
-                div().flex_1().min_h_0().child(
-                    // The gutter between the sidebar and the thread is the resize handle.
-                    gpui::base::h_resizable("main")
-                        .with_handle_appearance(gutter())
-                        .child(resizable_panel().size(px(260.)).size_range(px(200.)..px(420.)).fixed().child(div().size_full().pr(px(3.)).child(self.sidebar(cx)).into_any_element()))
-                        .child(resizable_panel().child(v_flex().size_full().pl(px(4.)).child(div().flex_1().min_h_0().child(self.center(window, cx))).into_any_element())),
-                ),
-            )
+            .child(div().flex_1().min_h_0().child(if self.sidebar_hidden {
+                // Folded away: the center card takes the window, and its first row leaves room for the traffic lights.
+                v_flex().size_full().child(div().flex_1().min_h_0().child(self.center(window, cx))).into_any_element()
+            } else {
+                // The gutter between the sidebar and the thread is the resize handle.
+                gpui::base::h_resizable("main")
+                    .with_state(&self.sidebar_size)
+                    .with_handle_appearance(gutter())
+                    .child(resizable_panel().size(px(260.)).size_range(px(200.)..px(420.)).fixed().child(div().size_full().pr(px(3.)).child(self.sidebar(cx)).into_any_element()))
+                    .child(resizable_panel().child(v_flex().size_full().pl(px(4.)).child(div().flex_1().min_h_0().child(self.center(window, cx))).into_any_element()))
+                    .into_any_element()
+            }))
             .children(dialog)
     }
 }
@@ -582,6 +603,7 @@ impl LilaApp {
                     self.show_new(p, window, cx);
                 }
             }
+            ("b", false) => self.toggle_sidebar(cx),
             (",", false) => self.open_prefs(crate::prefs::PrefPage::Usage, cx),
             (",", true) | ("<", _) => {
                 if let Some(p) = self.current_project() {

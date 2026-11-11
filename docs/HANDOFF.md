@@ -74,7 +74,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
   - herdr-core 的 `hc`（装在 `~/.local/bin/hc`；也可以用 `LILA_HC` 指定路径）；
   - 已经登录的 `claude` 和 `codex`；可选 `omp`；
   - 可选：magpie（`/Applications/magpie.app`），装了的话用量页会读它的账号。
-- **旧数据不迁移**：新版第一次打开 v3 的数据库（`~/.local/share/lila/lila.db`）时，把它改名为 `lila.db.v3.bak`，新库从空开始。项目要在窗口里重新添加（侧栏「项目」右边的 `+`）或 `lila project add <文件夹>`。
+- **旧数据不迁移**：新版第一次打开 v3 的数据库（`~/.local/share/lila/lila.db`）时，把它改名为 `lila.db.v3.bak`，新库从空开始。工作区要在窗口里重新添加（侧栏「工作区」右边的文件夹加号）或 `lila project add <文件夹>`。
 - 不随仓库走的东西：账号（`~/.config/lila/accounts.toml` 和 `accounts/`）、数据库、窗口上次显示的会话（`~/.local/state/lila/app-tabs.json`）。`~/.config/lila/roles/` 是旧版留下的，现在没人读。
 
 ## 技术栈
@@ -99,7 +99,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | `hc-client` | herdr-core JSON-RPC 客户端 |
 | `lila` | 命令行和 lilad。`daemon/`：`mod.rs`（状态、hc 事件）、`threads.rs`（项目和会话的生命周期）、`permissions.rs`（权限卡片）、`conversation.rs`（读对话、发消息、`/` 和 `@` 菜单）、`host.rs`、`hooks.rs`、`requests.rs`（方法分派）、`server.rs`（socket、推送）、`tests.rs`（用假终端）。`policy.rs`：档位判定。`project.rs`：project.toml 读写。`host.rs`：`lila host codex|omp`。`accounts.rs`、`signin.rs`、`magpie.rs`、`usage.rs`、`sessions.rs`、`commands.rs`。留着没人调用的：`worktree.rs`、`commit.rs`（P2）、`github.rs`、`daemon/sources.rs`（P4） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app） |
-| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、选中的会话或新会话、系统通知。`sidebar.rs`：侧栏。`ui.rs`：标题行、中间卡片、权限卡片、终端对话框的提示。`composer.rs`：输入区。`conversation.rs`：对话视图、对话/终端切换。`settings.rs`：项目设置。`prefs.rs`、`usage.rs`：全局设置。`dialog.rs`、`engines.rs`、`style.rs`、`data.rs` |
+| `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、选中的会话或新会话、系统通知。`sidebar.rs`：侧栏。`ui.rs`：标题行（`header_actions`）、中间卡片、权限卡片、终端对话框的提示。`composer.rs`：输入区。`conversation.rs`：对话视图、对话/终端切换。`settings.rs`：工作区设置。`prefs.rs`、`usage.rs`：全局设置。`dialog.rs`、`engines.rs`、`style.rs`、`data.rs` |
 
 ## 关键机制
 
@@ -129,10 +129,10 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 规范在 `DESIGN.md`（它是唯一的界面规范），接口在 `docs/architecture-v4.md` §9。这里只记怎么接手：
 
-- **结构**：左边侧栏（项目、会话，状态一眼能看出；在等你的整行红底），中间标题行加对话（Claude Code 会话可切到它的终端）或新会话的输入框；右边的 diff、文件、GitHub 面板是后面的阶段，现在没有。
-- **新会话**：没有会话被选中时，中间就是新会话的输入框（composer 的 key 是 `new:<项目>`），发出第一条消息才 `thread.new`。引擎、模型、努力程度、权限档的选择在 `app::Draft`，默认值取项目的 `defaults`。
-- **设置**：全局设置（⌘,）：用量、关于；项目设置（⇧⌘,）：名称和新会话的默认值（`project.set`）。
-- **快捷键**：⌘N 新会话、⌘1–9 第 n 个项目的最近会话、⌘, 全局设置、⇧⌘, 项目设置、⌘. 中断、⌘[ 终端切回对话、Esc 关对话框。
+- **结构**：左边侧栏（新会话按钮、工作区、会话，状态一眼能看出：转圈在工作、红点在等你；⌘B 收起），中间标题行（会话标题和「引擎 · 模型 · 努力程度」，右端是在访达中显示等按钮，之后的文件、改动按钮加在 `ui::header_actions`）加对话（Claude Code 会话可切到它的终端）或新会话的输入框；右边的 diff、文件、GitHub 面板是后面的阶段，现在没有。
+- **新会话**：没有会话被选中时，中间就是新会话的输入框（composer 的 key 是 `new:<项目>`），发出第一条消息才 `thread.new`。引擎、模型、努力程度、权限档的选择在 `app::Draft`，默认值取工作区的 `defaults`。输入框工具条：`+`、权限档、「模型 · 引擎 努力程度」、发送（在跑且框空时是停止）。
+- **设置**：全局设置（⌘,）：用量、关于；工作区设置（⇧⌘,）：名称和新会话的默认值（`project.set`）。
+- **快捷键**：⌘N 新会话、⌘B 收起或展开侧栏、⌘1–9 第 n 个工作区的最近会话、⌘, 全局设置、⇧⌘, 工作区设置、⌘. 中断、⌘[ 终端切回对话、Esc 关对话框。
 - **通知**：`app::notify_changes` 对比两次 `thread.list`；窗口不在前面时，会话开始等你或一轮跑完发 `osascript` 通知。
 
 ## 无法点鼠标时怎么验证
@@ -142,7 +142,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 - `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG（2882 × 1802，不含红绿灯，也截不到真实的毛玻璃）。
 - `LILA_APP_FAKE=/path.json`：**不起 lilad**，用造好的数据画界面。JSON 是 `{projects, threads, conversations}`：前两个和 `project.list`、`thread.list` 的返回一样，`conversations` 是会话 id 到 `thread.read` 返回的 `items`、`permissions`、`writing`、`config`。任何状态（在等你、归档、已结束、权限卡片、终端里的对话框……）都能这样造；这时窗口里的操作发不出去（没有 lilad）。
-- `LILA_APP_THREAD=<id>`：显示这个会话；`LILA_APP_NEW=<项目>,engine=codex,model=…,effort=…,permission=confirm`：打开新会话的输入框并选好；`LILA_APP_ADD=<文件夹>`：像选了文件夹那样添加项目。
+- `LILA_APP_THREAD=<id>`：显示这个会话；`LILA_APP_NEW=<项目>,engine=codex,model=…,effort=…,permission=confirm`：打开新会话的输入框并选好；`LILA_APP_ADD=<文件夹>`：像选了文件夹那样新建工作区。
 - `LILA_APP_CLICK="x,y;right:x,y;move:x,y;keys:cmd-n h i enter;wait:ms"`：启动 3 秒后依次点击（窗口里的点，不是截图的像素：截图是 2 倍，再缩放过的话自己换算）、右击、移动、按键（打字也行）、等待。点下拉菜单、右键菜单、对话框里的控件都靠它；真的 lilad 加它可以走完「新会话 → 发消息 → 回答 → 结束」。
 - `LILA_APP_KEYS="cmd-, cmd-shift-,"`：启动后 1.5 秒按这些键，用来验证快捷键。
 - `LILA_APP_INACTIVE=1` 加 `LILA_APP_NOTIFY_LOG=<文件>`：窗口当作不在前面，通知写进文件而不是真的发。
@@ -164,9 +164,9 @@ macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; ki
 都过了测试和截图，但要用鼠标、键盘或真实环境确认：
 
 - **P1b 的窗口（项目 → 会话，2026-11-10）**：模拟的点击和按键、真跑一个 Haiku 会话都过了，下面这些要用真的鼠标和键盘点一遍：
-  - 添加项目的系统文件夹选择框；
-  - 中文输入法在输入框、重命名、项目名称里；复制粘贴（含粘贴图片）、拖文件进对话区；
-  - 点击和右键的手感：侧栏会话行、项目行（折叠）、菜单、对话框外点一下关闭、拖动窗口、红绿灯；
+  - 新建工作区的系统文件夹选择框；
+  - 中文输入法在输入框、重命名、工作区名称里；复制粘贴（含粘贴图片）、拖文件进对话区；
+  - 点击和右键的手感：侧栏会话行、工作区行（折叠，悬停出现 `+`）、菜单、对话框外点一下关闭、拖动窗口、红绿灯；
   - 系统通知：窗口放到后面，让一个会话等权限或跑完一轮（`osascript` 的通知在系统设置里要允许「脚本编辑器」之类的来源）；
   - 权限确认卡片在真引擎上的完整一轮（Claude 的 `confirm` 档、Codex 的 `git push`）；Codex 和 omp 的新会话没真跑过；
   - 窗口缩到很窄时侧栏、标题行、输入工具条的挤压。
@@ -178,11 +178,13 @@ macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; ki
 
 - **路线图**见上面「进度和下一步」和 `product-v4.md` §8。
 - **P1 留下的**：
+  - 在 Claude Code 没信任过的文件夹里开会话，会停在终端里的「信任此文件夹」对话框，窗口只显示「在等你」，不说等什么。
+  - Claude 会话的用户消息约 0.4 秒后才进会话记录（hc 粘贴 0.24 秒 + 跟读），窗口靠乐观显示盖住；回复靠 `MessageDisplay` hook 先显示，Stop 后保留到会话记录里有了为止。
   - Codex 偶尔停在工具结果之后不收尾（v3 就有的老问题）：120 秒的催促兜底没解决，发一条消息才继续。根因没查清。
   - Codex 的 MCP 工具审批和 `item/permissions/requestApproval`（模型主动申请额外权限）目前直接回「不支持」，不问人。P3 接 MCP 工具层时必须处理。
   - 角色预设（引擎、模型、努力程度、附加提示词的组合）整个推迟了，没留数据结构。
   - ACP 引擎只内置 omp；再接一个要在 `lila_core::Runtime` 加一项。
-  - 项目按 id 排序；折叠的项目和归档开关不记住；会话标题行不显示项目名。
+  - 工作区按 id 排序；折叠的工作区和「显示已归档」不记住（侧栏收起记住，`app-sidebar.json`）；会话标题行不显示项目名。
   - `README.md` 里的窗口截图（`docs/images/window.png`）还是旧窗口，等用户满意后换成真实截图。
   - Claude 会话的终端视图由窗口直接连 hc（和以前一样），是「只走 lilad 的 socket」的唯一例外，做远程访问时要处理。
 - **更早留下的**：

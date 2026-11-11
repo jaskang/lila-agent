@@ -1,11 +1,11 @@
-//! The sidebar card: a new session, then each project with its sessions. A session's row says
-//! how it is doing at a glance (docs: DESIGN.md, Sidebar); the right-click menus rename, end,
-//! resume and archive.
+//! The sidebar card: a new session, then each workspace (a project folder) with its sessions. A
+//! session's row says how it is doing at a glance (docs: DESIGN.md, Sidebar); the right-click menus
+//! rename, end, resume and archive.
 
 use crate::app::{LilaApp, Rename};
 use crate::data::{self, Project};
 use crate::style::{self, card, muted, muted2};
-use crate::ui::{BAR, TRAFFIC_LIGHTS, avatar, drag_bar, dot, s};
+use crate::ui::{BAR, TRAFFIC_LIGHTS, drag_bar, dot, s};
 use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
@@ -16,12 +16,21 @@ use crate::style::Control as _;
 use gpui::prelude::*;
 use gpui::*;
 use serde_json::{Value, json};
-use std::time::Duration;
 
-/// A project lists this many sessions (those that need the person, or run, always); the rest are one click away.
+/// A workspace lists this many sessions (those that need the person, or run, always); the rest are one click away.
 const SHOWN: usize = 8;
 
-/// A section heading in the sidebar (项目).
+/// A row's outer margin (`mx_2`) and inner padding (`px_2`).
+const OUTER: f32 = 8.;
+const INNER: f32 = 8.;
+/// The workspace row's folder icon, and the gap after it; the workspace's name starts after both.
+const FOLDER: f32 = 16.;
+const FOLDER_GAP: f32 = 8.;
+/// Where a workspace's name starts, from its row's own left edge. The rows under it (sessions, the new one,
+/// "more") pad their left by this, so their words start under the name's first letter.
+const NAME_PAD: f32 = INNER + FOLDER + FOLDER_GAP;
+
+/// A section heading in the sidebar (工作区).
 fn label(text: impl Into<SharedString>) -> Div {
     div().text_xs().font_semibold().text_color(muted()).child(text.into())
 }
@@ -30,8 +39,8 @@ fn label(text: impl Into<SharedString>) -> Div {
 fn row(id: impl Into<ElementId>, active: bool) -> Stateful<Div> {
     h_flex()
         .id(id)
-        .mx_2()
-        .px_2()
+        .mx(px(OUTER))
+        .px(px(INNER))
         .h(px(style::ROW))
         .mb(px(style::ROW_GAP))
         .gap_2()
@@ -41,23 +50,12 @@ fn row(id: impl Into<ElementId>, active: bool) -> Stateful<Div> {
         .when(!active, |d| d.hover(|d| d.bg(style::hover())))
 }
 
-/// A tile that breathes a red ring while its session waits for you: slow
-/// enough to notice without nagging.
-fn waiting_ring(tile: Div, id: String) -> AnyElement {
-    tile.with_animation(SharedString::from(format!("ring-{id}")), Animation::new(Duration::from_millis(1800)).repeat(), |d, t| {
-        let k = (t / 0.7).min(1.);
-        let ease = 1. - (1. - k).powi(3);
-        d.shadow(vec![BoxShadow { color: style::red().opacity(0.55 * (1. - k)), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(5. * ease), inset: false }])
-    })
-    .into_any_element()
-}
-
 /// What a waiting session waits for, in the words of its second line.
 pub fn waiting_words(t: &Value) -> &'static str {
     if t["waiting"] == "terminal" { "终端在等你" } else { "要你允许" }
 }
 
-/// Which of a project's threads the sidebar lists: the latest `SHOWN`, and always those that need the person,
+/// Which of a workspace's threads the sidebar lists: the latest `SHOWN`, and always those that need the person,
 /// run, are shown or archived. The rest count as `more`.
 pub fn visible(threads: &[Value], shown: Option<&str>, all: bool) -> (Vec<Value>, usize) {
     let mut out = Vec::new();
@@ -78,42 +76,28 @@ pub fn visible(threads: &[Value], shown: Option<&str>, all: bool) -> (Vec<Value>
 }
 
 impl LilaApp {
-    /// One thread row under its project: the engine's tile, the title, and on the right how it is doing.
+    /// One thread row under its workspace: the title under the workspace's name, and on the right how it is doing
+    /// (a spinner while it works, a red dot while it waits for you, else how long ago).
     fn thread_row(&self, t: &Value, shown: bool, now: i64, cx: &mut Context<Self>) -> AnyElement {
         let id = s(t, "id");
         let state = s(t, "state");
         let waiting = state == "waiting";
-        let ended = state == "ended";
-        let archived = t["archived"] == true;
+        let dim = state == "ended" || t["archived"] == true;
         let click = id.clone();
-        let tile = style::cli_tile(&s(t, "engine"), 20.).when(ended || archived, |d| d.opacity(0.5));
-        let tile = if waiting { waiting_ring(tile, id.clone()) } else { tile.into_any_element() };
         let mark = match state.as_str() {
             "running" | "starting" => Spinner::new().xsmall().color(style::blue()).into_any_element(),
             "waiting" => dot(style::red()).size(px(8.)).into_any_element(),
             _ => div().text_size(px(11.)).text_color(muted2()).child(data::age(t["active_ms"].as_i64().unwrap_or(0), now)).into_any_element(),
         };
-        h_flex()
-            .id(SharedString::from(format!("thread-{id}")))
-            .relative()
-            .ml(px(18.))
-            .mr_2()
-            .px_2()
+        row(SharedString::from(format!("thread-{id}")), shown)
+            .pl(px(NAME_PAD))
             .h(px(if waiting { style::THREAD_ROW_WAITING } else { style::ROW }))
-            .mb(px(style::ROW_GAP))
-            .gap(px(10.))
-            .rounded(px(style::R_CTL))
-            .cursor_pointer()
-            .when(waiting, |d| d.bg(style::red().opacity(0.1)).hover(|d| d.bg(style::red().opacity(0.15))))
-            .when(shown, |d| d.bg(if waiting { style::red().opacity(0.2) } else { style::accent() }))
-            .when(!shown && !waiting, |d| d.hover(|d| d.bg(style::hover())))
-            .child(tile)
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .gap(px(1.))
-                    .child(div().text_size(px(13.)).font_medium().truncate().text_color(if ended || archived { muted() } else { style::fg() }).child(s(t, "title")))
+                    .child(div().text_size(px(13.)).font_medium().truncate().text_color(if dim { muted() } else { style::fg() }).child(s(t, "title")))
                     .when(waiting, |d| d.child(div().text_xs().truncate().text_color(style::tint(style::red(), 0.25)).child(waiting_words(t)))),
             )
             .child(div().flex_none().child(mark))
@@ -124,19 +108,7 @@ impl LilaApp {
 
     /// The row of the session about to be made: while its box is open, it is where the person is.
     fn new_row(&self) -> AnyElement {
-        h_flex()
-            .id("new-row")
-            .ml(px(18.))
-            .mr_2()
-            .px_2()
-            .h(px(style::ROW))
-            .mb(px(style::ROW_GAP))
-            .gap(px(10.))
-            .rounded(px(style::R_CTL))
-            .bg(style::accent())
-            .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(Icon::new(IconName::Plus).size(px(14.)).text_color(muted())))
-            .child(div().text_size(px(13.)).font_medium().text_color(muted()).child("新会话"))
-            .into_any_element()
+        row("new-row", true).pl(px(NAME_PAD)).child(div().text_size(px(13.)).font_medium().text_color(muted()).child("新会话")).into_any_element()
     }
 
     pub fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -144,28 +116,32 @@ impl LilaApp {
         let shown = self.thread.clone();
         let projects = self.snap.projects.clone();
         let now = data::now_ms();
-        let archived_total = self.snap.threads.iter().filter(|t| t["archived"] == true).count();
+        let current = self.current_project();
         let mut rows: Vec<AnyElement> = Vec::new();
         for p in &projects {
             let threads = self.threads_of(&p.id);
             let waiting = threads.iter().filter(|t| t["state"] == "waiting").count();
             let folded = self.folded.contains(&p.id);
+            let here = current.as_deref() == Some(p.id.as_str());
             let (id, add, fold) = (p.id.clone(), p.id.clone(), p.id.clone());
+            // The new-session `+` shows while the pointer is on the row.
+            let group = SharedString::from(format!("project-group-{id}"));
             rows.push(
                 row(SharedString::from(format!("project-{id}")), false)
-                    .child(Icon::new(if folded { IconName::ChevronRight } else { IconName::ChevronDown }).size(px(12.)).text_color(muted2()))
-                    .child(avatar(&p.id, 20., cx))
+                    .group(group.clone())
+                    .gap(px(FOLDER_GAP))
+                    .child(Icon::new(if folded { IconName::FolderClosed } else { IconName::FolderOpen }).size(px(FOLDER)).text_color(if here { style::blue() } else { muted() }))
                     .child(div().text_size(px(13.)).font_semibold().truncate().min_w_0().child(p.label()))
-                    // project.toml can't be read (the folder moved, the file is broken): the project runs on defaults.
+                    // project.toml can't be read (the folder moved, the file is broken): the workspace runs on defaults.
                     .when_some(p.error.clone(), |d, e| {
                         d.child(div().id(SharedString::from(format!("project-error-{id}"))).flex_none().tooltip(move |window, cx| gpui::component::tooltip::Tooltip::new(e.clone()).build(window, cx)).child(Icon::new(IconName::TriangleAlert).size(px(13.)).text_color(style::yellow())))
                     })
                     .child(div().flex_1())
                     .when(waiting > 0, |d| d.child(style::pill(style::red(), waiting.to_string())))
-                    .child(Button::new(SharedString::from(format!("new-thread-{id}"))).custom(quiet).xsmall().icon(IconName::Plus).tooltip("新会话 (⌘N)").on_click(cx.listener(move |this, _, window, cx| {
+                    .child(div().flex_none().invisible().group_hover(group, |d| d.visible()).child(Button::new(SharedString::from(format!("new-thread-{id}"))).custom(quiet).xsmall().icon(IconName::Plus).tooltip("新会话 (⌘N)").on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.show_new(add.clone(), window, cx)
-                    })))
+                    }))))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !this.folded.remove(&fold) {
                             this.folded.insert(fold.clone());
@@ -182,7 +158,7 @@ impl LilaApp {
                 rows.push(self.new_row());
             }
             let mut listed = threads;
-            if self.show_archived {
+            if self.archived_shown.contains(&p.id) {
                 listed.extend(self.archived_of(&p.id));
             }
             let all = self.unfolded.contains(&p.id);
@@ -193,9 +169,9 @@ impl LilaApp {
                 rows.push(
                     h_flex()
                         .id(SharedString::from(format!("more-{id}")))
-                        .ml(px(18.))
-                        .mr_2()
-                        .px_2()
+                        .mx(px(OUTER))
+                        .pl(px(NAME_PAD))
+                        .pr(px(INNER))
                         .h(px(26.))
                         .gap(px(6.))
                         .rounded(px(style::R_CTL))
@@ -216,30 +192,38 @@ impl LilaApp {
             }
         }
 
-        let current = self.current_project();
         let body = card()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            // The first row: the traffic lights, the app's name, Lila's settings. It drags the window.
+            // The first row: the traffic lights, and fold the sidebar away on the right. It drags the window.
             .child(
                 drag_bar(h_flex().id("sidebar-top"), cx)
                     .h(px(BAR))
                     .flex_none()
                     .pl(px(TRAFFIC_LIGHTS))
                     .pr(px(10.))
-                    .child(div().text_size(px(13.)).font_semibold().child("Lila"))
                     .child(div().flex_1())
-                    .child(Button::new("prefs").custom(quiet).xsmall().icon(IconName::Settings).tooltip("设置 (⌘,)").on_click(cx.listener(|this, _, _, cx| this.open_prefs(crate::prefs::PrefPage::Usage, cx)))),
+                    .child(Button::new("sidebar-hide").custom(quiet).xsmall().icon(IconName::PanelLeftClose).tooltip("收起侧栏 (⌘B)").on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))),
             )
             .children(current.map(|p| {
-                row("new-session", false)
+                h_flex()
+                    .id("new-session")
+                    .mx(px(OUTER))
                     .mb(px(6.))
+                    .h(px(style::ROW))
                     .gap_2()
+                    .justify_center()
+                    .rounded(px(style::R_CTL))
+                    .bg(style::fill())
+                    .border_1()
+                    .border_color(style::hairline())
+                    .cursor_pointer()
+                    .hover(|d| d.bg(style::accent()))
                     .child(Icon::new(IconName::Plus).size(px(14.)).text_color(muted()))
                     .child(div().text_size(px(13.)).font_medium().child("新会话"))
-                    .tooltip(|window, cx| gpui::component::tooltip::Tooltip::new("⌘N").build(window, cx))
+                    .tooltip(|window, cx| gpui::component::tooltip::Tooltip::new("新会话 (⌘N)").build(window, cx))
                     .on_click(cx.listener(move |this, _, window, cx| this.show_new(p.clone(), window, cx)))
             }))
             .child(
@@ -247,31 +231,26 @@ impl LilaApp {
                     .pl_4()
                     .pr(px(10.))
                     .py(px(6.))
-                    .child(label("项目"))
+                    .child(label("工作区"))
                     .child(div().flex_1())
-                    // Archived sessions are hidden; this brings them back into the list.
-                    .when(archived_total > 0 || self.show_archived, |d| {
-                        d.child(
-                            Button::new("show-archived")
-                                .custom(quiet)
-                                .xsmall()
-                                .icon(style::icon("lila/archive.svg").text_color(if self.show_archived { style::fg() } else { muted() }))
-                                .when(self.show_archived, |b| b.bg(style::accent()))
-                                .tooltip(format!("已归档 ({archived_total})"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_archived = !this.show_archived;
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .child(Button::new("add-project").custom(quiet).xsmall().icon(IconName::Plus).tooltip("添加项目").on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))),
+                    .child(Button::new("add-project").custom(quiet).xsmall().icon(style::icon("lila/folder-plus.svg")).tooltip("新建工作区").on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))),
             )
-            .child(v_flex().id("thread-tree").flex_1().min_h_0().overflow_y_scrollbar().pb_2().children(rows));
+            .child(v_flex().id("thread-tree").flex_1().min_h_0().overflow_y_scrollbar().pb_2().children(rows))
+            // The last row: Lila's own settings.
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(BAR))
+                    .px(px(10.))
+                    .border_t_1()
+                    .border_color(style::divider())
+                    .child(Button::new("prefs").custom(quiet).xsmall().icon(IconName::Settings).tooltip("设置 (⌘,)").on_click(cx.listener(|this, _, _, cx| this.open_prefs(crate::prefs::PrefPage::Usage, cx)))),
+            );
 
         v_flex().size_full().text_color(style::fg()).child(body)
     }
 
-    /// Asks for a folder, and adds it as a project.
+    /// Asks for a folder, and adds it as a workspace.
     pub fn choose_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("添加".into()) });
         cx.spawn_in(window, async move |this, cx| {
@@ -284,21 +263,38 @@ impl LilaApp {
         .detach();
     }
 
-    /// The right-click menu of a project.
+    /// The right-click menu of a workspace.
     fn project_menu(&self, p: &Project, cx: &mut Context<Self>) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let weak = cx.entity().downgrade();
         let (id, cwd) = (p.id.clone(), p.cwd.clone());
+        let showing = self.archived_shown.contains(&p.id);
+        // Without archived sessions in it, the choice would show nothing.
+        let archived = showing || !self.archived_of(&p.id).is_empty();
         move |menu, _, _| {
             let (w1, id1) = (weak.clone(), id.clone());
             let (w2, id2) = (weak.clone(), id.clone());
+            let (w3, id3) = (weak.clone(), id.clone());
             let cwd = cwd.clone();
-            menu.item(PopupMenuItem::new("新会话").icon(IconName::Plus).on_click(move |_, window, cx| {
-                let _ = w1.update(cx, |this, cx| this.show_new(id1.clone(), window, cx));
-            }))
-            .item(PopupMenuItem::new("项目设置…").icon(IconName::Settings2).on_click(move |_, window, cx| {
-                let _ = w2.update(cx, |this, cx| this.open_settings(id2.clone(), window, cx));
-            }))
-            .separator()
+            let menu = menu
+                .item(PopupMenuItem::new("新会话").icon(IconName::Plus).on_click(move |_, window, cx| {
+                    let _ = w1.update(cx, |this, cx| this.show_new(id1.clone(), window, cx));
+                }))
+                .item(PopupMenuItem::new("工作区设置…").icon(IconName::Settings2).on_click(move |_, window, cx| {
+                    let _ = w2.update(cx, |this, cx| this.open_settings(id2.clone(), window, cx));
+                }));
+            let menu = if archived {
+                menu.item(PopupMenuItem::new(if showing { "隐藏已归档" } else { "显示已归档" }).icon(style::icon("lila/archive.svg")).on_click(move |_, _, cx| {
+                    let _ = w3.update(cx, |this, cx| {
+                        if !this.archived_shown.remove(&id3) {
+                            this.archived_shown.insert(id3.clone());
+                        }
+                        cx.notify();
+                    });
+                }))
+            } else {
+                menu
+            };
+            menu.separator()
             .item(PopupMenuItem::new("在访达中显示").icon(IconName::FolderOpen).on_click(move |_, _, _| {
                 let _ = std::process::Command::new("open").arg(&cwd).spawn();
             }))

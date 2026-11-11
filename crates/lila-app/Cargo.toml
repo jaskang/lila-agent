@@ -28,6 +28,7 @@ serde_json.workspace = true
 shots-gpui = { package = "gpui-pre", version = "=0.3.11", optional = true, features = ["test-support"] }
 shots-gpui-macos = { package = "gpui-pre-macos", version = "=0.3.11", optional = true, features = ["test-support"] }
 png = { version = "0.17", optional = true }
+nucleo-matcher = "0.3.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `shots`: logs the window buttons' size (they are not in the PNG).

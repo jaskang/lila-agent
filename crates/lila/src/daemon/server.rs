@@ -10,7 +10,7 @@ pub(super) enum Input {
     /// A fresh `events.subscribe` snapshot and when it was taken.
     Snapshot(Value, i64),
     Tick,
-    /// Read what Claude Code threads added to their transcripts (fast: the window follows along).
+    /// Read what Claude Code threads added to their transcripts (every 100 ms: the window follows along; also after a hook or a terminal event).
     Follow,
     /// A thread's host attached: the thread, its command channel.
     HostAttach(String, std::sync::mpsc::Sender<String>),
@@ -144,7 +144,7 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
     let tx_follow = tx.clone();
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             if tx_follow.send(Input::Follow).is_err() {
                 return;
             }
@@ -186,7 +186,11 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
                 let known: Vec<String> = snap["terminals"].as_array().into_iter().flatten().filter(|t| t["state"] == "live").filter_map(|t| t["address"].as_str().map(String::from)).collect();
                 daemon.reconcile(&known, taken_ms, now);
             }
-            Input::Hc(line) => daemon.on_event(&line, now),
+            Input::Hc(line) => {
+                daemon.on_event(&line, now);
+                // A state change of the terminal (idle at the end of a turn) goes out with what the thread wrote.
+                daemon.follow_transcripts();
+            }
             Input::Tick => daemon.tick(now),
             Input::Follow => daemon.follow_transcripts(),
             Input::HostAttach(tid, ctx) => daemon.host_attach(&tid, ctx, now),

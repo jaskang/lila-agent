@@ -11,6 +11,7 @@
 //! `thread.files`, and `config` in `thread.read`), and what is not there is not drawn.
 
 use crate::app::LilaApp;
+use crate::conversation::Pending;
 use crate::style::{self, muted, muted2};
 use crate::ui::s;
 use gpui::component::attachment::{Attachment, AttachmentContent, AttachmentGroup, AttachmentMedia, AttachmentTitle};
@@ -20,7 +21,10 @@ use gpui::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui::component::{Disableable as _, Icon, IconName, Sizable, StyledExt as _, h_flex, v_flex};
 use gpui::prelude::*;
 use gpui::*;
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -90,10 +94,93 @@ pub fn detect(text: &str, cursor: usize, dollar: bool) -> Option<Trigger> {
     None
 }
 
-/// Does a row with these words answer what was typed (case aside)?
-pub fn matches(query: &str, words: &[&str]) -> bool {
-    let q = query.to_lowercase();
-    q.is_empty() || words.iter().any(|w| w.to_lowercase().contains(&q))
+/// How a row's words answer what was typed: how well (higher is better), and which bytes of the words matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub score: u32,
+    pub at: Vec<Range<usize>>,
+}
+
+/// What was typed after `@` or `/`, ready to be held against many rows. Its letters must appear in the words
+/// in order, apart or together, case aside (`atxt` finds `abc.txt`, `ca` does not); the matching is nucleo's (helix's).
+pub struct Query(Pattern);
+
+thread_local! {
+    /// nucleo's scratch memory, kept: a menu of thousands of files matches on every key.
+    static SCRATCH: RefCell<(Matcher, Vec<char>, Vec<u32>)> = RefCell::new((Matcher::new(Config::DEFAULT), Vec::new(), Vec::new()));
+}
+
+impl Query {
+    pub fn new(typed: &str) -> Self {
+        Self(Pattern::new(typed, CaseMatching::Ignore, Normalization::Smart, AtomKind::Fuzzy))
+    }
+
+    /// Does `text` answer the query? `path`: it is a file's path, where the letters after a `/` or `.` score better.
+    pub fn hit(&self, text: &str, path: bool) -> Option<Hit> {
+        SCRATCH.with_borrow_mut(|(matcher, buf, chars)| {
+            matcher.config = if path { Config::DEFAULT.match_paths() } else { Config::DEFAULT };
+            chars.clear();
+            let score = self.0.indices(Utf32Str::new(text, buf), matcher, chars)?;
+            // nucleo counts characters, a highlight needs bytes: they differ in the middle of `文档.md`.
+            chars.sort_unstable();
+            chars.dedup();
+            let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).chain([text.len()]).collect();
+            let mut at: Vec<Range<usize>> = Vec::new();
+            for &c in chars.iter() {
+                let range = starts[c as usize]..starts[c as usize + 1];
+                match at.last_mut() {
+                    Some(last) if last.end == range.start => last.end = range.end,
+                    _ => at.push(range),
+                }
+            }
+            Some(Hit { score, at })
+        })
+    }
+}
+
+/// The words with what the typed letters matched in the accent colour and bolder.
+fn marked(text: String, at: Vec<Range<usize>>) -> StyledText {
+    let mark = HighlightStyle { color: Some(style::blue()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() };
+    StyledText::new(text).with_highlights(at.into_iter().map(|r| (r, mark)))
+}
+
+/// A file that answers what was typed, with what marks its name and what marks its folders.
+type RankedFile<'a> = (&'a String, Vec<Range<usize>>, Vec<Range<usize>>);
+
+/// The files that answer `typed`, best first: those whose name has it come before those that only have it in the
+/// folders. With each: what marks the name, and what marks the folders.
+fn rank_files<'a>(typed: &str, files: &'a [String]) -> Vec<RankedFile<'a>> {
+    let query = Query::new(typed);
+    let (mut named, mut deeper) = (Vec::new(), Vec::new());
+    for f in files {
+        let name_at = f.len() - f.rsplit('/').next().unwrap_or(f).len();
+        if let Some(hit) = query.hit(&f[name_at..], false) {
+            // The folders matched nothing: the name did it alone.
+            named.push((hit.score, f, hit.at, Vec::new()));
+        } else if let Some(hit) = query.hit(f, true) {
+            let dir = name_at.saturating_sub(1);
+            deeper.push((hit.score, f, within(&hit.at, name_at..f.len()), within(&hit.at, 0..dir)));
+        }
+    }
+    // Stable: files that score alike stay in the order lilad listed them.
+    named.sort_by_key(|h| std::cmp::Reverse(h.0));
+    deeper.sort_by_key(|h| std::cmp::Reverse(h.0));
+    named.into_iter().chain(deeper).map(|(_, f, name, dir)| (f, name, dir)).collect()
+}
+
+/// The parts of `ranges` inside `window`, moved so that `window` starts at 0.
+fn within(ranges: &[Range<usize>], window: Range<usize>) -> Vec<Range<usize>> {
+    ranges.iter().filter(|r| r.start < window.end && r.end > window.start).map(|r| r.start.max(window.start) - window.start..r.end.min(window.end) - window.start).collect()
+}
+
+/// Where `query` sits in `text` as it is (case aside), for the words that are found by plain inclusion.
+fn included(query: &str, text: &str) -> Vec<Range<usize>> {
+    let (q, t) = (query.to_lowercase(), text.to_lowercase());
+    // Lowercasing that changes the length (a few letters do) would put the bytes out of place.
+    if q.is_empty() || t.len() != text.len() {
+        return Vec::new();
+    }
+    t.match_indices(&q).map(|(i, m)| i..i + m.len()).filter(|r| text.is_char_boundary(r.start) && text.is_char_boundary(r.end)).collect()
 }
 
 /// What choosing a row does.
@@ -113,6 +200,9 @@ pub struct Row {
     pub icon: Icon,
     pub name: String,
     pub detail: String,
+    /// The bytes of `name` and `detail` that the typed words matched: drawn in colour.
+    pub name_at: Vec<Range<usize>>,
+    pub detail_at: Vec<Range<usize>>,
     pub pick: Pick,
 }
 
@@ -262,31 +352,36 @@ impl LilaApp {
         match menu.trigger.kind {
             Kind::File => {
                 let files = self.menu_files.get(&key).map(Vec::as_slice).unwrap_or_default();
-                // Those whose name has it before those that only have it in the folders.
-                let (named, deeper): (Vec<&String>, Vec<&String>) = files.iter().filter(|f| matches(q, &[f])).partition(|f| matches(q, &[f.rsplit('/').next().unwrap_or(f)]));
-                named
+                rank_files(q, files)
                     .into_iter()
-                    .chain(deeper)
                     .take(SHOWN)
-                    .map(|f| {
+                    .map(|(f, name_at, detail_at)| {
                         let (dir, name) = f.rsplit_once('/').map_or(("", f.as_str()), |(d, n)| (d, n));
                         let text = if f.contains(char::is_whitespace) { format!("@\"{f}\" ") } else { format!("@{f} ") };
                         let icon = if lila_agent::image_mime(f).is_some() { style::icon("lila/image.svg") } else { Icon::new(IconName::FileText) };
-                        Row { icon, name: name.to_owned(), detail: dir.to_owned(), pick: Pick::Put { text, send: false } }
+                        Row { icon, name: name.to_owned(), detail: dir.to_owned(), name_at, detail_at, pick: Pick::Put { text, send: false } }
                     })
                     .collect()
             }
             Kind::Command => {
                 let sigil = if self.dollar(target) { '$' } else { '/' };
-                let mut rows: Vec<Row> = Vec::new();
+                let query = Query::new(q);
+                // (score, row): those whose name matches, then those that only mention it in their description.
+                let (mut named, mut described): (Vec<(u32, Row)>, Vec<Row>) = (Vec::new(), Vec::new());
                 let own = [
-                    (Icon::new(IconName::Square), "停止", "", Pick::Stop, working),
-                    (Icon::new(IconName::SquareTerminal), "终端", "", Pick::Terminal, tui),
+                    (Icon::new(IconName::Square), "停止", Pick::Stop, working),
+                    (Icon::new(IconName::SquareTerminal), "终端", Pick::Terminal, tui),
                 ];
-                rows.extend(own.into_iter().filter(|o| o.4 && matches(q, &[o.1])).map(|o| Row { icon: o.0, name: o.1.to_owned(), detail: o.2.to_owned(), pick: o.3 }));
+                for (icon, name, pick, offered) in own {
+                    if let (true, Some(hit)) = (offered, query.hit(name, false)) {
+                        named.push((hit.score, Row { icon, name: name.to_owned(), detail: String::new(), name_at: hit.at, detail_at: Vec::new(), pick }));
+                    }
+                }
                 for c in self.menu_commands.get(&key).into_iter().flatten() {
                     let (name, detail, kind) = (s(c, "name"), s(c, "description"), s(c, "kind"));
-                    if !matches(q, &[&name, &detail]) {
+                    let by_name = query.hit(&name, false);
+                    let by_words = if by_name.is_some() { Vec::new() } else { included(q, &detail) };
+                    if by_name.is_none() && by_words.is_empty() {
                         continue;
                     }
                     let icon = match kind.as_str() {
@@ -295,6 +390,9 @@ impl LilaApp {
                         _ => style::icon("lila/command.svg"),
                     };
                     let hint = c["hint"].as_str().unwrap_or_default();
+                    // The hint goes in front of the description: what was found in the description moves with it.
+                    let shift = if hint.is_empty() { 0 } else { hint.len() + 2 };
+                    let detail_at = by_words.iter().map(|r| r.start + shift..r.end + shift).collect();
                     let detail = if hint.is_empty() { detail } else { format!("{hint}  {detail}") };
                     let pick = match (c["action"].as_str(), c["insert"].as_str()) {
                         (Some(a), _) => Pick::Run(a.to_owned()),
@@ -302,8 +400,16 @@ impl LilaApp {
                         (None, Some(t)) => Pick::Put { text: t.replace(['/', '$'], &sigil.to_string()), send: hint.is_empty() && kind != "skill" },
                         _ => continue,
                     };
-                    rows.push(Row { icon, name: format!("{sigil}{name}"), detail, pick });
+                    // The sign is part of what is drawn, so the highlight moves past it.
+                    let name_at = by_name.iter().flat_map(|h| h.at.iter()).map(|r| r.start + 1..r.end + 1).collect();
+                    let row = Row { icon, name: format!("{sigil}{name}"), detail, name_at, detail_at, pick };
+                    match by_name {
+                        Some(h) => named.push((h.score, row)),
+                        None => described.push(row),
+                    }
                 }
+                named.sort_by_key(|h| std::cmp::Reverse(h.0));
+                let mut rows: Vec<Row> = named.into_iter().map(|h| h.1).chain(described).collect();
                 rows.truncate(SHOWN);
                 rows
             }
@@ -428,8 +534,10 @@ impl LilaApp {
     }
 
     /// Sends the box's words and files: to the thread, or, for a new session's box, as its first message
-    /// (which makes the thread, on the engine, model, effort and tier the box shows). They are cleared once
-    /// it went; if it did not, they stay and the box says why.
+    /// (which makes the thread, on the engine, model, effort and tier the box shows). To a thread they go
+    /// at once: the box empties and the message shows at the end of the conversation (`Pending`) until the
+    /// record has it, and if the send fails they come back into the box, with the reason. A new session's
+    /// box keeps them until it is made.
     pub fn send_message(&mut self, target: String, window: &mut Window, cx: &mut Context<Self>) {
         let ck = self.composer_key(&target);
         let Some(c) = self.composers.get_mut(&ck) else { return };
@@ -441,32 +549,65 @@ impl LilaApp {
         c.busy = true;
         c.error = None;
         let sent = files.len();
-        let (method, params) = match new_project(&target) {
+        let (method, params, pending) = match new_project(&target) {
             Some(project) => {
                 let (engine, model, effort, permission) = self.draft_of(project).unwrap_or_default();
                 let mut p = json!({"project": project, "text": text, "attachments": files, "engine": engine, "effort": effort, "permission": permission});
                 if !model.is_empty() {
                     p["model"] = json!(model);
                 }
-                ("thread.new", p)
+                ("thread.new", p, None)
             }
             None => {
                 // An ended thread goes on with the words: they are the message it resumes with.
                 let ended = self.snap.threads.iter().any(|t| t["id"] == target.as_str() && t["state"] == "ended");
-                (if ended { "thread.resume" } else { "thread.send" }, json!({"thread": target, "text": text, "attachments": files}))
+                let id = self.next_pending;
+                self.next_pending += 1;
+                self.pending.push(Pending { id, thread: target.clone(), text: text.clone(), files: files.clone(), at_ms: crate::data::now_ms(), taken_ms: None });
+                // Gone from the box already: what shows is the message, at the end of the conversation.
+                let c = self.composers.get_mut(&ck).expect("had it");
+                c.input.update(cx, |st, cx| st.set_value("", window, cx));
+                c.files.clear();
+                c.back = None;
+                (if ended { "thread.resume" } else { "thread.send" }, json!({"thread": target, "text": text, "attachments": files}), Some(id))
             }
         };
         self.request_result(method, params, window, cx, move |this, r, window, cx| {
+            let ok = r.is_ok();
+            if let Some(id) = pending {
+                if ok {
+                    if let Some(p) = this.pending.iter_mut().find(|p| p.id == id) {
+                        p.taken_ms = Some(crate::data::now_ms());
+                    }
+                    this.settle_pending();
+                } else if let Some(at) = this.pending.iter().position(|p| p.id == id) {
+                    // It did not go: the temporary row goes, the words and files are back in the box.
+                    let p = this.pending.remove(at);
+                    if let Some(c) = this.composers.get_mut(&ck) {
+                        let now = c.input.read(cx).value().to_string();
+                        let words = if now.trim().is_empty() { p.text.clone() } else { format!("{}\n{now}", p.text) };
+                        // The words coming back are not typing: they must not take the complaint away (`composer_changed`).
+                        c.seen = words.clone();
+                        c.input.update(cx, |st, cx| {
+                            st.set_value(words.clone(), window, cx);
+                            st.set_selected_range(words.len()..words.len(), cx);
+                        });
+                        c.files.splice(0..0, p.files.iter().map(PathBuf::from).filter(|f| !c.files.contains(f)).collect::<Vec<_>>());
+                    }
+                }
+            }
             let Some(c) = this.composers.get_mut(&ck) else { return };
             c.busy = false;
             match r {
                 Ok(v) => {
-                    // What was typed meanwhile stays.
-                    let same = c.input.read(cx).value().trim() == text;
-                    if same {
-                        c.input.update(cx, |st, cx| st.set_value("", window, cx));
+                    if pending.is_none() {
+                        // What was typed meanwhile stays.
+                        let same = c.input.read(cx).value().trim() == text;
+                        if same {
+                            c.input.update(cx, |st, cx| st.set_value("", window, cx));
+                        }
+                        c.files.drain(..sent.min(c.files.len()));
                     }
-                    c.files.drain(..sent.min(c.files.len()));
                     c.back = None;
                     // The session is made: show it.
                     if let Some(project) = new_project(&ck) {
@@ -587,42 +728,49 @@ impl LilaApp {
         });
     }
 
-    /// The model and effort shown in the box's tool row: a menu where the runtime lets the session change them,
-    /// else the plain words. A yellow dot when they are not the project's.
-    fn model_control(&mut self, target: &str, cfg: &Value, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The button on the right of the tool row for a session: the model, the engine and its effort. A menu of models
+    /// and efforts where the session can change them (the engine never changes), else the plain words.
+    /// Claude Code can't while it lives: its `/model` and `/effort` save the person's defaults (`thread.model`);
+    /// ended, it can. A yellow dot when they are not the workspace's.
+    fn thread_spec(&mut self, target: &str, m: &Value, cfg: &Value, cx: &mut Context<Self>) -> AnyElement {
         let quiet = style::quiet(cx);
-        let model = cfg["model"].as_str().filter(|m| !m.is_empty())?.to_owned();
-        let effort = cfg["effort"].as_str().unwrap_or_default().to_owned();
-        let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_owned();
-        let label = if effort.is_empty() { short(&model) } else { format!("{} · {effort}", short(&model)) };
-        let differs = differs(cfg);
-        let dot = || div().size(px(6.)).flex_none().rounded_full().bg(style::yellow());
-        // Where the session can't change them, the title row already says what they are.
-        if cfg["switch"] != true {
-            return None;
+        let engine = s(m, "engine");
+        let known = |key: &str| Some(s(cfg, key)).filter(|v| !v.is_empty()).unwrap_or_else(|| s(m, key));
+        let (model, effort) = (known("model"), known("effort"));
+        let label = crate::engines::engine_spec(&engine, &model, &effort);
+        let switch = match engine.as_str() {
+            "claude" => m["state"] == "ended",
+            // omp changes only what it lists, once it runs.
+            "omp" => cfg["switch"] == true,
+            _ => true,
+        };
+        if !switch {
+            return spec_text(label);
         }
-        // The choices: omp lists its own; Codex takes the models and efforts the settings offer.
+        // The choices: the engine lists its own (omp), else those the settings offer.
         let pairs = |list: &Value| -> Vec<(String, String)> { list.as_array().into_iter().flatten().map(|c| (s(c, "id"), s(c, "name"))).collect() };
         let (mut models, mut efforts) = (pairs(&cfg["models"]), pairs(&cfg["efforts"]));
         if models.is_empty() {
-            models = crate::engines::models("codex").iter().map(|m| (m.to_string(), m.to_string())).collect();
-            if !models.iter().any(|(id, _)| *id == model) {
-                models.insert(0, (model.clone(), model.clone()));
+            models = crate::engines::models(&engine).iter().map(|m| (m.to_string(), crate::engines::short_model(m))).collect();
+            if !model.is_empty() && !models.iter().any(|(id, _)| *id == model) {
+                models.insert(0, (model.clone(), crate::engines::short_model(&model)));
             }
         }
-        if efforts.is_empty() {
+        if efforts.is_empty() && crate::engines::has_effort(&engine) {
             efforts = crate::engines::EFFORTS.iter().map(|e| (e.to_string(), e.to_string())).collect();
         }
         let weak = cx.entity().downgrade();
         let to = target.to_owned();
-        let button = Button::new("conv-model").custom(quiet).xsmall().label(label).dropdown_caret(true).dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
+        let button = Button::new("conv-model").custom(quiet).xsmall().label(label).dropdown_caret(true).tooltip("模型").dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
             for (id, name) in &models {
                 let (weak, to, id2) = (weak.clone(), to.clone(), id.clone());
                 menu = menu.item(PopupMenuItem::new(name.clone()).checked(*id == model).on_click(move |_, window, cx| {
                     let _ = weak.update(cx, |this, cx| this.set_session_model(&to, Some(id2.clone()), None, window, cx));
                 }));
             }
-            menu = menu.separator();
+            if !models.is_empty() && !efforts.is_empty() {
+                menu = menu.separator();
+            }
             for (id, name) in &efforts {
                 let (weak, to, id2) = (weak.clone(), to.clone(), id.clone());
                 menu = menu.item(PopupMenuItem::new(name.clone()).checked(*id == effort).on_click(move |_, window, cx| {
@@ -631,7 +779,7 @@ impl LilaApp {
             }
             menu
         });
-        Some(h_flex().gap(px(2.)).items_center().when(differs, |d| d.child(dot())).child(button).into_any_element())
+        h_flex().gap(px(2.)).items_center().when(differs(cfg), |d| d.child(div().size(px(6.)).flex_none().rounded_full().bg(style::yellow()))).child(button).into_any_element()
     }
 
     /// The box under a thread's conversation, on a bar of its own, with `ask` (the engine waits in its terminal) above it.
@@ -647,7 +795,6 @@ impl LilaApp {
 
     /// The rounded box: files, the words, and a row of tools. `m` is the thread it writes to; none for a new session's.
     fn composer_box(&mut self, target: &str, m: Option<&Value>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let quiet = style::quiet(cx);
         let target = target.to_owned();
         let working = m.is_some_and(|m| s(m, "state") == "running");
         let waiting = m.is_some_and(|m| m["state"] == "waiting");
@@ -660,7 +807,8 @@ impl LilaApp {
             (c.input.clone(), c.files.clone(), c.error.clone(), c.busy, c.menu.is_some())
         };
         // Words to a thread that waits on a card or a dialog would answer it: lilad turns them down.
-        let can_send = !busy && !waiting && (!input.read(cx).value().trim().is_empty() || !files.is_empty());
+        let has_content = !input.read(cx).value().trim().is_empty() || !files.is_empty();
+        let can_send = !busy && !waiting && has_content;
         let menu = if has_menu {
             let menu = self.composers[&ck].menu.as_ref().expect("has one");
             let rows = self.menu_rows(&target, working, tui, menu);
@@ -749,37 +897,37 @@ impl LilaApp {
                     .on_paste(move |item, _, cx| weak.update(cx, |this, cx| this.paste_files(&paste_to, item, cx)).unwrap_or(false)),
             );
 
+        // Running, with nothing written: the button stops the turn. Words written go as a message even now (they queue or cut in).
+        let stop = working && !has_content;
+        let tier: Vec<AnyElement> = match m {
+            Some(m) => {
+                let (weak, id) = (cx.entity().downgrade(), target.clone());
+                vec![self.tier_button("conv-tier", &s(m, "permission"), Anchor::BottomLeft, cx, move |key, cx| {
+                    let _ = weak.update(cx, |this, cx| this.act("thread.permission", json!({"thread": id, "permission": key}), cx));
+                })]
+            }
+            None => new_project(&target).map(String::from).map(|p| self.tier_control(&p, cx)).unwrap_or_default(),
+        };
+        let spec = match m {
+            Some(m) => Some(self.thread_spec(&target, m, &cfg, cx)),
+            None => new_project(&target).map(String::from).and_then(|p| self.new_spec(&p, cx)),
+        };
         let tools = h_flex()
             .px_2()
             .pb_2()
             .gap_1()
             .items_center()
-            .child({
-                let to = target.clone();
-                Button::new("conv-attach").custom(quiet).size(px(style::CTL_SM)).icon(style::icon("lila/paperclip.svg").text_color(muted())).tooltip("添加附件").on_click(cx.listener(move |this, _, window, cx| this.choose_files(to.clone(), window, cx)))
-            })
-            .when(m.is_some(), |d| {
-                let to = target.clone();
-                d.child(Button::new("conv-commands").custom(quiet).size(px(style::CTL_SM)).icon(style::icon("lila/square-slash.svg").text_color(muted())).tooltip("命令 (/)").on_click(cx.listener(move |this, _, window, cx| this.toggle_menu(&to, window, cx))))
-            })
-            .when(m.is_some(), |d| d.children(self.model_control(&target, &cfg, cx)))
-            .when_some(new_project(&target).map(String::from), |d, project| d.children(self.start_controls(&project, cx)))
+            .child(self.plus_button(&target, m.is_some(), cx))
+            .children(tier)
             .child(div().flex_1())
-            .when(working, |d| {
-                let to = target.clone();
-                d.child(
-                    Button::new("conv-stop")
-                        .secondary()
-                        .size(px(style::CTL_SM))
-                        .icon(IconName::Square)
-                        .tooltip("停止")
-                        .on_click(cx.listener(move |this, _, _, cx| this.request("thread.interrupt", json!({"thread": to}), cx, |this, _, _| this.refresh_now()))),
-                )
-            })
-            .when_some(new_project(&target).map(String::from), |d, project| d.children(self.tier_control(&project, cx)))
+            .children(spec)
             .child({
                 let to = target.clone();
-                Button::new("conv-send").primary().size(px(style::CTL_SM)).icon(IconName::ArrowUp).disabled(!can_send).tooltip("发送 (↩)").on_click(cx.listener(move |this, _, window, cx| this.send_message(to.clone(), window, cx)))
+                if stop {
+                    Button::new("conv-stop").primary().size(px(style::CTL_SM)).icon(IconName::Square).tooltip("停止 (⌘.)").on_click(cx.listener(move |this, _, _, cx| this.request("thread.interrupt", json!({"thread": to}), cx, |this, _, _| this.refresh_now())))
+                } else {
+                    Button::new("conv-send").primary().size(px(style::CTL_SM)).icon(IconName::ArrowUp).disabled(!can_send).tooltip("发送 (↩)").on_click(cx.listener(move |this, _, window, cx| this.send_message(to.clone(), window, cx)))
+                }
             });
 
         v_flex()
@@ -797,29 +945,12 @@ impl LilaApp {
             .into_any_element()
     }
 
-    /// The engine and the model and effort a new session starts on, as buttons that open their choices.
-    fn start_controls(&mut self, project: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The button on the right of a new session's tool row: the model, the engine and its effort, as one menu: the
+    /// engines, then the models, then the efforts (the effort where the engine takes one).
+    fn new_spec(&mut self, project: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
         let quiet = style::quiet(cx);
-        let Some((engine, model, effort, _)) = self.draft_of(project) else { return Vec::new() };
+        let (engine, model, effort, _) = self.draft_of(project)?;
         let weak = cx.entity().downgrade();
-        let button = |id: &'static str, label: String| Button::new(id).custom(quiet).xsmall().label(label);
-        // The engine.
-        let engine_button = {
-            let (weak, project, now) = (weak.clone(), project.to_owned(), engine.clone());
-            button("new-engine", crate::engines::engine_name(&engine).to_owned()).dropdown_caret(true).tooltip("引擎").dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
-                for (id, name) in crate::engines::ENGINES {
-                    let (weak, project) = (weak.clone(), project.clone());
-                    menu = menu.item(PopupMenuItem::new(name).checked(id == now).on_click(move |_, _, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.drafts.entry(project.clone()).or_default().set_engine(id);
-                            cx.notify();
-                        });
-                    }));
-                }
-                menu
-            })
-        };
-        // The model and, where the engine takes one, the effort.
         let models: Vec<String> = {
             let mut m: Vec<String> = crate::engines::models(&engine).iter().map(|m| m.to_string()).collect();
             if !model.is_empty() && !m.contains(&model) {
@@ -827,48 +958,84 @@ impl LilaApp {
             }
             m
         };
-        let label = crate::engines::spec_label(&engine, &model, &effort);
         let shown_model = if model.is_empty() { crate::engines::default_model(&engine).to_owned() } else { model.clone() };
-        let spec_button = if models.is_empty() && !crate::engines::has_effort(&engine) {
-            // omp chooses its own models once it runs.
-            h_flex().h(px(style::CTL_SM)).px_2().items_center().text_size(px(12.)).text_color(muted2()).child(label).into_any_element()
-        } else {
-            let (weak, project, engine) = (weak.clone(), project.to_owned(), engine.clone());
-            button("new-spec", label).dropdown_caret(true).tooltip("模型和努力程度").dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
-                for m in &models {
-                    let (weak, project, id) = (weak.clone(), project.clone(), m.clone());
-                    menu = menu.item(PopupMenuItem::new(crate::engines::short_model(m)).checked(*m == shown_model).on_click(move |_, _, cx| {
-                        let _ = weak.update(cx, |this, cx| {
-                            this.drafts.entry(project.clone()).or_default().model = Some(id.clone());
-                            cx.notify();
-                        });
-                    }));
-                }
-                if crate::engines::has_effort(&engine) {
-                    if !models.is_empty() {
-                        menu = menu.separator();
-                    }
-                    for e in std::iter::once("").chain(crate::engines::EFFORTS) {
+        let (now_engine, project) = (engine.clone(), project.to_owned());
+        Some(
+            Button::new("new-spec")
+                .custom(quiet)
+                .xsmall()
+                .label(crate::engines::engine_spec(&engine, &model, &effort))
+                .dropdown_caret(true)
+                .tooltip("模型")
+                .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
+                    for (id, name) in crate::engines::ENGINES {
                         let (weak, project) = (weak.clone(), project.clone());
-                        menu = menu.item(PopupMenuItem::new(if e.is_empty() { "默认" } else { e }).checked(e == effort).on_click(move |_, _, cx| {
+                        menu = menu.item(PopupMenuItem::new(name).checked(id == now_engine).on_click(move |_, _, cx| {
                             let _ = weak.update(cx, |this, cx| {
-                                this.drafts.entry(project.clone()).or_default().effort = Some(e.to_owned());
+                                this.drafts.entry(project.clone()).or_default().set_engine(id);
                                 cx.notify();
                             });
                         }));
                     }
-                }
-                menu
+                    if !models.is_empty() {
+                        menu = menu.separator();
+                    }
+                    for m in &models {
+                        let (weak, project, id) = (weak.clone(), project.clone(), m.clone());
+                        menu = menu.item(PopupMenuItem::new(crate::engines::short_model(m)).checked(*m == shown_model).on_click(move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.drafts.entry(project.clone()).or_default().model = Some(id.clone());
+                                cx.notify();
+                            });
+                        }));
+                    }
+                    if crate::engines::has_effort(&now_engine) {
+                        menu = menu.separator();
+                        for e in std::iter::once("").chain(crate::engines::EFFORTS) {
+                            let (weak, project) = (weak.clone(), project.clone());
+                            menu = menu.item(PopupMenuItem::new(if e.is_empty() { "默认" } else { e }).checked(e == effort).on_click(move |_, _, cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.drafts.entry(project.clone()).or_default().effort = Some(e.to_owned());
+                                    cx.notify();
+                                });
+                            }));
+                        }
+                    }
+                    menu
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The `+` at the start of the tool row. A session: a menu of what can be added (a file; the commands, which
+    /// the engine reports, so a new session's box has none). A new session's box has only files: it opens the dialog.
+    fn plus_button(&mut self, target: &str, commands: bool, cx: &mut Context<Self>) -> AnyElement {
+        let quiet = style::quiet(cx);
+        let to = target.to_owned();
+        let button = Button::new("conv-plus").custom(quiet).size(px(style::CTL_SM)).icon(Icon::new(IconName::Plus).text_color(muted()));
+        if !commands {
+            return button.tooltip("添加附件").on_click(cx.listener(move |this, _, window, cx| this.choose_files(to.clone(), window, cx))).into_any_element();
+        }
+        let weak = cx.entity().downgrade();
+        button
+            .tooltip("添加")
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                let (w1, to1) = (weak.clone(), to.clone());
+                let (w2, to2) = (weak.clone(), to.clone());
+                menu.item(PopupMenuItem::new("添加附件").icon(style::icon("lila/paperclip.svg")).on_click(move |_, window, cx| {
+                    let _ = w1.update(cx, |this, cx| this.choose_files(to1.clone(), window, cx));
+                }))
+                .item(PopupMenuItem::new("命令").icon(style::icon("lila/square-slash.svg")).on_click(move |_, window, cx| {
+                    let _ = w2.update(cx, |this, cx| this.toggle_menu(&to2, window, cx));
+                }))
             })
             .into_any_element()
-        };
-        vec![engine_button.into_any_element(), spec_button]
     }
 
     /// The permission tier a new session starts on.
     fn tier_control(&mut self, project: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some((.., tier)) = self.draft_of(project) else { return Vec::new() };
-        vec![self.tier_button("new-tier", &tier, Anchor::BottomRight, cx, {
+        vec![self.tier_button("new-tier", &tier, Anchor::BottomLeft, cx, {
             let (weak, project) = (cx.entity().downgrade(), project.to_owned());
             move |key, cx| {
                 let _ = weak.update(cx, |this, cx| {
@@ -947,8 +1114,8 @@ impl LilaApp {
                             .when(ix == selected, |d| d.bg(style::accent()))
                             .hover(|d| d.bg(style::hover()))
                             .child(row.icon.size(px(13.)).text_color(muted()))
-                            .child(div().flex_none().max_w(relative(0.5)).truncate().text_size(px(13.)).font_medium().child(row.name))
-                            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(muted2()).child(row.detail))
+                            .child(div().flex_none().max_w(relative(0.5)).truncate().text_size(px(13.)).font_medium().child(marked(row.name, row.name_at)))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(muted2()).child(marked(row.detail, row.detail_at)))
                             .on_click(cx.listener(move |this, _, window, cx| this.pick(&to, picked.clone(), window, cx)))
                     })),
             )
@@ -980,6 +1147,11 @@ impl LilaApp {
     }
 }
 
+/// The model, engine and effort as plain words, where the session can't change them.
+fn spec_text(label: String) -> AnyElement {
+    h_flex().h(px(style::CTL_SM)).px_2().items_center().text_size(px(12.)).text_color(muted2()).child(label).into_any_element()
+}
+
 /// Is the model or effort not the project's? (Claude Code's model is read from its replies, as an id: only an id can differ for certain.)
 pub fn differs(cfg: &Value) -> bool {
     let (m, dm) = (cfg["model"].as_str().unwrap_or_default(), cfg["default_model"].as_str().unwrap_or_default());
@@ -1002,7 +1174,7 @@ pub fn prune(paths: &lila::paths::Paths) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, detect, differs, matches};
+    use super::{Kind, Query, detect, differs, included, rank_files, within};
     use serde_json::json;
 
     fn word(text: &str, dollar: bool) -> Option<(Kind, std::ops::Range<usize>, String)> {
@@ -1028,12 +1200,87 @@ mod tests {
         assert_eq!(detect("看看", 1, false), None, "inside a character");
     }
 
+    /// The matched pieces of `text` for `query`, as text.
+    fn found(query: &str, text: &str) -> Option<Vec<String>> {
+        Query::new(query).hit(text, false).map(|h| h.at.into_iter().map(|r| text[r].to_owned()).collect())
+    }
+
     #[test]
-    fn rows_match_by_what_was_typed_case_aside() {
-        assert!(matches("", &["x"]));
-        assert!(matches("MAIN", &["src/main.rs"]));
-        assert!(matches("压缩", &["compact", "压缩上下文"]));
-        assert!(!matches("zzz", &["compact", "Compact the conversation"]));
+    fn letters_in_order_match_apart_or_together_case_aside() {
+        for q in ["ab", "bc", "ac", "atxt", "AB", "abc.txt", ""] {
+            assert!(found(q, "abc.txt").is_some(), "{q} should find abc.txt");
+        }
+        for q in ["ca", "txta", "zzz", "abcd"] {
+            assert!(found(q, "abc.txt").is_none(), "{q} should not find abc.txt");
+        }
+        assert!(Query::new("MAIN").hit("src/main.rs", true).is_some());
+    }
+
+    #[test]
+    fn what_matched_is_given_as_byte_ranges_and_neighbours_join() {
+        assert_eq!(found("ab", "abc.txt"), Some(vec!["ab".into()]));
+        assert_eq!(found("ac", "abc.txt"), Some(vec!["a".into(), "c".into()]));
+        assert_eq!(found("atxt", "abc.txt").map(|v| v.concat()), Some("atxt".into()));
+        assert_eq!(found("", "abc.txt"), Some(vec![]), "nothing typed: everything, nothing marked");
+        let hit = Query::new("ac").hit("abc.txt", false).unwrap();
+        assert_eq!(hit.at, vec![0..1, 2..3]);
+    }
+
+    #[test]
+    fn wide_characters_are_counted_in_bytes_not_characters() {
+        let hit = Query::new("档md").hit("文档.md", false).unwrap();
+        // 文 is bytes 0..3, 档 3..6, '.' 6..7, m 7..8, d 8..9.
+        assert_eq!(hit.at, vec![3..6, 7..9]);
+        assert_eq!(found("文md", "文档.md"), Some(vec!["文".into(), "md".into()]));
+        assert_eq!(found("压缩", "压缩上下文"), Some(vec!["压缩".into()]));
+        assert!(found("缩压", "压缩上下文").is_none());
+        // Mixed with letters before them: the offsets of the letters are right too.
+        assert_eq!(found("a文", "ab文档"), Some(vec!["a".into(), "文".into()]));
+    }
+
+    #[test]
+    fn a_better_match_scores_higher() {
+        let q = Query::new("main");
+        let (whole, loose) = (q.hit("main.rs", false).unwrap(), q.hit("my_amazing_index.rs", false).unwrap());
+        assert!(whole.score > loose.score);
+    }
+
+    #[test]
+    fn a_path_is_split_into_what_marks_the_folders_and_the_name() {
+        // `src/main.rs`: the folders are bytes 0..3, the name starts at 4.
+        let hit = Query::new("sm").hit("src/main.rs", true).unwrap();
+        assert_eq!(hit.at, vec![0..1, 4..5]);
+        assert_eq!(within(&hit.at, 4..11), vec![0..1]);
+        assert_eq!(within(&hit.at, 0..3), vec![0..1]);
+        // A match that runs across the slash is cut at it.
+        let one: Vec<std::ops::Range<usize>> = std::iter::once(2..6).collect();
+        assert_eq!(within(&one, 0..3), vec![2..3]);
+        assert_eq!(within(&one, 4..11), vec![0..2]);
+    }
+
+    #[test]
+    fn files_named_for_it_come_before_files_in_folders_named_for_it() {
+        let files: Vec<String> = ["docs/readme.md", "src/app/main.rs", "src/ui/app.rs", "app.txt", "x/y/z.rs"].map(String::from).to_vec();
+        let ranked = rank_files("app", &files);
+        let names: Vec<&str> = ranked.iter().map(|r| r.0.as_str()).collect();
+        // Named for it: app.txt and app.rs (best first, the shorter whole match wins); only in a folder: src/app/main.rs.
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[2], "src/app/main.rs");
+        assert!(names[..2].contains(&"app.txt") && names[..2].contains(&"src/ui/app.rs"));
+        assert_eq!(ranked[2].1, Vec::<std::ops::Range<usize>>::new());
+        assert_eq!(ranked[2].2, vec![4..7], "the folder part `src/app` marks `app` at bytes 4..7");
+        assert!(rank_files("zq", &files).is_empty());
+        assert_eq!(rank_files("", &files).len(), 5, "nothing typed: all, in the order given");
+        assert_eq!(rank_files("", &files)[0].0, "docs/readme.md");
+    }
+
+    #[test]
+    fn a_description_is_searched_by_plain_inclusion() {
+        assert_eq!(included("Compact", "compact the conversation"), vec![0..7]);
+        assert_eq!(included("the", "compact the conversation"), vec![8..11]);
+        assert!(included("cmt", "compact the conversation").is_empty(), "no skipping letters here");
+        assert_eq!(included("压缩", "压缩上下文"), vec![0..6]);
+        assert!(included("", "x").is_empty());
     }
 
     #[test]

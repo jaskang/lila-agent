@@ -117,6 +117,10 @@ pub fn notify(title: &str, body: &str) {
 
 /// One request to lilad. `autostart`: start lilad first if needed.
 pub fn act(paths: &Paths, method: &str, params: Value, autostart: bool) -> anyhow::Result<Value> {
+    #[cfg(feature = "shots")]
+    if let Some(answer) = fake_act(method) {
+        return answer;
+    }
     lila::client::request(paths, method, params, autostart)
 }
 
@@ -148,6 +152,20 @@ pub fn save_views(paths: &Paths, tui: &std::collections::HashSet<String>) {
     let _ = std::fs::write(views_file(paths), json!({ "tui": list }).to_string());
 }
 
+fn sidebar_file(paths: &Paths) -> std::path::PathBuf {
+    paths.state.join("app-sidebar.json")
+}
+
+/// Was the sidebar folded away last time?
+pub fn load_sidebar_hidden(paths: &Paths) -> bool {
+    std::fs::read_to_string(sidebar_file(paths)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|v| v["hidden"] == true)
+}
+
+pub fn save_sidebar_hidden(paths: &Paths, hidden: bool) {
+    let _ = std::fs::create_dir_all(&paths.state);
+    let _ = std::fs::write(sidebar_file(paths), json!({ "hidden": hidden }).to_string());
+}
+
 pub fn save_last(paths: &Paths, thread: Option<&str>, project: Option<&str>) {
     let _ = std::fs::create_dir_all(&paths.state);
     let _ = std::fs::write(last_file(paths), json!({ "thread": thread, "project": project }).to_string());
@@ -157,20 +175,39 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// How long ago, in a few characters for a sidebar row: 刚刚, 5分, 3时, 2天.
+/// How long ago, for a sidebar row: 刚刚, 5 分钟, 19 小时, 3 天.
 pub fn age(ms: i64, now: i64) -> String {
     let mins = (now - ms).max(0) / 60_000;
     match mins {
         0 => "刚刚".to_owned(),
-        1..=59 => format!("{mins}分"),
-        60..=1439 => format!("{}时", mins / 60),
-        _ => format!("{}天", mins / 1440),
+        1..=59 => format!("{mins} 分钟"),
+        60..=1439 => format!("{} 小时", mins / 60),
+        _ => format!("{} 天", mins / 1440),
     }
 }
 
 /// Wall clock with milliseconds, for debug logs.
 pub fn clock_ms() -> String {
     chrono::Local::now().format("%H:%M:%S%.3f").to_string()
+}
+
+/// `--features shots`, with `LILA_APP_FAKE`: what the menus list (`files`, `commands` in the file) and how a send goes
+/// (`LILA_APP_FAKE_SEND_MS` takes that long, `LILA_APP_FAKE_SEND_ERR=<words>` fails with them); every other request is left to fail.
+#[cfg(feature = "shots")]
+fn fake_act(method: &str) -> Option<anyhow::Result<Value>> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(std::env::var("LILA_APP_FAKE").ok()?).ok()?).ok()?;
+    match method {
+        "thread.files" => Some(Ok(json!({"files": v["files"]}))),
+        "thread.commands" => Some(Ok(json!({"commands": v["commands"]}))),
+        "thread.send" | "thread.resume" => {
+            std::thread::sleep(std::time::Duration::from_millis(std::env::var("LILA_APP_FAKE_SEND_MS").ok().and_then(|m| m.parse().ok()).unwrap_or(0)));
+            Some(match std::env::var("LILA_APP_FAKE_SEND_ERR") {
+                Ok(e) => Err(anyhow::anyhow!(e)),
+                Err(_) => Ok(json!({"sent": true})),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// `--features shots`: `LILA_APP_FAKE=<file>` stands in for lilad, so a screenshot can show any state without
@@ -209,8 +246,8 @@ mod tests {
     fn ages_are_short() {
         let now = 10_000_000_000;
         assert_eq!(age(now - 20_000, now), "刚刚");
-        assert_eq!(age(now - 5 * 60_000, now), "5分");
-        assert_eq!(age(now - 3 * 3_600_000, now), "3时");
-        assert_eq!(age(now - 50 * 3_600_000, now), "2天");
+        assert_eq!(age(now - 5 * 60_000, now), "5 分钟");
+        assert_eq!(age(now - 19 * 3_600_000, now), "19 小时");
+        assert_eq!(age(now - 50 * 3_600_000, now), "2 天");
     }
 }

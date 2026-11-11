@@ -54,7 +54,7 @@ pub fn red() -> Hsla {
 pub fn yellow() -> Hsla {
     c(0xffd60aff)
 }
-/// Claude Code's own orange, for its tile.
+/// Claude Code's own orange (its row in the usage page).
 pub fn claude() -> Hsla {
     c(0xf0905fff)
 }
@@ -147,27 +147,6 @@ pub fn pill(color: Hsla, text: impl Into<SharedString>) -> Div {
     tag(color, text).rounded(px(9.)).min_w(px(18.)).justify_center().px(px(5.))
 }
 
-/// Which engine a thread runs on, as a small tile: Claude Code's asterisk in its
-/// orange, Codex as a neutral prompt, omp in blue.
-pub fn cli_tile(runtime: &str, size: f32) -> Div {
-    let (color, bg, line, icon) = match runtime {
-        "codex" => (c(0xe5e5eaff), c(0xffffff17), c(0xffffff1a), "lila/prompt.svg"),
-        "omp" => (blue(), blue().opacity(0.16), blue().opacity(0.22), "lila/prompt.svg"),
-        _ => (claude(), claude().opacity(0.16), claude().opacity(0.2), "lila/claude.svg"),
-    };
-    div()
-        .size(px(size))
-        .flex_none()
-        .rounded(px(size * 0.32))
-        .bg(bg)
-        .border_1()
-        .border_color(line)
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(Icon::empty().path(icon).size(px(size * 0.6)).text_color(color))
-}
-
 /// An icon from Lila's own set (see [`Assets`]).
 pub fn icon(name: &'static str) -> Icon {
     Icon::empty().path(name)
@@ -187,32 +166,13 @@ pub fn link(id: impl Into<ElementId>, text: impl Into<SharedString>, plus: bool)
         .child(text.into())
 }
 
-/// One place that says what state a thread is in: a mark and a word on a soft wash.
-pub fn status_pill(status: &str, cx: &App) -> Div {
-    let color = crate::ui::status_color(status, cx);
-    h_flex()
-        .h(px(20.))
-        .pl(px(7.))
-        .pr(px(8.))
-        .gap(px(6.))
-        .flex_none()
-        .rounded(px(10.))
-        .text_size(px(11.))
-        .font_semibold()
-        .text_color(tint(color, 0.15))
-        .bg(color.opacity(0.15))
-        .child(crate::ui::status_mark(status, cx))
-        .child(crate::ui::status_label(status))
-}
-
 /// The kit's Lucide subset, plus Lila's own icons under `lila/`.
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let own: Option<&'static [u8]> = match path {
-            "lila/claude.svg" => Some(include_bytes!("../assets/lila/claude.svg")),
-            "lila/prompt.svg" => Some(include_bytes!("../assets/lila/prompt.svg")),
+            "lila/folder-plus.svg" => Some(include_bytes!("../assets/lila/folder-plus.svg")),
             "lila/trash.svg" => Some(include_bytes!("../assets/lila/trash.svg")),
             "lila/brain.svg" => Some(include_bytes!("../assets/lila/brain.svg")),
             "lila/archive.svg" => Some(include_bytes!("../assets/lila/archive.svg")),

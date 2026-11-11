@@ -104,16 +104,25 @@ impl Transcript {
             // After a compaction the CLI records its summary as a user message, flagged `isCompactSummary`
             // (checked on real transcripts: every such message has it). It starts no turn.
             let summary = e["isCompactSummary"] == true;
+            // Stopping a turn records `[Request interrupted by user]` (`… for tool use` mid-tool): it ends the turn, starts none.
+            let interrupted = text.starts_with("[Request interrupted by user");
             let turn = e["promptId"].as_str().unwrap_or(uuid).to_owned();
-            if !summary {
+            if !summary && !interrupted {
                 self.turn = Some(turn.clone());
             }
+            let origin = if summary {
+                Origin::Summary
+            } else if interrupted {
+                Origin::Interrupted
+            } else {
+                crate::model::origin(text)
+            };
             out.push(Item {
                 id: uuid.to_owned(),
                 turn: Some(turn),
                 at_ms,
                 state: ItemState::Done,
-                kind: ItemKind::UserMessage { text: text.to_owned(), origin: if summary { Origin::Summary } else { crate::model::origin(text) }, attachments },
+                kind: ItemKind::UserMessage { text: text.to_owned(), origin, attachments },
             });
         }
         out
@@ -369,6 +378,20 @@ mod tests {
         let got = t.feed(&json!({"type": "user", "uuid": "u", "message": {"content": pasted}}).to_string());
         assert_eq!(got[0].kind, ItemKind::UserMessage { text: "<lila task=\"T1\" from=\"human\">\nCreate hello.txt\n</lila>".into(), origin: Origin::Lila { task: Some("T1".into()) }, attachments: vec![] });
         assert_eq!(unwrap_paste("plain"), "plain");
+    }
+
+    #[test]
+    fn stopping_a_turn_is_a_mark_not_something_the_person_said() {
+        let mut t = Transcript::new();
+        t.feed(&json!({"type": "user", "uuid": "u", "promptId": "p1", "message": {"role": "user", "content": "go"}}).to_string());
+        for (uuid, words) in [("i1", "[Request interrupted by user]"), ("i2", "[Request interrupted by user for tool use]")] {
+            let got = t.feed(&json!({"type": "user", "uuid": uuid, "promptId": "p2", "message": {"role": "user", "content": [{"type": "text", "text": words}]}}).to_string());
+            assert_eq!(got[0].kind, ItemKind::UserMessage { text: words.into(), origin: Origin::Interrupted, attachments: vec![] });
+            assert_eq!(serde_json::to_value(&got[0]).unwrap()["from"], "interrupted");
+        }
+        // It starts no turn.
+        let call = t.feed(&json!({"type": "assistant", "uuid": "a", "message": {"content": [{"type": "tool_use", "id": "x", "name": "Bash", "input": {"command": "ls"}}]}}).to_string());
+        assert_eq!(call[0].turn.as_deref(), Some("p1"));
     }
 
     #[test]

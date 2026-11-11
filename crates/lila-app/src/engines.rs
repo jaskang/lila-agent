@@ -51,11 +51,22 @@ pub fn short_model(model: &str) -> String {
     m.strip_prefix("claude-").unwrap_or(m).to_owned()
 }
 
+/// The model as a button shows it; the engine's default when none is named.
+fn model_name(engine: &str, model: &str) -> String {
+    let model = if model.is_empty() { default_model(engine) } else { model };
+    if model.is_empty() { "默认".to_owned() } else { short_model(model) }
+}
+
 /// A model and effort as one phrase: `sonnet-5-5 · high`; the engine's default model when none is named.
 pub fn spec_label(engine: &str, model: &str, effort: &str) -> String {
-    let model = if model.is_empty() { default_model(engine) } else { model };
-    let model = if model.is_empty() { "默认".to_owned() } else { short_model(model) };
+    let model = model_name(engine, model);
     if effort.is_empty() { model } else { format!("{model} · {effort}") }
+}
+
+/// What the box's model button says: the model, then the engine and its effort (`sonnet-5-5 · Claude Code high`).
+pub fn engine_spec(engine: &str, model: &str, effort: &str) -> String {
+    let (model, engine) = (model_name(engine, model), engine_name(engine));
+    if effort.is_empty() { format!("{model} · {engine}") } else { format!("{model} · {engine} {effort}") }
 }
 
 #[cfg(test)]
@@ -69,6 +80,8 @@ mod tests {
         assert_eq!(spec_label("claude", "", "high"), "sonnet-5-5 · high");
         assert_eq!(spec_label("codex", "gpt-6-luna", ""), "gpt-6-luna");
         assert_eq!(spec_label("omp", "", ""), "默认");
+        assert_eq!(engine_spec("claude", "", "high"), "sonnet-5-5 · Claude Code high");
+        assert_eq!(engine_spec("omp", "", ""), "默认 · omp");
         assert!(ENGINES.iter().all(|(id, _)| lila_core::Runtime::parse(id).is_some()));
         assert!(TIERS.iter().all(|(id, ..)| lila_core::Tier::parse(id).is_some()));
     }

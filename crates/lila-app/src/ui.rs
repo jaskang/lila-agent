@@ -1,5 +1,5 @@
 //! How the window looks: a graphite glass window with two cards. The sidebar (`sidebar.rs`)
-//! holds the projects, each with its threads; the center card is a header row and the shown
+//! holds the workspaces, each with its threads; the center card is a header row and the shown
 //! thread's conversation or its terminal, or the box that starts a new session.
 
 use crate::app::LilaApp;
@@ -17,33 +17,8 @@ pub fn s(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or_default().to_owned()
 }
 
-/// A thread's state (`starting`, `running`, `waiting`, `idle`, `ended`) as a color.
-pub fn status_color(state: &str, _cx: &App) -> Hsla {
-    match state {
-        "running" => style::blue(),
-        "waiting" => style::red(),
-        "idle" => muted(),
-        _ => gpui::Hsla::from(rgba(0xa1a1a180)),
-    }
-}
-
-pub fn status_label(state: &str) -> &'static str {
-    match state {
-        "running" => "工作中",
-        "waiting" => "等你",
-        "idle" => "空闲",
-        "ended" => "已结束",
-        _ => "启动中",
-    }
-}
-
 pub fn dot(color: Hsla) -> Div {
     div().size(px(6.)).flex_none().rounded_full().bg(color)
-}
-
-/// A thread's state as a small mark: a spinner while it works, else a dot.
-pub fn status_mark(status: &str, cx: &App) -> AnyElement {
-    if status == "running" { Spinner::new().xsmall().color(status_color(status, cx)).into_any_element() } else { dot(status_color(status, cx)).into_any_element() }
 }
 
 /// A tinted letter tile, its hue picked from the name: the hue on a soft wash.
@@ -68,8 +43,8 @@ pub fn avatar(name: &str, size: f32, _cx: &App) -> Div {
         .child(letter)
 }
 
-/// The first row of the sidebar card (the traffic lights and the app's name)
-/// and the center card's project row: as tall as each other, so they line up.
+/// The first row of the sidebar card (the traffic lights, fold the sidebar)
+/// and the center card's title row: as tall as each other, so they line up.
 pub const BAR: f32 = 44.;
 
 /// The room the macOS traffic lights take at the start of the sidebar card's
@@ -94,56 +69,68 @@ pub fn drag_bar(bar: Stateful<Div>, cx: &mut Context<LilaApp>) -> Stateful<Div> 
 }
 
 impl LilaApp {
-    /// The center card's first row. A thread: its engine, title and how it runs, then its tools (the view, the
-    /// permission tier, interrupt, end or resume). A new session: the project it will be in. Drags the window.
+    /// The center card's first row. A thread: its title, then in grey the engine, model and effort, and on the right
+    /// its actions (`header_actions`). A new session: the workspace it will be in. With the sidebar folded away the row
+    /// leaves room for the traffic lights and starts with the button that brings it back. Drags the window.
     fn header(&mut self, thread: Option<&Value>, terminal: Option<Entity<lila_term::TerminalView>>, cx: &mut Context<Self>) -> impl IntoElement {
         let quiet = style::quiet(cx);
-        let tool = |id: &'static str, icon: Icon, tip: &'static str| Button::new(id).custom(quiet).xsmall().icon(icon).tooltip(tip);
-        let bar = drag_bar(h_flex().id("thread-bar"), cx).h(px(BAR)).flex_none().pl(px(14.)).pr_2().gap_2().whitespace_nowrap();
+        let folded = self.sidebar_hidden;
+        let bar = drag_bar(h_flex().id("thread-bar"), cx)
+            .h(px(BAR))
+            .flex_none()
+            .pl(px(if folded { TRAFFIC_LIGHTS } else { 14. }))
+            .pr_2()
+            .gap_2()
+            .whitespace_nowrap()
+            .when(folded, |d| d.child(Button::new("sidebar-show").custom(quiet).xsmall().icon(IconName::PanelLeftOpen).tooltip("展开侧栏 (⌘B)").on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))));
         let Some(t) = thread else {
             let avatar = self.new_in.as_deref().map(|id| avatar(id, 20., cx));
             return bar.children(avatar).child(self.project_switch(cx)).child(div().flex_1());
         };
-        let id = s(t, "id");
-        let ended = t["state"] == "ended";
-        let tier = s(t, "permission");
-        let spec = crate::engines::spec_label(&s(t, "engine"), &s(t, "model"), &s(t, "effort"));
-        let weak = cx.entity().downgrade();
+        let engine = s(t, "engine");
+        let info = format!("{} · {}", crate::engines::engine_name(&engine), crate::engines::spec_label(&engine, &s(t, "model"), &s(t, "effort")));
         bar.border_b_1()
             .border_color(style::divider())
-            .child(style::cli_tile(&s(t, "engine"), 20.))
             .child(div().min_w_0().truncate().text_size(px(13.)).font_semibold().child(s(t, "title")))
-            .child(div().flex_none().text_size(px(12.)).text_color(muted2()).child(spec))
-            .child(style::status_pill(&s(t, "state"), cx))
+            .child(div().flex_none().text_size(px(12.)).text_color(muted2()).child(info))
             .child(div().flex_1())
-            // Claude Code's TUI keeps running under its conversation.
-            .when(t["caps"]["tui"] == true && !ended, |d| d.child(self.view_switch(t, cx)))
-            .child(self.tier_button("tier", &tier, Anchor::TopRight, cx, {
-                let id = id.clone();
-                move |key, cx| {
-                    let _ = weak.update(cx, |this, cx| this.act("thread.permission", json!({"thread": id, "permission": key}), cx));
-                }
-            }))
-            .when(t["state"] == "running", |d| {
-                let id = id.clone();
-                d.child(tool("interrupt-thread", Icon::new(IconName::Square), "中断 (⌘.)").on_click(cx.listener(move |this, _, _, cx| this.act("thread.interrupt", json!({"thread": id}), cx))))
-            })
-            .map(|d| {
-                let id = id.clone();
-                if ended {
-                    d.child(Button::new("resume-thread").small().small_button().primary().icon(IconName::Play).label("继续").on_click(cx.listener(move |this, _, _, cx| this.act("thread.resume", json!({"thread": id}), cx))))
-                } else {
-                    d.child(tool("stop-thread", style::icon("lila/power.svg"), "结束").on_click(cx.listener(move |this, _, _, cx| this.act("thread.stop", json!({"thread": id}), cx))))
-                }
-            })
-            .when_some(terminal, |d, view| {
-                d.child(tool("terminal-find", Icon::new(IconName::Search), "搜索 (⌘F)").on_click(move |_, window, cx| {
-                    view.update(cx, |view, cx| view.open_search(window, cx));
-                }))
-            })
+            .child(h_flex().flex_none().gap_1().children(self.header_actions(t, terminal, cx)))
     }
 
-    /// The project a new session goes to, with a menu of the others when there are any.
+    /// The buttons at the right end of a thread's first row, left to right.
+    fn header_actions(&mut self, t: &Value, terminal: Option<Entity<lila_term::TerminalView>>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let quiet = style::quiet(cx);
+        let tool = |id: &'static str, icon: IconName, tip: &'static str| Button::new(id).custom(quiet).xsmall().icon(icon).tooltip(tip);
+        let id = s(t, "id");
+        let ended = t["state"] == "ended";
+        let mut actions: Vec<AnyElement> = Vec::new();
+        // Claude Code's TUI keeps running under its conversation.
+        if t["caps"]["tui"] == true && !ended {
+            actions.push(self.view_switch(t, cx).into_any_element());
+        }
+        // Only an ended session has a button: a message to a live or ended one carries on, and ending is in the sidebar menu.
+        if ended {
+            actions.push(Button::new("resume-thread").small().small_button().primary().icon(IconName::Play).label("继续").on_click(cx.listener(move |this, _, _, cx| this.act("thread.resume", json!({"thread": id}), cx))).into_any_element());
+        }
+        // Searches the terminal, when it is what is shown.
+        if let Some(view) = terminal {
+            actions.push(tool("terminal-find", IconName::Search, "搜索 (⌘F)").on_click(move |_, window, cx| view.update(cx, |view, cx| view.open_search(window, cx))).into_any_element());
+        }
+        // The files and changes buttons (they open the right panel, P2) go here, before the folder's.
+        let cwd = s(t, "cwd");
+        if !cwd.is_empty() {
+            actions.push(
+                tool("reveal-cwd", IconName::FolderOpen, "在访达中显示")
+                    .on_click(move |_, _, _| {
+                        let _ = std::process::Command::new("open").arg(&cwd).spawn();
+                    })
+                    .into_any_element(),
+            );
+        }
+        actions
+    }
+
+    /// The workspace a new session goes to, with a menu of the others when there are any.
     fn project_switch(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let quiet = style::quiet(cx);
         let Some(p) = self.new_in.as_deref().and_then(|id| self.project(id)) else { return div().into_any_element() };
@@ -190,7 +177,7 @@ impl LilaApp {
             },
             (Some(_), None) => placeholder("这个会话已经结束".into(), cx).into_any_element(),
             (None, _) if !self.snap.daemon => empty().child(Spinner::new().color(muted())).child(div().text_color(muted()).child("正在连接 lilad…")).into_any_element(),
-            (None, _) if self.snap.projects.is_empty() => empty().child(Button::new("add-project-big").primary().icon(IconName::Plus).label("添加项目").on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))).into_any_element(),
+            (None, _) if self.snap.projects.is_empty() => empty().child(Button::new("add-project-big").primary().icon(IconName::Plus).label("新建工作区").on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))).into_any_element(),
             (None, _) => match self.new_in.clone() {
                 Some(p) => self.new_session_view(&p, window, cx),
                 None => empty().child(Spinner::new().color(muted())).into_any_element(),

@@ -52,14 +52,24 @@ impl<T: Terminals> Daemon<T> {
                 Ok(json!({}))
             }
             // A turn starts or ends: whatever was being written is in the transcript now.
-            "UserPromptSubmit" | "Stop" => {
+            // The transcript is read now, not at the next round of following: what the turn wrote and the
+            // state it ends in go out in the same push, so the reply is never later than the idle.
+            "UserPromptSubmit" => {
+                self.follow_transcripts();
                 if self.writing.remove(&tid).is_some() {
                     self.mark(&tid);
                 }
                 Ok(json!({}))
             }
+            // Claude Code can end the turn before its transcript has the reply: what it wrote stays
+            // shown until following the transcript finds the reply there (`follow_transcripts`).
+            "Stop" => {
+                self.follow_transcripts();
+                Ok(json!({}))
+            }
             "StopFailure" => {
                 let why = payload["error"].as_str().or(payload["message"].as_str()).or(payload["reason"].as_str()).map(String::from).unwrap_or_else(|| payload.to_string());
+                self.follow_transcripts();
                 self.writing.remove(&tid);
                 self.store.event(&tid, "claude", "turn_failed", &why, now)?;
                 self.mark(&tid);

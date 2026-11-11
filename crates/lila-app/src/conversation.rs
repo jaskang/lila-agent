@@ -74,6 +74,59 @@ impl Conv {
     }
 }
 
+/// A message the person just sent, shown at the end of its conversation before the record has it (`composer::send_message`).
+/// It goes when the record has a message of theirs with the same words, or when the send failed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pending {
+    pub id: u64,
+    pub thread: String,
+    pub text: String,
+    /// Absolute paths of the files that went with it.
+    pub files: Vec<String>,
+    /// When it was sent (ms): a message of the record older than this is not it.
+    pub at_ms: i64,
+    /// When lilad took it (ms), once it did.
+    pub taken_ms: Option<i64>,
+}
+
+/// The record's clock and ours are the same machine's; this much apart is still the same moment.
+const SKEW_MS: i64 = 10_000;
+/// A message lilad took that the record still has not shown after this long is given up on (its words came out different).
+const GIVE_UP_MS: i64 = 120_000;
+
+/// Which of `pending` (of `thread`, oldest first) the record `items` already has: a message of the person
+/// with the same words, from about that moment on; each message of the record answers one. The rest of
+/// `pending` is not in the record yet.
+pub fn is_in_record(pending: &[&Pending], items: &[Value]) -> Vec<bool> {
+    let mut claimed = vec![false; items.len()];
+    pending
+        .iter()
+        .map(|p| {
+            let found = items.iter().enumerate().position(|(i, it)| {
+                !claimed[i]
+                    && it["kind"] == "user_message"
+                    && it["from"] == "person"
+                    && it["text"].as_str().is_some_and(|t| t.trim() == p.text)
+                    && it["at_ms"].as_i64().is_none_or(|at| at == 0 || at >= p.at_ms - SKEW_MS)
+            });
+            if let Some(i) = found {
+                claimed[i] = true;
+            }
+            found.is_some()
+        })
+        .collect()
+}
+
+/// Has the agent put anything after the person's last message? (Its reply, a step, a thought, or a reply being written.)
+fn answered(conv: Option<&Conv>) -> bool {
+    let Some(c) = conv else { return false };
+    if c.writing.is_some() {
+        return true;
+    }
+    let last = c.items.iter().rposition(|i| i["kind"] == "user_message" && i["from"] == "person");
+    c.items.iter().skip(last.map_or(0, |l| l + 1)).any(|i| matches!(i["kind"].as_str(), Some("agent_message" | "tool_call" | "thought")))
+}
+
 /// What a row of the list is. The kind says which row it is (rows of the same kind
 /// keep their measured height); `ver` changes when what it shows does.
 #[derive(Clone, Debug, PartialEq)]
@@ -90,13 +143,18 @@ enum RowKind {
     /// A run of tool calls and thoughts between two messages, by the index of its first.
     Steps(usize),
     Writing,
+    /// A message just sent, not in the record yet (its id).
+    Pending(u64),
+    /// Only a spinner: the thread works and has put nothing down since the person's last message.
+    Busy,
     /// A permission card the thread waits on (its id).
     Ask(String),
 }
 
 /// The rows the list shows: one per message, one per run of steps between messages,
-/// the reply being written, and the cards the thread waits on.
-fn build_rows(conv: Option<&Conv>, asks: &[String]) -> Vec<Row> {
+/// the messages just sent, the reply being written (or just a spinner while the thread works and has
+/// said nothing yet), and the cards the thread waits on.
+fn build_rows(conv: Option<&Conv>, pending: &[&Pending], running: bool, asks: &[String]) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     if let Some(c) = conv {
         for (i, item) in c.items.iter().enumerate() {
@@ -117,6 +175,11 @@ fn build_rows(conv: Option<&Conv>, asks: &[String]) -> Vec<Row> {
         if let Some(w) = &c.writing {
             rows.push(Row { kind: RowKind::Writing, span: 0..0, ver: w.len() as u64 });
         }
+    }
+    rows.extend(pending.iter().map(|p| Row { kind: RowKind::Pending(p.id), span: 0..0, ver: p.text.len() as u64 + p.files.len() as u64 }));
+    // A card means it waits for the person, not that it works.
+    if (running || !pending.is_empty()) && asks.is_empty() && (!pending.is_empty() || !answered(conv)) {
+        rows.push(Row { kind: RowKind::Busy, span: 0..0, ver: 0 });
     }
     rows.extend(asks.iter().map(|id| Row { kind: RowKind::Ask(id.clone()), span: 0..0, ver: 0 }));
     rows
@@ -222,6 +285,20 @@ impl LilaApp {
                 self.conv_open.clear();
             }
         }
+        self.settle_pending();
+    }
+
+    /// Drops the messages just sent that the record has now (or that it never will).
+    pub fn settle_pending(&mut self) {
+        let now = data::now_ms();
+        let mut gone = std::collections::HashSet::new();
+        if let Some(c) = &self.conv {
+            let mine: Vec<&Pending> = self.pending.iter().filter(|p| p.thread == c.thread).collect();
+            let seen = is_in_record(&mine, &c.items);
+            gone.extend(mine.iter().zip(seen).filter(|(_, seen)| *seen).map(|(p, _)| p.id));
+        }
+        gone.extend(self.pending.iter().filter(|p| p.taken_ms.is_some_and(|t| now - t > GIVE_UP_MS)).map(|p| p.id));
+        self.pending.retain(|p| !gone.contains(&p.id));
     }
 
     /// The cards the shown thread waits on from the person (a permission), under its conversation.
@@ -236,7 +313,10 @@ impl LilaApp {
     pub fn sync_conv(&mut self, cx: &mut Context<Self>) {
         let conv = self.conv.as_ref().filter(|c| Some(&c.thread) == self.thread.as_ref());
         let key = conv.map(|c| (c.thread.clone(), c.session.clone()));
-        let rows = build_rows(conv, &self.conv_asks());
+        let shown = self.thread.as_deref().unwrap_or_default();
+        let pending: Vec<&Pending> = self.pending.iter().filter(|p| p.thread == shown).collect();
+        let running = self.shown_thread().is_some_and(|t| matches!(t["state"].as_str(), Some("running" | "starting")));
+        let rows = build_rows(conv, &pending, running, &self.conv_asks());
         let list = self.conv_list.clone();
         if key != self.conv_key {
             self.conv_key = key;
@@ -337,6 +417,8 @@ impl LilaApp {
             RowKind::Item(i) => self.item_row(*i, cx),
             RowKind::Steps(_) => Some(self.steps_row(row.span.clone(), window, cx)),
             RowKind::Writing => self.conv.as_ref().and_then(|c| c.writing.clone()).map(writing_row),
+            RowKind::Pending(id) => self.pending.iter().find(|p| p.id == *id).map(pending_row),
+            RowKind::Busy => Some(busy_row()),
             RowKind::Ask(id) => {
                 let thread = self.thread.clone().unwrap_or_default();
                 let found = self.conv.as_ref().and_then(|c| c.cards.iter().find(|k| k["id"] == id.as_str()).cloned());
@@ -356,6 +438,7 @@ impl LilaApp {
         Some(match i["kind"].as_str()? {
             "user_message" if i["from"] == "lila" || i["from"] == "local" => self.lila_row(at, &id, &text, cx),
             "user_message" if i["from"] == "summary" => self.summary_row(at, &id, &text, cx),
+            "user_message" if i["from"] == "interrupted" => interrupted_row(),
             "user_message" => {
                 let (body, more) = self.folded(at, &id, &text, div().px_3().py_2().rounded(px(style::R_CTL)).bg(style::fill()).text_size(px(13.)).line_height(relative(1.55)), cx);
                 let files = sent_files(&id, &i["attachments"]);
@@ -609,6 +692,19 @@ fn markdown(id: SharedString, text: String) -> TextView {
     TextView::markdown(id, text).inline_code_style(StyleRefinement::default().bg(style::fill()).text_color(style::fg()))
 }
 
+/// What the person just sent, as it will look once the record has it.
+fn pending_row(p: &Pending) -> AnyElement {
+    let list: Vec<Value> = p.files.iter().filter_map(|f| serde_json::to_value(lila_agent::Attachment::file(f)).ok()).collect();
+    let files = sent_files(&format!("pending-{}", p.id), &Value::Array(list));
+    let body = div().px_3().py_2().rounded(px(style::R_CTL)).bg(style::fill()).text_size(px(13.)).line_height(relative(1.55)).when(is_long(&p.text), |d| d.line_clamp(FOLD_LINES).text_ellipsis()).child(p.text.clone());
+    h_flex().w_full().justify_end().child(v_flex().max_w(relative(0.8)).items_end().gap_1().children(files).when(!p.text.is_empty(), |d| d.child(body))).into_any_element()
+}
+
+/// Just a spinner, where the reply will start: it works, and has put nothing down yet.
+fn busy_row() -> AnyElement {
+    h_flex().w_full().h(px(20.)).items_start().child(div().pt(px(3.)).child(Spinner::new().xsmall().color(style::blue()))).into_any_element()
+}
+
 /// The reply as it is written, until it is in the record: a spinner, and the text as it stands.
 fn writing_row(text: String) -> AnyElement {
     h_flex()
@@ -675,9 +771,22 @@ fn diff_block(d: &Value) -> AnyElement {
         .into_any_element()
 }
 
+/// Where the person stopped a turn: a quiet mark, not a message.
+fn interrupted_row() -> AnyElement {
+    h_flex()
+        .w_full()
+        .h(px(24.))
+        .gap_2()
+        .px_1()
+        .child(Icon::new(IconName::Square).size(px(11.)).text_color(muted2()))
+        .child(div().text_xs().text_color(muted2()).child("已中断"))
+        .child(div().flex_1().h(px(1.)).bg(style::divider()))
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Conv, RowKind, build_rows, diff_counts, is_long};
+    use super::{Conv, Pending, RowKind, build_rows, diff_counts, is_in_record, is_long};
     use serde_json::json;
 
     fn read(items: serde_json::Value) -> serde_json::Value {
@@ -695,35 +804,72 @@ mod tests {
     fn a_run_of_steps_between_messages_is_one_row() {
         let mut c = Conv::new("t".into());
         c.merge(&read(json!([item("user_message", "u"), item("thought", "t"), item("tool_call", "a"), item("tool_call", "b"), item("agent_message", "r"), item("tool_call", "c")])));
-        let rows = build_rows(Some(&c), &["card".into()]);
+        let rows = build_rows(Some(&c), &[], false, &["card".into()]);
         let shape: Vec<(RowKind, std::ops::Range<usize>)> = rows.into_iter().map(|r| (r.kind, r.span)).collect();
         assert_eq!(shape, [(RowKind::Item(0), 0..1), (RowKind::Steps(1), 1..4), (RowKind::Item(4), 4..5), (RowKind::Steps(5), 5..6), (RowKind::Ask("card".into()), 0..0)]);
+    }
+
+    fn said(id: &str, text: &str, from: &str, at_ms: i64) -> serde_json::Value {
+        json!({"id": id, "kind": "user_message", "text": text, "from": from, "at_ms": at_ms, "state": "done"})
+    }
+
+    fn sent(id: u64, text: &str, at_ms: i64) -> Pending {
+        Pending { id, thread: "t".into(), text: text.into(), files: vec![], at_ms, taken_ms: None }
+    }
+
+    #[test]
+    fn a_sent_message_stays_until_the_record_has_one_with_the_same_words() {
+        let items = vec![said("u0", "go on", "person", 1_000), said("u1", "hi", "lila", 9_000), said("u2", "go on", "person", 20_000)];
+        let (a, b) = (sent(1, "go on", 19_990), sent(2, "go on", 20_100));
+        // The older "go on" is from before; the newer one answers the first of them, and only the first.
+        assert_eq!(is_in_record(&[&a, &b], &items), [true, false]);
+        assert_eq!(is_in_record(&[&sent(3, "other", 19_990)], &items), [false], "other words");
+        assert_eq!(is_in_record(&[&sent(4, "hi", 8_000)], &items), [false], "not from the person");
+        assert_eq!(is_in_record(&[&sent(5, "go on", 19_990)], &items[..1]), [false], "older than the send");
+    }
+
+    #[test]
+    fn a_spinner_stands_in_until_the_agent_has_put_something_down() {
+        let kinds = |c: &Conv, pending: &[&Pending], running| build_rows(Some(c), pending, running, &[]).into_iter().map(|r| r.kind).collect::<Vec<_>>();
+        let mut c = Conv::new("t".into());
+        c.merge(&read(json!([said("u", "hi", "person", 1)])));
+        assert_eq!(kinds(&c, &[], false), [RowKind::Item(0)], "it does not work: nothing");
+        assert_eq!(kinds(&c, &[], true), [RowKind::Item(0), RowKind::Busy], "works, has said nothing");
+        let p = sent(7, "more", 5);
+        assert_eq!(kinds(&c, &[&p], false), [RowKind::Item(0), RowKind::Pending(7), RowKind::Busy], "just sent: it works, as far as anyone knows");
+        c.merge(&read(json!([item("tool_call", "a")])));
+        assert_eq!(kinds(&c, &[], true), [RowKind::Item(0), RowKind::Steps(1)], "a step is something");
+        assert_eq!(kinds(&c, &[&p], true), [RowKind::Item(0), RowKind::Steps(1), RowKind::Pending(7), RowKind::Busy], "but not after a new message");
+        // The reply being written has its own spinner; a card means it waits for the person.
+        c.merge(&json!({"thread": {"id": "t", "session": "s"}, "seq": 2, "items": [], "writing": "Chec"}));
+        assert_eq!(kinds(&c, &[], true).last(), Some(&RowKind::Writing));
+        assert!(build_rows(Some(&c), &[&p], true, &["card".into()]).iter().all(|r| r.kind != RowKind::Busy));
     }
 
     #[test]
     fn a_row_is_measured_again_when_its_content_or_count_changes() {
         let mut c = Conv::new("t".into());
         c.merge(&read(json!([item("user_message", "u"), item("tool_call", "a")])));
-        let before = build_rows(Some(&c), &[]);
+        let before = build_rows(Some(&c), &[], false, &[]);
         // The call finishes: the same item, replaced.
         let mut done = item("tool_call", "a");
         done["state"] = json!("failed");
         c.merge(&read(json!([done])));
-        let after = build_rows(Some(&c), &[]);
+        let after = build_rows(Some(&c), &[], false, &[]);
         assert_eq!(before[1].kind, after[1].kind);
         assert_ne!(before[1].ver, after[1].ver);
         assert_eq!(before[0].ver, after[0].ver, "what did not change keeps its measure");
         // A run that grows.
         c.merge(&read(json!([item("tool_call", "b")])));
-        let grown = build_rows(Some(&c), &[]);
+        let grown = build_rows(Some(&c), &[], false, &[]);
         assert_eq!((grown[1].kind.clone(), grown[1].span.clone()), (RowKind::Steps(1), 1..3));
         assert_ne!(after[1].ver, grown[1].ver);
         // The reply being written, and a new session starting over.
         c.merge(&json!({"thread": {"id": "t", "session": "s"}, "seq": 3, "items": [], "writing": "Chec"}));
-        assert_eq!(build_rows(Some(&c), &[]).last().map(|r| r.kind.clone()), Some(RowKind::Writing));
+        assert_eq!(build_rows(Some(&c), &[], false, &[]).last().map(|r| r.kind.clone()), Some(RowKind::Writing));
         c.merge(&json!({"thread": {"id": "t", "session": "s2"}, "seq": 1, "items": [item("agent_message", "x")]}));
         assert_eq!(c.items.len(), 1);
-        assert_eq!(build_rows(Some(&c), &[]).len(), 1);
+        assert_eq!(build_rows(Some(&c), &[], false, &[]).len(), 1);
     }
 
     #[test]
@@ -741,3 +887,4 @@ mod tests {
         assert_eq!(diff_counts(d.as_array().unwrap()), (2, 2));
     }
 }
+

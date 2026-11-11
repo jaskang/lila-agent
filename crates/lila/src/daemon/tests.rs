@@ -570,6 +570,33 @@ fn a_claude_threads_transcript_becomes_its_conversation() {
 }
 
 #[test]
+fn the_turns_end_reads_the_transcript_at_once() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({}));
+    w.status(&tid, "working");
+    let session = w.d.store.thread(&tid).unwrap().unwrap().session.unwrap();
+    let file = sessions::claude_file(&w.d.live_sources(), &w.repo.to_string_lossy(), &session);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let line = |v: Value| v.to_string() + "\n";
+    let mut text = line(json!({"type": "user", "uuid": "u1", "timestamp": "2026-11-10T01:00:00.000Z", "message": {"role": "user", "content": "hi"}}));
+    text.push_str(&line(json!({"type": "assistant", "uuid": "a1", "timestamp": "2026-11-10T01:00:01.000Z", "message": {"id": "m1", "role": "assistant", "model": "claude-haiku-5-5", "content": [{"type": "text", "text": "Hello"}]}})));
+    std::fs::write(&file, text).unwrap();
+    w.d.take_dirty();
+    // No round of following in between: the hook that ends the turn reads the transcript itself.
+    w.hook(&tid, "Stop", json!({}));
+    let kinds: Vec<String> = w.ok("thread.read", json!({"thread": tid}))["items"].as_array().unwrap().iter().map(|i| i["kind"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(kinds, ["user_message", "agent_message"]);
+    assert_eq!(w.d.take_dirty().0, std::slice::from_ref(&tid), "one change, heard once");
+    // The same for the turn's start: the message that began it.
+    let more = line(json!({"type": "user", "uuid": "u2", "timestamp": "2026-11-10T01:01:00.000Z", "message": {"role": "user", "content": "again"}}));
+    let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+    std::io::Write::write_all(&mut f, more.as_bytes()).unwrap();
+    w.hook(&tid, "UserPromptSubmit", json!({}));
+    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["items"].as_array().unwrap().len(), 3);
+}
+
+#[test]
 fn a_thread_that_waits_in_its_terminal_says_so() {
     let mut w = world();
     w.project();
