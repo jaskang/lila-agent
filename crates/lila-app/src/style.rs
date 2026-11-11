@@ -187,6 +187,10 @@ impl AssetSource for Assets {
             "lila/lock.svg" => Some(include_bytes!("../assets/lila/lock.svg")),
             "lila/shield-check.svg" => Some(include_bytes!("../assets/lila/shield-check.svg")),
             "lila/zap.svg" => Some(include_bytes!("../assets/lila/zap.svg")),
+            "lila/git-branch.svg" => Some(include_bytes!("../assets/lila/git-branch.svg")),
+            "lila/git-compare.svg" => Some(include_bytes!("../assets/lila/git-compare.svg")),
+            "lila/folder-tree.svg" => Some(include_bytes!("../assets/lila/folder-tree.svg")),
+            "lila/at-sign.svg" => Some(include_bytes!("../assets/lila/at-sign.svg")),
             _ => None,
         };
         match own {
@@ -237,8 +241,8 @@ pub fn install(cx: &mut App) {
             "sidebar.primary.background": "#f5f5f7",
             "sidebar.primary.foreground": "#111113",
             "list.background": "#00000000",
-            "list.active.background": "#0a84ff33",
-            "list.active.border": "#0a84ff",
+            "list.active.background": "#ffffff17",
+            "list.active.border": "#00000000",
             "list.hover.background": "#ffffff0d",
             "scrollbar.background": "#00000000",
             "scrollbar.thumb.background": "#ffffff24",
@@ -274,7 +278,12 @@ pub fn install(cx: &mut App) {
             "base.cyan.light": "#a0e4ff"
         }
     }"##;
-    match serde_json::from_str::<ThemeConfig>(config) {
+    // The code colors (the kit's own dark ones, on the window's glass): the default theme's are for a light page.
+    let mut config: serde_json::Value = serde_json::from_str(config).expect("the theme is JSON");
+    if let Ok(highlight) = serde_json::from_str::<serde_json::Value>(include_str!("../assets/lila/highlight-dark.json")) {
+        config["highlight"] = highlight;
+    }
+    match serde_json::from_value::<ThemeConfig>(config) {
         Ok(config) => {
             Theme::global_mut(cx).dark_theme = std::rc::Rc::new(config);
             Theme::change(ThemeMode::Dark, None, cx);

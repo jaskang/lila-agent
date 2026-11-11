@@ -21,6 +21,8 @@ pub struct Draft {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub permission: Option<String>,
+    /// The session gets a worktree of its own (only offered where the folder is a repository).
+    pub worktree: bool,
 }
 
 impl Draft {
@@ -96,6 +98,8 @@ pub struct LilaApp {
     pub just_made: Option<String>,
     /// When each thread last notified that a turn was done, so a flickering state doesn't repeat it.
     notified: HashMap<String, i64>,
+    /// The right panel: files and changes of the shown thread.
+    pub panel: crate::panel::Panel,
     /// The global settings (usage, about), while open.
     pub prefs: Option<crate::prefs::Prefs>,
     /// The 用量 section: accounts and their windows, read in the background.
@@ -219,6 +223,7 @@ impl LilaApp {
         .detach();
         let tui = data::load_views(&paths);
         let sidebar_hidden = data::load_sidebar_hidden(&paths);
+        let panel = crate::panel::Panel::new(&paths, cx);
         let mut app = LilaApp {
             paths,
             focus: cx.focus_handle(),
@@ -240,6 +245,7 @@ impl LilaApp {
             seen: None,
             just_made: None,
             notified: HashMap::new(),
+            panel,
             prefs: None,
             dialog_offset: Point::default(),
             dialog_drag: None,
@@ -333,7 +339,16 @@ impl LilaApp {
             }
         }
         self.snap = snap;
+        self.panel_follow(cx);
+        self.merged_note(cx);
         cx.notify();
+    }
+
+    /// The shown thread was merged: reads which commit it went in as.
+    fn merged_note(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.shown_thread().filter(|t| t["merged_ms"].is_number()).map(|t| crate::ui::s(&t, "id")) {
+            self.fetch_merged_sha(id, cx);
+        }
     }
 
     /// A system notification for a thread that began waiting for the person, or finished its turn,
@@ -368,6 +383,8 @@ impl LilaApp {
             self.thread = Some(id);
             self.new_in = None;
             self.refresh_now();
+            self.panel_refresh(cx);
+            self.merged_note(cx);
         }
         cx.notify();
     }
@@ -503,6 +520,17 @@ impl LilaApp {
         .detach();
     }
 
+    /// A request off the UI thread, then `done` with what came: for what the panel reads, which does not touch the
+    /// notice or refresh anything.
+    pub fn call(&mut self, method: &'static str, params: Value, cx: &mut Context<Self>, done: impl FnOnce(&mut Self, anyhow::Result<Value>, &mut Context<Self>) + 'static) {
+        let paths = self.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { data::act(&paths, method, params, false) }).await;
+            let _ = this.update(cx, |this, cx| done(this, r, cx));
+        })
+        .detach();
+    }
+
     pub fn terminal(&mut self, address: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
         let core = self.core.clone()?;
         // A view whose stream ended while its thread still runs (a lost
@@ -526,7 +554,7 @@ impl LilaApp {
 
 impl Render for LilaApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dialog = self.prefs_dialog(cx).or_else(|| self.settings_dialog(cx)).or_else(|| self.rename_dialog(cx)).or_else(|| self.remove_dialog(cx));
+        let dialog = self.prefs_dialog(cx).or_else(|| self.settings_dialog(cx)).or_else(|| self.rename_dialog(cx)).or_else(|| self.remove_dialog(cx)).or_else(|| self.merge_dialog(cx));
         let pad = px(crate::style::GAP);
         if window.focused(cx).is_none() {
             let focus = self.focus.clone();
@@ -543,14 +571,14 @@ impl Render for LilaApp {
             .on_key_down(cx.listener(Self::shortcut))
             .child(div().flex_1().min_h_0().child(if self.sidebar_hidden {
                 // Folded away: the center card takes the window, and its first row leaves room for the traffic lights.
-                v_flex().size_full().child(div().flex_1().min_h_0().child(self.center(window, cx))).into_any_element()
+                v_flex().size_full().child(div().flex_1().min_h_0().child(self.work(window, cx))).into_any_element()
             } else {
                 // The gutter between the sidebar and the thread is the resize handle.
                 gpui::base::h_resizable("main")
                     .with_state(&self.sidebar_size)
                     .with_handle_appearance(gutter())
                     .child(resizable_panel().size(px(260.)).size_range(px(200.)..px(420.)).fixed().child(div().size_full().pr(px(3.)).child(self.sidebar(cx)).into_any_element()))
-                    .child(resizable_panel().child(v_flex().size_full().pl(px(4.)).child(div().flex_1().min_h_0().child(self.center(window, cx))).into_any_element()))
+                    .child(resizable_panel().child(v_flex().size_full().pl(px(4.)).child(div().flex_1().min_h_0().child(self.work(window, cx))).into_any_element()))
                     .into_any_element()
             }))
             .children(dialog)
@@ -559,7 +587,7 @@ impl Render for LilaApp {
 
 /// A gutter between cards that resizes them: nothing at rest, a thin blue line
 /// while the pointer is on it or dragging.
-fn gutter() -> gpui::base::ResizeHandleRenderer {
+pub fn gutter() -> gpui::base::ResizeHandleRenderer {
     std::rc::Rc::new(move |handle, _, _| {
         let mut on = !matches!(handle.state(), gpui::base::ResizeHandleState::Idle);
         // Checks without a mouse: `LILA_APP_GUTTERS=1` shows every line.
@@ -574,12 +602,12 @@ fn gutter() -> gpui::base::ResizeHandleRenderer {
 impl LilaApp {
     /// A dialog is open over the window.
     fn modal(&self) -> bool {
-        self.prefs.is_some() || self.settings.is_some() || self.renaming.is_some() || self.removing.is_some()
+        self.prefs.is_some() || self.settings.is_some() || self.renaming.is_some() || self.removing.is_some() || self.panel.merge_confirm.is_some()
     }
 
     /// Closes the topmost dialog; false when none is open.
     fn close_dialog(&mut self) -> bool {
-        if self.removing.take().is_some() || self.renaming.take().is_some() || self.settings.take().is_some() || self.prefs.take().is_some() {
+        if self.panel.merge_confirm.take().is_some() || self.removing.take().is_some() || self.renaming.take().is_some() || self.settings.take().is_some() || self.prefs.take().is_some() {
             return true;
         }
         false
@@ -604,6 +632,14 @@ impl LilaApp {
                 }
             }
             ("b", false) => self.toggle_sidebar(cx),
+            // The right panel: the files (as VS Code's explorer), the changes.
+            ("e", true) | ("g", true) => {
+                // Only beside a thread that has a folder to show.
+                if self.shown_thread().is_none_or(|t| t["merged_ms"].is_number()) {
+                    return;
+                }
+                self.toggle_panel(if k.key == "e" { crate::panel::View::Files } else { crate::panel::View::Changes }, cx);
+            }
             (",", false) => self.open_prefs(crate::prefs::PrefPage::Usage, cx),
             (",", true) | ("<", _) => {
                 if let Some(p) = self.current_project() {

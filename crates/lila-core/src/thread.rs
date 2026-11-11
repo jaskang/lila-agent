@@ -138,8 +138,16 @@ pub struct Thread {
     pub model: String,
     pub effort: Option<String>,
     pub tier: Tier,
-    /// The folder the engine runs in (the project's folder, or a worktree later).
+    /// The folder the engine runs in: the project's folder, or the thread's own worktree.
     pub cwd: String,
+    /// The thread works in a worktree of its own (`cwd`), on its own branch, made when it started.
+    pub worktree: bool,
+    /// The branch the project folder was on when the worktree was made: where a merge goes.
+    pub base_branch: Option<String>,
+    /// The commit that branch was at then.
+    pub base_commit: Option<String>,
+    /// When the worktree's work was merged into `base_branch` (the worktree and its branch are gone then).
+    pub merged_ms: Option<i64>,
     /// The engine's own id for the conversation, once known: what resumes it.
     pub session: Option<String>,
     /// The hc terminal it runs in now; none once it ended.

@@ -78,9 +78,12 @@ impl<T: Terminals> Daemon<T> {
                 }
             }
             AgentEvent::PermissionResolved { id } => self.request_resolved(tid, &id),
-            AgentEvent::TurnEnded { failed: Some(why), .. } => {
-                let _ = self.store.event(tid, "host", "turn_failed", &why, now);
-                self.mark(tid);
+            AgentEvent::TurnEnded { failed, .. } => {
+                if let Some(why) = failed {
+                    let _ = self.store.event(tid, "host", "turn_failed", &why, now);
+                    self.mark(tid);
+                }
+                self.refresh_changes(tid);
             }
             AgentEvent::Limits { used_percent, resets_ms } => {
                 if used_percent >= 100.0 {
@@ -104,7 +107,7 @@ impl<T: Terminals> Daemon<T> {
                     l.commands = commands;
                 }
             }
-            AgentEvent::TurnStarted { .. } | AgentEvent::TurnEnded { .. } | AgentEvent::Usage { .. } => {}
+            AgentEvent::TurnStarted { .. } | AgentEvent::Usage { .. } => {}
         }
     }
 }

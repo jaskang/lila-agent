@@ -4,7 +4,19 @@
 use super::*;
 
 impl<T: Terminals> Daemon<T> {
+    /// A request answered now: work that has to be run off the loop (`begin`) is run here, one thing at a time (tests; the server runs it on threads).
     pub fn handle(&mut self, method: &str, params: &Value, now: i64) -> Result<Value> {
+        match self.begin(method, params, now)? {
+            Begin::Done(v) => Ok(v),
+            Begin::Job(job) => {
+                let result = job.run();
+                self.finish(job, result, now)
+            }
+        }
+    }
+
+    /// Every request that needs no job.
+    pub(super) fn dispatch(&mut self, method: &str, params: &Value, now: i64) -> Result<Value> {
         match method {
             "ping" => Ok(json!({"pong": true, "pid": std::process::id()})),
             "status" => self.status(now),
@@ -17,7 +29,6 @@ impl<T: Terminals> Daemon<T> {
             "project.remove" => self.project_remove(params, now),
             "project.reload" => self.project_reload(params, now),
             "project.set" => self.project_set(params, now),
-            "thread.new" => self.thread_new(params, now),
             "thread.list" => self.thread_list(params, now),
             "thread.show" => {
                 let t = self.thread_of(params)?;
@@ -37,6 +48,7 @@ impl<T: Terminals> Daemon<T> {
             "thread.run" => self.thread_run(params),
             "thread.commands" => self.thread_commands(params),
             "thread.files" => self.thread_files(params),
+            "thread.file" => self.thread_file(params),
             "thread.log" => self.thread_log(params),
             "hook" => self.hook(params, now),
             "hook.answer" => self.hook_answer(params),

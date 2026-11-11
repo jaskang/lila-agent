@@ -117,14 +117,15 @@ pub fn is_in_record(pending: &[&Pending], items: &[Value]) -> Vec<bool> {
         .collect()
 }
 
-/// Has the agent put anything after the person's last message? (Its reply, a step, a thought, or a reply being written.)
-fn answered(conv: Option<&Conv>) -> bool {
+/// Does the end of the conversation already show that the agent works? (A reply being written, or a step
+/// under way, which its row shows turning.) Otherwise a running turn gets its own turning mark at the end.
+fn shows_work(conv: Option<&Conv>) -> bool {
     let Some(c) = conv else { return false };
     if c.writing.is_some() {
         return true;
     }
     let last = c.items.iter().rposition(|i| i["kind"] == "user_message" && i["from"] == "person");
-    c.items.iter().skip(last.map_or(0, |l| l + 1)).any(|i| matches!(i["kind"].as_str(), Some("agent_message" | "tool_call" | "thought")))
+    c.items.iter().skip(last.map_or(0, |l| l + 1)).any(|i| i["kind"] == "tool_call" && i["state"] == "running")
 }
 
 /// What a row of the list is. The kind says which row it is (rows of the same kind
@@ -178,7 +179,7 @@ fn build_rows(conv: Option<&Conv>, pending: &[&Pending], running: bool, asks: &[
     }
     rows.extend(pending.iter().map(|p| Row { kind: RowKind::Pending(p.id), span: 0..0, ver: p.text.len() as u64 + p.files.len() as u64 }));
     // A card means it waits for the person, not that it works.
-    if (running || !pending.is_empty()) && asks.is_empty() && (!pending.is_empty() || !answered(conv)) {
+    if (running || !pending.is_empty()) && asks.is_empty() && (!pending.is_empty() || !shows_work(conv)) {
         rows.push(Row { kind: RowKind::Busy, span: 0..0, ver: 0 });
     }
     rows.extend(asks.iter().map(|id| Row { kind: RowKind::Ask(id.clone()), span: 0..0, ver: 0 }));
@@ -717,7 +718,7 @@ fn writing_row(text: String) -> AnyElement {
 }
 
 /// The diff of a tool call, in gpui-kit's viewer: the files as one unified patch.
-fn diff_view(id: &str, diffs: &[Value], window: &mut Window, cx: &mut App) -> AnyElement {
+pub(crate) fn diff_view(id: &str, diffs: &[Value], window: &mut Window, cx: &mut App) -> AnyElement {
     use gpui::component::ActiveTheme as _;
     use gpui::component::diff::{Diff, DiffFile, DiffHunkSeparator, DiffState};
     let mut patch = String::new();
@@ -829,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spinner_stands_in_until_the_agent_has_put_something_down() {
+    fn a_spinner_shows_the_turn_runs_until_something_else_does() {
         let kinds = |c: &Conv, pending: &[&Pending], running| build_rows(Some(c), pending, running, &[]).into_iter().map(|r| r.kind).collect::<Vec<_>>();
         let mut c = Conv::new("t".into());
         c.merge(&read(json!([said("u", "hi", "person", 1)])));
@@ -837,9 +838,14 @@ mod tests {
         assert_eq!(kinds(&c, &[], true), [RowKind::Item(0), RowKind::Busy], "works, has said nothing");
         let p = sent(7, "more", 5);
         assert_eq!(kinds(&c, &[&p], false), [RowKind::Item(0), RowKind::Pending(7), RowKind::Busy], "just sent: it works, as far as anyone knows");
-        c.merge(&read(json!([item("tool_call", "a")])));
-        assert_eq!(kinds(&c, &[], true), [RowKind::Item(0), RowKind::Steps(1)], "a step is something");
-        assert_eq!(kinds(&c, &[&p], true), [RowKind::Item(0), RowKind::Steps(1), RowKind::Pending(7), RowKind::Busy], "but not after a new message");
+        let mut step = item("tool_call", "a");
+        step["state"] = json!("running");
+        c.merge(&read(json!([step])));
+        assert_eq!(kinds(&c, &[], true), [RowKind::Item(0), RowKind::Steps(1)], "a step under way turns in its own row");
+        step["state"] = json!("done");
+        c.merge(&read(json!([step, item("agent_message", "r")])));
+        assert_eq!(kinds(&c, &[], true).last(), Some(&RowKind::Busy), "done steps and a word said: it still works");
+        assert_eq!(kinds(&c, &[&p], true), [RowKind::Item(0), RowKind::Steps(1), RowKind::Item(2), RowKind::Pending(7), RowKind::Busy], "and after a new message");
         // The reply being written has its own spinner; a card means it waits for the person.
         c.merge(&json!({"thread": {"id": "t", "session": "s"}, "seq": 2, "items": [], "writing": "Chec"}));
         assert_eq!(kinds(&c, &[], true).last(), Some(&RowKind::Writing));

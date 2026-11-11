@@ -9,12 +9,14 @@
 mod conversation;
 mod hooks;
 mod host;
+mod jobs;
 mod permissions;
 mod requests;
 mod server;
 mod sources;
 mod threads;
 
+pub use jobs::{Begin, Job, Output};
 pub use server::serve;
 pub use sources::{PollJob, PostJob};
 
@@ -107,6 +109,9 @@ struct Proj {
     config: ProjectConfig,
     /// Why its `.lila/project.toml` could not be read (the folder is gone, the file is broken); the defaults stand in.
     error: Option<String>,
+    /// The folder is the top of a git repository (so a thread there can have a worktree of its own). Asked once, when
+    /// the project is loaded or reloaded: `project.list` runs in the main loop and must not start git.
+    repo: bool,
 }
 
 pub struct Daemon<T: Terminals> {
@@ -145,6 +150,15 @@ pub struct Daemon<T: Terminals> {
     writing: HashMap<String, (String, String)>,
     /// magpie's command line, when it is installed (set by `serve`; tests leave it out).
     pub magpie: Option<PathBuf>,
+    /// Work waiting to be run off the loop (`jobs`), taken by the server.
+    jobs: Vec<jobs::Job>,
+    /// What each thread has changed, counted after its turns end (`jobs`): `None` is a folder outside git.
+    summaries: HashMap<String, Option<crate::changes::Summary>>,
+    /// Threads whose changes are being counted now, and those asked again meanwhile.
+    refreshing: BTreeSet<String>,
+    refresh_again: BTreeSet<String>,
+    /// Threads being merged: nothing is sent to them or started in them until it is done.
+    merging: BTreeSet<String>,
 }
 
 fn now_ms() -> i64 {
@@ -187,6 +201,11 @@ impl<T: Terminals> Daemon<T> {
             next_hook: 0,
             writing: HashMap::new(),
             magpie: None,
+            jobs: Vec::new(),
+            summaries: HashMap::new(),
+            refreshing: BTreeSet::new(),
+            refresh_again: BTreeSet::new(),
+            merging: BTreeSet::new(),
         };
         for p in d.store.projects().unwrap_or_default() {
             d.load_project(&p.id, Path::new(&p.cwd));
@@ -195,6 +214,12 @@ impl<T: Terminals> Daemon<T> {
         let now = now_ms();
         for t in d.store.live_threads().unwrap_or_default() {
             d.live.insert(t.id, Live::new(AgentStatus::Unknown, now));
+        }
+        // What every thread has changed, counted in the background.
+        for p in d.projects.keys().cloned().collect::<Vec<_>>() {
+            for t in d.store.threads(&p, false).unwrap_or_default() {
+                d.refresh_changes(&t.id);
+            }
         }
         d
     }
@@ -213,7 +238,7 @@ impl<T: Terminals> Daemon<T> {
     pub(super) fn thread_event(&self, tid: &str, seq: u64) -> Option<Value> {
         let t = self.store.thread(tid).ok()??;
         let (state, waiting) = self.state_of(&t, now_ms());
-        Some(json!({"event": "thread", "project": t.project, "thread": tid, "state": state.as_str(), "waiting": waiting, "items_seq": self.store.last_seq(tid).unwrap_or(0), "seq": seq}))
+        Some(json!({"event": "thread", "project": t.project, "thread": tid, "state": state.as_str(), "waiting": waiting, "items_seq": self.store.last_seq(tid).unwrap_or(0), "changes": self.summary_of(tid).map(|c| c.json()), "seq": seq}))
     }
 
     fn mark(&mut self, thread: &str) {
@@ -240,7 +265,8 @@ impl<T: Terminals> Daemon<T> {
         if let Some(e) = &error {
             self.say(format!("project {id}: {e}"));
         }
-        self.projects.insert(id.to_owned(), Proj { cwd: cwd.to_path_buf(), config, error });
+        let repo = crate::worktree::is_repo_root(cwd, &self.path_env);
+        self.projects.insert(id.to_owned(), Proj { cwd: cwd.to_path_buf(), config, error, repo });
         self.dirty_projects.insert(id.to_owned());
         self.live_version += 1;
     }
@@ -323,11 +349,16 @@ impl<T: Terminals> Daemon<T> {
         if new.is_free() && !old.is_free() {
             live.free_since = now;
         }
+        // A turn ended: what it changed is counted again.
+        let turn_ended = new.is_free() && matches!(old, AgentStatus::Working | AgentStatus::Blocked);
         if new != AgentStatus::Unknown {
             live.reported = true;
         }
         if changed {
             self.mark(tid);
+        }
+        if turn_ended {
+            self.refresh_changes(tid);
         }
         if old != new {
             self.pump(now);
@@ -424,6 +455,8 @@ impl<T: Terminals> Daemon<T> {
             "msg": live.map(|l| l.msg.clone()).filter(|m| !m.is_empty()),
             "terminal": t.terminal, "caps": Self::caps(t.engine),
             "created_ms": t.created_ms, "active_ms": t.active_ms, "started_ms": t.started_ms, "ended_ms": t.ended_ms, "archived": t.archived,
+            "worktree": t.worktree, "base_branch": t.base_branch, "base_commit": t.base_commit, "merged_ms": t.merged_ms,
+            "merging": self.merging.contains(&t.id), "changes": self.summary_of(&t.id).map(|c| c.json()),
         })
     }
 

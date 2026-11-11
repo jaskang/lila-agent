@@ -46,6 +46,11 @@ pub fn new_project(key: &str) -> Option<&str> {
     key.strip_prefix("new:")
 }
 
+/// What `@` puts in the box for a file: its path (in quotes when it has spaces), and a space after.
+pub fn at_text(path: &str) -> String {
+    if path.contains(char::is_whitespace) { format!("@\"{path}\" ") } else { format!("@{path} ") }
+}
+
 /// What the menu in front of the box is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -357,7 +362,7 @@ impl LilaApp {
                     .take(SHOWN)
                     .map(|(f, name_at, detail_at)| {
                         let (dir, name) = f.rsplit_once('/').map_or(("", f.as_str()), |(d, n)| (d, n));
-                        let text = if f.contains(char::is_whitespace) { format!("@\"{f}\" ") } else { format!("@{f} ") };
+                        let text = at_text(f);
                         let icon = if lila_agent::image_mime(f).is_some() { style::icon("lila/image.svg") } else { Icon::new(IconName::FileText) };
                         Row { icon, name: name.to_owned(), detail: dir.to_owned(), name_at, detail_at, pick: Pick::Put { text, send: false } }
                     })
@@ -555,6 +560,10 @@ impl LilaApp {
                 let mut p = json!({"project": project, "text": text, "attachments": files, "engine": engine, "effort": effort, "permission": permission});
                 if !model.is_empty() {
                     p["model"] = json!(model);
+                }
+                // The worktree is made before the reply: a few seconds, with the box busy.
+                if self.drafts.get(project).is_some_and(|d| d.worktree) && self.project(project).is_some_and(|p| p.repo) {
+                    p["worktree"] = json!(true);
                 }
                 ("thread.new", p, None)
             }
@@ -784,6 +793,13 @@ impl LilaApp {
 
     /// The box under a thread's conversation, on a bar of its own, with `ask` (the engine waits in its terminal) above it.
     pub fn composer_view(&mut self, m: &Value, ask: Option<AnyElement>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // Merged: nothing more is said to it.
+        if m["merged_ms"].is_number() {
+            let id = s(m, "id");
+            let sha = self.panel.merged_sha.get(&id).cloned().flatten();
+            let text = format!("已合并到 {}{}", s(m, "base_branch"), sha.map(|s| format!(" · {s}")).unwrap_or_default());
+            return h_flex().flex_none().justify_center().py_3().border_t_1().border_color(style::divider()).child(div().w_full().max_w(px(760.)).px_5().text_size(px(13.)).text_color(muted()).child(text)).into_any_element();
+        }
         let boxed = self.composer_box(&s(m, "id"), Some(m), window, cx);
         h_flex().flex_none().justify_center().pb_3().pt_2().border_t_1().border_color(style::divider()).child(v_flex().w_full().max_w(px(760.)).px_5().gap_2().children(ask).child(boxed)).into_any_element()
     }
@@ -926,7 +942,7 @@ impl LilaApp {
                 if stop {
                     Button::new("conv-stop").primary().size(px(style::CTL_SM)).icon(IconName::Square).tooltip("停止 (⌘.)").on_click(cx.listener(move |this, _, _, cx| this.request("thread.interrupt", json!({"thread": to}), cx, |this, _, _| this.refresh_now())))
                 } else {
-                    Button::new("conv-send").primary().size(px(style::CTL_SM)).icon(IconName::ArrowUp).disabled(!can_send).tooltip("发送 (↩)").on_click(cx.listener(move |this, _, window, cx| this.send_message(to.clone(), window, cx)))
+                    Button::new("conv-send").primary().size(px(style::CTL_SM)).icon(IconName::ArrowUp).loading(busy && new_project(&to).is_some()).disabled(!can_send).tooltip("发送 (↩)").on_click(cx.listener(move |this, _, window, cx| this.send_message(to.clone(), window, cx)))
                 }
             });
 
@@ -1032,10 +1048,10 @@ impl LilaApp {
             .into_any_element()
     }
 
-    /// The permission tier a new session starts on.
+    /// The permission tier a new session starts on, and (in a folder that is a repository) the worktree switch.
     fn tier_control(&mut self, project: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some((.., tier)) = self.draft_of(project) else { return Vec::new() };
-        vec![self.tier_button("new-tier", &tier, Anchor::BottomLeft, cx, {
+        let mut controls = vec![self.tier_button("new-tier", &tier, Anchor::BottomLeft, cx, {
             let (weak, project) = (cx.entity().downgrade(), project.to_owned());
             move |key, cx| {
                 let _ = weak.update(cx, |this, cx| {
@@ -1043,7 +1059,32 @@ impl LilaApp {
                     cx.notify();
                 });
             }
-        })]
+        })];
+        if self.project(project).is_some_and(|p| p.repo) {
+            controls.push(self.worktree_switch(project, cx));
+        }
+        controls
+    }
+
+    /// The switch for a worktree of the session's own: filled and blue while on. Not while the first message is on its way.
+    fn worktree_switch(&mut self, project: &str, cx: &mut Context<Self>) -> AnyElement {
+        let quiet = style::quiet(cx);
+        let on = self.drafts.get(project).is_some_and(|d| d.worktree);
+        let busy = self.composers.get(&new_key(project)).is_some_and(|c| c.busy);
+        let project = project.to_owned();
+        Button::new("new-worktree")
+            .custom(quiet)
+            .xsmall()
+            .icon(style::icon("lila/git-branch.svg").text_color(if on { style::blue() } else { muted() }))
+            .when(on, |b| b.bg(style::accent()))
+            .disabled(busy)
+            .tooltip("独立 worktree")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let d = this.drafts.entry(project.clone()).or_default();
+                d.worktree = !d.worktree;
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// A button showing a permission tier, and the three to choose from; `pick` gets the one chosen.
@@ -1149,7 +1190,7 @@ impl LilaApp {
 
 /// The model, engine and effort as plain words, where the session can't change them.
 fn spec_text(label: String) -> AnyElement {
-    h_flex().h(px(style::CTL_SM)).px_2().items_center().text_size(px(12.)).text_color(muted2()).child(label).into_any_element()
+    h_flex().h(px(style::CTL_SM)).px_2().min_w_0().overflow_hidden().whitespace_nowrap().items_center().text_size(px(12.)).text_color(muted2()).child(label).into_any_element()
 }
 
 /// Is the model or effort not the project's? (Claude Code's model is read from its replies, as an id: only an id can differ for certain.)

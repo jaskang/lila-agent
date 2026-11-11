@@ -18,6 +18,8 @@ pub struct Project {
     pub model: String,
     pub effort: String,
     pub permission: String,
+    /// The folder is the top of a git repository: a session there can have a worktree of its own.
+    pub repo: bool,
 }
 
 impl Project {
@@ -38,6 +40,7 @@ impl Project {
             model: d("model"),
             effort: d("effort"),
             permission: Some(d("permission")).filter(|e| !e.is_empty()).unwrap_or_else(|| "full".into()),
+            repo: v["repo"] == true,
         }
     }
 }
@@ -118,7 +121,7 @@ pub fn notify(title: &str, body: &str) {
 /// One request to lilad. `autostart`: start lilad first if needed.
 pub fn act(paths: &Paths, method: &str, params: Value, autostart: bool) -> anyhow::Result<Value> {
     #[cfg(feature = "shots")]
-    if let Some(answer) = fake_act(method) {
+    if let Some(answer) = fake_act(method, &params) {
         return answer;
     }
     lila::client::request(paths, method, params, autostart)
@@ -166,6 +169,24 @@ pub fn save_sidebar_hidden(paths: &Paths, hidden: bool) {
     let _ = std::fs::write(sidebar_file(paths), json!({ "hidden": hidden }).to_string());
 }
 
+fn panel_file(paths: &Paths) -> std::path::PathBuf {
+    paths.state.join("app-panel.json")
+}
+
+/// The right panel as it was left: open or not, which view (`files` or `changes`), how wide.
+pub fn load_panel(paths: &Paths) -> (bool, Option<String>, Option<f32>) {
+    let v: Option<Value> = std::fs::read_to_string(panel_file(paths)).ok().and_then(|t| serde_json::from_str(&t).ok());
+    match v {
+        Some(v) => (v["open"] == true, v["view"].as_str().map(String::from), v["width"].as_f64().map(|w| w as f32)),
+        None => (false, None, None),
+    }
+}
+
+pub fn save_panel(paths: &Paths, open: bool, view: &str, width: f32) {
+    let _ = std::fs::create_dir_all(&paths.state);
+    let _ = std::fs::write(panel_file(paths), json!({ "open": open, "view": view, "width": width.round() }).to_string());
+}
+
 pub fn save_last(paths: &Paths, thread: Option<&str>, project: Option<&str>) {
     let _ = std::fs::create_dir_all(&paths.state);
     let _ = std::fs::write(last_file(paths), json!({ "thread": thread, "project": project }).to_string());
@@ -191,16 +212,63 @@ pub fn clock_ms() -> String {
     chrono::Local::now().format("%H:%M:%S%.3f").to_string()
 }
 
-/// `--features shots`, with `LILA_APP_FAKE`: what the menus list (`files`, `commands` in the file) and how a send goes
-/// (`LILA_APP_FAKE_SEND_MS` takes that long, `LILA_APP_FAKE_SEND_ERR=<words>` fails with them); every other request is left to fail.
+/// `--features shots`, with `LILA_APP_FAKE`: what the menus and the right panel list, and how a send goes
+/// (`LILA_APP_FAKE_SEND_MS` takes that long, `LILA_APP_FAKE_READ_MS` for the panel's reads, `LILA_APP_FAKE_SEND_ERR=<words>` fails with them). In the file:
+/// `files` and `commands` (the menus; `files` is also the file tree), `changes` (a thread's id to what `thread.changes`
+/// says), `diffs` (a thread's id to its path to the `thread.diff` item), `file` (a path to what `thread.file` says),
+/// `commit` and `merge` (what those answer, or `{"error": "…"}`, after `LILA_APP_FAKE_SEND_MS`); every other request is left to fail.
 #[cfg(feature = "shots")]
-fn fake_act(method: &str) -> Option<anyhow::Result<Value>> {
+fn fake_act(method: &str, params: &Value) -> Option<anyhow::Result<Value>> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(std::env::var("LILA_APP_FAKE").ok()?).ok()?).ok()?;
+    let wait = |var: &str| std::thread::sleep(std::time::Duration::from_millis(std::env::var(var).ok().and_then(|m| m.parse().ok()).unwrap_or(0)));
+    // What is read (`LILA_APP_FAKE_READ_MS`) and what is done (`LILA_APP_FAKE_SEND_MS`) take their own time.
+    let (read, slow) = (|| wait("LILA_APP_FAKE_READ_MS"), || wait("LILA_APP_FAKE_SEND_MS"));
+    let thread = params["thread"].as_str().unwrap_or_default();
+    // What the file says as an answer: a message in `error` is a failure.
+    let answer = |a: &Value| match a["error"].as_str() {
+        Some(e) => Err(anyhow::anyhow!(e.to_owned())),
+        None => Ok(a.clone()),
+    };
     match method {
         "thread.files" => Some(Ok(json!({"files": v["files"]}))),
         "thread.commands" => Some(Ok(json!({"commands": v["commands"]}))),
+        "thread.changes" => {
+            read();
+            Some(match &v["changes"][thread] {
+                Value::Null => Err(anyhow::anyhow!("no fake changes for {thread}")),
+                a => answer(a),
+            })
+        }
+        "thread.diff" => {
+            read();
+            let files = &v["diffs"][thread];
+            let wanted = params["path"].as_str();
+            let mut diffs: Vec<Value> = v["changes"][thread]["files"].as_array().into_iter().flatten().filter_map(|f| files.get(f["path"].as_str()?).cloned()).collect();
+            diffs.retain(|d| wanted.is_none_or(|w| d["path"] == w || d["old_path"] == w));
+            Some(Ok(json!({"diffs": diffs, "truncated": false})))
+        }
+        "thread.file" => {
+            read();
+            let path = params["path"].as_str().unwrap_or_default();
+            Some(match &v["file"][path] {
+                Value::Null => Err(anyhow::anyhow!("no such file")),
+                a => answer(a),
+            })
+        }
+        "thread.commit" | "thread.merge" => {
+            slow();
+            Some(answer(&v[method.trim_start_matches("thread.")]))
+        }
+        "thread.log" => Some(Ok(v["log"][thread].clone())),
+        "thread.new" if v["new"].is_object() => {
+            slow();
+            Some(match std::env::var("LILA_APP_FAKE_SEND_ERR") {
+                Ok(e) => Err(anyhow::anyhow!(e)),
+                Err(_) => Ok(v["new"].clone()),
+            })
+        }
         "thread.send" | "thread.resume" => {
-            std::thread::sleep(std::time::Duration::from_millis(std::env::var("LILA_APP_FAKE_SEND_MS").ok().and_then(|m| m.parse().ok()).unwrap_or(0)));
+            slow();
             Some(match std::env::var("LILA_APP_FAKE_SEND_ERR") {
                 Ok(e) => Err(anyhow::anyhow!(e)),
                 Err(_) => Ok(json!({"sent": true})),
@@ -240,6 +308,19 @@ mod tests {
         let bare = Project::of(&json!({"id": "a", "cwd": "/a", "label": "a"}));
         assert_eq!((bare.engine.as_str(), bare.permission.as_str()), ("claude", "full"));
         assert_eq!(bare.label(), "a");
+        // Whether the folder can have worktrees is lilad's word; not said, no.
+        assert!(!bare.repo);
+        assert!(Project::of(&json!({"id": "a", "cwd": "/a", "repo": true})).repo);
+    }
+
+    #[test]
+    fn the_panel_is_kept_open_with_its_view_and_width() {
+        let tmp = std::env::temp_dir().join(format!("lila-app-panel-{}", std::process::id()));
+        let paths = Paths { state: tmp.clone(), ..Paths::from_env() };
+        assert_eq!(load_panel(&paths), (false, None, None));
+        save_panel(&paths, true, "files", 412.4);
+        assert_eq!(load_panel(&paths), (true, Some("files".to_owned()), Some(412.)));
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

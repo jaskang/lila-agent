@@ -9,6 +9,7 @@ struct Fake {
     kills: Vec<String>,
     keys: Vec<(String, Vec<String>)>,
     refuse_sends: bool,
+    refuse_runs: bool,
 }
 
 impl Terminals for Fake {
@@ -17,6 +18,9 @@ impl Terminals for Fake {
     }
 
     fn run(&mut self, req: Value) -> Result<String> {
+        if self.refuse_runs {
+            bail!("no terminal");
+        }
         self.runs.push(req);
         Ok(format!("t{}", self.runs.len()))
     }
@@ -156,6 +160,21 @@ impl World {
             .iter()
             .map(|e| format!("{} {}", e["kind"].as_str().unwrap(), e["detail"].as_str().unwrap()))
             .collect()
+    }
+
+    /// The jobs lilad queued itself (the summaries of changes, worktrees to remove), run now, with what follows from them.
+    fn settle(&mut self) {
+        loop {
+            let jobs = self.d.take_jobs();
+            if jobs.is_empty() {
+                return;
+            }
+            for job in jobs {
+                self.now += 10;
+                let result = job.run();
+                let _ = self.d.finish(job, result, self.now);
+            }
+        }
     }
 
     fn host_event(&mut self, tid: &str, ev: AgentEvent) {
@@ -675,4 +694,445 @@ fn unknown_requests_and_threads_are_errors() {
     assert!(w.d.term.runs.is_empty(), "nothing was started");
     let status = w.ok("status", json!({}));
     assert_eq!(status["projects"], 1);
+}
+
+// ---------------- worktrees, changes, commit, merge (P2) ----------------
+
+mod p2 {
+    use super::*;
+    use crate::worktree::tests::{repo, sh};
+
+    /// The project `shop` in a git repository on `main` (its `.lila/project.toml` committed).
+    fn git_world() -> World {
+        let mut w = world();
+        // The engines are the fake ones; git is the real one.
+        w.d.path_env = format!("{}:{}", w.d.path_env, std::env::var("PATH").unwrap_or_default());
+        w.project();
+        repo(&w.repo);
+        w
+    }
+
+    /// A Codex thread (it reports through a host, so tests can make it idle), in a worktree.
+    fn in_worktree(w: &mut World) -> String {
+        let tid = w.new_thread(json!({"engine": "codex", "worktree": true, "text": "start"}));
+        w.status(&tid, "idle");
+        tid
+    }
+
+    fn worktree_of(w: &World, tid: &str) -> PathBuf {
+        PathBuf::from(w.d.store.thread(tid).unwrap().unwrap().cwd)
+    }
+
+    fn write(dir: &Path, name: &str, text: &str) {
+        let p = dir.join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    /// A commit in a worktree, as the agent would make one.
+    fn commit(dir: &Path, file: &str, text: &str, message: &str) {
+        write(dir, file, text);
+        sh(dir, &["add", "-A"]);
+        sh(dir, &["commit", "-q", "-m", message]);
+    }
+
+    #[test]
+    fn the_project_list_says_whether_the_folder_can_have_worktrees() {
+        let mut w = git_world();
+        // Asked when the project is loaded: the repository was made after that, so it is still not one.
+        assert_eq!(w.ok("project.list", json!({}))[0]["repo"], json!(false));
+        w.ok("project.reload", json!({"project": "shop"}));
+        assert_eq!(w.ok("project.list", json!({}))[0]["repo"], json!(true));
+        assert_eq!(w.ok("project.show", json!({"project": "shop"}))["repo"], json!(true));
+    }
+
+    #[test]
+    fn a_thread_can_start_in_a_worktree_of_its_own() {
+        let mut w = git_world();
+        let head = sh(&w.repo, &["rev-parse", "HEAD"]);
+        let tid = w.new_thread(json!({"engine": "codex", "worktree": true, "text": "hello"}));
+        let wt = w.d.paths.data.join("worktrees/shop").join(&tid);
+        let j = w.ok("thread.show", json!({"thread": tid}));
+        assert_eq!((j["worktree"].clone(), j["base_branch"].clone(), j["base_commit"].clone(), j["merged_ms"].clone()), (json!(true), json!("main"), json!(head), Value::Null));
+        assert_eq!(j["cwd"], wt.to_string_lossy().as_ref());
+        // The engine starts there.
+        assert_eq!(w.d.term.runs[0]["cwd"], wt.to_string_lossy().as_ref());
+        assert_eq!(w.d.term.runs[0]["env"]["LILA_ROOT"], wt.to_string_lossy().as_ref());
+        assert_eq!(sh(&wt, &["symbolic-ref", "--short", "HEAD"]), format!("lila/{tid}"));
+        assert_eq!(sh(&wt, &["rev-parse", "HEAD"]), head);
+        assert_eq!(sh(&w.repo, &["symbolic-ref", "--short", "HEAD"]), "main", "the project folder stays where it was");
+        w.status(&tid, "working");
+        assert_eq!(w.sends_to(&tid), ["hello"]);
+        // Not asked for: the project folder, as before.
+        let plain = w.new_thread(json!({"engine": "codex"}));
+        let j = w.ok("thread.show", json!({"thread": plain}));
+        assert_eq!((j["worktree"].clone(), j["base_branch"].clone(), j["cwd"].clone()), (json!(false), Value::Null, json!(w.repo.to_string_lossy())));
+        // It is the thread list's too.
+        let list = w.ok("thread.list", json!({"project": "shop"}));
+        assert_eq!(list.as_array().unwrap().iter().filter(|t| t["worktree"] == true).count(), 1);
+    }
+
+    #[test]
+    fn a_worktree_needs_a_repository_on_a_branch_and_leaves_nothing_when_it_fails() {
+        // Not a repository.
+        let mut w = world();
+        w.d.path_env = format!("{}:{}", w.d.path_env, std::env::var("PATH").unwrap_or_default());
+        w.project();
+        let err = format!("{:#}", w.call("thread.new", json!({"project": "shop", "worktree": true})).unwrap_err());
+        assert!(err.contains("not the top of a git repository"), "{err}");
+        assert!(w.ok("thread.list", json!({"archived": true})).as_array().unwrap().is_empty());
+        // A folder inside a bigger repository.
+        let mut w = git_world();
+        let inner = w.repo.join("app");
+        std::fs::create_dir_all(&inner).unwrap();
+        let inner_s = inner.to_string_lossy().to_string();
+        w.ok("project.add", json!({"cwd": inner_s, "name": "app"}));
+        let err = format!("{:#}", w.call("thread.new", json!({"project": "app", "worktree": true})).unwrap_err());
+        assert!(err.contains("not the top of a git repository"), "{err}");
+        // Detached HEAD.
+        sh(&w.repo, &["checkout", "-q", "--detach"]);
+        let err = format!("{:#}", w.call("thread.new", json!({"project": "shop", "worktree": true})).unwrap_err());
+        assert!(err.contains("detached HEAD"), "{err}");
+        sh(&w.repo, &["checkout", "-q", "main"]);
+        // The engine cannot start: the worktree and its branch are not left behind.
+        w.d.term.refuse_runs = true;
+        let err = format!("{:#}", w.call("thread.new", json!({"project": "shop", "worktree": true})).unwrap_err());
+        assert!(err.contains("start claude"), "{err}");
+        w.settle();
+        assert!(w.ok("thread.list", json!({"archived": true})).as_array().unwrap().is_empty());
+        assert!(sh(&w.repo, &["branch", "--list", "lila/*"]).is_empty());
+        assert_eq!(std::fs::read_dir(w.d.paths.data.join("worktrees/shop")).map(|d| d.count()).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn changes_list_every_kind_and_the_diff_is_the_conversations_file_diff() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        let wt = worktree_of(&w, &tid);
+        commit(&wt, "gone.txt", "bye\n", "add gone");
+        commit(&wt, "old.txt", "1\n2\n3\n4\n5\n6\n", "add old");
+        write(&wt, "a.txt", "a\nmore\n");
+        std::fs::remove_file(wt.join("gone.txt")).unwrap();
+        std::fs::rename(wt.join("old.txt"), wt.join("new name.txt")).unwrap();
+        write(&wt, "fresh.rs", "fn a() {}\n");
+        write(&wt, "pic.bin", "p\0q");
+
+        let c = w.ok("thread.changes", json!({"thread": tid}));
+        assert_eq!((c["repo"].clone(), c["branch"].clone(), c["worktree"].clone(), c["base_branch"].clone(), c["ahead"].clone()), (json!(true), json!(format!("lila/{tid}")), json!(true), json!("main"), json!(2)));
+        assert_eq!(c["commits"][0]["subject"], "add old");
+        let file = |p: &str| c["files"].as_array().unwrap().iter().find(|f| f["path"] == p).unwrap_or_else(|| panic!("{p} in {c}")).clone();
+        assert_eq!((file("a.txt")["status"].clone(), file("a.txt")["add"].clone(), file("a.txt")["del"].clone()), (json!("modified"), json!(1), json!(0)));
+        assert_eq!((file("gone.txt")["status"].clone(), file("gone.txt")["del"].clone()), (json!("deleted"), json!(1)));
+        assert_eq!((file("new name.txt")["status"].clone(), file("new name.txt")["old_path"].clone()), (json!("renamed"), json!("old.txt")));
+        assert_eq!((file("fresh.rs")["status"].clone(), file("fresh.rs")["add"].clone()), (json!("untracked"), json!(1)));
+        assert_eq!((file("pic.bin")["status"].clone(), file("pic.bin")["binary"].clone()), (json!("untracked"), json!(true)));
+
+        let d = w.ok("thread.diff", json!({"thread": tid, "path": "fresh.rs"}));
+        assert_eq!(d["diffs"], json!([{"path": "fresh.rs", "lines": ["@@ -0,0 +1 @@", "+fn a() {}"], "status": "untracked"}]));
+        let d = w.ok("thread.diff", json!({"thread": tid, "path": "pic.bin"}));
+        assert_eq!((d["diffs"][0]["binary"].clone(), d["diffs"][0]["lines"].clone()), (json!(true), json!([])));
+        let all = w.ok("thread.diff", json!({"thread": tid}));
+        assert_eq!(all["diffs"].as_array().unwrap().len(), 5);
+        assert_eq!(all["truncated"], false);
+        // The shape the conversation's diff viewer takes.
+        let fd: Vec<lila_agent::FileDiff> = serde_json::from_value(all["diffs"].clone()).unwrap();
+        assert!(fd.iter().any(|f| f.path == "a.txt" && f.lines == ["@@ -1 +1,2 @@", " a", "+more"]));
+        assert!(w.call("thread.diff", json!({"thread": tid, "path": "../a"})).is_err());
+
+        // Not in git: nothing to list.
+        let mut n = world();
+        n.d.path_env = w.d.path_env.clone();
+        n.project();
+        let plain = n.new_thread(json!({"engine": "codex"}));
+        let c = n.ok("thread.changes", json!({"thread": plain}));
+        assert_eq!((c["repo"].clone(), c["files"].clone()), (json!(false), json!([])));
+        assert_eq!(n.ok("thread.diff", json!({"thread": plain}))["diffs"], json!([]));
+    }
+
+    #[test]
+    fn a_file_is_read_inside_the_threads_folder_only() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        let wt = worktree_of(&w, &tid);
+        write(&wt, "src/lib.rs", "pub fn f() {}\n");
+        let f = w.ok("thread.file", json!({"thread": tid, "path": "src/lib.rs"}));
+        assert_eq!(f, json!({"path": "src/lib.rs", "text": "pub fn f() {}\n", "size": 14}));
+        write(&wt, "x.bin", "\0\0");
+        assert_eq!(w.ok("thread.file", json!({"thread": tid, "path": "x.bin"}))["binary"], true);
+        std::os::unix::fs::symlink(&w.repo, wt.join("out")).unwrap();
+        for bad in ["../../a.txt", "/etc/passwd", "out/a.txt", "src/../../x", ""] {
+            assert!(w.call("thread.file", json!({"thread": tid, "path": bad})).is_err(), "{bad}");
+        }
+        assert!(w.call("thread.file", json!({"thread": tid})).is_err());
+        assert_eq!(std::fs::read_to_string(w.repo.join("a.txt")).unwrap(), "a\n", "the project folder's own file is not the worktree's");
+        assert_eq!(w.ok("thread.file", json!({"thread": tid, "path": "a.txt"}))["text"], "a\n");
+    }
+
+    #[test]
+    fn the_summary_is_counted_when_a_turn_ends_and_pushed_once() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        w.settle();
+        let wt = worktree_of(&w, &tid);
+        let summary = |w: &mut World| w.ok("thread.show", json!({"thread": tid}))["changes"].clone();
+        assert_eq!(summary(&mut w), json!({"files": 0, "add": 0, "del": 0}), "counted when it started");
+        w.d.take_dirty();
+
+        // Files change during the turn: nothing is counted (and nobody is told) until it ends.
+        w.status(&tid, "working");
+        write(&wt, "a.txt", "a\nb\nc\n");
+        write(&wt, "new.txt", "1\n2\n");
+        w.settle();
+        assert!(w.d.take_jobs().is_empty());
+        w.d.follow_transcripts();
+        assert!(w.d.take_jobs().is_empty(), "following the transcripts does not run git");
+        assert_eq!(summary(&mut w), json!({"files": 0, "add": 0, "del": 0}));
+
+        w.d.take_dirty();
+        w.status(&tid, "idle");
+        w.settle();
+        assert_eq!(summary(&mut w), json!({"files": 2, "add": 4, "del": 0}));
+        assert!(w.d.take_dirty().0.contains(&tid), "the window is told");
+        // The same again: no change, no push.
+        w.status(&tid, "working");
+        w.status(&tid, "idle");
+        w.d.take_dirty();
+        w.settle();
+        assert!(!w.d.take_dirty().0.contains(&tid), "counting again and finding the same is not news");
+        // The turn-end event of a host counts too.
+        write(&wt, "third.txt", "x\n");
+        w.host_event(&tid, AgentEvent::TurnEnded { turn: "tu1".into(), failed: None });
+        w.settle();
+        assert_eq!(summary(&mut w)["files"], 3);
+        // And the push event carries it.
+        let ev = w.d.thread_event(&tid, 7).unwrap();
+        assert_eq!(ev["changes"]["files"], 3);
+        // A folder outside git has none.
+        let mut n = world();
+        n.d.path_env = w.d.path_env.clone();
+        n.project();
+        let plain = n.new_thread(json!({"engine": "codex"}));
+        n.settle();
+        assert_eq!(n.ok("thread.show", json!({"thread": plain}))["changes"], Value::Null);
+    }
+
+    #[test]
+    fn a_claude_threads_stop_hook_counts_the_changes() {
+        let mut w = git_world();
+        let tid = w.new_thread(json!({"text": "hi"}));
+        w.settle();
+        write(&w.repo, "x.txt", "x\n");
+        w.hook(&tid, "Stop", json!({}));
+        w.settle();
+        assert_eq!(w.ok("thread.show", json!({"thread": tid}))["changes"], json!({"files": 1, "add": 1, "del": 0}));
+        // Asked again while counting: once more after, not at once.
+        w.hook(&tid, "Stop", json!({}));
+        w.hook(&tid, "Stop", json!({}));
+        assert_eq!(w.d.take_jobs().len(), 1);
+    }
+
+    #[test]
+    fn asking_for_a_commit_sends_the_agent_a_note_from_lila() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        let wt = worktree_of(&w, &tid);
+        let err = |w: &mut World| format!("{:#}", w.call("thread.commit", json!({"thread": tid})).unwrap_err());
+        assert!(err(&mut w).contains("nothing to commit"));
+        write(&wt, "a.txt", "changed\n");
+        w.status(&tid, "working");
+        assert!(err(&mut w).contains("working now"));
+        w.status(&tid, "idle");
+        let before = w.sends_to(&tid).len();
+        let r = w.ok("thread.commit", json!({"thread": tid}));
+        assert_eq!(r, json!({"sent": true, "thread": tid}));
+        let sent = w.sends_to(&tid);
+        assert_eq!(sent.len(), before + 1);
+        let text = sent.last().unwrap();
+        assert!(text.starts_with("<lila ") && text.contains("提交"), "{text}");
+        assert!(text.contains("git status") && text.contains("git diff") && text.contains("不要推送"), "{text}");
+        assert_eq!(lila_agent::model::origin(text), lila_agent::model::Origin::Lila { task: None }, "a quiet line, not a person's bubble");
+        assert!(w.events(&tid).iter().any(|e| e.starts_with("commit ")));
+        // Not while it waits or is gone.
+        w.d.term.sends.clear();
+        w.ok("thread.stop", json!({"thread": tid}));
+        assert!(err(&mut w).contains("has ended"));
+        // Outside git.
+        let mut n = world();
+        n.d.path_env = w.d.path_env.clone();
+        n.project();
+        let plain = n.new_thread(json!({"engine": "codex"}));
+        n.status(&plain, "idle");
+        assert!(format!("{:#}", n.call("thread.commit", json!({"thread": plain})).unwrap_err()).contains("not in a git repository"));
+    }
+
+    #[test]
+    fn merging_puts_the_threads_work_on_the_base_branch_and_ends_the_thread() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        let wt = worktree_of(&w, &tid);
+        w.ok("thread.rename", json!({"thread": tid, "title": "Add login"}));
+        commit(&wt, "login.rs", "fn login() {}\n", "wip login");
+        commit(&wt, "login.rs", "fn login() { 1 }\n", "finish login");
+        // The base moved meanwhile.
+        write(&w.repo, "other.txt", "o\n");
+        sh(&w.repo, &["add", "-A"]);
+        sh(&w.repo, &["commit", "-q", "-m", "other work"]);
+        let r = w.ok("thread.merge", json!({"thread": tid}));
+        assert_eq!((r["merged"].clone(), r["commits"].clone(), r["files"].clone(), r["branch"].clone()), (json!(true), json!(2), json!(1), json!("main")));
+        assert_eq!(r["commit"], sh(&w.repo, &["rev-parse", "--short", "HEAD"]).as_str());
+        assert_eq!(sh(&w.repo, &["log", "--format=%s"]), "Add login\nother work\nfirst");
+        assert_eq!(sh(&w.repo, &["log", "-1", "--format=%B"]), "Add login\n\n- wip login\n- finish login");
+        assert_eq!(std::fs::read_to_string(w.repo.join("login.rs")).unwrap(), "fn login() { 1 }\n");
+        // The thread: its engine ended, archived, merged; the worktree and its branch go (off the loop).
+        let t = &r["thread"];
+        assert_eq!((t["archived"].clone(), t["state"].clone(), t["merging"].clone(), t["changes"].clone()), (json!(true), json!("ended"), json!(false), Value::Null));
+        assert!(t["merged_ms"].is_number());
+        assert_eq!(w.d.term.kills.len(), 1);
+        w.settle();
+        assert!(!wt.exists());
+        assert!(sh(&w.repo, &["branch", "--list", "lila/*"]).is_empty());
+        assert!(!sh(&w.repo, &["worktree", "list"]).contains(&tid));
+        assert!(w.events(&tid).iter().any(|e| e == &format!("merged 2 commit(s) into main as {}", r["commit"].as_str().unwrap())), "{:?}", w.events(&tid));
+        assert!(w.ok("thread.list", json!({"project": "shop"})).as_array().unwrap().is_empty());
+        // It does not come back.
+        assert!(format!("{:#}", w.call("thread.resume", json!({"thread": tid})).unwrap_err()).contains("was merged"));
+        assert!(format!("{:#}", w.call("thread.merge", json!({"thread": tid})).unwrap_err()).contains("merged already"));
+        assert!(format!("{:#}", w.call("thread.commit", json!({"thread": tid})).unwrap_err()).contains("was merged"));
+        assert_eq!(w.ok("thread.changes", json!({"thread": tid}))["repo"], false);
+    }
+
+    #[test]
+    fn a_thread_whose_agent_has_ended_can_be_merged() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        commit(&worktree_of(&w, &tid), "b.txt", "b\n", "Add b");
+        w.ok("thread.stop", json!({"thread": tid}));
+        let kills = w.d.term.kills.len();
+        let r = w.ok("thread.merge", json!({"thread": tid}));
+        assert_eq!(r["merged"], true);
+        assert_eq!(w.d.term.kills.len(), kills, "no engine to end");
+        assert_eq!(sh(&w.repo, &["log", "--format=%s"]), "Add b\nfirst");
+    }
+
+    #[test]
+    fn one_commit_keeps_its_own_message() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        commit(&worktree_of(&w, &tid), "b.txt", "b\n", "Add b\n\nBecause.");
+        w.ok("thread.merge", json!({"thread": tid}));
+        assert_eq!(sh(&w.repo, &["log", "-1", "--format=%B"]), "Add b\n\nBecause.");
+        assert_eq!(sh(&w.repo, &["log", "--format=%s"]), "Add b\nfirst");
+    }
+
+    #[test]
+    fn merging_is_refused_when_it_would_lose_or_not_do_anything() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        let wt = worktree_of(&w, &tid);
+        let refused = |w: &mut World, tid: &str, expect: &str| {
+            let err = format!("{:#}", w.call("thread.merge", json!({"thread": tid})).unwrap_err());
+            assert!(err.contains(expect), "{err}");
+            w.settle();
+            assert_eq!(w.state(tid), "idle", "the thread is as it was");
+            assert_eq!(w.ok("thread.show", json!({"thread": tid}))["merging"], false);
+        };
+        // A thread that is not in a worktree.
+        let plain = w.new_thread(json!({"engine": "codex"}));
+        w.status(&plain, "idle");
+        refused(&mut w, &plain, "does not work in a worktree");
+        // No commits.
+        refused(&mut w, &tid, "nothing to merge");
+        // Uncommitted work.
+        commit(&wt, "b.txt", "b\n", "Add b");
+        write(&wt, "loose.txt", "x");
+        refused(&mut w, &tid, "uncommitted changes; commit them first");
+        std::fs::remove_file(wt.join("loose.txt")).unwrap();
+        // The project folder is on another branch.
+        sh(&w.repo, &["checkout", "-q", "-b", "elsewhere"]);
+        refused(&mut w, &tid, "on elsewhere, not on main");
+        sh(&w.repo, &["checkout", "-q", "main"]);
+        // The person's own uncommitted change to a file the merge brings.
+        write(&w.repo, "b.txt", "mine\n");
+        refused(&mut w, &tid, "uncommitted changes to files this merge changes: b.txt");
+        std::fs::remove_file(w.repo.join("b.txt")).unwrap();
+        // While it works.
+        w.status(&tid, "working");
+        refused_running(&mut w, &tid);
+        w.status(&tid, "idle");
+        // The refusals changed nothing: the work is all still there.
+        assert_eq!(sh(&wt, &["log", "--format=%s", "main..HEAD"]), "Add b");
+        assert_eq!(sh(&w.repo, &["log", "--format=%s"]), "first");
+        assert!(wt.exists());
+        // A conflict is recorded in the thread's log.
+        write(&w.repo, "b.txt", "conflicting\n");
+        sh(&w.repo, &["add", "-A"]);
+        sh(&w.repo, &["commit", "-q", "-m", "b on main"]);
+        refused(&mut w, &tid, "conflict");
+        assert!(w.events(&tid).iter().any(|e| e.starts_with("merge_failed ") && e.contains("b.txt")), "{:?}", w.events(&tid));
+        assert_eq!(sh(&wt, &["log", "--format=%s", "main..HEAD"]), "Add b", "its commit is as it was");
+        assert_eq!(sh(&wt, &["status", "--porcelain"]), "");
+        // The thread goes on: it can still be told to resolve it.
+        assert!(w.call("thread.send", json!({"thread": tid, "text": "bring main in"})).is_ok());
+    }
+
+    fn refused_running(w: &mut World, tid: &str) {
+        let err = format!("{:#}", w.call("thread.merge", json!({"thread": tid})).unwrap_err());
+        assert!(err.contains("working now"), "{err}");
+    }
+
+    #[test]
+    fn nothing_reaches_a_thread_while_it_is_being_merged() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        commit(&worktree_of(&w, &tid), "b.txt", "b\n", "Add b");
+        w.now += 1000;
+        let Begin::Job(job) = w.d.begin("thread.merge", &json!({"thread": tid}), w.now).unwrap() else { panic!("a merge is a job") };
+        assert_eq!(w.ok("thread.show", json!({"thread": tid}))["merging"], true);
+        for (method, params) in [("thread.send", json!({"thread": tid, "text": "x"})), ("thread.merge", json!({"thread": tid})), ("thread.commit", json!({"thread": tid})), ("thread.resume", json!({"thread": tid}))] {
+            let err = format!("{:#}", w.call(method, params).unwrap_err());
+            assert!(err.contains("being merged") || err.contains("is running"), "{method}: {err}");
+        }
+        let result = job.run();
+        w.d.finish(job, result, w.now).unwrap();
+        assert_eq!(w.ok("thread.show", json!({"thread": tid}))["merging"], false);
+    }
+
+    #[test]
+    fn archiving_a_worktree_thread_keeps_its_worktree() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        let wt = worktree_of(&w, &tid);
+        commit(&wt, "b.txt", "b\n", "Add b");
+        w.ok("thread.archive", json!({"thread": tid}));
+        w.settle();
+        assert!(wt.join("b.txt").exists(), "the work is still there");
+        assert!(sh(&w.repo, &["branch", "--list", "lila/*"]).contains(&tid));
+        let j = w.ok("thread.unarchive", json!({"thread": tid}));
+        assert_eq!((j["archived"].clone(), j["worktree"].clone(), j["merged_ms"].clone()), (json!(false), json!(true), Value::Null));
+        // And it goes on: resumed in the same worktree.
+        w.ok("thread.resume", json!({"thread": tid}));
+        assert_eq!(w.d.term.runs.last().unwrap()["cwd"], wt.to_string_lossy().as_ref());
+        // Its folder deleted by hand: said so.
+        w.ok("thread.stop", json!({"thread": tid}));
+        sh(&w.repo, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
+        assert!(format!("{:#}", w.call("thread.resume", json!({"thread": tid})).unwrap_err()).contains("is gone"));
+    }
+
+    #[test]
+    fn lilad_counts_every_threads_changes_when_it_starts() {
+        let mut w = git_world();
+        let tid = in_worktree(&mut w);
+        write(&worktree_of(&w, &tid), "x.txt", "x\n");
+        // A new lilad on the same data.
+        let store = Store::open(&w.d.paths.db()).unwrap();
+        let mut d = Daemon::new(store, Fake::default(), w.d.paths.clone(), w.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
+        let jobs = d.take_jobs();
+        assert_eq!(jobs.len(), 1);
+        for job in jobs {
+            let r = job.run();
+            d.finish(job, r, 5).unwrap();
+        }
+        let t = d.store.thread(&tid).unwrap().unwrap();
+        assert_eq!(d.thread_json(&t, 6)["changes"], json!({"files": 1, "add": 1, "del": 0}));
+    }
 }

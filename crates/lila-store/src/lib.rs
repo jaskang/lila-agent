@@ -7,8 +7,18 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::Path;
 
 /// Bumped when the schema changes. A database from before threads (v3) has `user_version` 0
-/// and tables of tasks and members: it is moved aside and a new one starts empty.
-const VERSION: i64 = 4;
+/// and tables of tasks and members: it is moved aside and a new one starts empty. Later changes
+/// only add columns (`ADDED_COLUMNS`), which `migrate` adds to a table that lacks them.
+/// 5: threads got `worktree`, `base_branch`, `base_commit`, `merged_ms`.
+const VERSION: i64 = 5;
+
+/// Columns added to `threads` after version 4: a v4 database gets them by `ALTER TABLE`.
+const ADDED_COLUMNS: [(&str, &str); 4] = [
+    ("worktree", "INTEGER NOT NULL DEFAULT 0"),
+    ("base_branch", "TEXT"),
+    ("base_commit", "TEXT"),
+    ("merged_ms", "INTEGER"),
+];
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
@@ -31,7 +41,11 @@ CREATE TABLE IF NOT EXISTS threads (
     active_ms INTEGER NOT NULL,
     started_ms INTEGER,
     ended_ms INTEGER,
-    archived INTEGER NOT NULL DEFAULT 0
+    archived INTEGER NOT NULL DEFAULT 0,
+    worktree INTEGER NOT NULL DEFAULT 0,
+    base_branch TEXT,
+    base_commit TEXT,
+    merged_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS threads_project ON threads (project, active_ms);
 CREATE TABLE IF NOT EXISTS conv_items (
@@ -84,6 +98,15 @@ pub struct NewThread {
     pub tier: Tier,
     pub cwd: String,
     pub session: Option<String>,
+    /// The thread works in a worktree of its own: the branch the project folder was on and its commit then.
+    pub worktree: Option<Base>,
+}
+
+/// Where a worktree thread started: what its work is merged back onto.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Base {
+    pub branch: String,
+    pub commit: String,
 }
 
 /// Words waiting for a thread that cannot take them yet (still starting).
@@ -114,6 +137,13 @@ fn open_db(path: &Path) -> Result<Connection> {
 
 fn migrate(db: &Connection) -> Result<()> {
     db.execute_batch(SCHEMA)?;
+    // A table made by an earlier version has fewer columns: add what is missing, whatever the version said.
+    let have: Vec<String> = db.prepare("SELECT name FROM pragma_table_info('threads')")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    for (name, ddl) in ADDED_COLUMNS {
+        if !have.iter().any(|c| c == name) {
+            db.execute_batch(&format!("ALTER TABLE threads ADD COLUMN {name} {ddl}"))?;
+        }
+    }
     db.pragma_update(None, "user_version", VERSION)?;
     Ok(())
 }
@@ -144,10 +174,14 @@ fn thread_from(r: &Row) -> rusqlite::Result<Thread> {
         started_ms: r.get(12)?,
         ended_ms: r.get(13)?,
         archived: r.get::<_, i64>(14)? != 0,
+        worktree: r.get::<_, i64>(15)? != 0,
+        base_branch: r.get(16)?,
+        base_commit: r.get(17)?,
+        merged_ms: r.get(18)?,
     })
 }
 
-const THREAD_COLS: &str = "id, project, title, engine, model, effort, tier, cwd, session, terminal, created_ms, active_ms, started_ms, ended_ms, archived";
+const THREAD_COLS: &str = "id, project, title, engine, model, effort, tier, cwd, session, terminal, created_ms, active_ms, started_ms, ended_ms, archived, worktree, base_branch, base_commit, merged_ms";
 
 impl Store {
     /// Opens (making it if needed) the database. A v3 one is moved to `<name>.v3.bak` first: its
@@ -243,8 +277,8 @@ impl Store {
 
     pub fn create_thread(&self, new: NewThread, now: i64) -> Result<Thread> {
         self.db.execute(
-            "INSERT INTO threads (id, project, title, engine, model, effort, tier, cwd, session, created_ms, active_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-            params![new.id, new.project, new.title, new.engine.as_str(), new.model, new.effort, new.tier.as_str(), new.cwd, new.session, now],
+            "INSERT INTO threads (id, project, title, engine, model, effort, tier, cwd, session, created_ms, active_ms, worktree, base_branch, base_commit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13)",
+            params![new.id, new.project, new.title, new.engine.as_str(), new.model, new.effort, new.tier.as_str(), new.cwd, new.session, now, new.worktree.is_some(), new.worktree.as_ref().map(|b| &b.branch), new.worktree.as_ref().map(|b| &b.commit)],
         )?;
         Ok(self.thread(&new.id)?.expect("just inserted"))
     }
@@ -297,6 +331,12 @@ impl Store {
     /// What the thread runs on next time it starts (a running one keeps its own until then).
     pub fn set_model(&self, id: &str, model: &str, effort: Option<&str>) -> Result<()> {
         self.db.execute("UPDATE threads SET model = ?2, effort = ?3 WHERE id = ?1", params![id, model, effort])?;
+        Ok(())
+    }
+
+    /// The thread's worktree work went into its base branch at `now`; the worktree is removed.
+    pub fn set_merged(&self, id: &str, now: i64) -> Result<()> {
+        self.db.execute("UPDATE threads SET merged_ms = ?2 WHERE id = ?1", params![id, now])?;
         Ok(())
     }
 
@@ -410,7 +450,7 @@ mod tests {
     }
 
     fn new(id: &str) -> NewThread {
-        NewThread { id: id.into(), project: "shop".into(), title: "first".into(), engine: Runtime::Codex, model: "gpt".into(), effort: Some("low".into()), tier: Tier::Full, cwd: "/repo/shop".into(), session: None }
+        NewThread { id: id.into(), project: "shop".into(), title: "first".into(), engine: Runtime::Codex, model: "gpt".into(), effort: Some("low".into()), tier: Tier::Full, cwd: "/repo/shop".into(), session: None, worktree: None }
     }
 
     #[test]
@@ -483,6 +523,43 @@ mod tests {
         s.remove_project("shop").unwrap();
         assert!(s.thread("t00000001").unwrap().is_none() && s.items("t00000001", 0, 9).unwrap().is_empty() && s.outbox("t00000001").unwrap().is_empty() && s.events("t00000001", 9).unwrap().is_empty());
         assert!(s.projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_worktree_thread_remembers_where_it_started_and_when_it_was_merged() {
+        let s = store();
+        let t = s.create_thread(NewThread { worktree: Some(Base { branch: "main".into(), commit: "abc123".into() }), cwd: "/data/worktrees/shop/t00000001".into(), ..new("t00000001") }, 1).unwrap();
+        assert_eq!((t.worktree, t.base_branch.as_deref(), t.base_commit.as_deref(), t.merged_ms), (true, Some("main"), Some("abc123"), None));
+        s.set_merged("t00000001", 50).unwrap();
+        assert_eq!(s.thread("t00000001").unwrap().unwrap().merged_ms, Some(50));
+        let plain = s.create_thread(new("t00000002"), 1).unwrap();
+        assert_eq!((plain.worktree, plain.base_branch, plain.base_commit), (false, None, None));
+    }
+
+    #[test]
+    fn a_version_4_database_gains_the_worktree_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lila.db");
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, cwd TEXT NOT NULL UNIQUE, created_ms INTEGER NOT NULL);
+                 CREATE TABLE threads (id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL, engine TEXT NOT NULL, model TEXT NOT NULL, effort TEXT, tier TEXT NOT NULL,
+                    cwd TEXT NOT NULL, session TEXT, terminal TEXT, created_ms INTEGER NOT NULL, active_ms INTEGER NOT NULL, started_ms INTEGER, ended_ms INTEGER, archived INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO projects VALUES ('shop', '/repo/shop', 1);
+                 INSERT INTO threads (id, project, title, engine, model, tier, cwd, created_ms, active_ms) VALUES ('t00000001', 'shop', 'old', 'claude', 'm', 'full', '/repo/shop', 1, 1);
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let t = s.thread("t00000001").unwrap().unwrap();
+        assert_eq!((t.title.as_str(), t.worktree, t.base_branch, t.merged_ms), ("old", false, None, None), "the old thread is as it was");
+        s.create_thread(NewThread { worktree: Some(Base { branch: "main".into(), commit: "c".into() }), ..new("t00000002") }, 2).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.thread("t00000002").unwrap().unwrap().base_branch.as_deref(), Some("main"), "opening it again changes nothing");
+        assert_eq!(s.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), VERSION);
     }
 
     #[test]

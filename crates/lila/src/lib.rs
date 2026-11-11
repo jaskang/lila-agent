@@ -3,13 +3,14 @@
 
 pub mod accounts;
 pub mod check;
-pub mod commands;
+pub mod changes;
 pub mod client;
-pub mod commit;
+pub mod commands;
 pub mod daemon;
 pub mod github;
 pub mod host;
 pub mod magpie;
+pub mod merge;
 pub mod paths;
 pub mod policy;
 pub mod project;

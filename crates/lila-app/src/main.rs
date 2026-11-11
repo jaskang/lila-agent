@@ -7,6 +7,7 @@ mod conversation;
 mod data;
 mod dialog;
 mod engines;
+mod panel;
 mod prefs;
 mod settings;
 mod sidebar;
@@ -28,7 +29,14 @@ fn main() {
         // Terminals sit on the glass cards, so they leave their background unpainted.
         lila_term::theme::set_transparent(true);
         style::install(cx);
-        let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+        // `--features shots`: `LILA_APP_SIZE=1000x700` opens the window that size, to look at narrow ones.
+        #[allow(unused_mut)]
+        let mut window_size = size(px(1440.), px(900.));
+        #[cfg(feature = "shots")]
+        if let Some((w, h)) = std::env::var("LILA_APP_SIZE").ok().as_deref().and_then(|s| s.split_once('x')).and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))) {
+            window_size = size(px(w), px(h));
+        }
+        let bounds = Bounds::centered(None, window_size, cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             // No separate title bar: the traffic lights sit in the sidebar card's first

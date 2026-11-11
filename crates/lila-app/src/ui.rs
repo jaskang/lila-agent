@@ -91,8 +91,21 @@ impl LilaApp {
         let info = format!("{} · {}", crate::engines::engine_name(&engine), crate::engines::spec_label(&engine, &s(t, "model"), &s(t, "effort")));
         bar.border_b_1()
             .border_color(style::divider())
-            .child(div().min_w_0().truncate().text_size(px(13.)).font_semibold().child(s(t, "title")))
-            .child(div().flex_none().text_size(px(12.)).text_color(muted2()).child(info))
+            .child(div().flex_none().max_w(relative(0.45)).truncate().text_size(px(13.)).font_semibold().child(s(t, "title")))
+            // What runs it, and the branch: they give way first when the card is narrow.
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .text_color(muted2())
+                    .child(div().flex_none().child(info))
+                    .when(t["worktree"] == true, |d| {
+                        // A thread in a worktree of its own works on its own branch.
+                        d.child(h_flex().flex_none().gap_1().child(style::icon("lila/git-branch.svg").size(px(12.)).text_color(muted2())).child(format!("lila/{}", s(t, "id"))))
+                    }),
+            )
             .child(div().flex_1())
             .child(h_flex().flex_none().gap_1().children(self.header_actions(t, terminal, cx)))
     }
@@ -102,7 +115,9 @@ impl LilaApp {
         let quiet = style::quiet(cx);
         let tool = |id: &'static str, icon: IconName, tip: &'static str| Button::new(id).custom(quiet).xsmall().icon(icon).tooltip(tip);
         let id = s(t, "id");
-        let ended = t["state"] == "ended";
+        // A merged thread is over: its worktree is gone, there is nothing to continue or to show.
+        let merged = t["merged_ms"].is_number();
+        let ended = t["state"] == "ended" && !merged;
         let mut actions: Vec<AnyElement> = Vec::new();
         // Claude Code's TUI keeps running under its conversation.
         if t["caps"]["tui"] == true && !ended {
@@ -116,9 +131,10 @@ impl LilaApp {
         if let Some(view) = terminal {
             actions.push(tool("terminal-find", IconName::Search, "搜索 (⌘F)").on_click(move |_, window, cx| view.update(cx, |view, cx| view.open_search(window, cx))).into_any_element());
         }
-        // The files and changes buttons (they open the right panel, P2) go here, before the folder's.
+        // The files and changes buttons open the right panel.
+        actions.extend(self.panel_buttons(t, cx));
         let cwd = s(t, "cwd");
-        if !cwd.is_empty() {
+        if !cwd.is_empty() && !merged {
             actions.push(
                 tool("reveal-cwd", IconName::FolderOpen, "在访达中显示")
                     .on_click(move |_, _, _| {

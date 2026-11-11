@@ -161,6 +161,9 @@ enum ThreadCmd {
         /// A file to send along (repeatable).
         #[arg(long = "file")]
         files: Vec<std::path::PathBuf>,
+        /// Work in a git worktree of its own, on its own branch (the project folder must be a repository on a branch).
+        #[arg(long)]
+        worktree: bool,
     },
     /// The project's threads, or every project's with --all.
     List {
@@ -218,6 +221,18 @@ enum ThreadCmd {
         #[arg(long)]
         effort: Option<String>,
     },
+    /// What the thread's folder has changed since its HEAD: files, counts, and for a worktree its commits.
+    Changes { thread: String },
+    /// The diff of the changed files, or of one.
+    Diff {
+        thread: String,
+        /// A path relative to the thread's folder.
+        path: Option<String>,
+    },
+    /// Ask the agent to commit all the changes (it writes the message; it does not push).
+    Commit { thread: String },
+    /// A worktree thread's work becomes one commit on the branch it started from; the worktree goes and the thread is archived.
+    Merge { thread: String },
     /// What lilad did for a thread on its own: starts, ends, answers by the tier, cards.
     Log {
         thread: String,
@@ -357,7 +372,7 @@ fn files_of(files: Vec<std::path::PathBuf>) -> Result<Vec<String>> {
 
 fn thread(cmd: ThreadCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out) -> Result<()> {
     match cmd {
-        ThreadCmd::New { text, project, title, engine, model, effort, permission, files } => {
+        ThreadCmd::New { text, project, title, engine, model, effort, permission, files, worktree } => {
             let mut p = at(project)?;
             p["text"] = json!(text);
             p["title"] = json!(title);
@@ -366,6 +381,7 @@ fn thread(cmd: ThreadCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out
             p["effort"] = json!(effort);
             p["permission"] = json!(permission);
             p["attachments"] = json!(files_of(files)?);
+            p["worktree"] = json!(worktree);
             out(call("thread.new", p)?, &fmt_thread)
         }
         ThreadCmd::List { project, all, archived } => {
@@ -399,6 +415,19 @@ fn thread(cmd: ThreadCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out
             out(call("thread.answer", p)?, &|v| format!("{} answered", v["card"].as_str().unwrap_or("?")))
         }
         ThreadCmd::Model { thread, model, effort } => out(call("thread.model", json!({"thread": thread, "model": model, "effort": effort}))?, &|_| "set".into()),
+        ThreadCmd::Changes { thread } => out(call("thread.changes", json!({"thread": thread}))?, &fmt_changes),
+        ThreadCmd::Diff { thread, path } => out(call("thread.diff", json!({"thread": thread, "path": path}))?, &fmt_diffs),
+        ThreadCmd::Commit { thread } => out(call("thread.commit", json!({"thread": thread}))?, &|v| format!("asked {} to commit", v["thread"].as_str().unwrap_or("?"))),
+        ThreadCmd::Merge { thread } => out(call("thread.merge", json!({"thread": thread}))?, &|v| {
+            format!(
+                "merged {}: {} commit(s), {} file(s) into {} as {}",
+                v["thread"]["id"].as_str().unwrap_or("?"),
+                v["commits"],
+                v["files"],
+                v["branch"].as_str().unwrap_or("?"),
+                v["commit"].as_str().unwrap_or("?")
+            )
+        }),
         ThreadCmd::Log { thread, limit } => out(call("thread.log", json!({"thread": thread, "limit": limit}))?, &fmt_log),
     }
     Ok(())
@@ -460,9 +489,9 @@ fn usage(paths: &Paths, days: Option<u64>, as_json: bool) -> Result<()> {
     let owners: Owners = threads.as_array().into_iter().flatten().filter_map(|t| Some((t["session"].as_str()?.to_owned(), (name.clone(), t["id"].as_str()?.to_owned())))).collect();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
     let since = days.map(|d| now - d as i64 * 86_400_000);
-    // Threads also work in the project's worktrees.
-    let slots = lila::worktree::existing(&paths.worktrees(&name));
-    let cwds: Vec<String> = std::iter::once(std::path::PathBuf::from(root)).chain(slots).map(|p| p.to_string_lossy().to_string()).collect();
+    // Threads that work in a worktree of their own ran in its folder.
+    let mut cwds: Vec<String> = vec![root];
+    cwds.extend(threads.as_array().into_iter().flatten().filter(|t| t["worktree"] == true).filter_map(|t| t["cwd"].as_str().map(String::from)));
     let u = Scanner::default().usage(&Sources::from_env(), &name, &cwds, &owners, since);
     if as_json {
         let rows: Vec<Value> = u
@@ -527,7 +556,75 @@ fn thread_line(t: &Value) -> String {
         t["permission"].as_str().unwrap_or(""),
         t["title"].as_str().unwrap_or(""),
         if t["archived"] == true { "  [archived]" } else { "" }
-    )
+    ) + &worktree_note(t)
+}
+
+/// `  [worktree main]` or `  [merged]`, and the changes it has, at the end of a thread's line.
+fn worktree_note(t: &Value) -> String {
+    let mut s = String::new();
+    if t["merged_ms"].is_number() {
+        s.push_str("  [merged]");
+    } else if t["worktree"] == true {
+        s.push_str(&format!("  [worktree of {}]", t["base_branch"].as_str().unwrap_or("?")));
+    }
+    if t["merging"] == true {
+        s.push_str("  [merging]");
+    }
+    if let Some(c) = t["changes"].as_object().filter(|c| c["files"].as_u64().unwrap_or(0) > 0) {
+        s.push_str(&format!("  {} file(s) +{} -{}", c["files"], c["add"], c["del"]));
+    }
+    s
+}
+
+fn fmt_changes(v: &Value) -> String {
+    if v["repo"] != true {
+        return "not in a git repository".into();
+    }
+    let mut s = format!("branch {}", v["branch"].as_str().unwrap_or("(detached HEAD)"));
+    if v["worktree"] == true {
+        s.push_str(&format!(" (worktree of {}, {} commit(s) ahead)", v["base_branch"].as_str().unwrap_or("?"), v["ahead"].as_u64().unwrap_or(0)));
+    }
+    for c in v["commits"].as_array().into_iter().flatten() {
+        s.push_str(&format!("\n  {} {}", c["sha"].as_str().unwrap_or(""), c["subject"].as_str().unwrap_or("")));
+    }
+    if v["files"].as_array().is_none_or(|f| f.is_empty()) {
+        s.push_str("\nno uncommitted changes");
+    }
+    for f in v["files"].as_array().into_iter().flatten() {
+        let mark = match f["status"].as_str().unwrap_or("") {
+            "added" => "A",
+            "deleted" => "D",
+            "renamed" => "R",
+            "untracked" => "?",
+            _ => "M",
+        };
+        let from = f["old_path"].as_str().map(|o| format!("{o} -> ")).unwrap_or_default();
+        let counts = if f["binary"] == true { "binary".to_owned() } else { format!("+{} -{}", f["add"], f["del"]) };
+        s.push_str(&format!("\n{mark} {counts:<12} {from}{}", f["path"].as_str().unwrap_or("")));
+    }
+    if v["truncated"] == true {
+        s.push_str("\n… more files than are listed");
+    }
+    s
+}
+
+fn fmt_diffs(v: &Value) -> String {
+    let mut s = String::new();
+    for d in v["diffs"].as_array().into_iter().flatten() {
+        let from = d["old_path"].as_str().map(|o| format!(" (from {o})")).unwrap_or_default();
+        s.push_str(&format!("--- {} [{}]{from}\n", d["path"].as_str().unwrap_or(""), d["status"].as_str().unwrap_or("")));
+        if d["binary"] == true {
+            s.push_str("Binary file\n");
+        }
+        for l in d["lines"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            s.push_str(l);
+            s.push('\n');
+        }
+        if d["truncated"] == true {
+            s.push_str("… cut here\n");
+        }
+    }
+    if s.is_empty() { "no changes".into() } else { s.trim_end().to_owned() }
 }
 
 fn fmt_thread(t: &Value) -> String {
@@ -577,3 +674,22 @@ fn clock(ms: i64) -> String {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changes_and_diffs_read_as_git_would_show_them() {
+        let v = json!({"repo": true, "branch": "lila/t1", "worktree": true, "base_branch": "main", "ahead": 1, "commits": [{"sha": "abc1234", "subject": "Add b"}],
+            "files": [{"path": "a.txt", "status": "modified", "add": 2, "del": 1}, {"path": "new.txt", "status": "renamed", "old_path": "old.txt", "add": 0, "del": 0}, {"path": "p.bin", "status": "untracked", "add": 0, "del": 0, "binary": true}]});
+        let text = fmt_changes(&v);
+        assert_eq!(text.lines().next(), Some("branch lila/t1 (worktree of main, 1 commit(s) ahead)"));
+        assert!(text.contains("\n  abc1234 Add b") && text.contains("M +2 -1        a.txt") && text.contains("R +0 -0        old.txt -> new.txt") && text.contains("? binary       p.bin"), "{text}");
+        assert_eq!(fmt_changes(&json!({"repo": false})), "not in a git repository");
+        let d = fmt_diffs(&json!({"diffs": [{"path": "a.txt", "status": "modified", "lines": ["@@ -1 +1 @@", "-a", "+b"], "truncated": true}, {"path": "p.bin", "status": "added", "lines": [], "binary": true}]}));
+        assert_eq!(d, "--- a.txt [modified]\n@@ -1 +1 @@\n-a\n+b\n… cut here\n--- p.bin [added]\nBinary file");
+        let line = thread_line(&json!({"id": "t1", "state": "idle", "engine": "codex", "model": "m", "permission": "full", "title": "T", "worktree": true, "base_branch": "main", "changes": {"files": 2, "add": 5, "del": 1}}));
+        assert!(line.ends_with("T  [worktree of main]  2 file(s) +5 -1"), "{line}");
+    }
+}

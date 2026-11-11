@@ -170,6 +170,9 @@ impl<T: Terminals> Daemon<T> {
         let Some(live) = self.live.get(&t.id).filter(|_| t.terminal.is_some()) else {
             bail!("{} has ended; resume it first", t.id);
         };
+        if self.merging.contains(&t.id) {
+            bail!("{} is being merged", t.id);
+        }
         match live.status {
             AgentStatus::Blocked => bail!("{} is waiting for an answer (its card, or its terminal): give it first", t.id),
             AgentStatus::Error => bail!("{} can't take a message now (error)", t.id),
@@ -265,6 +268,13 @@ impl<T: Terminals> Daemon<T> {
         // A thread's folder; before the thread exists (the window's new-session box), the project's.
         let cwd = if s(params, "thread").is_some() { self.thread_of(params)?.cwd } else { self.projects[&self.resolve_project(params)?].cwd.to_string_lossy().to_string() };
         Ok(json!({"files": project_files(Path::new(&cwd)), "cwd": cwd}))
+    }
+
+    /// `thread.file {thread, path}`: a file of the thread's folder to look at: `{path, text}`, or `binary` or `too_large` instead, and its `size`.
+    /// The path is relative to the folder and stays inside it (`changes::read_file`).
+    pub(super) fn thread_file(&mut self, params: &Value) -> Result<Value> {
+        let t = self.thread_of(params)?;
+        crate::changes::read_file(Path::new(&t.cwd), req(params, "path")?)
     }
 
     /// `thread.model {thread, model?, effort?}`: the thread runs on another model or effort from now

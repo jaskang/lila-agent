@@ -65,6 +65,7 @@ impl<T: Terminals> Daemon<T> {
             // shown until following the transcript finds the reply there (`follow_transcripts`).
             "Stop" => {
                 self.follow_transcripts();
+                self.refresh_changes(&tid);
                 Ok(json!({}))
             }
             "StopFailure" => {
@@ -72,6 +73,7 @@ impl<T: Terminals> Daemon<T> {
                 self.follow_transcripts();
                 self.writing.remove(&tid);
                 self.store.event(&tid, "claude", "turn_failed", &why, now)?;
+                self.refresh_changes(&tid);
                 self.mark(&tid);
                 Ok(json!({}))
             }

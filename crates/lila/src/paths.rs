@@ -68,9 +68,14 @@ impl Paths {
         Ok(tmp)
     }
 
-    /// A project's worktree slots (`worktree`): `<data>/worktrees/<project>/<n>`.
+    /// A project's threads' worktrees (`worktree`): `<data>/worktrees/<project>/<thread>`.
     pub fn worktrees(&self, project: &str) -> PathBuf {
         self.data.join("worktrees").join(project)
+    }
+
+    /// One thread's worktree.
+    pub fn worktree(&self, project: &str, thread: &str) -> PathBuf {
+        self.worktrees(project).join(thread)
     }
 
     /// A thread's files: the hooks' settings file Claude Code starts with.

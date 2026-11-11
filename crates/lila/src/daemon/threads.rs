@@ -4,6 +4,7 @@
 use super::*;
 use lila_agent::Command;
 use lila_core::runtime::{self, Session, Spec};
+use super::jobs::{Begin, Plan};
 use lila_store::NewThread;
 
 impl<T: Terminals> Daemon<T> {
@@ -41,7 +42,7 @@ impl<T: Terminals> Daemon<T> {
         }
         let d = &p.config.defaults;
         Ok(json!({
-            "id": id, "cwd": p.cwd, "title": p.config.title, "label": p.config.title.clone().unwrap_or_else(|| id.to_owned()), "error": p.error,
+            "id": id, "cwd": p.cwd, "title": p.config.title, "label": p.config.title.clone().unwrap_or_else(|| id.to_owned()), "error": p.error, "repo": p.repo,
             "defaults": {"engine": d.engine.as_str(), "model": d.model_or_default(), "effort": d.effort, "permission": d.permission.as_str()},
             "threads": threads.len(), "states": counts,
             "waiting": self.asking.iter().filter(|a| threads.iter().any(|t| t.id == a.thread)).count(),
@@ -119,10 +120,11 @@ impl<T: Terminals> Daemon<T> {
 
     // ---------------- threads ----------------
 
-    /// `thread.new {project|cwd, text?, attachments?, title?, engine?, model?, effort?, permission?}`: a new thread
+    /// `thread.new {project|cwd, text?, attachments?, title?, engine?, model?, effort?, permission?, worktree?}`: a new thread
     /// in a project, on what the project's defaults say unless told otherwise, and its engine started. The
-    /// first message waits for the engine to take it.
-    pub(super) fn thread_new(&mut self, params: &Value, now: i64) -> Result<Value> {
+    /// first message waits for the engine to take it. With `worktree`, the thread gets a worktree of its own
+    /// first (`worktree.rs`), made off the loop: the answer comes when the thread has started.
+    pub(super) fn thread_new(&mut self, params: &Value, now: i64) -> Result<Begin> {
         let pid = self.resolve_project(params)?;
         let proj = &self.projects[&pid];
         let defaults = proj.config.defaults.clone();
@@ -149,6 +151,7 @@ impl<T: Terminals> Daemon<T> {
         if !proj.cwd.is_dir() {
             bail!("the project folder {cwd} is gone");
         }
+        let main = proj.cwd.clone();
         // Every program first, so a missing one doesn't leave half a thread behind.
         self.engine_env(engine)?;
         let text = s(params, "text").unwrap_or_default().trim().to_owned();
@@ -157,8 +160,19 @@ impl<T: Terminals> Daemon<T> {
         let id = lila_core::new_thread_id(uuid::Uuid::new_v4().as_u128() as u32);
         // Claude Code takes the id Lila picks, so the session is known from the start.
         let session = (engine == Runtime::Claude).then(sessions::new_uuid);
-        let t = self.store.create_thread(NewThread { id: id.clone(), project: pid.clone(), title, engine, model, effort, tier, cwd, session: session.clone() }, now)?;
-        let session = Session::New(session);
+        let plan = Plan { new: NewThread { id, project: pid, title, engine, model, effort, tier, cwd, session, worktree: None }, text, files };
+        if params["worktree"].as_bool().unwrap_or(false) {
+            return Ok(Begin::Job(self.worktree_job(plan, main)));
+        }
+        Ok(Begin::Done(self.start_new(plan, now)?))
+    }
+
+    /// Makes the thread of a plan and starts its engine (in the worktree, when it has one).
+    pub(super) fn start_new(&mut self, plan: Plan, now: i64) -> Result<Value> {
+        let Plan { new, text, files } = plan;
+        let (id, engine) = (new.id.clone(), new.engine);
+        let session = Session::New(new.session.clone());
+        let t = self.store.create_thread(new, now)?;
         if let Err(e) = self.start_thread(&t, &session, now) {
             let _ = self.store.remove_thread(&id);
             return Err(e.context(format!("start {engine}")));
@@ -171,6 +185,7 @@ impl<T: Terminals> Daemon<T> {
             self.store.push_outbox(&id, &text, &serde_json::to_string(&files)?, now)?;
         }
         self.pump(now);
+        self.refresh_changes(&id);
         let t = self.store.thread(&id)?.expect("just made");
         Ok(self.thread_json(&t, now))
     }
@@ -220,7 +235,7 @@ impl<T: Terminals> Daemon<T> {
     }
 
     /// Kills a thread's terminal and marks it ended. Returns whether there was an engine running.
-    fn stop_engine(&mut self, t: &Thread, why: &str, now: i64) -> bool {
+    pub(super) fn stop_engine(&mut self, t: &Thread, why: &str, now: i64) -> bool {
         let Some(terminal) = t.terminal.clone() else { return false };
         if let Err(e) = self.term.kill(&terminal) {
             self.say(format!("{}: kill {} ({terminal}): {e:#}", t.project, t.id));
@@ -246,10 +261,19 @@ impl<T: Terminals> Daemon<T> {
         if t.terminal.is_some() {
             bail!("{} is running", t.id);
         }
+        if t.merged_ms.is_some() {
+            bail!("{} was merged and its worktree removed; start a new thread", t.id);
+        }
+        if self.merging.contains(&t.id) {
+            bail!("{} is being merged", t.id);
+        }
         if let Some(p) = self.projects.get(&t.project)
             && !p.cwd.is_dir()
         {
             bail!("the project folder {} is gone", p.cwd.display());
+        }
+        if t.worktree && !Path::new(&t.cwd).is_dir() {
+            bail!("the worktree {} is gone", t.cwd);
         }
         self.engine_env(t.engine)?;
         if let Some(m) = s(params, "model") {
@@ -293,6 +317,9 @@ impl<T: Terminals> Daemon<T> {
         }
         self.store.set_archived(&t.id, archive)?;
         self.mark(&t.id);
+        if !archive {
+            self.refresh_changes(&t.id);
+        }
         let t = self.thread_of(params)?;
         Ok(self.thread_json(&t, now))
     }
@@ -363,7 +390,7 @@ impl<T: Terminals> Daemon<T> {
             return;
         };
         let (Some(terminal), Some(live)) = (t.terminal.clone(), self.live.get(tid)) else { return };
-        if !live.status.accepts_input() || (t.engine.hosted() && !self.hosts.contains_key(tid)) {
+        if self.merging.contains(tid) || !live.status.accepts_input() || (t.engine.hosted() && !self.hosts.contains_key(tid)) {
             return;
         }
         let msgs = self.store.outbox(tid).unwrap_or_default();

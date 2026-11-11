@@ -18,6 +18,8 @@ pub(super) enum Input {
     HostEvent(String, lila_agent::AgentEvent),
     /// A thread's host detached.
     HostGone(String),
+    /// A job off the loop is done: the job, what it gave, and who is waiting for the answer (none: lilad asked for it).
+    JobDone(Job, std::result::Result<Output, String>, Option<std::sync::mpsc::Sender<Value>>),
     Stop,
 }
 
@@ -161,6 +163,30 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
         }
     });
 
+    // Jobs run on threads of their own, so the loop goes on while git works; the summaries of changes one at a time on one.
+    let tx_job = tx.clone();
+    let (serial_tx, serial_rx) = mpsc::channel::<Job>();
+    let tx_serial = tx.clone();
+    std::thread::spawn(move || {
+        for job in serial_rx {
+            let result = job.run();
+            if tx_serial.send(Input::JobDone(job, result, None)).is_err() {
+                return;
+            }
+        }
+    });
+    let launch = move |job: Job, reply: Option<mpsc::Sender<Value>>| {
+        if job.serial() {
+            let _ = serial_tx.send(job);
+            return;
+        }
+        let tx = tx_job.clone();
+        std::thread::spawn(move || {
+            let result = job.run();
+            let _ = tx.send(Input::JobDone(job, result, reply));
+        });
+    };
+
     let mut seen = daemon.fingerprint();
     let mut seq: u64 = 0;
     for input in rx {
@@ -172,12 +198,26 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
                     let _ = tx.send(Input::Stop);
                     continue;
                 }
-                let out = match daemon.handle(&method, &params, now) {
-                    Ok(v) => json!({"result": v}),
-                    Err(e) => json!({"error": format!("{e:#}")}),
-                };
-                let _ = reply.send(out);
+                match daemon.begin(&method, &params, now) {
+                    Ok(Begin::Done(v)) => {
+                        let _ = reply.send(json!({"result": v}));
+                    }
+                    Ok(Begin::Job(job)) => launch(job, Some(reply)),
+                    Err(e) => {
+                        let _ = reply.send(json!({"error": format!("{e:#}")}));
+                    }
+                }
             }
+            Input::JobDone(job, result, reply) => match (daemon.finish(job, result, now), reply) {
+                (Ok(v), Some(reply)) => {
+                    let _ = reply.send(json!({"result": v}));
+                }
+                (Err(e), Some(reply)) => {
+                    let _ = reply.send(json!({"error": format!("{e:#}")}));
+                }
+                (Err(e), None) => daemon.say(format!("job: {e:#}")),
+                (Ok(_), None) => {}
+            },
             Input::Snapshot(snap, taken_ms) => {
                 for rec in snap["terminals"].as_array().cloned().unwrap_or_default() {
                     daemon.on_terminal(&rec, now);
@@ -197,6 +237,9 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
             Input::HostEvent(tid, ev) => daemon.host_event(&tid, ev, now),
             Input::HostGone(tid) => daemon.host_gone(&tid),
             Input::Stop => break,
+        }
+        for job in daemon.take_jobs() {
+            launch(job, None);
         }
         let fp = daemon.fingerprint();
         if fp != seen {
