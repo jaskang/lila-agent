@@ -211,8 +211,10 @@ enum ThreadCmd {
     Rename { thread: String, title: String },
     /// Switch a thread's permission tier: read_only, confirm or full.
     Permission { thread: String, tier: String },
-    /// Answer a permission card: allow, deny, or dismiss (Claude Code then asks in its terminal).
+    /// Answer a permission card: allow, deny, always (allow what the card's option says for the rest of the thread), or dismiss (Claude Code then asks in its terminal).
     Answer { thread: String, card: String, answer: String },
+    /// Trust the folder Claude Code asks about in its terminal (a new project, a new worktree): presses the keys that accept, only while the screen is that dialog.
+    Trust { thread: String },
     /// Change the model or effort (a Codex or ACP thread at once; a Claude Code one when ended).
     Model {
         thread: String,
@@ -243,6 +245,13 @@ enum ThreadCmd {
         /// Only say which files would be put back, made again or deleted.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// What was allowed "always" for the thread (`lila thread answer <id> <card> always`): its rules, or with --remove one taken back.
+    Rules {
+        thread: String,
+        /// The number of the rule to take back.
+        #[arg(long)]
+        remove: Option<i64>,
     },
     /// What lilad did for a thread on its own: starts, ends, answers by the tier, cards.
     Log {
@@ -464,6 +473,14 @@ fn thread(cmd: ThreadCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out
             }
             out(call("thread.answer", p)?, &|v| format!("{} answered", v["card"].as_str().unwrap_or("?")))
         }
+        ThreadCmd::Trust { thread } => out(call("thread.trust", json!({"thread": thread}))?, &|v| format!("trusted {}", v["folder"].as_str().unwrap_or("?"))),
+        ThreadCmd::Rules { thread, remove } => {
+            if let Some(rule) = remove {
+                out(call("thread.rule.remove", json!({"thread": thread, "rule": rule}))?, &|v| fmt_rules(&v["rules"]))
+            } else {
+                out(call("thread.show", json!({"thread": thread}))?, &|v| fmt_rules(&v["rules"]))
+            }
+        }
         ThreadCmd::Model { thread, model, effort } => out(call("thread.model", json!({"thread": thread, "model": model, "effort": effort}))?, &|_| "set".into()),
         ThreadCmd::Changes { thread } => out(call("thread.changes", json!({"thread": thread}))?, &fmt_changes),
         ThreadCmd::Diff { thread, path } => out(call("thread.diff", json!({"thread": thread, "path": path}))?, &fmt_diffs),
@@ -598,7 +615,10 @@ fn fmt_project(p: &Value) -> String {
 }
 
 fn thread_line(t: &Value) -> String {
-    let waiting = t["waiting"].as_str().map(|w| format!(" ({w})")).unwrap_or_default();
+    let waiting = t["waiting"].as_str().map(|w| match t["waiting_for"].as_str() {
+        Some(what) => format!(" ({w}: {what})"),
+        None => format!(" ({w})"),
+    }).unwrap_or_default();
     format!(
         "{:<10} {:<9} {:<6} {:<20} {:<9} {}{}",
         t["id"].as_str().unwrap_or(""),
@@ -706,8 +726,17 @@ fn fmt_conversation(v: &Value) -> String {
         let opts: Vec<&str> = c["options"].as_array().into_iter().flatten().filter_map(|o| o["id"].as_str()).collect();
         s.push_str(&format!("\n? [{}] {} — {} ({})\n", c["id"].as_str().unwrap_or(""), c["title"].as_str().unwrap_or(""), c["why"].as_str().unwrap_or(""), opts.join(" / ")));
     }
+    if v["rules"].as_array().is_some_and(|r| !r.is_empty()) {
+        s.push_str(&format!("\nallowed always:\n{}\n", fmt_rules(&v["rules"])));
+    }
     s.push_str(&format!("\nseq {}", v["seq"]));
     s
+}
+
+/// A thread's rules, one a line: the number to take it back by, and what it allows.
+fn fmt_rules(rules: &Value) -> String {
+    let rows: Vec<String> = rules.as_array().into_iter().flatten().map(|r| format!("  {}  {}", r["id"], r["label"].as_str().unwrap_or(""))).collect();
+    if rows.is_empty() { "no rules".into() } else { rows.join("\n") }
 }
 
 fn fmt_checkpoints(v: &Value) -> String {

@@ -39,7 +39,7 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 | A1 | 安全网：每轮的 git 检查点和回退；Claude 用 `PreToolUse` 加自带沙箱 | **检查点和回退的后端 ✅ 2026-11-11**（`9de57b1`）（`architecture-v4.md` §11，协议版本 2）：每轮开始前用 git 打快照（Claude 在 `UserPromptSubmit` hook，Codex/omp 在 `deliver`），`thread.checkpoints`、`thread.restore {dry_run?}`、`lila thread checkpoints/restore`，对话里的 `restored` 标记，给 agent 的备注随下一条消息发出。验证过：`cargo test --workspace` 243 个全过、clippy 零警告；用临时 git 仓库测了快照不动 index/HEAD/分支/stash（比字节）、被忽略的文件不碰、子文件夹、中日文和空格路径、没有提交的仓库、dry run 什么都不改、各种拒绝、合并/移除项目后 ref 清掉、50 个上限、Claude 和 Codex/omp 的条目对应；隔离的 `LILA_HOME` 里用真 lilad 加假 `claude`（`sleep`）和真 `lila hook UserPromptSubmit`、命令行走了一遍。**没验证**：真 Claude Code 的 `UserPromptSubmit` 里 `prompt` 的实际样子（粘贴多行、带附件时和会话记录里的是否一致；对不上时检查点的 `item` 会是 `null`，仍可回退）、运行中排队的消息会不会也触发这个 hook、hook 等 job 做完这段时间 Claude 是否真的不开始；真 Codex/omp 的回显；窗口还没做。**窗口那一半要做的**见下 |
 | A1 窗口 | 对话里每条用户消息的「回到这里」、确认框（dry run 的文件清单）、`restored` 标记「已回到这里」加「撤销」 | 代码 ✅ 2026-11-11（`37cf9cc`；`restore.rs`，加 `conversation.rs`、`composer.rs`、`data.rs` 的小改动；界面规范在 `DESIGN.md` 对话一节，接口在 `architecture-v4.md` §9）。验证过：`cargo test --workspace` 249 个全过（窗口这边新增 6 个：谁有按钮、什么时候藏、检查点怎么挑、清单文字、标记成行、回退时末尾转圈）、clippy 零警告；`--features shots` 加假数据截图看过悬停按钮、确认框（几个文件、很多文件时清单滚动、有提交的一行、什么都不变；「…还有 N 个」只有单元测试，没截到）、回退进行中（对话末尾转圈、输入框不发）、回退失败（红色提示条）、dry run 失败、两种标记（有和没有「撤销」）、旧协议、在跑、已合并的会话都没有按钮、窄窗口（1000×680）。确认后「回到这里」的整个路径只在假文件上走过。**没验证**：没有接真 lilad 点过，没有用真鼠标，没有真引擎（见「等用户亲手验证的」） |
 | A1 判定 | Claude 的每个工具调用先过 `PreToolUse` hook，按档位判；自带沙箱 | `PreToolUse` ✅ 2026-11-11（`434f91f`；`hooks.rs`、`permissions.rs`、`client.rs`、`policy.rs`；`architecture-v4.md` §2、§6）。验证过：`cargo test --workspace` 253 个全过（新增 4 个：各档的判定、ask 交给 `PermissionRequest` 开卡片不判两次不记两次、保留的判定数量和过期、hook 输出）、clippy 零警告；隔离 `LILA_HOME` 里真 lilad、真 Haiku，项目的 `.claude/settings.json` 放 `Bash(touch:*)`、`Edit`、`Write` 的 allow 规则：以前 `read_only` 档里 `touch` 照样成功（缺口复现），现在被拒；`confirm` 档出卡片，答允许文件生成、答拒绝没有；`full` 档不弹框；`Write` 到文件夹外出 `outside_workspace` 卡片；运行中切档下一个调用就生效；每次往返约 4.6 毫秒。**沙箱没做**：「网络不限」设置表达不了（只有放行一切的本地代理 `httpProxyPort` 一个办法，要 lilad 托管代理）。**用户 2026-11-11 定：先不启用沙箱，记为待办，自用时确实遇到工作区外被改坏再做**；实验记录在 `architecture-v4.md` §6 末尾。**没验证**：subagent 里的工具调用、MCP 工具、`Edit`/`NotebookEdit` 没有在 lilad 里真跑（判定同一个函数，`Write` 跑过）；已经在跑的会话要结束再恢复才有 `PreToolUse` |
-| A2 | 等你闭环：提问卡片、卡片不过期、本会话总是允许、窗口里回答信任、原生通知 | |
+| A2 前半 | 卡片不过期、本会话总是允许、窗口里回答「信任此文件夹」 | 代码 ✅ 2026-11-11，未提交（协议版本 3；`architecture-v4.md` §6 和 §12，界面规范在 `DESIGN.md`）。(1) **卡片不过期**：Claude Code 把 hook 的 `timeout` 夹在 2^31−1 毫秒（约 24.8 天），所以 `PermissionRequest` 写 2 000 000 秒，`lila hook` 不设等待上限；lilad 重启时等着的 hook 带 `payload` 再问一次，卡片回来；hook 被杀（人在终端里答了）卡片 30 秒后丢，一轮结束也丢。(2) **本会话总是允许**（`rules.rs`、表 `thread_rules`、`thread.rule.remove`、`lila thread rules`）：`confirm` 档的卡片多一个 Lila 自己的选项，标签写明允许什么；规则 = 程序加子命令词 / 文件夹里的改动 / 一个 MCP 工具；一行里串几个命令要每段都有规则；包装器、解释器、危险一律不提供也不放行；切到只读清掉；Codex、ACP 自己的「总是」被它取代；窗口在权限档菜单里列出并可收回。(3) **信任对话框**（`daemon/trust.rs`、`thread.trust`、`lila thread trust`）：每 2 秒读终端屏幕认出对话框，`waiting_for: "trust"`，`thread.trust` 先读屏幕、移光标、再读、再按 Enter；窗口「信任并继续」。验证过：`cargo test --workspace` 281 个全过、clippy 零警告；隔离 `LILA_HOME` 里真 lilad 加真 Haiku：卡片放 11 分钟再答（一）、卡片开着重启 lilad 后答（二）、`touch` 的总是规则（第二个 `touch` 不出卡片、`mkdir` 出卡片、`full` 档的 `git push` 出 `git_push` 卡片且没有总是、`confirm` 档的 `git push` 卡片也没有总是）、信任对话框被认出并由 `thread.trust` 答掉、排队的第一条消息发出了；`--features shots` 截图看过卡片（短、长、窄）、规则列表、信任行（长路径、窄）。**没验证**：Codex、omp 的「总是」只有假 host 的单元测试；真鼠标；窗口没接真 lilad 点过。**A2 后半没做**：agent 的提问成卡片、原生通知 |
 | — | 从这里开始自用，之后每个阶段都在 Lila 里做 | |
 | A3 | 可观测：subagent、待办和计划、上下文占用、往前翻页、自动标题 | |
 | P3 | MCP 清单和注入；Codex 的 MCP 审批；浏览器工具；图片条目 | |
@@ -80,7 +80,7 @@ Lila 是一个原生界面（GPUI）的 agent 桌面应用。模型是 **项目 
 ```sh
 git clone git@github.com:jaskang/lila-agent.git && cd lila-agent   # 或 git pull
 # libghostty-vt 预编译在 crates/ghostty-sys/libghostty-vt（目前只有 Apple Silicon）
-cargo test --workspace                            # 应该是 253 个测试全过
+cargo test --workspace                            # 应该是 281 个测试全过
 lila daemon stop                                  # 如果有旧版 lilad 在跑
 cargo install --path crates/lila                  # 窗口通过 lila 命令启动 lilad
 cargo run -p lila-app                             # 或者：cargo install --path crates/lila-app
@@ -114,7 +114,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 | `lila-store` | SQLite：`projects`、`threads`、`conv_items`、`outbox`、`thread_events` |
 | `lila-agent` | 对话事件模型和三个驱动的协议翻译：`model.rs`、`claude.rs`（读会话记录）、`codex.rs`（app-server）、`acp.rs`（ACP，用官方类型 crate `agent-client-protocol-schema`） |
 | `hc-client` | herdr-core JSON-RPC 客户端 |
-| `lila` | 命令行和 lilad。`daemon/`：`mod.rs`（状态、hc 事件）、`threads.rs`（项目和会话的生命周期）、`permissions.rs`（权限卡片）、`conversation.rs`（读对话、发消息、`/` 和 `@` 菜单、`thread.file`）、`host.rs`、`hooks.rs`、`requests.rs`（方法分派）、`jobs.rs`（放在主循环外跑的 git 活：建 worktree、改动、diff、提交检查、合并，以及改动摘要的刷新）、`server.rs`（socket、推送、跑 job 的线程）、`tests.rs`（用假终端；`p2` 模块用临时 git 仓库）。`checkpoint.rs`（每轮的 git 快照、放回、删 ref）、`daemon/checkpoints.rs`（什么时候打、对上消息、回退的前置条件和后续）、`worktree.rs`（会话的 worktree）、`changes.rs`（改动列表、diff、读文件）、`merge.rs`（squash 并合并回起点分支）：都用 git 命令行，有真 git 的测试。`policy.rs`：档位判定。`project.rs`：project.toml 读写。`host.rs`：`lila host codex|omp`。`accounts.rs`、`signin.rs`、`magpie.rs`、`usage.rs`、`sessions.rs`、`commands.rs`。留着没人调用的：`github.rs`、`daemon/sources.rs`（P4） |
+| `lila` | 命令行和 lilad。`daemon/`：`mod.rs`（状态、hc 事件）、`threads.rs`（项目和会话的生命周期）、`permissions.rs`（权限卡片）、`conversation.rs`（读对话、发消息、`/` 和 `@` 菜单、`thread.file`）、`host.rs`、`hooks.rs`、`requests.rs`（方法分派）、`jobs.rs`（放在主循环外跑的 git 活：建 worktree、改动、diff、提交检查、合并，以及改动摘要的刷新）、`server.rs`（socket、推送、跑 job 的线程）、`tests.rs`（用假终端；`p2` 模块用临时 git 仓库）。`checkpoint.rs`（每轮的 git 快照、放回、删 ref）、`daemon/checkpoints.rs`（什么时候打、对上消息、回退的前置条件和后续）、`worktree.rs`（会话的 worktree）、`changes.rs`（改动列表、diff、读文件）、`merge.rs`（squash 并合并回起点分支）：都用 git 命令行，有真 git 的测试。`policy.rs`：档位判定。`rules.rs`：「本会话总是允许」的规则。`daemon/trust.rs`：认出并回答 Claude Code 的信任对话框（`daemon/fixtures/` 是真实屏幕文字）。`project.rs`：project.toml 读写。`host.rs`：`lila host codex|omp`。`accounts.rs`、`signin.rs`、`magpie.rs`、`usage.rs`、`sessions.rs`、`commands.rs`。留着没人调用的：`github.rs`、`daemon/sources.rs`（P4） |
 | `ghostty-sys`、`lila-term` | libghostty 绑定和终端视图（移植自 herdr-app） |
 | `lila-app` | 窗口。`app.rs`：状态、刷新、快捷键、选中的会话或新会话、系统通知。`sidebar.rs`：侧栏。`ui.rs`：标题行（`header_actions`）、中间卡片、权限卡片、终端对话框的提示。`composer.rs`：输入区。`panel.rs`：右面板（文件树和预览、改动和 diff、提交和合并、合并确认框）。`restore.rs`：回到某条消息（气泡上的按钮、dry run 的确认框、「已回到这里」标记和「撤销」）。`conversation.rs`：对话视图、对话/终端切换。`settings.rs`：工作区设置。`prefs.rs`、`usage.rs`：全局设置。`dialog.rs`、`engines.rs`、`style.rs`、`data.rs` |
 
@@ -126,7 +126,9 @@ cargo run -p lila-app                             # 或者：cargo install --pat
   - **全自动档的危险操作拦截靠识别命令文字，不是沙箱**（Codex 线程有沙箱，Claude 线程没有）：常见写法能拦下（`git push`、删分支、`gh` 的写操作、动工作区外的文件），别名、变量拼出的命令、脚本内部做的事拦不住。已如实告诉用户：它拦常见的误操作，不是安全边界。用户自己配的 allow 规则不再是缺口（见下一条）。Claude 自带沙箱的调查结果在 `architecture-v4.md` §6 末尾：网络不限设置表达不了，所以没启用。
   - Claude 始终以 `--permission-mode manual` 启动，档位由 lilad 的 hook 判定，切档不用重启。**每个工具调用先走 `PreToolUse`**：lilad 回 allow、deny 或 ask；ask 让 Claude Code 弹自己的框，弹框走 `PermissionRequest` hook 变成卡片（两个 hook 靠 `tool_name` 加 `tool_input` 的哈希对上，`PermissionRequest` 没有 `tool_use_id`），所以用户 allow 规则绕不过 lilad。已经在跑的会话没有 `PreToolUse`，结束再恢复才有。lilad 没起来时 hook 什么都不输出，Claude Code 自己决定。
   - Codex 的全自动档是「只能写工作区、不联网」的沙箱加 `on-request`：联网命令会多一轮申请，由 lilad 自动放行；切档在下一轮生效。
-- **新文件夹里 Claude Code 先问「信任这个文件夹」**：会话变成「终端在等你」，窗口提示打开终端去回答。lilad 不会替用户信任。
+- **新文件夹里 Claude Code 先问「信任这个文件夹」**（`architecture-v4.md` §12）：lilad 每 2 秒读这类会话的终端屏幕（`terminal.read`），认得 2.1.322 的这个对话框就标 `waiting_for: "trust"` 和文件夹，窗口那一行写出文件夹，给「信任并继续」（`thread.trust`：先读屏幕，光标移到 Yes 并再读到，再按 Enter；不是这个对话框一个键都不按）。认不出的（登录、别的版本的措辞）仍是「在终端里等你」加「打开终端」。lilad 不会替用户信任，没有「总是信任」的设置。已信任的项目的 worktree 实测不再问。
+- **权限卡片不过期、lilad 重启也在**（`architecture-v4.md` §6）：hook 的 timeout 是 2 000 000 秒（Claude Code 的上限约 24.8 天），hook 不设等待上限，lilad 重启后它带请求再问一次、卡片重开；hook 被杀（人在终端里答了）30 秒后卡片丢。已经在跑的会话要结束再恢复才换上新的 timeout。
+- **本会话总是允许**（`architecture-v4.md` §6）：只在 `confirm` 档、`danger` 为空、`policy::danger` 也没认出危险的卡片上出现，`rules::derive`/`covers` 每次都先问 `policy::danger`，所以规则吞不掉危险，`confirm` 档里的 `git push` 也没有这个选项。引擎自己的「总是」不再出现在卡片上。
 - **会话不注入系统提示词**；用量按会话记录的 session id 归属到会话。
 - **账号和用量**（全局设置 → 用量）：
   - 账号写在 `~/.config/lila/accounts.toml`，每个账号一个 CLI 配置目录；会话用当前账号启动（`CLAUDE_CONFIG_DIR` / `CODEX_HOME`）。
@@ -159,7 +161,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 - `LILA_APP_SHOT=/path.png`：每 2 秒把窗口画面存成 PNG（2882 × 1802，不含红绿灯，也截不到真实的毛玻璃）。
 - `LILA_APP_FAKE=/path.json`：**不起 lilad**，用造好的数据画界面。JSON 是 `{projects, threads, conversations}`（可选 `daemon`：造 `ping` 的 `{version, protocol}`，协议不是 `lila::PROTOCOL` 或没有就出现「lilad 版本不符」和重启按钮；`restart: "fixed"`：点了重启后恢复正常，否则变成「lila 命令需要重装」，点击不碰真 lilad）：前两个和 `project.list`、`thread.list` 的返回一样，`conversations` 是会话 id 到 `thread.read` 返回的 `items`、`permissions`、`writing`、`config`。任何状态（在等你、归档、已结束、权限卡片、终端里的对话框……）都能这样造；这时窗口里的操作发不出去（没有 lilad）。
-- `LILA_APP_THREAD=<id>`：显示这个会话；`LILA_APP_SIZE=1000x680`：窗口这么大（看窄窗口）；右面板的状态在 `<LILA_HOME>/state/app-panel.json`（`{"open":true,"view":"changes","width":380}`）；假数据文件里还可以有 `changes`、`diffs`、`file`、`commit`、`merge`、`log`、`new`（见 `data::fake_act`），`LILA_APP_FAKE_READ_MS` 让面板的读和回退的 dry run 变慢（`LILA_APP_FAKE_SEND_MS` 让提交、合并和真回退变慢，截「回退进行中」就用它），`restore`（`{"dry_run": …, "restore": …}`，是 `thread.restore` 带和不带 `dry_run` 的回复，或 `{"error": "…"}`；按检查点编号分开写 `{"3": {"dry_run": …}}`；会话的 `restoring: true` 就是「正在放回」，对话里的 `checkpoints` 和 `from: "restored"` 条目直接写在 `conversations` 里，见 `data::fake_act`），`LILA_APP_NEW=<项目>,engine=codex,model=…,effort=…,permission=confirm`：打开新会话的输入框并选好；`LILA_APP_ADD=<文件夹>`：像选了文件夹那样新建工作区。
+- `LILA_APP_THREAD=<id>`：显示这个会话；`LILA_APP_SIZE=1000x680`：窗口这么大（看窄窗口）；右面板的状态在 `<LILA_HOME>/state/app-panel.json`（`{"open":true,"view":"changes","width":380}`）；假数据文件里还可以有 `changes`、`diffs`、`file`、`commit`、`merge`、`log`、`new`（见 `data::fake_act`），`LILA_APP_FAKE_READ_MS` 让面板的读和回退的 dry run 变慢（`LILA_APP_FAKE_SEND_MS` 让提交、合并和真回退变慢，截「回退进行中」就用它），`trust`（`thread.trust` 的回复，或 `{"error": "…"}`；会话要 `waiting: "terminal"`、`waiting_for: "trust"`、`trust_folder`，`LILA_APP_FAKE_SEND_MS` 让按钮转圈更久），`conversations` 里的 `rules`（`thread.read` 的规则列表，点权限档按钮就看得到：`LILA_APP_CLICK`），`restore`（`{"dry_run": …, "restore": …}`，是 `thread.restore` 带和不带 `dry_run` 的回复，或 `{"error": "…"}`；按检查点编号分开写 `{"3": {"dry_run": …}}`；会话的 `restoring: true` 就是「正在放回」，对话里的 `checkpoints` 和 `from: "restored"` 条目直接写在 `conversations` 里，见 `data::fake_act`），`LILA_APP_NEW=<项目>,engine=codex,model=…,effort=…,permission=confirm`：打开新会话的输入框并选好；`LILA_APP_ADD=<文件夹>`：像选了文件夹那样新建工作区。
 - `LILA_APP_CLICK="x,y;right:x,y;move:x,y;keys:cmd-n h i enter;wait:ms"`：启动 3 秒后依次点击（窗口里的点，不是截图的像素：截图是 2 倍，再缩放过的话自己换算）、右击、移动、按键（打字也行）、等待。点下拉菜单、右键菜单、对话框里的控件都靠它；真的 lilad 加它可以走完「新会话 → 发消息 → 回答 → 结束」。
 - `LILA_APP_KEYS="cmd-, cmd-shift-,"`：启动后 1.5 秒按这些键，用来验证快捷键。
 - `LILA_APP_INACTIVE=1` 加 `LILA_APP_NOTIFY_LOG=<文件>`：窗口当作不在前面，通知写进文件而不是真的发。
@@ -169,7 +171,7 @@ cargo run -p lila-app                             # 或者：cargo install --pat
 
 1. `LILA_HOME=/tmp/x target/debug/lila project add <一个 git 文件夹>`（这会在 hc 里起一个 lilad）；`lila project set --model claude-haiku-5-5 --effort low`；
 2. `LILA_HOME=/tmp/x LILA_APP_SHOT=… LILA_APP_CLICK="keys:cmd-n;wait:300;keys:h i enter;wait:12000" target/debug/lila-app`；
-3. 新文件夹里 Claude Code 先问「信任这个文件夹」：会话变成「终端在等你」，点「打开终端」，按 ↓ 和 Enter（`keys:down enter`），再 ⌘[ 回到对话；
+3. 新文件夹里 Claude Code 先问「信任这个文件夹」：几秒内会话那一行变成「信任此文件夹」，点「信任并继续」（或 `lila thread trust <id>`）；
 4. 收尾：`lila thread stop <id>`、`lila daemon stop`（会话的终端不随 lilad 结束，要逐个 stop）。
 
 **显示器睡着时截不到新画面**：窗口不重绘，PNG 一直是第一帧（多半是空的）。先看 `pmset -g assertions` 或 `system_profiler SPDisplaysDataType | grep Asleep`。刚编译出的二进制第一次启动慢，至少等 8 秒再截。
@@ -198,6 +200,14 @@ macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; ki
   - 回退后给 agent 的备注在下一条消息里的效果（后端那边的问题，要真引擎才看得出）；
   - 真键盘：确认框里 Esc 取消（模拟的 Esc 在 `--features shots` 里关掉了框）。
 
+- **A2 前半（2026-11-11）**，要在真实使用里确认：
+  - 重启 lilad 并把在跑的 Claude 会话结束再恢复，让它带上 2 000 000 秒的 timeout 和会重发请求的 hook；之后走开几个小时再回来答一张卡片；
+  - 窗口里真点：卡片上的「本会话总是允许 …」、权限档菜单里的规则行和 ×、新项目里的「信任并继续」（点了之后排队的第一条消息发出）；
+  - 真 Codex 和 omp 上的「总是」：卡片上只剩一个「总是」，点了之后引擎收到的是普通允许，下一次同样的命令由规则答（`lila thread log` 里看 `· rule:`）；
+  - 日常用中规则有没有太窄或太宽：`confirm` 档下 `cargo test 2>&1 | tail` 这类一行要两条规则（`cargo test`、`tail`）；`rm`、`python`、`bash -c` 永远要问；
+  - 第一次在没信任过的仓库里开 worktree 会话时 Claude Code 问的是哪个文件夹；
+  - 通知文字：信任对话框出现时侧栏和系统通知仍写「终端在等你」。
+
 - **A1 判定（2026-11-11）**，要在真实使用里确认：
   - 重启 lilad（`lila daemon restart`）后，把一个在跑的 Claude 会话结束再恢复，让它带上 `PreToolUse`；平时的编码里看 `lila thread log <会话>`：每个改动和命令一条 `auto_allowed`，没有重复；看东西的工具没有记录；
   - 自己 `~/.claude/settings.json` 里的 allow 规则下，`confirm` 档还是出卡片、`read_only` 档还是拒；
@@ -208,7 +218,7 @@ macOS 没有 `timeout`：`prog & P=$!; perl -e 'select(undef,undef,undef,6)'; ki
 
 - **路线图**见上面「进度和下一步」和 `product-v4.md` §8。
 - **P1 留下的**：
-  - 在 Claude Code 没信任过的文件夹里开会话，会停在终端里的「信任此文件夹」对话框，窗口只显示「在等你」，不说等什么。
+  - （A2 已改）在 Claude Code 没信任过的文件夹里开会话，窗口现在认出「信任此文件夹」并能在原处答（只认 2.1.322 的文字，措辞变了就退回「在终端里等你」）；登录等别的终端对话框仍只显示「在终端里等你」。权限卡片 570 秒后退回终端的问题也已改（不过期，见上）。
   - Claude 会话的用户消息约 0.4 秒后才进会话记录（hc 粘贴 0.24 秒 + 跟读），窗口靠乐观显示盖住；回复靠 `MessageDisplay` hook 先显示，Stop 后保留到会话记录里有了为止。
   - Codex 偶尔停在工具结果之后不收尾（v3 就有的老问题）：120 秒的催促兜底没解决，发一条消息才继续。根因没查清。
   - Codex 的 MCP 工具审批和 `item/permissions/requestApproval`（模型主动申请额外权限）目前直接回「不支持」，不问人。P3 接 MCP 工具层时必须处理。

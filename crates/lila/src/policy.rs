@@ -234,7 +234,7 @@ fn writes_outside(workspace: &Path, cwd: &Path, command: &str, depth: usize) -> 
 }
 
 /// A command line cut at `;`, `&&`, `||`, `|`, `&` and newlines (not inside quotes).
-fn split_commands(line: &str) -> Vec<String> {
+pub(crate) fn split_commands(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;

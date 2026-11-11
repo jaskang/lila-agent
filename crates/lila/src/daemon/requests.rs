@@ -32,7 +32,9 @@ impl<T: Terminals> Daemon<T> {
             "thread.list" => self.thread_list(params, now),
             "thread.show" => {
                 let t = self.thread_of(params)?;
-                Ok(self.thread_json(&t, now))
+                let mut v = self.thread_json(&t, now);
+                v["rules"] = self.rules_json(&t.id);
+                Ok(v)
             }
             "thread.read" => self.thread_read(params, now),
             "thread.send" => self.thread_send(params, now),
@@ -44,6 +46,8 @@ impl<T: Terminals> Daemon<T> {
             "thread.rename" => self.thread_rename(params, now),
             "thread.permission" => self.thread_permission(params, now),
             "thread.answer" => self.thread_answer(params, now),
+            "thread.trust" => self.thread_trust(params, now),
+            "thread.rule.remove" => self.thread_rule_remove(params, now),
             "thread.model" => self.thread_model(params),
             "thread.run" => self.thread_run(params),
             "thread.commands" => self.thread_commands(params),
@@ -52,7 +56,7 @@ impl<T: Terminals> Daemon<T> {
             "thread.log" => self.thread_log(params),
             "thread.checkpoints" => self.thread_checkpoints(params, now),
             "hook" => self.hook(params, now),
-            "hook.answer" => self.hook_answer(params),
+            "hook.answer" => self.hook_answer(params, now),
             other => Err(anyhow!("unknown request {other}")),
         }
     }

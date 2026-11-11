@@ -69,6 +69,25 @@ pub fn engine_spec(engine: &str, model: &str, effort: &str) -> String {
     if effort.is_empty() { format!("{model} · {engine}") } else { format!("{model} · {engine} {effort}") }
 }
 
+/// `text` cut to `max` characters with an ellipsis, for a label that has to fit a button or a menu row.
+pub fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max { text.to_owned() } else { format!("{}…", text.chars().take(max.saturating_sub(1)).collect::<String>()) }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::clip;
+
+    #[test]
+    fn a_long_label_is_cut_to_fit_and_a_short_one_is_left() {
+        assert_eq!(clip("本会话总是允许 cargo test", 40), "本会话总是允许 cargo test");
+        assert_eq!(clip("0123456789", 6), "01234…");
+        assert_eq!(clip("字字字字字", 5), "字字字字字");
+        assert_eq!(clip("字字字字字字", 5), "字字字字…");
+        assert_eq!(clip("", 0), "");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

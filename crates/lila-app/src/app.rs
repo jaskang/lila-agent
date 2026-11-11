@@ -111,6 +111,8 @@ pub struct LilaApp {
     pub just_made: Option<String>,
     /// When each thread last notified that a turn was done, so a flickering state doesn't repeat it.
     notified: HashMap<String, i64>,
+    /// Threads whose "trust this folder" is on its way to lilad (the strip's button turns).
+    pub trusting: std::collections::HashSet<String>,
     /// The right panel: files and changes of the shown thread.
     pub panel: crate::panel::Panel,
     /// Going back to a message: the question being asked, and what is under way.
@@ -261,6 +263,7 @@ impl LilaApp {
             seen: None,
             just_made: None,
             notified: HashMap::new(),
+            trusting: Default::default(),
             panel,
             restore: Default::default(),
             prefs: None,

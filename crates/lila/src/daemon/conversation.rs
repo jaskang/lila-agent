@@ -114,7 +114,7 @@ impl<T: Terminals> Daemon<T> {
         let cards: Vec<Value> = self.asking.iter().filter(|a| a.thread == t.id).map(super::permissions::card_json).collect();
         Ok(json!({
             "thread": self.thread_json(&t, now), "seq": seq, "items": items, "permissions": cards,
-            "writing": self.writing_of(&t.id), "config": self.config_json(&t), "checkpoints": self.checkpoint_rows(&t, now)?,
+            "writing": self.writing_of(&t.id), "config": self.config_json(&t), "checkpoints": self.checkpoint_rows(&t, now)?, "rules": self.rules_json(&t.id),
         }))
     }
 

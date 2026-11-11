@@ -10,6 +10,8 @@ pub(super) enum Input {
     /// A fresh `events.subscribe` snapshot and when it was taken.
     Snapshot(Value, i64),
     Tick,
+    /// Look at the screens of Claude Code threads that wait in their terminal or have not started (every 2 s): is it the trust dialog?
+    Look,
     /// Read what Claude Code threads added to their transcripts (every 100 ms: the window follows along; also after a hook or a terminal event).
     Follow,
     /// A thread's host attached: the thread, its command channel.
@@ -189,6 +191,16 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
         }
     });
 
+    let tx_look = tx.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if tx_look.send(Input::Look).is_err() {
+                return;
+            }
+        }
+    });
+
     // Jobs run on threads of their own, so the loop goes on while git works; the summaries of changes one at a time on one.
     let tx_job = tx.clone();
     let (serial_tx, serial_rx) = mpsc::channel::<Job>();
@@ -258,6 +270,7 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
                 daemon.follow_transcripts();
             }
             Input::Tick => daemon.tick(now),
+            Input::Look => daemon.look(),
             Input::Follow => daemon.follow_transcripts(),
             Input::HostAttach(tid, ctx) => daemon.host_attach(&tid, ctx, now),
             Input::HostEvent(tid, ev) => daemon.host_event(&tid, ev, now),

@@ -350,6 +350,13 @@ impl<T: Terminals> Daemon<T> {
         let tier = Tier::parse(p).ok_or_else(|| anyhow!("unknown permission {p:?} (read_only, confirm or full)"))?;
         self.store.set_tier(&t.id, tier)?;
         self.store.event(&t.id, "human", "permission", &format!("{} → {}", t.tier.as_str(), tier.as_str()), now)?;
+        // Read-only is the tier where nothing is let through: what was allowed "always" is forgotten, not kept for later.
+        if tier == Tier::ReadOnly {
+            let dropped = self.store.clear_rules(&t.id)?;
+            if !dropped.is_empty() {
+                self.store.event(&t.id, "lilad", "rules_dropped", &dropped.iter().map(|r| r.key.clone()).collect::<Vec<_>>().join(", "), now)?;
+            }
+        }
         if t.engine == Runtime::Codex && self.hosts.contains_key(&t.id) {
             let (approval, sandbox) = runtime::codex_settings(tier);
             self.host_command(&t.id, &Command::SetPermission { approval: approval.into(), sandbox: sandbox.into() })?;

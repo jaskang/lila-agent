@@ -12,8 +12,17 @@ use lila_agent::{PermKind, PermOption};
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
+/// How long Claude Code lets the `PermissionRequest` hook wait for the person (seconds). Claude Code 2.1.322 clamps a hook's
+/// timeout to 2^31-1 ms (about 24.8 days, the most a timer can hold) and honours anything below it, so a card stays answerable
+/// for as long as the thread lives; the hook process itself waits without a limit of its own (`client::hook`).
+pub const PERMISSION_WAIT_SECS: u64 = 2_000_000;
+
 /// The events Lila hooks, and how long Claude Code waits for each (seconds).
-pub const HOOKED: [(&str, u64); 6] = [("PreToolUse", 10), ("PermissionRequest", 600), ("MessageDisplay", 10), ("UserPromptSubmit", 30), ("Stop", 10), ("StopFailure", 10)];
+pub const HOOKED: [(&str, u64); 6] = [("PreToolUse", 10), ("PermissionRequest", PERMISSION_WAIT_SECS), ("MessageDisplay", 10), ("UserPromptSubmit", 30), ("Stop", 10), ("StopFailure", 10)];
+
+/// A card whose hook has not asked after it for this long (ms) has lost its hook (Claude Code killed it because the person
+/// answered in the terminal or interrupted the turn): the card goes. The hook asks every half second.
+const HOOK_GONE_MS: i64 = 30_000;
 
 /// How many tool calls' verdicts are kept per thread, and for how long (ms): a `PermissionRequest`
 /// follows its `PreToolUse` within moments.
@@ -60,24 +69,7 @@ impl<T: Terminals> Daemon<T> {
         let payload = &params["payload"];
         match req(params, "event")? {
             "PreToolUse" => Ok(self.pre_tool_use(&t, payload, now)?),
-            "PermissionRequest" => {
-                self.next_hook += 1;
-                let id = format!("hook-{}", self.next_hook);
-                let request = lila_agent::claude::permission_request(&id, payload, options());
-                // A call `PreToolUse` already judged is not judged again: the card it asked for opens, or the
-                // let-through is repeated, with nothing more in the log.
-                let judged = self.take_judged(&tid, call_key(payload));
-                let repeat = judged.as_ref().is_some_and(|j| j.ask.is_none()).then(|| request.pick(true).map(|o| o.id.clone())).flatten();
-                let decided = match (judged, repeat) {
-                    (Some(Judged { ask: Some((why, danger)), .. }), _) => self.open_card(&tid, request, why, danger, now)?,
-                    (_, Some(option)) => Decided::Answer { option, message: None },
-                    _ => self.ask_permission(&tid, request, now)?,
-                };
-                Ok(match decided {
-                    Decided::Answer { option, message } => json!({"decision": option, "message": message}),
-                    Decided::Card => json!({"wait": id}),
-                })
-            }
+            "PermissionRequest" => self.permission_hook(&t, payload, None, now),
             "MessageDisplay" => {
                 let message = payload["message_id"].as_str().unwrap_or_default().to_owned();
                 let delta = payload["delta"].as_str().unwrap_or_default();
@@ -103,6 +95,7 @@ impl<T: Terminals> Daemon<T> {
             // shown until following the transcript finds the reply there (`follow_transcripts`).
             "Stop" => {
                 self.follow_transcripts();
+                self.drop_hook_cards(&tid, "the turn ended", now);
                 self.refresh_changes(&tid);
                 Ok(json!({}))
             }
@@ -111,6 +104,7 @@ impl<T: Terminals> Daemon<T> {
                 self.follow_transcripts();
                 self.writing.remove(&tid);
                 self.store.event(&tid, "claude", "turn_failed", &why, now)?;
+                self.drop_hook_cards(&tid, "the turn failed", now);
                 self.refresh_changes(&tid);
                 self.mark(&tid);
                 Ok(json!({}))
@@ -138,6 +132,14 @@ impl<T: Terminals> Daemon<T> {
                 json!({"verdict": "deny", "reason": reason})
             }
             Verdict::Ask { why, danger } => {
+                // What the tier itself asks about may have been allowed "always" for this thread; a danger never is.
+                if danger.is_none()
+                    && let Some(by) = self.rules_covering(t, &request)
+                {
+                    self.rule_event(&t.id, t.tier, &request, &by, now)?;
+                    self.remember_judged(&t.id, call_key(payload), None, now);
+                    return Ok(json!({"verdict": "allow"}));
+                }
                 self.remember_judged(&t.id, call_key(payload), Some((why.clone(), danger)), now);
                 json!({"verdict": "ask", "reason": why})
             }
@@ -160,8 +162,43 @@ impl<T: Terminals> Daemon<T> {
         list.remove(at)
     }
 
-    /// `hook.answer {thread, id}`: the person's answer to a hook's permission request, once given.
-    pub(super) fn hook_answer(&mut self, params: &Value) -> Result<Value> {
+    /// A `PermissionRequest` from Claude Code's hook, or one the hook sends again after lilad forgot it (`again`: its id):
+    /// answered by the tier at once, or a card the hook then waits for.
+    fn permission_hook(&mut self, t: &Thread, payload: &Value, again: Option<&str>, now: i64) -> Result<Value> {
+        let tid = t.id.clone();
+        let id = match again {
+            Some(id) => id.to_owned(),
+            None => {
+                self.next_hook += 1;
+                format!("hook-{:x}-{}", self.boot, self.next_hook)
+            }
+        };
+        let request = lila_agent::claude::permission_request(&id, payload, options());
+        // A call `PreToolUse` already judged is not judged again: the card it asked for opens, or the
+        // let-through is repeated, with nothing more in the log.
+        let judged = self.take_judged(&tid, call_key(payload));
+        let repeat = judged.as_ref().is_some_and(|j| j.ask.is_none()).then(|| request.pick(true).map(|o| o.id.clone())).flatten();
+        let decided = match (judged, repeat) {
+            (Some(Judged { ask: Some((why, danger)), .. }), _) => self.open_card(&tid, request, why, danger, now)?,
+            (_, Some(option)) => Decided::Answer { option, message: None },
+            _ => self.ask_permission(&tid, request, now)?,
+        };
+        Ok(match decided {
+            Decided::Answer { option, message } => json!({"decision": option, "message": message}),
+            Decided::Card => {
+                if let Some(a) = self.asking.iter_mut().find(|a| a.thread == tid && a.request.id == id) {
+                    a.polled_ms = Some(now);
+                }
+                json!({"wait": id})
+            }
+        })
+    }
+
+    /// `hook.answer {thread, id, payload?}`: the person's answer to a hook's permission request, once given. The hook asks every
+    /// half second for as long as it waits. When lilad does not know the request (it was restarted meanwhile) it says so
+    /// (`unknown`); the hook then sends the request again with its `payload`, and the card comes back.
+    pub(super) fn hook_answer(&mut self, params: &Value, now: i64) -> Result<Value> {
+        let t = self.thread_of(params)?;
         let id = req(params, "id")?;
         if let Some(answer) = self.hook_answers.remove(id) {
             return Ok(match answer {
@@ -169,8 +206,38 @@ impl<T: Terminals> Daemon<T> {
                 None => json!({"decision": null}),
             });
         }
-        let open = self.asking.iter().any(|a| a.request.id == id);
-        Ok(if open { json!({"pending": true}) } else { json!({"decision": null}) })
+        if let Some(a) = self.asking.iter_mut().find(|a| a.request.id == id) {
+            a.polled_ms = Some(now);
+            return Ok(json!({"pending": true}));
+        }
+        // A thread that is gone (stopped, ended) has nobody left to answer: nothing comes back.
+        let alive = t.terminal.is_some() && self.live.contains_key(&t.id) && !t.engine.hosted();
+        match params.get("payload").filter(|p| p.is_object()) {
+            Some(payload) if alive => self.permission_hook(&t, payload, Some(id), now),
+            _ => Ok(json!({"decision": null, "unknown": true})),
+        }
+    }
+
+    /// Cards whose hook is gone (`HOOK_GONE_MS`) are dropped, so a card never outlives the question it stands for.
+    pub(super) fn drop_abandoned_cards(&mut self, now: i64) {
+        let gone: Vec<super::permissions::Asking> = self.asking.iter().filter(|a| a.polled_ms.is_some_and(|p| now - p > HOOK_GONE_MS)).cloned().collect();
+        for a in gone {
+            self.drop_card(&a, "its hook stopped asking (answered in the terminal, or Claude Code gave up)", now);
+        }
+    }
+
+    /// A turn ended: no dialog of Claude Code's can still be open, so the cards its hooks stand for are closed.
+    fn drop_hook_cards(&mut self, tid: &str, why: &str, now: i64) {
+        for a in self.asking.iter().filter(|a| a.thread == tid && a.polled_ms.is_some()).cloned().collect::<Vec<_>>() {
+            self.drop_card(&a, why, now);
+        }
+    }
+
+    fn drop_card(&mut self, a: &super::permissions::Asking, why: &str, now: i64) {
+        self.asking.retain(|x| x.id != a.id);
+        self.hook_answers.remove(&a.request.id);
+        let _ = self.store.event(&a.thread, "lilad", "dismissed", &format!("{} · {why}", a.request.title.lines().next().unwrap_or_default()), now);
+        self.mark(&a.thread);
     }
 
     /// What a Claude thread is writing right now (from `MessageDisplay`), until the transcript has it.

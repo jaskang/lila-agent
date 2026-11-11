@@ -256,7 +256,7 @@ pub fn clock_ms() -> String {
 /// says), `diffs` (a thread's id to its path to the `thread.diff` item), `file` (a path to what `thread.file` says),
 /// `commit` and `merge` (what those answer, or `{"error": "…"}`, after `LILA_APP_FAKE_SEND_MS`), `restore` (`{"dry_run": …, "restore": …}`,
 /// the replies of `thread.restore` with and without `dry_run`, or `{"error": "…"}`; under a checkpoint's number, `{"7": {"dry_run": …}}`, for that
-/// checkpoint alone); every other request is left to fail.
+/// checkpoint alone), `trust` (what `thread.trust` answers, after `LILA_APP_FAKE_SEND_MS`); every other request is left to fail.
 #[cfg(feature = "shots")]
 fn fake_act(method: &str, params: &Value) -> Option<anyhow::Result<Value>> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(std::env::var("LILA_APP_FAKE").ok()?).ok()?).ok()?;
@@ -311,6 +311,11 @@ fn fake_act(method: &str, params: &Value) -> Option<anyhow::Result<Value>> {
             })
         }
         "thread.log" => Some(Ok(v["log"][thread].clone())),
+        // `trust` (what `thread.trust` answers, or `{"error": "…"}`) after `LILA_APP_FAKE_SEND_MS`.
+        "thread.trust" => {
+            slow();
+            Some(answer(&v["trust"]))
+        }
         "thread.new" if v["new"].is_object() => {
             slow();
             Some(match std::env::var("LILA_APP_FAKE_SEND_ERR") {

@@ -7,7 +7,7 @@ use crate::style::{self, card, muted, muted2};
 use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui::component::spinner::Spinner;
-use gpui::component::{Icon, IconName, InteractiveElementExt, Sizable, StyledExt, h_flex, v_flex};
+use gpui::component::{Disableable as _, Icon, IconName, InteractiveElementExt, Sizable, StyledExt, h_flex, v_flex};
 use crate::style::Control as _;
 use gpui::prelude::*;
 use gpui::*;
@@ -247,26 +247,59 @@ impl LilaApp {
     }
 
     /// The row above the box when the engine waits in its terminal (Claude Code's "trust this folder", a login):
-    /// the conversation cannot answer it, so it says where to go.
+    /// the conversation cannot answer it, so it says where to go. For the trust dialog lilad has recognised (`waiting_for`),
+    /// the row shows the folder and answers it in place.
     pub(crate) fn terminal_ask(&mut self, t: &Value, cx: &mut Context<Self>) -> Option<AnyElement> {
         if t["waiting"] != "terminal" {
             return None;
         }
         let id = s(t, "id");
         let tui = t["caps"]["tui"] == true;
+        let trust = trust_folder(t);
+        let strip = h_flex()
+            .w_full()
+            .px_3()
+            .py(px(8.))
+            .gap_2()
+            .rounded(px(style::R_BLOCK))
+            .border_1()
+            .border_color(style::yellow().opacity(0.35))
+            .bg(style::yellow().opacity(0.06))
+            .child(Icon::new(IconName::SquareTerminal).small().text_color(style::yellow()));
+        let open = |id: String, primary: bool, cx: &mut Context<Self>| {
+            Button::new("open-terminal").small().small_button().when(primary, |b| b.primary()).when(!primary, |b| b.outline()).label("打开终端").on_click(cx.listener(move |this, _, _, cx| this.set_view(&id, true, cx)))
+        };
+        let Some(folder) = trust else {
+            return Some(strip.child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(format!("{} 在终端里等你", crate::engines::engine_name(&s(t, "engine"))))).when(tui, |d| d.child(open(id, true, cx))).into_any_element());
+        };
+        let busy = self.trusting.contains(&id);
+        let thread = id.clone();
         Some(
-            h_flex()
-                .w_full()
-                .px_3()
-                .py(px(8.))
-                .gap_2()
-                .rounded(px(style::R_BLOCK))
-                .border_1()
-                .border_color(style::yellow().opacity(0.35))
-                .bg(style::yellow().opacity(0.06))
-                .child(Icon::new(IconName::SquareTerminal).small().text_color(style::yellow()))
-                .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(format!("{} 在终端里等你", crate::engines::engine_name(&s(t, "engine")))))
-                .when(tui, |d| d.child(Button::new("open-terminal").small().small_button().primary().label("打开终端").on_click(cx.listener(move |this, _, _, cx| this.set_view(&id, true, cx)))))
+            strip
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_2()
+                        .child(div().flex_none().text_size(px(13.)).child("信任此文件夹"))
+                        // The end of a long path is the folder itself.
+                        .child(div().min_w_0().truncate().text_size(px(12.)).font_family(lila_term::theme::FONT).text_color(muted2()).child(crate::data::tail(&crate::data::tilde(&folder), 48))),
+                )
+                .when(tui, |d| d.child(open(id.clone(), false, cx)))
+                .child(Button::new("trust-folder").small().small_button().primary().loading(busy).disabled(busy).label("信任并继续").on_click(cx.listener(move |this, _, _, cx| {
+                    let thread = thread.clone();
+                    this.trusting.insert(thread.clone());
+                    cx.notify();
+                    let id = thread.clone();
+                    this.call("thread.trust", json!({"thread": id}), cx, move |this, r, cx| {
+                        this.trusting.remove(&thread);
+                        if let Err(e) = r {
+                            this.notice = Some(format!("{e:#}"));
+                        }
+                        this.refresh_now();
+                        cx.notify();
+                    });
+                })))
                 .into_any_element(),
         )
     }
@@ -322,7 +355,9 @@ impl LilaApp {
                             .rounded_full()
                             .when(main, |b| b.primary())
                             .when(!main, |b| b.outline())
-                            .label(label)
+                            // A rule's words can be long (a chained command): the button keeps to the card, the tooltip has all.
+                            .label(crate::engines::clip(&label, 44))
+                            .tooltip(label.clone())
                             .on_click(cx.listener(move |this, _, _, cx| this.act("thread.answer", json!({"thread": thread, "card": card, "option": opt}), cx)))
                     }))
                     // Claude Code can ask in its own terminal instead.
@@ -337,6 +372,30 @@ impl LilaApp {
     }
 }
 
+/// The folder of the trust dialog a thread waits at, when lilad has recognised it (`waiting_for`); an older lilad, or any other
+/// reason a terminal waits, says nothing, and the row is the plain "waits in its terminal".
+pub fn trust_folder(t: &Value) -> Option<String> {
+    (t["waiting"] == "terminal" && t["waiting_for"] == "trust").then(|| s(t, "trust_folder")).filter(|f| !f.is_empty())
+}
+
 pub fn placeholder(text: String, _cx: &App) -> impl IntoElement {
     div().flex_1().flex().items_center().justify_center().p_8().text_color(muted()).child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trust_folder;
+    use serde_json::json;
+
+    #[test]
+    fn only_a_recognised_trust_dialog_gets_the_trust_row() {
+        let waiting = json!({"waiting": "terminal", "waiting_for": "trust", "trust_folder": "/Users/me/shop"});
+        assert_eq!(trust_folder(&waiting).as_deref(), Some("/Users/me/shop"));
+        // A terminal that waits for something else, an older lilad (nothing said), a dialog without its folder, a thread that waits for a card.
+        assert_eq!(trust_folder(&json!({"waiting": "terminal", "waiting_for": null})), None);
+        assert_eq!(trust_folder(&json!({"waiting": "terminal"})), None);
+        assert_eq!(trust_folder(&json!({"waiting": "terminal", "waiting_for": "trust"})), None);
+        assert_eq!(trust_folder(&json!({"waiting": "card", "waiting_for": "trust", "trust_folder": "/x"})), None);
+        assert_eq!(trust_folder(&json!({"waiting": null, "waiting_for": "trust", "trust_folder": "/x"})), None);
+    }
 }

@@ -10,6 +10,10 @@ struct Fake {
     keys: Vec<(String, Vec<String>)>,
     refuse_sends: bool,
     refuse_runs: bool,
+    /// What each terminal's screen shows (`read`).
+    screens: HashMap<String, String>,
+    /// The dialogs on the screens ignore Down.
+    stuck_cursor: bool,
 }
 
 impl Terminals for Fake {
@@ -43,7 +47,22 @@ impl Terminals for Fake {
     }
     fn keys(&mut self, terminal: &str, keys: &[&str]) -> Result<()> {
         self.keys.push((terminal.into(), keys.iter().map(|k| k.to_string()).collect()));
+        // A trust dialog on the screen answers keys like Claude Code's does: Down moves the cursor, Enter on "Yes" goes on.
+        if let Some(screen) = self.screens.get_mut(terminal) {
+            for key in keys {
+                match *key {
+                    "down" if !self.stuck_cursor && screen.contains("❯ No, exit") => *screen = screen.replace("❯ No, exit", "  No, exit").replace("  Yes, I trust this folder", "❯ Yes, I trust this folder"),
+                    "enter" if screen.contains("❯ Yes, I trust this folder") => *screen = "\n ▐▛███▛█   Claude Code v2.1.322\n".into(),
+                    "enter" if screen.contains("❯ No, exit") => *screen = "$ ".into(),
+                    _ => {}
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn read(&mut self, terminal: &str) -> Result<String> {
+        self.screens.get(terminal).cloned().ok_or_else(|| anyhow!("no screen for {terminal}"))
     }
 }
 
@@ -309,7 +328,7 @@ fn a_claude_thread_starts_hooked_and_asks_in_manual_mode() {
     let at = args.iter().position(|a| a == "--settings").expect("--settings");
     let settings: Value = serde_json::from_str(&std::fs::read_to_string(&args[at + 1]).unwrap()).unwrap();
     assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], "'/opt/lila/bin/lila' hook PermissionRequest");
-    assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 600);
+    assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], super::hooks::PERMISSION_WAIT_SECS);
     assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "*", "every tool call is judged");
     assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/opt/lila/bin/lila' hook PreToolUse");
 
@@ -549,6 +568,110 @@ fn claude_requests_are_answered_by_the_threads_tier() {
     assert!(log.iter().any(|e| e.starts_with("auto_denied read_only")) && log.iter().any(|e| e.starts_with("permission full → read_only")) && log.iter().any(|e| e.starts_with("asked ")), "{log:?}");
 }
 
+impl World {
+    /// lilad is stopped and started again: a new one over the same database, which presumes the threads alive until herdr-core's snapshot says.
+    fn restart(&mut self) {
+        let paths = self.d.paths.clone();
+        let store = Store::open(&paths.db()).unwrap();
+        let sources = Sources { claude: self.d.sources.claude.clone(), codex: self.d.sources.codex.clone() };
+        let mut d = Daemon::new(store, Fake::default(), paths, self.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
+        d.sources = sources;
+        self.d = d;
+        // Another moment, as the id of a request is made of the moment lilad started.
+        self.now += 5000;
+        self.d.boot = self.now;
+    }
+}
+
+#[test]
+fn a_card_waits_as_long_as_its_hook_asks_after_it() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({"permission": "confirm"}));
+    w.status(&tid, "idle");
+    let id = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch x"}))["wait"].as_str().unwrap().to_owned();
+    // Hours pass; the hook asks every half second and the card is as it was.
+    for _ in 0..40 {
+        w.now += 600_000;
+        assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id})), json!({"pending": true}));
+        w.d.tick(w.now);
+    }
+    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().len(), 1);
+    assert_eq!(w.state(&tid), "waiting");
+    let card = w.ok("thread.read", json!({"thread": tid}))["permissions"][0]["id"].clone();
+    w.ok("thread.answer", json!({"thread": tid, "card": card, "allow": true}));
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id}))["decision"], "allow");
+}
+
+#[test]
+fn a_card_whose_hook_stopped_asking_goes_and_so_does_one_when_the_turn_ends() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({"permission": "confirm"}));
+    w.status(&tid, "idle");
+    // The hook was killed (the person answered in the terminal): nobody asks after the card any more.
+    let id = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch x"}))["wait"].as_str().unwrap().to_owned();
+    w.now += 20_000;
+    w.d.tick(w.now);
+    assert_eq!(w.state(&tid), "waiting", "not yet");
+    w.now += 20_000;
+    w.d.tick(w.now);
+    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
+    assert!(w.events(&tid).iter().any(|e| e.starts_with("dismissed touch x · its hook stopped asking")), "{:?}", w.events(&tid));
+    // A hook that is alive after all (lilad was slow) asks, and the card comes back when it sends the request again.
+    let payload = json!({"tool_name": "Bash", "tool_input": {"command": "touch x"}, "cwd": w.repo.to_string_lossy()});
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id})), json!({"decision": null, "unknown": true}));
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id, "payload": payload})), json!({"wait": id}));
+    assert_eq!(w.state(&tid), "waiting");
+    // The turn ended: no dialog can be open.
+    w.hook(&tid, "Stop", json!({}));
+    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
+    // The thread ended: its cards go with it, and a hook asking for one gets nothing back, whatever it sends.
+    let id2 = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch y"}))["wait"].as_str().unwrap().to_owned();
+    w.ok("thread.stop", json!({"thread": tid}));
+    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
+    let payload = json!({"tool_name": "Bash", "tool_input": {"command": "touch y"}, "cwd": w.repo.to_string_lossy()});
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id2, "payload": payload})), json!({"decision": null, "unknown": true}));
+    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn a_card_comes_back_when_lilad_is_restarted_while_its_hook_waits() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({"permission": "confirm"}));
+    w.status(&tid, "idle");
+    let payload = json!({"tool_name": "Bash", "tool_input": {"command": "touch x"}, "cwd": w.repo.to_string_lossy()});
+    let before = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch x"}))["wait"].as_str().unwrap().to_owned();
+
+    w.restart();
+    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty(), "lilad forgot the card");
+    // A request of the new lilad does not take the id of the old one's.
+    let other = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch other"}))["wait"].as_str().unwrap().to_owned();
+    assert_ne!(other, before);
+    let card = w.ok("thread.read", json!({"thread": tid}))["permissions"][0]["id"].clone();
+    w.ok("thread.answer", json!({"thread": tid, "card": card, "allow": false}));
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": other}))["decision"], "deny");
+
+    // The hook that waited through the restart asks: lilad does not know the request, and says so.
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before})), json!({"decision": null, "unknown": true}));
+    // It sends the request again; the card is back, as it was (the tier asks, and says why).
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before, "payload": payload})), json!({"wait": before}));
+    assert_eq!(w.state(&tid), "waiting");
+    let read = w.ok("thread.read", json!({"thread": tid}));
+    assert_eq!((read["permissions"].as_array().unwrap().len(), read["permissions"][0]["why"].as_str()), (1, Some("改动前确认")));
+    assert_eq!(read["permissions"][0]["command"], "touch x");
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before})), json!({"pending": true}));
+    let card = read["permissions"][0]["id"].clone();
+    w.ok("thread.answer", json!({"thread": tid, "card": card, "allow": true}));
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before}))["decision"], "allow");
+    // Sent again after it was answered (a second restart, say): the same story, never a card for an answered question twice in a row.
+    w.restart();
+    // The tier may have changed in the meantime; the new answer is the tier's.
+    w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before, "payload": payload}))["decision"], "allow", "the tier answers by itself now");
+}
+
 /// What Claude Code sends `PreToolUse` for a tool call (`PermissionRequest` has the same, without `tool_use_id`).
 fn pre(w: &mut World, tid: &str, tool: &str, input: Value) -> Value {
     w.hook(tid, "PreToolUse", json!({"tool_name": tool, "tool_input": input, "tool_use_id": "toolu_1", "cwd": w.repo.to_string_lossy()}))
@@ -652,6 +775,359 @@ fn an_ask_from_pre_tool_use_becomes_the_card_of_the_permission_request_that_foll
     assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "ls"})), json!({"verdict": "allow"}));
     w.ok("thread.permission", json!({"thread": tid, "permission": "read_only"}));
     assert_eq!(claude_ask(&mut w, &tid, "Bash", json!({"command": "ls -la"}))["decision"], "deny");
+}
+
+// ---------------- the trust dialog ----------------
+
+const TRUST_SCREEN: &str = include_str!("fixtures/claude-trust-2.1.322.txt");
+const LOGIN_SCREEN: &str = include_str!("fixtures/claude-login-2.1.322.txt");
+
+impl World {
+    fn screen(&mut self, tid: &str, text: &str) {
+        let t = self.terminal(tid);
+        self.d.term.screens.insert(t, text.to_owned());
+    }
+
+    /// A moment passes in which lilad looks at the screens.
+    fn look(&mut self) {
+        self.now += 2000;
+        self.d.look_at(self.now);
+    }
+
+    fn keys_to(&self, tid: &str) -> Vec<String> {
+        let t = self.terminal(tid);
+        self.d.term.keys.iter().filter(|(to, _)| *to == t).flat_map(|(_, k)| k.clone()).collect()
+    }
+}
+
+#[test]
+fn a_thread_at_the_trust_dialog_says_so_with_its_folder_and_trusting_it_sends_what_waited() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({"text": "hello"}));
+    // Claude Code has started and shows the dialog; it reports nothing.
+    w.screen(&tid, TRUST_SCREEN);
+    assert_eq!(w.state(&tid), "starting");
+    w.look();
+    let t = w.ok("thread.show", json!({"thread": tid}));
+    assert_eq!((t["state"].as_str(), t["waiting"].as_str(), t["waiting_for"].as_str(), t["trust_folder"].as_str()), (Some("waiting"), Some("terminal"), Some("trust"), Some("/tmp/shop")), "at once, not after 20 s: {t}");
+    // lilad does not trust by itself, however long it waits.
+    for _ in 0..5 {
+        w.look();
+    }
+    assert!(w.keys_to(&tid).is_empty());
+    assert!(w.sends_to(&tid).is_empty());
+    // Words sent meanwhile wait with the first, like any words to a thread that is still starting; nothing is typed into the dialog.
+    w.ok("thread.send", json!({"thread": tid, "text": "more"}));
+    assert!(w.sends_to(&tid).is_empty());
+
+    // The person trusts the folder: the cursor is moved to "Yes" and seen there, then Enter.
+    let r = w.ok("thread.trust", json!({"thread": tid}));
+    assert_eq!((r["trusted"].as_bool(), r["folder"].as_str()), (Some(true), Some("/tmp/shop")));
+    assert_eq!(w.keys_to(&tid), ["down", "enter"]);
+    assert!(w.events(&tid).iter().any(|e| e == "trusted /tmp/shop"), "{:?}", w.events(&tid));
+    let t = w.ok("thread.show", json!({"thread": tid}));
+    assert_eq!((t["waiting_for"].is_null(), t["trust_folder"].is_null()), (true, true));
+    // Claude Code goes on and reports idle: the first message is typed.
+    w.status(&tid, "idle");
+    assert_eq!(w.sends_to(&tid), ["hello\n\nmore"]);
+    w.look();
+    assert_eq!(w.state(&tid), "idle");
+}
+
+#[test]
+fn trusting_sends_nothing_unless_the_screen_just_read_is_the_dialog() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({}));
+    // No screen, a sign-in screen, a shell, a dialog changed in a detail: no keys, an error that says so.
+    assert!(w.call("thread.trust", json!({"thread": tid})).is_err(), "no screen to read");
+    for screen in [LOGIN_SCREEN.to_owned(), "$ ".to_owned(), TRUST_SCREEN.replace("I trust", "I do not trust"), String::new()] {
+        w.screen(&tid, &screen);
+        let e = w.call("thread.trust", json!({"thread": tid})).unwrap_err().to_string();
+        assert!(e.contains("not at Claude Code's trust dialog"), "{e}");
+    }
+    assert!(w.keys_to(&tid).is_empty());
+    // Not a Claude thread, not running.
+    let codex = w.new_thread(json!({"engine": "codex", "model": "gpt-6.1-sol"}));
+    assert!(w.call("thread.trust", json!({"thread": codex})).unwrap_err().to_string().contains("not a Claude Code thread"));
+    w.screen(&tid, TRUST_SCREEN);
+    let terminal = w.terminal(&tid);
+    w.ok("thread.stop", json!({"thread": tid}));
+    assert!(w.call("thread.trust", json!({"thread": tid})).is_err());
+    assert!(w.d.term.keys.iter().all(|(to, _)| *to != terminal));
+}
+
+#[test]
+fn a_dialog_that_is_not_recognised_leaves_the_thread_waiting_in_its_terminal_as_before() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({}));
+    w.screen(&tid, LOGIN_SCREEN);
+    w.look();
+    let t = w.ok("thread.show", json!({"thread": tid}));
+    assert_eq!((t["state"].as_str(), t["waiting_for"].is_null()), (Some("starting"), true), "nothing is known yet");
+    // After the usual 20 s without a status it waits in the terminal, and that is all it says.
+    w.now += 25_000;
+    w.look();
+    let t = w.ok("thread.show", json!({"thread": tid}));
+    assert_eq!((t["state"].as_str(), t["waiting"].as_str(), t["waiting_for"].is_null(), t["trust_folder"].is_null()), (Some("waiting"), Some("terminal"), true, true));
+    // The dialog then appears (the person was asked to sign in first, and has): it is told apart.
+    w.screen(&tid, TRUST_SCREEN);
+    w.look();
+    assert_eq!(w.ok("thread.show", json!({"thread": tid}))["waiting_for"], "trust");
+    // And is gone when the person answered it in the terminal themself: Claude Code reports, the mark goes.
+    w.screen(&tid, "\n ▐▛███▛█   Claude Code v2.1.322\n");
+    w.status(&tid, "idle");
+    w.look();
+    let t = w.ok("thread.show", json!({"thread": tid}));
+    assert_eq!((t["state"].as_str(), t["waiting_for"].is_null()), (Some("idle"), true));
+    // A thread that is working is never looked at.
+    let reads = |w: &World| w.d.term.screens.len();
+    w.status(&tid, "working");
+    w.look();
+    assert_eq!(reads(&w), 1);
+}
+
+#[test]
+fn the_cursor_is_checked_before_enter_so_a_dialog_that_does_not_move_is_not_answered() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({}));
+    // A dialog that ignores Down: Enter would be pressed on "No, exit", which ends Claude Code.
+    w.d.term.stuck_cursor = true;
+    w.screen(&tid, TRUST_SCREEN);
+    let e = w.call("thread.trust", json!({"thread": tid})).unwrap_err().to_string();
+    assert!(e.contains("could not move the cursor"), "{e}");
+    assert_eq!(w.keys_to(&tid), ["down"], "Down only; never Enter");
+    // A dialog that was answered in the terminal while lilad moved the cursor: it is not the dialog any more.
+    w.d.term.stuck_cursor = false;
+    w.d.term.keys.clear();
+    w.screen(&tid, "$ ");
+    assert!(w.call("thread.trust", json!({"thread": tid})).is_err());
+    assert!(w.keys_to(&tid).is_empty());
+}
+
+// ---------------- "always allow for this thread" ----------------
+
+/// The card the thread has open, with its option labels.
+fn the_card(w: &mut World, tid: &str) -> Value {
+    let read = w.ok("thread.read", json!({"thread": tid}));
+    assert_eq!(read["permissions"].as_array().unwrap().len(), 1, "{read}");
+    read["permissions"][0].clone()
+}
+
+fn labels(card: &Value) -> Vec<String> {
+    card["options"].as_array().unwrap().iter().map(|o| o["label"].as_str().unwrap().to_owned()).collect()
+}
+
+fn rule_keys(w: &mut World, tid: &str) -> Vec<String> {
+    w.ok("thread.show", json!({"thread": tid}))["rules"].as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap().to_owned()).collect()
+}
+
+#[test]
+fn always_allow_on_a_claude_card_is_a_rule_of_the_thread_that_answers_the_next_one() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({"permission": "confirm"}));
+    w.status(&tid, "idle");
+    let cmd = |c: &str| json!({"command": c});
+
+    // The first `cargo test` asks, and the card offers the rule it would make (and says what that allows).
+    assert_eq!(pre(&mut w, &tid, "Bash", cmd("cargo test -p lila"))["verdict"], "ask");
+    let id = claude_ask(&mut w, &tid, "Bash", cmd("cargo test -p lila"))["wait"].as_str().unwrap().to_owned();
+    let card = the_card(&mut w, &tid);
+    assert_eq!(labels(&card), ["允许", "本会话总是允许 cargo test", "拒绝"]);
+    assert_eq!((card["options"][1]["id"].as_str(), card["options"][1]["kind"].as_str(), card["danger"].is_null()), (Some("always"), Some("allow_always"), true));
+    assert!(rule_keys(&mut w, &tid).is_empty());
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
+    let a = w.ok("hook.answer", json!({"thread": tid, "id": id}));
+    assert_eq!((a["decision"].as_str(), a["message"].is_null()), (Some("allow"), true), "Claude Code is told a plain allow: the option is Lila's own");
+    assert_eq!(rule_keys(&mut w, &tid), ["cargo test"]);
+    let shown = w.ok("thread.show", json!({"thread": tid}))["rules"][0].clone();
+    assert_eq!((shown["kind"].as_str(), shown["label"].as_str()), (Some("command"), Some("cargo test")));
+    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["rules"].as_array().unwrap().len(), 1);
+
+    // The same program and sub-command now goes without a card, in PreToolUse and in a PermissionRequest, and the log names the rule.
+    assert_eq!(pre(&mut w, &tid, "Bash", cmd("cargo test --lib"))["verdict"], "allow");
+    assert_eq!(claude_ask(&mut w, &tid, "Bash", cmd("cargo test --doc"))["decision"], "allow");
+    assert!(w.events(&tid).iter().any(|e| e == "auto_allowed confirm · Bash: cargo test --lib · rule: cargo test"), "{:?}", w.events(&tid));
+    // Another sub-command, another program, a chain with a part that is not covered, a wrapper: asked.
+    for c in ["cargo build", "ls", "cargo test && ls", "sudo cargo test", "bash -c 'cargo test'", "cargo test $(ls)", "FOO=1 cargo test"] {
+        assert_eq!(pre(&mut w, &tid, "Bash", cmd(c))["verdict"], "ask", "{c}");
+    }
+    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty(), "nothing waits inside PreToolUse");
+
+    // A chain: `cargo test` is covered, `tail` is offered; and `git commit`, once ruled, still does not let a push through.
+    claude_ask(&mut w, &tid, "Bash", cmd("cargo test 2>&1 | tail -5"));
+    let card = the_card(&mut w, &tid);
+    assert_eq!(labels(&card)[1], "本会话总是允许 tail");
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "本会话总是允许 tail"}));
+    assert_eq!(rule_keys(&mut w, &tid), ["cargo test", "tail"]);
+    assert_eq!(pre(&mut w, &tid, "Bash", cmd("cargo test | tail"))["verdict"], "allow");
+    claude_ask(&mut w, &tid, "Bash", cmd("git commit -am x"));
+    let card = the_card(&mut w, &tid);
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
+    assert_eq!(pre(&mut w, &tid, "Bash", cmd("git commit -m y"))["verdict"], "allow");
+    for c in ["git commit -m y && git push", "git push", "cargo test; git push origin main", "git branch -D x"] {
+        assert_eq!(pre(&mut w, &tid, "Bash", cmd(c))["verdict"], "ask", "{c}");
+        claude_ask(&mut w, &tid, "Bash", cmd(c));
+        let card = the_card(&mut w, &tid);
+        assert_eq!(labels(&card), ["允许", "拒绝"], "a push never gets an always: {c}");
+        assert!(w.call("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"})).is_err());
+        w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": false}));
+    }
+    // Not even in the full tier: the danger is asked, with no "always" on its card.
+    w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
+    assert_eq!(pre(&mut w, &tid, "Bash", cmd("git push"))["verdict"], "ask");
+    claude_ask(&mut w, &tid, "Bash", cmd("git push"));
+    let card = the_card(&mut w, &tid);
+    assert_eq!((labels(&card), card["danger"].as_str()), (vec!["允许".to_owned(), "拒绝".to_owned()], Some("git_push")));
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": false}));
+    // And what was ruled stays for when the tier asks again (the full tier asks nothing it can judge harmless).
+    assert_eq!(rule_keys(&mut w, &tid), ["cargo test", "tail", "git commit"]);
+}
+
+#[test]
+fn rules_survive_a_restart_and_a_resume_go_when_the_tier_is_read_only_and_can_be_taken_back() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({"permission": "confirm"}));
+    w.status(&tid, "idle");
+    claude_ask(&mut w, &tid, "Bash", json!({"command": "touch a"}));
+    let card = the_card(&mut w, &tid);
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch b"}))["verdict"], "allow");
+
+    // lilad restarted: the rule is there and answers.
+    w.restart();
+    assert_eq!(rule_keys(&mut w, &tid), ["touch"]);
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch c"}))["verdict"], "allow");
+    // The thread ended and resumed: still there.
+    w.ok("thread.stop", json!({"thread": tid}));
+    w.ok("thread.resume", json!({"thread": tid}));
+    w.status(&tid, "idle");
+    assert_eq!(rule_keys(&mut w, &tid), ["touch"]);
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch d"}))["verdict"], "allow");
+
+    // Full and back: kept, and answering again. Read-only: forgotten, and logged.
+    w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
+    assert_eq!(rule_keys(&mut w, &tid), ["touch"]);
+    w.ok("thread.permission", json!({"thread": tid, "permission": "read_only"}));
+    assert!(rule_keys(&mut w, &tid).is_empty());
+    assert!(w.events(&tid).iter().any(|e| e == "rules_dropped touch"), "{:?}", w.events(&tid));
+    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch e"}))["verdict"], "ask", "not kept for later");
+
+    // A rule taken back asks again; a rule that is not there is an error.
+    claude_ask(&mut w, &tid, "Bash", json!({"command": "ls"}));
+    let card = the_card(&mut w, &tid);
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
+    let rules = w.ok("thread.show", json!({"thread": tid}))["rules"].clone();
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "ls -la"}))["verdict"], "allow");
+    let r = w.ok("thread.rule.remove", json!({"thread": tid, "rule": rules[0]["id"]}));
+    assert_eq!((r["removed"].as_bool(), r["rules"].as_array().unwrap().len()), (Some(true), 0));
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "ls -la"}))["verdict"], "ask");
+    assert!(w.call("thread.rule.remove", json!({"thread": tid, "rule": rules[0]["id"]})).is_err());
+    assert!(w.call("thread.rule.remove", json!({"thread": tid})).is_err());
+    let log = w.events(&tid);
+    assert!(log.iter().any(|e| e == "rule_added ls") && log.iter().any(|e| e == "rule_removed ls"), "{log:?}");
+}
+
+#[test]
+fn always_on_one_of_several_open_cards_answers_the_others_the_rule_covers() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({"permission": "confirm"}));
+    w.status(&tid, "idle");
+    let ids: Vec<String> = ["touch a", "touch b", "ls"].iter().map(|c| claude_ask(&mut w, &tid, "Bash", json!({"command": c}))["wait"].as_str().unwrap().to_owned()).collect();
+    let read = w.ok("thread.read", json!({"thread": tid}));
+    assert_eq!(read["permissions"].as_array().unwrap().len(), 3);
+    w.ok("thread.answer", json!({"thread": tid, "card": read["permissions"][0]["id"], "option": "always"}));
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": ids[0]}))["decision"], "allow");
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": ids[1]}))["decision"], "allow", "the same rule answers it");
+    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": ids[2]})), json!({"pending": true}), "another program still waits");
+    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().len(), 1);
+    assert!(w.events(&tid).iter().any(|e| e == "auto_allowed confirm · Bash: touch b · rule: touch"), "{:?}", w.events(&tid));
+}
+
+#[test]
+fn edits_inside_the_folder_can_be_allowed_always_and_nothing_outside_and_no_mcp_write() {
+    let mut w = world();
+    w.project();
+    let repo = w.repo.to_string_lossy().to_string();
+    let tid = w.new_thread(json!({"permission": "confirm"}));
+    w.status(&tid, "idle");
+    claude_ask(&mut w, &tid, "Edit", json!({"file_path": format!("{repo}/src/a.rs")}));
+    let card = the_card(&mut w, &tid);
+    assert_eq!(labels(&card)[1], "本会话总是允许改动此文件夹里的文件");
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
+    for tool in ["Edit", "Write", "NotebookEdit"] {
+        let input = if tool == "NotebookEdit" { json!({"notebook_path": format!("{repo}/n.ipynb")}) } else { json!({"file_path": format!("{repo}/src/b.rs")}) };
+        assert_eq!(pre(&mut w, &tid, tool, input)["verdict"], "allow", "{tool}");
+    }
+    // Outside the folder it asks, in confirm too, and offers nothing "always".
+    assert_eq!(pre(&mut w, &tid, "Write", json!({"file_path": "/etc/hosts"}))["verdict"], "ask");
+    claude_ask(&mut w, &tid, "Write", json!({"file_path": "/etc/hosts"}));
+    let card = the_card(&mut w, &tid);
+    assert_eq!(labels(&card), ["允许", "拒绝"]);
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": false}));
+    // A command is not an edit.
+    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch x"}))["verdict"], "ask");
+
+    // An MCP tool that only looks is let through by the tier (nothing to ask); one that writes to the outside world is a
+    // danger, and has no "always". (A rule for one exact tool exists for tools the tier cannot tell: `rules` has its tests.)
+    assert_eq!(pre(&mut w, &tid, "mcp__github__get_pull_request", json!({"number": 4}))["verdict"], "allow");
+    claude_ask(&mut w, &tid, "mcp__github__create_pull_request", json!({}));
+    assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"]);
+}
+
+#[test]
+fn codex_and_acp_own_always_answers_give_way_to_the_one_of_lila() {
+    let mut w = world();
+    w.project();
+    for (engine, model) in [("codex", "gpt-6.1-sol"), ("omp", "deepseek/deepseek-v4")] {
+        let tid = w.new_thread(json!({"engine": engine, "model": model, "permission": "confirm"}));
+        w.status(&tid, "idle");
+        let answer = |w: &World, id: &str| w.commands(&tid).into_iter().rev().find_map(|c| match c {
+            Command::Answer { permission, option } if permission == id => Some(option),
+            _ => None,
+        });
+        // The engine's "for the session" is not shown: one "always", and it is Lila's.
+        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c1", "shell", "cargo test") });
+        let card = the_card(&mut w, &tid);
+        assert_eq!(labels(&card), ["允许", "本会话总是允许 cargo test", "拒绝"], "{engine}");
+        w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
+        assert_eq!(answer(&w, "c1").as_deref(), Some("accept"), "the engine is told a plain allow, so it asks again next time and Lila answers");
+        // The next one is answered by the rule, with the log naming it.
+        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c2", "shell", "cargo test --lib") });
+        assert_eq!(answer(&w, "c2").as_deref(), Some("accept"));
+        assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
+        assert!(w.events(&tid).iter().any(|e| e.ends_with("· rule: cargo test") && e.starts_with("auto_allowed confirm")), "{:?}", w.events(&tid));
+        // What cannot be ruled has no always at all, not even the engine's.
+        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c3", "shell", "bash -c 'rm x'") });
+        assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"], "{engine}");
+        w.host_event(&tid, AgentEvent::PermissionResolved { id: "c3".into() });
+        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c4", "shell", "git push origin main") });
+        assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"]);
+        w.host_event(&tid, AgentEvent::PermissionResolved { id: "c4".into() });
+        // A patch inside the folder: the edit rule; the same patch outside it, in the full tier, a danger without "always".
+        let inside = w.repo.join("src/a.rs").to_string_lossy().to_string();
+        w.host_event_ask(&tid, AgentEvent::Permission { request: edit_ask("c5", &inside) });
+        let card = the_card(&mut w, &tid);
+        assert_eq!(labels(&card)[1], "本会话总是允许改动此文件夹里的文件");
+        w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
+        w.host_event_ask(&tid, AgentEvent::Permission { request: edit_ask("c6", &inside) });
+        assert_eq!(answer(&w, "c6").as_deref(), Some("accept"));
+        w.host_event_ask(&tid, AgentEvent::Permission { request: edit_ask("c7", "/Users/someone/.zshrc") });
+        assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"]);
+        w.host_event(&tid, AgentEvent::PermissionResolved { id: "c7".into() });
+        w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
+        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c8", "shell", "git push origin main") });
+        let card = the_card(&mut w, &tid);
+        assert_eq!((labels(&card), card["danger"].as_str()), (vec!["允许".to_owned(), "拒绝".to_owned()], Some("git_push")), "{engine}: not even the engine's own, which would answer the next push by itself");
+        w.host_event(&tid, AgentEvent::PermissionResolved { id: "c8".into() });
+    }
 }
 
 #[test]

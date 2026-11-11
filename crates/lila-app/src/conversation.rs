@@ -41,11 +41,13 @@ pub struct Conv {
     /// The folder's checkpoints, newest first (`thread.read`'s `checkpoints`): a message of the person's
     /// is the one whose `item` is its id. Whole in every read, so each read replaces them.
     pub checkpoints: Vec<Value>,
+    /// What was allowed "always" for the thread (`thread.read`'s `rules`): `{id, kind, key, label}`. Whole in every read.
+    pub rules: Vec<Value>,
 }
 
 impl Conv {
     pub fn new(thread: String) -> Self {
-        Conv { thread, session: None, seq: 0, items: Vec::new(), ver: Vec::new(), writing: None, config: Value::Null, cards: Vec::new(), checkpoints: Vec::new() }
+        Conv { thread, session: None, seq: 0, items: Vec::new(), ver: Vec::new(), writing: None, config: Value::Null, cards: Vec::new(), checkpoints: Vec::new(), rules: Vec::new() }
     }
 
     /// Folds a `thread.read` reply in: a new session starts over; items
@@ -75,6 +77,7 @@ impl Conv {
         self.config = v["config"].clone();
         self.cards = v["permissions"].as_array().cloned().unwrap_or_default();
         self.checkpoints = v["checkpoints"].as_array().cloned().unwrap_or_default();
+        self.rules = v["rules"].as_array().cloned().unwrap_or_default();
     }
 }
 
@@ -922,6 +925,20 @@ mod tests {
         let busy = |running| build_rows(Some(&c), &[], running, &[]).last().map(|r| r.kind.clone());
         assert_eq!(busy(true), Some(RowKind::Busy));
         assert_eq!(busy(false), Some(RowKind::Item(1)));
+    }
+
+    #[test]
+    fn the_rules_of_each_read_replace_the_last_and_an_older_lilad_has_none() {
+        let mut c = Conv::new("t".into());
+        let mut r = read(json!([]));
+        r["rules"] = json!([{"id": 1, "kind": "command", "key": "cargo test", "label": "cargo test", "at_ms": 5}, {"id": 2, "kind": "edit", "key": "", "label": "改动此文件夹里的文件", "at_ms": 6}]);
+        c.merge(&r);
+        assert_eq!(c.rules.iter().map(|r| r["id"].as_i64().unwrap()).collect::<Vec<_>>(), [1, 2]);
+        r["rules"] = json!([{"id": 2, "kind": "edit", "key": "", "label": "改动此文件夹里的文件", "at_ms": 6}]);
+        c.merge(&r);
+        assert_eq!(c.rules.len(), 1, "one was taken back");
+        c.merge(&read(json!([])));
+        assert!(c.rules.is_empty(), "a lilad that does not say has none");
     }
 
     #[test]

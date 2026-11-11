@@ -11,7 +11,8 @@ use std::path::Path;
 /// only add columns (`ADDED_COLUMNS`), which `migrate` adds to a table that lacks them.
 /// 5: threads got `worktree`, `base_branch`, `base_commit`, `merged_ms`.
 /// 6: the `checkpoints` table, and `outbox.hold` (a note that goes out only with a message).
-const VERSION: i64 = 6;
+/// 7: the `thread_rules` table (what a person allowed "always" for a thread).
+const VERSION: i64 = 7;
 
 /// Columns added to a table after it first existed: an older database gets them by `ALTER TABLE`.
 const ADDED_COLUMNS: [(&str, &str, &str); 5] = [
@@ -88,6 +89,14 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     text TEXT NOT NULL DEFAULT '',
     item TEXT,
     PRIMARY KEY (thread, n)
+);
+CREATE TABLE IF NOT EXISTS thread_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    UNIQUE (thread, kind, key)
 );
 "#;
 
@@ -180,6 +189,16 @@ impl Checkpoint {
     pub fn matched_item(&self) -> Option<&str> {
         self.item.as_deref().filter(|i| !i.is_empty())
     }
+}
+
+/// What a person allowed "always" for a thread (`lila::rules`): kept with the thread, so it survives a restart and a resume.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleRow {
+    pub id: i64,
+    pub thread: String,
+    pub kind: String,
+    pub key: String,
+    pub created_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -327,7 +346,7 @@ impl Store {
     /// Forgets a project and everything Lila recorded for it. Its folder is not touched.
     pub fn remove_project(&self, project: &str) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        for table in ["conv_items", "outbox", "thread_events", "checkpoints"] {
+        for table in ["conv_items", "outbox", "thread_events", "checkpoints", "thread_rules"] {
             tx.execute(&format!("DELETE FROM {table} WHERE thread IN (SELECT id FROM threads WHERE project = ?1)"), [project])?;
         }
         tx.execute("DELETE FROM threads WHERE project = ?1", [project])?;
@@ -416,7 +435,7 @@ impl Store {
 
     pub fn remove_thread(&self, id: &str) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        for table in ["conv_items", "outbox", "thread_events", "checkpoints"] {
+        for table in ["conv_items", "outbox", "thread_events", "checkpoints", "thread_rules"] {
             tx.execute(&format!("DELETE FROM {table} WHERE thread = ?1"), [id])?;
         }
         tx.execute("DELETE FROM threads WHERE id = ?1", [id])?;
@@ -476,6 +495,36 @@ impl Store {
         let mut st = self.db.prepare("SELECT at_ms, thread, actor, kind, detail FROM (SELECT * FROM thread_events WHERE thread = ?1 ORDER BY id DESC LIMIT ?2) ORDER BY id")?;
         let rows = st.query_map(params![thread, limit as i64], |r| Ok(Event { at_ms: r.get(0)?, thread: r.get(1)?, actor: r.get(2)?, kind: r.get(3)?, detail: r.get(4)? }))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ---------- rules: what was allowed "always" ----------
+
+    /// A thread's rules, oldest first.
+    pub fn rules(&self, thread: &str) -> Result<Vec<RuleRow>> {
+        let mut st = self.db.prepare("SELECT id, thread, kind, key, created_ms FROM thread_rules WHERE thread = ?1 ORDER BY id")?;
+        let rows = st.query_map([thread], |r| Ok(RuleRow { id: r.get(0)?, thread: r.get(1)?, kind: r.get(2)?, key: r.get(3)?, created_ms: r.get(4)? }))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Adds a rule (one that is there already stays as it is). Returns whether it is new.
+    pub fn add_rule(&self, thread: &str, kind: &str, key: &str, now: i64) -> Result<bool> {
+        Ok(self.db.execute("INSERT OR IGNORE INTO thread_rules (thread, kind, key, created_ms) VALUES (?1, ?2, ?3, ?4)", params![thread, kind, key, now])? > 0)
+    }
+
+    /// Removes a rule of the thread; returns it, if there was one.
+    pub fn remove_rule(&self, thread: &str, id: i64) -> Result<Option<RuleRow>> {
+        let row = self.rules(thread)?.into_iter().find(|r| r.id == id);
+        if row.is_some() {
+            self.db.execute("DELETE FROM thread_rules WHERE thread = ?1 AND id = ?2", params![thread, id])?;
+        }
+        Ok(row)
+    }
+
+    /// Removes all of a thread's rules; returns them.
+    pub fn clear_rules(&self, thread: &str) -> Result<Vec<RuleRow>> {
+        let rows = self.rules(thread)?;
+        self.db.execute("DELETE FROM thread_rules WHERE thread = ?1", [thread])?;
+        Ok(rows)
     }
 
     // ---------- checkpoints ----------
@@ -727,6 +776,51 @@ mod tests {
         s.add_checkpoint(&checkpoint(1)).unwrap();
         s.remove_thread("t00000001").unwrap();
         assert!(s.checkpoints("t00000001").unwrap().is_empty());
+    }
+
+    #[test]
+    fn rules_belong_to_a_thread_are_kept_once_and_go_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lila.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.upsert_project("shop", "/repo/shop", 1).unwrap();
+            s.create_thread(new("t00000001"), 1).unwrap();
+            s.create_thread(new("t00000002"), 1).unwrap();
+            assert!(s.add_rule("t00000001", "command", "cargo test", 10).unwrap());
+            assert!(!s.add_rule("t00000001", "command", "cargo test", 11).unwrap(), "once");
+            assert!(s.add_rule("t00000001", "edit", "", 12).unwrap());
+            assert!(s.add_rule("t00000002", "command", "cargo test", 13).unwrap(), "another thread's own");
+        }
+        // Kept across opening it again (lilad restarted).
+        let s = Store::open(&path).unwrap();
+        let rules = s.rules("t00000001").unwrap();
+        assert_eq!(rules.iter().map(|r| (r.kind.as_str(), r.key.as_str(), r.created_ms)).collect::<Vec<_>>(), [("command", "cargo test", 10), ("edit", "", 12)]);
+        assert!(s.remove_rule("t00000001", 999).unwrap().is_none());
+        assert!(s.remove_rule("t00000002", rules[0].id).unwrap().is_none(), "not another thread's");
+        assert_eq!(s.remove_rule("t00000001", rules[0].id).unwrap().map(|r| r.key), Some("cargo test".into()));
+        assert_eq!(s.rules("t00000001").unwrap().len(), 1);
+        assert_eq!(s.clear_rules("t00000001").unwrap().len(), 1);
+        assert!(s.rules("t00000001").unwrap().is_empty() && s.rules("t00000002").unwrap().len() == 1);
+        s.remove_thread("t00000002").unwrap();
+        assert!(s.rules("t00000002").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_version_6_database_gains_the_rules_table_and_keeps_its_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lila.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.upsert_project("shop", "/repo/shop", 1).unwrap();
+            s.create_thread(new("t00000001"), 1).unwrap();
+            s.db.execute_batch("DROP TABLE thread_rules; PRAGMA user_version = 6;").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.thread("t00000001").unwrap().unwrap().title, "first");
+        assert!(s.rules("t00000001").unwrap().is_empty());
+        assert!(s.add_rule("t00000001", "command", "ls", 5).unwrap());
+        assert_eq!(s.db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), VERSION);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Lila 架构 v4：项目与会话（lilad 的 socket 接口）
 
-> 2026-11-10 · P1a（后端）和 P1b（窗口，见 §9）；2026-11-11 · P2 后端（worktree、改动、提交、合并，见 §4、§10）；2026-11-11 · A1 后端（每轮检查点和回退，协议版本 2，见 §11）。需求见 `product-v4.md`；引擎驱动和对话事件模型见 `architecture-v3.md`（继续有效）。
+> 2026-11-10 · P1a（后端）和 P1b（窗口，见 §9）；2026-11-11 · P2 后端（worktree、改动、提交、合并，见 §4、§10）；2026-11-11 · A1 后端（每轮检查点和回退，协议版本 2，见 §11）；2026-11-11 · A2 前半（卡片不过期、本会话总是允许、窗口里回答「信任此文件夹」，协议版本 3，见 §6、§12）。需求见 `product-v4.md`；引擎驱动和对话事件模型见 `architecture-v3.md`（继续有效）。
 > 本文和代码一致，窗口只看这份就能接。旧实现（任务、成员、请求）在标签 `v3-final`。
 
 ## 1. 模型
@@ -43,13 +43,13 @@
   |---|---|
   | `starting` | 引擎已启动，还没报过状态 |
   | `running` | 在处理一轮 |
-  | `waiting` | 在等人。`waiting` 字段说等什么：`card`（有权限卡片，在 `thread.read` 的 `permissions` 里）或 `terminal`（终端里有对话框：Claude 的「信任这个文件夹？」、登录；或启动 20 秒还没报状态） |
+  | `waiting` | 在等人。`waiting` 字段说等什么：`card`（有权限卡片，在 `thread.read` 的 `permissions` 里）或 `terminal`（终端里有对话框：Claude 的「信任这个文件夹？」、登录；或启动 20 秒还没报状态）。`terminal` 时 `waiting_for` 说是不是认得出的那一种：现在只有 `trust`（Claude Code 的「信任此文件夹」，见 §12），`trust_folder` 是它问的文件夹；认不出的（登录、别的）是 `null` |
   | `idle` | 在提示符前，能收消息 |
   | `ended` | 引擎进程没了。对话还在，可 `thread.resume` |
 
   另有 `status`：终端报的原始词（`idle`/`working`/`blocked`/`done`/`error`/`unknown`/`gone`）。
 
-- **数据库**（`lila-store`，SQLite，`PRAGMA user_version = 6`）：`projects`、`threads`、`conv_items`（按会话递增的 `seq`）、`outbox`（引擎还不能收时排队的话；`hold = 1` 的是「随下一条消息一起发的备注」，自己不会被发出）、`thread_events`（lilad 自己做过的事）、`checkpoints`（§11：`thread, n, kind(turn|restore), at_ms, sha, tree, head, branch, text, item`，主键 `(thread, n)`）。**v3 的库不迁移**：打开 v3 的库（没有版本号、有 `tasks` 表）时，文件改名为 `lila.db.v3.bak`，新库从空开始。**v4 的库平滑升级**：版本 5 给 `threads` 加了 `worktree`（默认 0）、`base_branch`、`base_commit`、`merged_ms` 四列；`migrate` 每次打开都按 `pragma_table_info` 查缺哪列就 `ALTER TABLE ADD COLUMN`，已有会话变成「不是 worktree」，再打开不变。以后只加列的改动照这样加到 `ADDED_COLUMNS`（现在是 `(表, 列, 定义)`，版本 6 加了 `outbox.hold`；新表用 `CREATE TABLE IF NOT EXISTS`，版本 6 加了 `checkpoints`）。旧库打开后原有的会话、排队的话都照旧。
+- **数据库**（`lila-store`，SQLite，`PRAGMA user_version = 7`）：`projects`、`threads`、`conv_items`（按会话递增的 `seq`）、`outbox`（引擎还不能收时排队的话；`hold = 1` 的是「随下一条消息一起发的备注」，自己不会被发出）、`thread_events`（lilad 自己做过的事）、`checkpoints`（§11：`thread, n, kind(turn|restore), at_ms, sha, tree, head, branch, text, item`，主键 `(thread, n)`）、`thread_rules`（§6「本会话总是允许」：`id, thread, kind(command|edit|tool), key, created_ms`，`(thread, kind, key)` 唯一；会话删除时一起删）。**v3 的库不迁移**：打开 v3 的库（没有版本号、有 `tasks` 表）时，文件改名为 `lila.db.v3.bak`，新库从空开始。**v4 的库平滑升级**：版本 5 给 `threads` 加了 `worktree`（默认 0）、`base_branch`、`base_commit`、`merged_ms` 四列；`migrate` 每次打开都按 `pragma_table_info` 查缺哪列就 `ALTER TABLE ADD COLUMN`，已有会话变成「不是 worktree」，再打开不变。以后只加列的改动照这样加到 `ADDED_COLUMNS`（现在是 `(表, 列, 定义)`，版本 6 加了 `outbox.hold`；新表用 `CREATE TABLE IF NOT EXISTS`，版本 6 加了 `checkpoints`，版本 7 加了 `thread_rules`：旧库打开后只多一张空表，原有的都照旧，有测试）。旧库打开后原有的会话、排队的话都照旧。
 - `changes` 摘要**不进数据库**：lilad 在内存里记，启动时给每个没归档的会话数一遍（后台一个一个数）。
 
 ## 2. 进程与终端
@@ -74,6 +74,8 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 **请求 id**（可选）：请求里可以带 `"id"`（任意 JSON 字符串或数字），lilad 原样放进这条请求的回复：`{"id": "a-1", "result": ...}`、`{"id": 7, "error": "…"}`，`subscribe` 和 `host.attach` 的第一条回复也带。不带 id 的请求，回复和以前一模一样。`id` 是别的类型（对象、数组、布尔）回 `{"error": "bad request: id must be a string or a number"}`；`null` 当作没带；整行不是 JSON 时没有 id 可回。这只是给以后的远程客户端留的：lilad 不做多路复用，回复仍然按顺序，不会乱序。`lila::client` 现在不发 id。
 
 **协议版本 2**（A1）：加了 `thread.checkpoints`、`thread.restore`，`thread.read` 多了 `checkpoints`，会话多了 `restoring`，条目多了 `from: "restored"`。窗口用这些就要求 `protocol >= 2`。
+
+**协议版本 3**（A2）：会话多了 `waiting_for`、`trust_folder`；`thread.show`、`thread.read` 多了 `rules`；加了 `thread.trust`、`thread.rule.remove`；卡片选项多了 Lila 自己的 `always`（见 §6）。窗口都是读这些字段：旧 lilad 没有它们，窗口照旧画「在终端里等你」、没有「总是允许」、权限菜单里没有规则，什么都不坏（所以窗口不查协议号，只是侧栏会照常提示 lilad 版本不符）。
 
 **版本握手**：`lila::PROTOCOL`（`crates/lila/src/lib.rs`）是 socket 协议的版本号，方法、参数、回复有不兼容的改动就加一。`ping` 和 `status` 都带 `version`（`CARGO_PKG_VERSION`）和 `protocol`。窗口和命令行用 `lila::client::daemon_version` 比较：协议一样、不一样（带两边的数字；还没有这套握手的旧 lilad 不报协议，算不一样）、没有运行、连不上。重装或重新编译后，旧 lilad 会一直跑着（会话在各自的终端里，重启 lilad 是安全的），所以窗口和 `lila daemon status` 会提示，`lila daemon restart` 或窗口里的按钮重启它。
 
@@ -119,7 +121,9 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 | `thread.archive` / `thread.unarchive` | `thread` | 会话。归档会先结束引擎；worktree 会话归档时 worktree 和分支**保留**，取消归档后可以继续（`thread.resume`）。现在没有单独删除 worktree 的入口（合并是唯一会删的地方） |
 | `thread.rename` | `thread`, `title` | 会话 |
 | `thread.permission` | `thread`, `permission` | 会话。立即生效，不用重启，见 §6 |
-| `thread.answer` | `thread`, `card`｜`permission`, `option`｜`allow`｜`dismiss` | `{thread, card, answered: true}`。回答权限卡片：`option` 是卡片选项的 `id` 或 `label`；`allow: true/false` 选第一个允许或拒绝的选项；`dismiss: true`（只对 Claude）关掉卡片、让 Claude Code 在自己的终端里问。卡片已经没了（别处答过、引擎收回了）报错 |
+| `thread.answer` | `thread`, `card`｜`permission`, `option`｜`allow`｜`dismiss` | `{thread, card, answered: true}`。回答权限卡片：`option` 是卡片选项的 `id` 或 `label`（`always` 见 §6：先把卡片说的规则加给会话，再用引擎的普通「允许」回答；这一刻不再提供就报错）；`allow: true/false` 选第一个允许或拒绝的选项；`dismiss: true`（只对 Claude）关掉卡片、让 Claude Code 在自己的终端里问。卡片已经没了（别处答过、引擎收回了）报错 |
+| `thread.rule.remove` | `thread`, `rule` | `{thread, rule, removed: true, rules}`。收回一条「总是允许」（`rule` 是 `rules` 里的 `id`），它允许的以后又会问；没有这条规则报错 |
+| `thread.trust` | `thread` | `{thread, trusted: true, folder}`。人信任 Claude Code 正在问的文件夹，见 §12。屏幕不是那个对话框就报错，什么键都不按 |
 | `thread.model` | `thread`, `model?`, `effort?` | `{set: true}`。Codex、omp 运行中立即换（omp 只能换它列出的）；Claude 运行中拒绝（它的 `/model` 会改用户的全局默认），要先 stop 再改再 resume；ended 的会话只改存的值，下次启动用 |
 | `thread.run` | `thread`, `action` | `{ran: true}`。现在只有 Codex 的 `compact` |
 | `thread.commands` | `thread` | `{commands: [{name, description, kind: builtin｜skill｜command, hint, insert, action}]}`，`/` 菜单的内容 |
@@ -142,7 +146,8 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
  "terminal": "t78"|null, "caps": {"tui": false, "gui": true, "steer": true},
  "created_ms": 0, "active_ms": 0, "started_ms": 0, "ended_ms": null, "archived": false,
  "worktree": false, "base_branch": null, "base_commit": null, "merged_ms": null, "merging": false, "restoring": false,
- "changes": {"files": 3, "add": 40, "del": 2}|null}
+ "changes": {"files": 3, "add": 40, "del": 2}|null,
+ "waiting_for": "trust"|null, "trust_folder": "/abs/path"|null}
 ```
 
 `model`/`effort` 是引擎正在用的（Claude 取自最近一条回复的 `model`；Codex、omp 取自引擎报告），没有就是存的。`cards` 是待答卡片数。`msg` 是终端报的说明（比如 blocked 的原因）。`caps`：`tui` 能切到终端（只有 Claude），`steer` 运行中发的话能进当前这一轮（omp 不能，会排到下一轮）。
@@ -150,13 +155,14 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 `thread.read`：
 
 ```json
-{"thread": {会话}, "seq": 12, "items": [...], "permissions": [卡片], "writing": "正在写的回复"|null, "checkpoints": [检查点],
+{"thread": {会话}, "seq": 12, "items": [...], "permissions": [卡片], "writing": "正在写的回复"|null, "checkpoints": [检查点], "rules": [规则],
  "config": {"model": "…", "effort": "…", "default_model": "…", "default_effort": "…", "switch": true, "models": [{id,name}], "efforts": [{id,name}]}}
 ```
 
 - `items`：`seq` 大于 `after` 的条目，旧到新；超过 `limit` 取最新的。同一个 `id` 的条目更新时整条覆盖并拿到新的 `seq`，所以客户端按 `id` 替换。`seq` 是返回的最大序号，下次当 `after`。条目格式是 `lila_agent::Item`：`{id, turn?, at_ms, state: running｜done｜failed, kind: user_message｜agent_message｜thought｜tool_call, …}`，用户消息带 `from: person｜local｜summary`，工具调用带 `tool`（`execute/read/edit/search/fetch/delete/…`）、`name`、`title`、`output?`、`diffs?`。
 - `checkpoints`：和 `thread.checkpoints` 的 `checkpoints` 一样（§11）。窗口用其中的 `item` 把「回到这里」挂到对应的用户消息上；因为 `item` 可能比消息晚才有，窗口每次读都按这份列表重新挂，不要只看新来的条目。
 - `from: "restored"` 的条目：回退留下的安静标记，`{id: "restored-<检查点>-<毫秒>", kind: "user_message", from: "restored", checkpoint: 3, undo: 7, text: "…", at_ms}`；窗口自己画「已回到这里」，`undo` 是回退前状态的检查点（可以再回退一次来撤销）。
+- `rules`（`thread.show` 里同样有）：会话的「总是允许」规则，旧到新：`{id, kind: command｜edit｜tool, key, label, at_ms}`，`label` 是给人看的（`cargo test`、`改动此文件夹里的文件`），见 §6。
 - `writing`：Claude 的 `MessageDisplay` 增量攒出的「正在写」，会话记录里有了回复就清掉。
 - `permissions`：待答的卡片：
 
@@ -166,7 +172,7 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
    "danger": "git_push"|null, "options": [{"id": "accept", "label": "允许", "kind": "allow"}, …], "at_ms": 0}
   ```
 
-  `danger`：`outside_workspace`｜`git_push`｜`external_action`｜`computer_use`，档位本身要问（`confirm`）时为空。选项的 `kind`：`allow`｜`allow_always`｜`reject`｜`reject_always`。
+  `danger`：`outside_workspace`｜`git_push`｜`external_action`｜`computer_use`，档位本身要问（`confirm`）时为空。选项的 `kind`：`allow`｜`allow_always`｜`reject`｜`reject_always`。**`allow_always` 只有 Lila 自己的那一个**（id `always`，`label` 写明会允许什么，如「本会话总是允许 cargo test」），见 §6；引擎自己的「总是」选项不出现在卡片上。
 - `config.switch`：窗口能不能让用户换模型和努力程度（见 `thread.model`）。
 
 **改动、diff、文件、提交、合并**（`thread.changes`、`diff`、`file`、`commit`、`merge`；P2）：
@@ -197,7 +203,7 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 
 **改动摘要**（`changes` 字段）不是实时的：lilad 在这些时候重新数，**变了才**推送（`thread` 事件，`changes` 字段也带在事件里）：每一轮结束（Claude 的 Stop 和 StopFailure hook、终端状态从工作中/被拦转为空闲，Codex、omp 的 turn 结束）、`thread.commit` 发出后、`thread.merge` 之后、会话建好时、取消归档时、lilad 启动时（所有没归档的会话）。一轮进行当中不数，更不是每 100ms 跑 git；用户自己在 worktree 里改文件要等下一次触发才反映，窗口要最新的就调 `thread.changes`（它也会更新摘要）。摘要在后台一个一个数，同一个会话数的时候又被要求就在数完后再数一次。
 
-`thread.log` 的 `kind`：`checkpoint_failed`（这一轮没打成检查点，`detail` 是原因，轮照常进行）、`restored`（`detail`：`checkpoint 3 (首行): 1 put back, 1 made again, 1 deleted; undo is checkpoint 7`）、`restore_failed`、`started`、`ended`、`resumed`、`auto_allowed`、`auto_denied`、`asked`（开了卡片）、`answered`、`dismissed`、`permission`（档位切换）、`turn_failed`、`notice`、`limit`、`commit`（要 agent 提交）、`merged`（`detail`：`2 commit(s) into main as f898670`）、`merge_failed`。`auto_allowed`/`auto_denied` 记着档位和请求，是审计「lilad 替你答了什么」的地方。
+`thread.log` 的 `kind`：`checkpoint_failed`（这一轮没打成检查点，`detail` 是原因，轮照常进行）、`restored`（`detail`：`checkpoint 3 (首行): 1 put back, 1 made again, 1 deleted; undo is checkpoint 7`）、`restore_failed`、`started`、`ended`、`resumed`、`auto_allowed`、`auto_denied`、`asked`（开了卡片）、`answered`、`dismissed`、`permission`（档位切换）、`turn_failed`、`notice`、`limit`、`commit`（要 agent 提交）、`merged`（`detail`：`2 commit(s) into main as f898670`）、`merge_failed`、`rule_added`（人点了「总是允许」，`detail` 是加的规则）、`rule_removed`、`rules_dropped`（切到只读时规则被清掉）、`trusted`（`thread.trust`，`detail` 是文件夹）。`auto_allowed`/`auto_denied` 记着档位和请求，是审计「lilad 替你答了什么」的地方；规则答的那条以 `· rule: cargo test` 结尾，点名是哪条规则；`dismissed` 也记「它的 hook 不再来问」（卡片被丢弃，见 §6）。
 
 ### 其他
 
@@ -246,7 +252,7 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 - **Claude Code**：始终以 `--permission-mode manual` 启动，**每个工具调用在跑之前**先走 `PreToolUse` hook（`daemon/hooks.rs::pre_tool_use`），lilad 按会话的档位（`policy::decide`）判定，所以切档不用重启（实测：`lila thread permission` 之后的下一个工具调用就按新档位）：
   - **allow**：Claude Code 不再问。这个 allow 也盖过 Claude Code 的「命令里有变量，没法事先检查」之类的确认，但盖不过它对「工作目录以外的路径」的检查（那个框照样弹，到 `PermissionRequest`，见下）。
   - **deny**（带文字）：工具不跑，文字回到 agent（Claude Code 在对话里把它显示成「PreToolUse:Bash hook error: …」）。
-  - **ask**：Claude Code 弹自己的确认框，弹框触发 `PermissionRequest` hook，lilad 在那里开卡片；人的回答走原来的 `hook.answer`（hook 每 0.5 秒问一次，最多 570 秒；卡片被 `dismiss`、lilad 重启丢了请求、超时：hook 什么都不输出，Claude Code 在终端里问，会话变 `waiting`/`terminal`）。`PreToolUse` 里不等人。
+  - **ask**：Claude Code 弹自己的确认框，弹框触发 `PermissionRequest` hook，lilad 在那里开卡片；人的回答走原来的 `hook.answer`（hook 每 0.5 秒问一次，**不设上限**地等，卡片不过期，见下「卡片不过期」；只有卡片被 `dismiss` 时 hook 什么都不输出，Claude Code 在终端里问，会话变 `waiting`/`terminal`）。`PreToolUse` 里不等人。
   - 用户自己配的 allow 规则（实测：项目 `.claude/settings.json` 里的 `Bash(touch:*)`、`Edit`、`Write`）**不再绕过 lilad**：hook 的 deny 和 ask 都压过 allow 规则（`read_only` 档里 `touch x` 被拒；`confirm` 档里照样出卡片）。在手写 hook 加开着沙箱的会话里也验证过 ask、deny 压过 `autoAllowBashIfSandboxed`。
   - 两个 hook 的负载（2.1.322 实测）：`PreToolUse` 有 `session_id, transcript_path, cwd, scratchpad_dir, prompt_id, permission_mode, effort, hook_event_name, tool_name, tool_input, tool_use_id`；`PermissionRequest` 有同样的，**没有 `tool_use_id`**，而且 `permission_suggestions` 有时有（空数组）有时没有。所以两个 hook 靠 `tool_name` 加 `tool_input` 的哈希对上：`PreToolUse` 把判定记下（每个会话最近 64 个、10 分钟内），后到的 `PermissionRequest` 取走：判定是 ask 就直接开卡片（不再按档位判一次，日志里只有一条 `asked`）；判定是 allow（Claude Code 自己还要问，比如工作目录以外的路径）就再放行一次，不再记日志；对不上（没有 `PreToolUse`：旧会话、lilad 当时没起来；输入被别的 hook 改过）就照旧按档位判，行为和以前一样。
   - 日志（`thread_events`）：看东西的工具（`policy::reads`：读、搜索、取网页，Claude 自己的待办、提问、`ToolSearch` 这类 `INERT` 里的）放行不记；其他自动回答每个调用记一条（`auto_allowed`/`auto_denied`），出卡片时记 `asked`。`PreToolUse` 看得到所有调用，包括 Claude Code 本来不问的，所以 `confirm` 档下不在 `reads` 里的新工具会出卡片、`read_only` 档下会被拒；Claude Code 新增了无害的内部工具时，要加进 `policy::INERT`。
@@ -262,6 +268,35 @@ unix socket：`$LILA_HOME/state/lilad.sock`（没设 `LILA_HOME` 时 `~/.local/s
 
   `full` 的做法：沙箱本身不让写工作区外、不让联网，所以 `git push`、`gh pr create` 这些要靠「请求越出沙箱」才能执行，请求到 lilad 手里按上面四类判定（实测：`git push` 出卡片）。代价是装依赖、拉代码这类联网命令也会多一轮「请求越出沙箱」，由 lilad 自动允许。Codex 的 `item/permissions/requestApproval`（模型主动申请额外权限）目前直接回「不支持」，不问人。
 - **ACP（omp）**：omp 对执行、编辑、删除、移动类工具发 `session/request_permission`，全部到 lilad，按档位判定，切档立即生效；读类不问。
+
+### 卡片不过期，lilad 重启也在（A2）
+
+- Claude Code 2.1.322 对 hook 的 `timeout`（设置里的秒数）取 `min(timeout × 1000, 2^31−1)` 毫秒（二进制里的 `Math.min(…, 2147483647)`，约 24.8 天，计时器能放下的最大值），默认 10 分钟。实测：`timeout: 99999999` 不会被立刻杀（没有溢出），一个 20 秒的 hook 照常跑完。所以 `PermissionRequest` 的 `timeout` 写 **2 000 000 秒**（`hooks::PERMISSION_WAIT_SECS`，约 23 天），`lila hook` 自己没有等待上限，等到人答、卡片被 `dismiss` 或 Claude Code 把它杀掉。端到端实测：`confirm` 档下一张卡片放了 11 分钟再答，hook 还在，命令照常执行。不需要「到点先回 deny」的办法。
+- 只有新启动或 `resume` 的会话有新的 `timeout`；已经在跑的会话的 settings 文件里还是 600 秒，要结束再恢复。
+- **lilad 重启**：等着的 hook 进程还活着，继续每 0.5 秒问。新的 lilad 不认得这个请求 id，`hook.answer` 回 `{"decision": null, "unknown": true}`；hook 于是带上原来的 `payload` 再问一次（只在 lilad 说不认得时才带，平时不传几百 KB 的写入内容），lilad 把它当作新的 `PermissionRequest` 重新判（`permission_hook(…, again: Some(id))`）：按档位重新答或重开卡片（卡片又出现，判的是现在的档位，所以重启期间切了档就按新档位）。会话已结束就不重开。hook 的请求 id 带 lilad 的启动时刻（`hook-<boot>-<n>`），重启前后的不会撞。lilad 不在时 hook 的请求失败，它继续问到 lilad 回来为止。旧版 `lila hook`（没有这套）遇到 `unknown` 照旧退到终端。实测：卡片开着时 `lila daemon restart`，6 秒内卡片带着同样的内容回来，答了之后命令执行。
+- **卡片跟着 hook 走**：每次 `hook.answer` 记下这张卡片最后被问的时间；超过 30 秒没人问（Claude Code 因为人在终端里答了、或被中断而杀了 hook），卡片就丢掉并记 `dismissed`；这一轮结束（`Stop`、`StopFailure`）时 Claude 线程的卡片也直接丢。线程结束（`thread_gone`）照旧清掉所有卡片。
+
+### 本会话总是允许（A2，`crates/lila/src/rules.rs`）
+
+`confirm` 档下每个命令和每次改动都是卡片，长任务没法用。卡片多一个选项，点了就把一条或几条**规则**记在会话上（`thread_rules`，lilad 重启、`thread.resume` 之后还在），之后同样的请求由 lilad 直接放行，不再出卡片。
+
+**规则的形状**（简单、可预期）：
+
+| 种类 | 内容 | 例 |
+|---|---|---|
+| `command` | 命令的**程序**，对按子命令用的工具（`git cargo npm pnpm yarn bun docker kubectl gh brew pip pip3 uv go make just rustup`）再加第一个子命令词 | `cargo test`、`git commit`、`npm run`、`ls`、`touch` |
+| `edit` | 会话文件夹里的改动：改文件的工具（Claude 的 Edit/Write/NotebookEdit，Codex 的补丁，ACP 的编辑），所列的文件都在文件夹里（且列了文件） | 「改动此文件夹里的文件」 |
+| `tool` | 一个 MCP 工具，名字完全一样（`mcp__…`） | `mcp__github__get_pull_request` |
+
+- 程序按**写出来的词**比：`cargo` 不是 `/usr/bin/cargo`，`cargo-evil` 不是 `cargo`；没有「更宽」的规则（不按前缀、不按别名、不按路径）。子命令词必须是普通的小写词（`cargo +nightly test`、`git -C x status`、`git --no-pager log` 不成规则，因为那个词是选项）。
+- **一行里串了几个命令**（`;`、`&&`、`||`、`|`、`&`、换行；用 `policy::split_commands` 切）：只有**每一段都有规则**才放行。卡片上的选项把**还没有规则的**那几段一起列出（`本会话总是允许 cargo test、tail`，最多 3 段，更多就不提供），点一下加几条规则。`cd`/`pushd`/`popd` 不算命令。
+- **不提供、也永远不按规则放行**：包装器（`sudo env command time nohup nice timeout xargs watch exec eval source bash sh zsh …`，含 `bash -c`）、解释器和包运行器（`python node deno ruby perl php lua osascript awk npx bunx uvx pipx`）、`find ssh scp nc tmux screen open`、名字就说明会动文件的（`rm rmdir dd shred mkfs kill killall pkill chmod chown chgrp trash unlink`）、以 `VAR=值` 开头的行、命令替换（`$(…)`、反引号、`<(…)`）、here-document、子 shell 和 `if/for/while`、用变量或通配符当程序的、一行里有任何一段属于以上的；子命令里会跑任意东西的也不行（`npm exec`、`pnpm dlx`、`docker run/exec/compose`、`kubectl exec/run`、`bun x`、`uv tool`）。
+- **危险永远不被规则吞掉，也不提供**：`rules::derive` 和 `rules::covers` 先问 `policy::danger`（工作区外、`git push`/删分支、对外动作、computer use），有就一律 `None`。这个检查是对**请求本身**做的，不依赖档位怎么问的：`confirm` 档里 `git push` 的卡片 `danger` 是空的（档位问的），但它照样没有「总是」选项、不会被 `git` 之类的规则放行（实测、有测试）。`full` 档的危险卡片（`danger` 非空）同样没有。只有 `confirm` 档、`danger` 为空、且规则能把「会允许什么」说准的卡片才有这个选项。
+- **选项**：id `always`，`kind: allow_always`，标签写明从现在起允许什么（`本会话总是允许 cargo test`、`本会话总是允许改动此文件夹里的文件`）。放在「允许」之后、「拒绝」之前。点的时候 lilad 再算一遍（档位、规则可能变了），不再提供就报错。答的时候先加规则、记 `rule_added`，再用引擎自己的普通「允许」选项回答，所以对 Claude 就是一个 allow；同一会话里这时还开着的、被新规则答得了的别的卡片一起答掉（Claude 常一次发好几个调用）。
+- **三个引擎怎么合成「一个总是」**：Codex 的 `acceptForSession`、ACP 的 `allow_always`/`reject_always` 的含义是引擎自己的（范围 Lila 说不出，也收不回、重启就没了），所以**卡片上一律不出现**，由 Lila 的 `always` 取代；点了之后引擎收到的是普通的 allow，下一次同样的请求还是先到 lilad，由规则答，日志里点名规则。引擎自己的「总是」会让引擎自己吞下以后的危险请求（比如 `git push`），所以危险卡片上也一并去掉。没有普通 allow 选项的请求（理论上有）保留引擎的选项不动。Codex、omp 只有假 host 的单元测试，没有真跑。
+- **答的地方**：`ask_permission`（Codex、ACP、Claude 的 `PermissionRequest`）和 `pre_tool_use`（Claude 每个调用）在档位判成 `Ask`、`danger` 为空、档位是 `confirm` 时先看规则；规则放行也记 `auto_allowed confirm · Bash: cargo test --lib · rule: cargo test`。`full` 档里规则不起作用（保留着）；**切到 `read_only` 时规则全部清掉**（记 `rules_dropped`），再切回 `confirm` 也不回来。
+- 窗口里规则列在权限档菜单里，每条一行点一下收回（`thread.rule.remove`）；命令行 `lila thread rules <id> [--remove N]`。
+- **实际上还用不上的**：`tool` 规则现在不会被提供：档位在 `confirm` 下问的 MCP 工具只有名字带写动词的，它们本来就是「对外动作」的危险；不带写动词的 MCP 工具档位当作读，直接放行。规则本身有单元测试，等 P3 接了档位分不清的 MCP 工具才派上用场。
 
 ### Claude Code 自带的沙箱（A1 调查，2026-11-11，**没有启用**）
 
@@ -290,7 +325,9 @@ lila thread interrupt|stop|archive|unarchive <id>
 lila thread resume <id> ["话"] [--model --effort --permission]
 lila thread rename <id> <标题>
 lila thread permission <id> read_only|confirm|full
-lila thread answer <id> <卡片> allow|deny|dismiss|<选项>
+lila thread answer <id> <卡片> allow|deny|always|dismiss|<选项>
+lila thread rules <id> [--remove N]    # 本会话「总是允许」的规则；--remove 收回一条
+lila thread trust <id>               # 信任 Claude Code 在终端里问的文件夹（只在屏幕上正是那个对话框时按键）
 lila thread model <id> [--model --effort]
 lila thread changes <id>             # 分支、提交（worktree）、改动的文件和行数
 lila thread diff <id> [路径]          # 改动的 diff（一个文件或全部）
@@ -322,6 +359,8 @@ lila --json …                        # 任何命令都能输出原始 JSON
 | `lila/src/checkpoint.rs` | 检查点的 git 工作（§11）：打快照、放回、删 ref |
 | `lila/src/daemon/checkpoints.rs` | 什么时候打、检查点怎么对上对话里的消息、回退的前置条件和后续 |
 | `lila/src/policy.rs` | 档位判定（§6） |
+| `lila/src/rules.rs` | 「本会话总是允许」的规则：怎么从请求算出规则、哪些请求被规则答、标签（§6） |
+| `lila/src/daemon/trust.rs` | 认出 Claude Code 的「信任此文件夹」对话框，`thread.trust`，每 2 秒看一次屏幕（§12）；`daemon/fixtures/` 是 2.1.322 真实屏幕文字 |
 | `lila/src/project.rs` | project.toml 的读写 |
 | 留着、没人调用的 | `github.rs`、`daemon/sources.rs`（P4）；它们不依赖任务和流程，能独立编译、有测试 |
 
@@ -345,6 +384,9 @@ lila --json …                        # 任何命令都能输出原始 JSON
 | 右面板：文件、改动（P2） | 标题行按钮和 ⇧⌘E / ⇧⌘G 开关，宽度、视图记在 `state/app-panel.json`。文件树 `thread.files`，预览 `thread.file`；改动 `thread.changes`、点开一行 `thread.diff {path}`；提交 `thread.commit`，合并 `thread.merge`（确认后；成功就离开会话）。重新读的时机：打开、切视图、换会话、推送里该会话的 `changes` 摘要或 `state` 变了、提交或合并之后 |
 | 新会话选独立 worktree | `project.list` 的 `repo` 为真才有开关；发出时 `thread.new {…, worktree: true}`（回复要等 worktree 建好，窗口在后台等，发送按钮转圈） |
 | 每轮的「回到这里」（A1，`restore.rs`） | `thread.read` 的 `checkpoints`（窗口每次读都整份换掉，按 `item` 对上用户消息）。一条 `from: person` 的消息有按钮，要同时：有 `kind: turn`、`item` 对得上、`restorable` 为真的检查点；会话 `idle`/`ended`、没在合并或回退、没合并过；`ping` 的 `protocol` ≥ 2。点了先 `thread.restore {dry_run: true}`（后台线程，按钮转圈），回复的 `counts`、清单、`truncated`、`head_moved` 放进确认框；全是 0 就只说「文件已经是这个样子」，没有可确认的。确认后 `thread.restore`（后台线程；窗口记在 `restore.going`，lilad 的 `restoring` 也算，这期间对话末尾转圈、输入框不发送）；回复后不论成败都 `refresh_now` 并重读右面板（失败也读：可能做到一半）。失败的文字原样放进窗口顶部的红色提示条（和别处操作失败一样，可关）。条目 `from: "restored"` 画成「已回到这里」一行；`undo` 对应的检查点还在列表里且 `restorable` 时带「撤销」，走同一条 dry run、确认、回退的路。窗口不调 `thread.checkpoints`，也不读 `can_restore`/`why_not`（`thread.read` 里没有；每行的 `restorable` 够用） |
+| 权限卡片的「总是允许」（A2） | 卡片选项由 lilad 给，窗口照画（`ui::permission_card`）：第一个 allow 是主按钮，其余 outline，所以「本会话总是允许 cargo test」是第二个 outline 胶囊；标签超过 44 字截断、tooltip 是全文；窄时按钮折行。点了 `thread.answer {option: "always"}`。旧 lilad 不给这个选项，卡片和以前一样 |
+| 会话的规则（A2） | 权限档菜单（输入框工具条里的权限按钮）：三档下面一条线，每条规则一行「不再总是允许 cargo test」加 × 图标，点一下 `thread.rule.remove`。数据来自 `thread.read` 的 `rules`（`Conv.rules`，每次读整份换）；新会话的输入框没有规则 |
+| 引擎在终端里等「信任此文件夹」（A2） | `thread.show` 的 `waiting == "terminal"` 且 `waiting_for == "trust"`：输入框上方那一行写「信任此文件夹」和文件夹（`trust_folder`，长了留结尾），右边「打开终端」（outline）和主按钮「信任并继续」→ `thread.trust`（后台，按钮转圈；失败的话是顶部红色提示条）。别的终端等待、旧 lilad：仍是「Claude Code 在终端里等你」加主按钮「打开终端」 |
 | 已合并的会话 | `merged_ms` 有值：输入框换成「已合并到 <base_branch> · <sha>」，sha 从 `thread.log` 里 `merged` 那条的 `detail`（`… as f898670`）取 |
 
 - 窗口记着：上次显示的会话和项目、哪些会话切成了终端视图（`state/app-tabs.json`、`app-views.json`）。折叠的项目、归档开关不记。
@@ -356,7 +398,7 @@ lila --json …                        # 任何命令都能输出原始 JSON
 - **建**：`thread.new {worktree: true}`。项目文件夹必须是 git 仓库的**根目录**（`worktree::is_repo_root`：仓库里的子文件夹、整个 home 在 git 里都不行）、在某个分支上、已有提交。worktree 在仓库外：`<data>/worktrees/<项目>/<会话 id>`（`Paths::worktree`，`LILA_HOME` 下就在它的 `data/` 里），分支 `lila/<会话 id>`，从项目文件夹当前分支的 HEAD 建（`git worktree add -b`）；记下 `base_branch` 和 `base_commit`。引擎在里面启动：`cwd`、终端的工作目录、`LILA_ROOT` 都是它，权限档判定的「工作区」也是它（所以 worktree 会话动项目文件夹里的文件会被当成工作区外）。
 - **留**：归档、结束（`thread.stop`）都不动 worktree；`thread.resume` 在同一个 worktree 里继续（worktree 的文件夹被手工删了会报错）。项目被移除（`project.remove`）也**不**删它的 worktree 和分支。没有单独删 worktree 的入口，`thread.merge` 是唯一会删的地方。
 - **合并**（`merge::run`，在主循环外）：分支上相对 `base_branch` 的全部提交（`base_branch..HEAD`）压成一个提交——只有一个提交就原样用它；多个就用会话标题当第一行、正文逐条列各提交的标题（`- 标题`）——放到 `base_branch` 最新提交之上（`git rebase`），再在项目文件夹里 `git merge --ff-only`，所以项目文件夹的分支只是向前移动；然后会话的引擎结束、会话归档并记 `merged_ms`，worktree 和分支由另一个后台 job 删掉（失败记 `notice`，不影响合并的结果）。`git commit`（压缩时）和 rebase 照常跑用户的 hook 和 git 配置。开始改动 worktree 之前先查完所有会失败的条件（见 `thread.merge`）；rebase 冲突、commit hook 拒绝、ff 失败时 `git reset --hard` 回合并前的提交、`rebase --abort`，worktree 的分支和项目文件夹都是原样。ff 时 `base_branch` 刚好又前进了就重新 rebase 再试（最多重试 3 次）。
-- **已知的局限**：worktree 里只有 git 跟踪的文件，被忽略的（`.env`、`node_modules/`、`target/`）不会带过去，引擎在里面可能跑不起来，目前不处理；Claude Code 对每个新文件夹会先问「信任这个文件夹」（和 P1 留下的问题一样，`waiting: terminal`）；`.lila/project.toml` 没提交的话 worktree 里没有它。
+- **已知的局限**：worktree 里只有 git 跟踪的文件，被忽略的（`.env`、`node_modules/`、`target/`）不会带过去，引擎在里面可能跑不起来，目前不处理；Claude Code 在没信任过的仓库里第一次开 worktree 会话可能先问「信任这个文件夹」（现在窗口里可以答，§12；项目文件夹已经信任过的，实测 worktree 不再问）；`.lila/project.toml` 没提交的话 worktree 里没有它。
 
 ## 11. 检查点和回退（A1）
 
@@ -423,3 +465,13 @@ lila --json …                        # 任何命令都能输出原始 JSON
 - 回退只更新工作区的文件，**不更新用户的 index**：回退之前暂存的内容、回退后 index 里还是原来那份。
 - Claude 的 hook 超时 30 秒（旧会话 10 秒）：快照超时时 Claude 不等，这一轮可能已经开始动文件。Claude 运行中排队的消息会不会也触发 `UserPromptSubmit` 没有验证；如果会，那只是多一个检查点（无害，没变化就复用同一个提交）。
 - 回退进行中（几秒）用户在 Claude 自己的终端里提交了消息，这一轮不打检查点（记 `checkpoint_failed`）。
+
+## 12. 在窗口里回答「信任此文件夹」（A2）
+
+Claude Code 在没信任过的文件夹里（新项目）先在终端里问「信任此文件夹」，这时它不报任何状态（`hc` 的 `status` 为空、`reported: false`），会话以前要等 20 秒才变成「在终端里等你」。
+
+- **认出**：`trust::recognise` 读 `terminal.read` 的屏幕文字（2.1.322 的真实文字存在 `daemon/fixtures/claude-trust-2.1.322.txt`，登录屏幕的存在 `claude-login-2.1.322.txt` 当反例）。要求同时有：一行 `Accessing workspace:`、一行 `Quick safety check…`、紧挨着的两行选项 `No, exit` 和 `Yes, I trust this folder`（光标 `❯` 在其中恰好一个上，启动时在 `No, exit`）、一行以 `Enter to confirm` 开头；文件夹是前两行之间的文字（路径长了会折行，拼回去）。缺一样、顺序不对、多出别的字，都认不出，那时一切照旧。
+- **看的时机**：每 2 秒（`Input::Look` → `Daemon::look`）读一次**状态是 `starting` 或 `waiting`/`terminal` 的 Claude 线程**的屏幕（刚启动 1 秒内不看；在工作的线程从不看）。认出了：`trust_seen[线程]=文件夹`，会话立刻是 `waiting`/`terminal`、`waiting_for: "trust"`、`trust_folder`，不再等 20 秒（实测：启动后约 3 秒）；屏幕不再是这个对话框（人自己在终端里答了，Claude 开始报状态）就去掉。
+- **`thread.trust {thread}`**：只对在跑的 Claude 线程。**先读屏幕**，不是这个对话框就报错、什么键都不按。光标在 `No, exit` 上时按 `down`，再读屏幕，**看到光标在 `Yes` 上**（最多等 1.5 秒）才继续，否则报错（那时不会按 Enter：Enter 在 `No, exit` 上会让 Claude Code 退出）；按 `enter` 之前**再读一次**屏幕确认。然后记 `trusted`，会话继续，排队的第一条消息在 Claude 报 `idle` 后照常发出（实测）。lilad 自己从不信任：没有「总是信任」的设置，窗口里是一个按钮，命令行是 `lila thread trust`。对话框还在时发的消息和别的排队的话一起等着，不会打进对话框。
+- **实测**（Claude Code 2.1.322，临时文件夹）：对话框约 1 秒内被认出；`thread.trust` 按 `down`、`enter` 后 Claude 在 2 秒内开始工作并回答；已经没有对话框时再 `thread.trust` 报「not at Claude Code's trust dialog」；**项目文件夹被信任之后，它的 worktree 不再问**（worktree 在 `<data>/worktrees/…`，不在项目文件夹里面，Claude Code 仍认得它属于已信任的仓库）；信任过的文件夹的子文件夹也不问。一个还没信任过的仓库里第一次开 worktree 会话，它问的是仓库还是 worktree 的文件夹，没有单独验证。
+- **局限**：只认 2.1.322 的文字；Claude Code 改了措辞就退回「在终端里等你」（失败安全）。`hc keys` 有「3 秒内没人打字」的规矩，人正在那个终端里打字时按键会晚一点。屏幕每 2 秒读一次，最多比对话框出现晚 2 秒。

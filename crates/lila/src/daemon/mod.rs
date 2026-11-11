@@ -16,6 +16,7 @@ mod requests;
 mod server;
 mod sources;
 mod threads;
+mod trust;
 
 pub use jobs::{Begin, Job, Output};
 pub use server::serve;
@@ -42,6 +43,8 @@ pub trait Terminals {
     fn kill(&mut self, terminal: &str) -> Result<()>;
     /// Presses named keys (`esc`, `ctrl+c`, …).
     fn keys(&mut self, terminal: &str, keys: &[&str]) -> Result<()>;
+    /// The terminal's screen as text.
+    fn read(&mut self, terminal: &str) -> Result<String>;
 }
 
 pub struct HcTerminals(pub hc_client::Hc);
@@ -74,6 +77,11 @@ impl Terminals for HcTerminals {
     fn keys(&mut self, terminal: &str, keys: &[&str]) -> Result<()> {
         self.0.call("terminal.keys", json!({"terminal": terminal, "keys": keys}))?;
         Ok(())
+    }
+
+    fn read(&mut self, terminal: &str) -> Result<String> {
+        let r = self.0.call("terminal.read", json!({"terminal": terminal}))?;
+        r["text"].as_str().map(String::from).ok_or_else(|| anyhow!("terminal.read returned no text"))
     }
 }
 
@@ -147,10 +155,14 @@ pub struct Daemon<T: Terminals> {
     /// Answers waiting for the Claude Code hook that asked (`hooks`), by request id: the option and a message for the agent, or none (left to the terminal).
     hook_answers: HashMap<String, Option<(String, Option<String>)>>,
     next_hook: u64,
+    /// When this lilad started: in the ids of its hook requests, so one from before a restart is never mistaken for one of ours.
+    boot: i64,
     /// What `PreToolUse` decided about recent tool calls (`hooks`), by thread, for the `PermissionRequest` that may follow.
     judged: HashMap<String, std::collections::VecDeque<hooks::Judged>>,
     /// What Claude threads are writing now (`MessageDisplay`), by thread: (message id, text so far).
     writing: HashMap<String, (String, String)>,
+    /// The Claude threads whose terminal shows the trust dialog (`trust`), by thread: the folder it asks about.
+    trust_seen: HashMap<String, String>,
     /// magpie's command line, when it is installed (set by `serve`; tests leave it out).
     pub magpie: Option<PathBuf>,
     /// Work waiting to be run off the loop (`jobs`), taken by the server.
@@ -208,8 +220,10 @@ impl<T: Terminals> Daemon<T> {
             next_card: 0,
             hook_answers: HashMap::new(),
             next_hook: 0,
+            boot: now_ms(),
             judged: HashMap::new(),
             writing: HashMap::new(),
+            trust_seen: HashMap::new(),
             magpie: None,
             jobs: Vec::new(),
             summaries: HashMap::new(),
@@ -251,7 +265,7 @@ impl<T: Terminals> Daemon<T> {
     pub(super) fn thread_event(&self, tid: &str, seq: u64) -> Option<Value> {
         let t = self.store.thread(tid).ok()??;
         let (state, waiting) = self.state_of(&t, now_ms());
-        Some(json!({"event": "thread", "project": t.project, "thread": tid, "state": state.as_str(), "waiting": waiting, "items_seq": self.store.last_seq(tid).unwrap_or(0), "changes": self.summary_of(tid).map(|c| c.json()), "seq": seq}))
+        Some(json!({"event": "thread", "project": t.project, "thread": tid, "state": state.as_str(), "waiting": waiting, "waiting_for": self.trust_seen.get(tid).filter(|_| waiting == Some("terminal")).map(|_| "trust"), "items_seq": self.store.last_seq(tid).unwrap_or(0), "changes": self.summary_of(tid).map(|c| c.json()), "seq": seq}))
     }
 
     fn mark(&mut self, thread: &str) {
@@ -391,6 +405,7 @@ impl<T: Terminals> Daemon<T> {
         self.writing.remove(tid);
         self.tails.remove(tid);
         self.asking.retain(|a| a.thread != tid);
+        self.trust_seen.remove(tid);
         let _ = self.store.event(tid, "lilad", "ended", &format!("{} ({}): {why}", t.terminal.unwrap_or_default(), t.engine), now);
         self.say(format!("{}: thread {tid} ended ({why})", t.project));
         self.mark(tid);
@@ -420,6 +435,7 @@ impl<T: Terminals> Daemon<T> {
             self.say(format!("thread {tid} has not reported a status"));
             self.mark(&tid);
         }
+        self.drop_abandoned_cards(now);
         self.pump(now);
     }
 
@@ -441,6 +457,11 @@ impl<T: Terminals> Daemon<T> {
             state = ThreadState::Waiting;
             waiting = Some("terminal");
         }
+        // The dialog is on the screen: the thread waits for it already, not only when the engine has been quiet for a while.
+        if state == ThreadState::Starting && self.trust_seen.contains_key(&t.id) {
+            state = ThreadState::Waiting;
+            waiting = Some("terminal");
+        }
         (state, waiting)
     }
 
@@ -459,12 +480,14 @@ impl<T: Terminals> Daemon<T> {
         let (state, waiting) = self.state_of(t, now);
         let live = self.live.get(&t.id).filter(|_| t.terminal.is_some());
         let cards = self.asking.iter().filter(|a| a.thread == t.id).count();
+        let trust = self.trust_seen.get(&t.id).filter(|_| waiting == Some("terminal"));
         json!({
             "id": t.id, "project": t.project, "title": t.title, "engine": t.engine.as_str(),
             "model": live.and_then(|l| l.config.model.clone()).unwrap_or_else(|| t.model.clone()),
             "effort": live.and_then(|l| l.config.effort.clone()).or_else(|| t.effort.clone()),
             "permission": t.tier.as_str(), "cwd": t.cwd, "session": t.session,
             "state": state.as_str(), "status": live.map_or("gone", |l| l.status.as_str()), "waiting": waiting, "cards": cards,
+            "waiting_for": trust.map(|_| "trust"), "trust_folder": trust,
             "msg": live.map(|l| l.msg.clone()).filter(|m| !m.is_empty()),
             "terminal": t.terminal, "caps": Self::caps(t.engine),
             "created_ms": t.created_ms, "active_ms": t.active_ms, "started_ms": t.started_ms, "ended_ms": t.ended_ms, "archived": t.archived,

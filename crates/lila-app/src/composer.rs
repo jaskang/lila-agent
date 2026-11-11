@@ -241,6 +241,15 @@ pub struct Composer {
 /// What the `/` menu of a thread offers besides Lila's own actions, as lilad listed it.
 pub type Commands = Vec<Value>;
 
+/// A thread's rules in the permission menu: what each allows, `(id, words)`, and what taking one back does.
+pub struct TierRules {
+    pub list: Vec<(i64, String)>,
+    pub drop: DropRule,
+}
+
+/// Takes the rule with this id back.
+pub type DropRule = std::rc::Rc<dyn Fn(i64, &mut App)>;
+
 impl LilaApp {
     /// The key a thread's box is kept under (a thread's id, or `new:<project>`).
     pub fn composer_key(&self, thread: &str) -> String {
@@ -922,7 +931,16 @@ impl LilaApp {
         let tier: Vec<AnyElement> = match m {
             Some(m) => {
                 let (weak, id) = (cx.entity().downgrade(), target.clone());
-                vec![self.tier_button("conv-tier", &s(m, "permission"), Anchor::BottomLeft, cx, move |key, cx| {
+                // What was allowed "always" is listed under the three, each to be taken back by a click.
+                let rules: Vec<(i64, String)> = self.conv.as_ref().filter(|c| c.thread == target).map(|c| c.rules.iter().filter_map(|r| Some((r["id"].as_i64()?, s(r, "label")))).collect()).unwrap_or_default();
+                let (weak2, id2) = (weak.clone(), id.clone());
+                let rules = TierRules {
+                    list: rules,
+                    drop: std::rc::Rc::new(move |rule, cx| {
+                        let _ = weak2.update(cx, |this, cx| this.act("thread.rule.remove", json!({"thread": id2, "rule": rule}), cx));
+                    }),
+                };
+                vec![self.tier_button("conv-tier", &s(m, "permission"), Some(rules), Anchor::BottomLeft, cx, move |key, cx| {
                     let _ = weak.update(cx, |this, cx| this.act("thread.permission", json!({"thread": id, "permission": key}), cx));
                 })]
             }
@@ -1055,7 +1073,7 @@ impl LilaApp {
     /// The permission tier a new session starts on, and (in a folder that is a repository) the worktree switch.
     fn tier_control(&mut self, project: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some((.., tier)) = self.draft_of(project) else { return Vec::new() };
-        let mut controls = vec![self.tier_button("new-tier", &tier, Anchor::BottomLeft, cx, {
+        let mut controls = vec![self.tier_button("new-tier", &tier, None, Anchor::BottomLeft, cx, {
             let (weak, project) = (cx.entity().downgrade(), project.to_owned());
             move |key, cx| {
                 let _ = weak.update(cx, |this, cx| {
@@ -1091,8 +1109,8 @@ impl LilaApp {
             .into_any_element()
     }
 
-    /// A button showing a permission tier, and the three to choose from; `pick` gets the one chosen.
-    pub fn tier_button(&self, id: &'static str, tier: &str, anchor: Anchor, cx: &App, pick: impl Fn(&'static str, &mut App) + Clone + 'static) -> AnyElement {
+    /// A button showing a permission tier, and the three to choose from; `pick` gets the one chosen. Under them, the thread's `rules`.
+    pub fn tier_button(&self, id: &'static str, tier: &str, rules: Option<TierRules>, anchor: Anchor, cx: &App, pick: impl Fn(&'static str, &mut App) + Clone + 'static) -> AnyElement {
         let quiet = style::quiet(cx);
         let now = tier.to_owned();
         Button::new(id)
@@ -1106,6 +1124,13 @@ impl LilaApp {
                 for (key, name, _) in crate::engines::TIERS {
                     let pick = pick.clone();
                     menu = menu.item(PopupMenuItem::new(name).checked(key == now).on_click(move |_, _, cx| pick(key, cx)));
+                }
+                if let Some(rules) = rules.as_ref().filter(|r| !r.list.is_empty()) {
+                    menu = menu.separator();
+                    for (rule, label) in &rules.list {
+                        let (drop, rule) = (rules.drop.clone(), *rule);
+                        menu = menu.item(PopupMenuItem::new(format!("不再总是允许{}{}", if label.starts_with(|c: char| c.is_ascii()) { " " } else { "" }, crate::engines::clip(label, 36))).icon(IconName::Close).on_click(move |_, _, cx| drop(rule, cx)));
+                    }
                 }
                 menu
             })

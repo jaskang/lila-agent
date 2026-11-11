@@ -187,9 +187,8 @@ pub fn start_daemon(paths: &Paths) -> Result<()> {
     bail!("lilad did not come up in terminal {addr}; see `hc read {addr}`")
 }
 
-/// How long `lila hook PermissionRequest` waits for the person before leaving the
-/// question to the terminal (under the hook's own 600 s, `daemon::hooks`).
-pub const HOOK_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(570);
+/// How often `lila hook PermissionRequest` asks lilad whether the person has answered.
+const HOOK_ASK_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What a `PreToolUse` hook prints for lilad's reply (`{verdict, reason?}`): Claude Code's
 /// `permissionDecision` of allow, deny or ask.
@@ -200,6 +199,43 @@ fn pre_tool_use_output(reply: &Value) -> Option<Value> {
         out["hookSpecificOutput"]["permissionDecisionReason"] = json!(reason);
     }
     Some(out)
+}
+
+/// Waits for the person's answer to the request `id` of `thread`: `(decision, message)` once given, or `(None, None)` when the
+/// card was dismissed (Claude Code asks in its terminal). Asks lilad every `every`; while lilad is away, keeps asking. A lilad that
+/// was restarted does not know the request: it says `unknown`, and the request is sent again with its `payload`, so the card is back.
+pub fn wait_for_answer(paths: &Paths, thread: &str, id: &str, payload: &Value, every: std::time::Duration) -> (Option<String>, Option<String>) {
+    let mut id = id.to_owned();
+    let mut remind = false;
+    loop {
+        std::thread::sleep(every);
+        let mut params = json!({"thread": thread, "id": id});
+        if remind {
+            params["payload"] = payload.clone();
+        }
+        let Ok(a) = request(paths, "hook.answer", params, false) else {
+            // lilad is away or busy; it may come back.
+            continue;
+        };
+        if a["pending"] == true {
+            remind = false;
+            continue;
+        }
+        if a["unknown"] == true {
+            // Said once: the next ask carries the request. If that is not understood either, give up to the terminal.
+            if remind {
+                return (None, None);
+            }
+            remind = true;
+            continue;
+        }
+        if let Some(new) = a["wait"].as_str() {
+            id = new.to_owned();
+            remind = false;
+            continue;
+        }
+        return (a["decision"].as_str().map(String::from), a["message"].as_str().map(String::from));
+    }
 }
 
 /// `lila hook <event>`: a Claude Code hook in a thread's session. Hands the event
@@ -225,17 +261,9 @@ pub fn hook(paths: &Paths, event: &str) -> Result<()> {
     let mut decision = r["decision"].as_str().map(String::from);
     let mut message = r["message"].as_str().map(String::from);
     if let Some(id) = r["wait"].as_str() {
-        let until = std::time::Instant::now() + HOOK_ANSWER_WAIT;
-        while std::time::Instant::now() < until {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let Ok(a) = request(paths, "hook.answer", json!({"thread": thread, "id": id}), false) else { continue };
-            if a["pending"] == true {
-                continue;
-            }
-            decision = a["decision"].as_str().map(String::from);
-            message = a["message"].as_str().map(String::from);
-            break;
-        }
+        // The person may be away for as long as the thread lives (Claude Code lets this hook wait that long); the card
+        // is there for as long as that, and when lilad is restarted meanwhile it comes back (`wait_for_answer`).
+        (decision, message) = wait_for_answer(paths, &thread, id, &payload, HOOK_ASK_EVERY);
     }
     if let Some(d) = decision {
         let behavior = if d == "allow" { "allow" } else { "deny" };
@@ -269,6 +297,69 @@ mod tests {
         let paths = Paths { config: root.join("config"), data: root.join("data"), state: root.join("state"), isolated: true };
         paths.ensure().unwrap();
         paths
+    }
+
+    /// A stand-in lilad that gives one reply per request, in turn (the last for ever), and keeps what it was asked.
+    fn scripted(paths: &Paths, replies: Vec<Value>) -> std::sync::Arc<std::sync::Mutex<Vec<Value>>> {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let listener = UnixListener::bind(paths.socket().unwrap()).unwrap();
+        std::thread::spawn(move || {
+            for (n, conn) in listener.incoming().flatten().enumerate() {
+                let mut line = String::new();
+                BufReader::new(&conn).read_line(&mut line).unwrap();
+                log.lock().unwrap().push(serde_json::from_str::<Value>(&line).unwrap()["params"].clone());
+                writeln!(&conn, "{}", json!({"result": replies[n.min(replies.len() - 1)]})).unwrap();
+            }
+        });
+        asked
+    }
+
+    #[test]
+    fn a_hook_waits_through_a_restart_of_lilad_and_sends_its_request_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let payload = json!({"tool_name": "Bash", "tool_input": {"command": "touch x"}});
+        // Pending, then lilad was restarted (it does not know the request), then it knows it again, then the person answers.
+        let asked = scripted(
+            &paths,
+            vec![json!({"pending": true}), json!({"decision": null, "unknown": true}), json!({"wait": "hook-1"}), json!({"pending": true}), json!({"decision": "allow", "message": null})],
+        );
+        let (decision, message) = wait_for_answer(&paths, "t1", "hook-1", &payload, std::time::Duration::from_millis(1));
+        assert_eq!((decision.as_deref(), message), (Some("allow"), None));
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 5);
+        // The request travels only when lilad said it does not know it.
+        let carried: Vec<bool> = asked.iter().map(|p| p.get("payload").is_some()).collect();
+        assert_eq!(carried, [false, false, true, false, false]);
+    }
+
+    #[test]
+    fn a_hook_dismissed_or_not_understood_leaves_the_question_to_the_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        scripted(&paths, vec![json!({"decision": null})]);
+        assert_eq!(wait_for_answer(&paths, "t1", "hook-1", &json!({}), std::time::Duration::from_millis(1)), (None, None));
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        scripted(&paths, vec![json!({"decision": null, "unknown": true})]);
+        assert_eq!(wait_for_answer(&paths, "t1", "hook-1", &json!({}), std::time::Duration::from_millis(1)), (None, None), "told twice that nobody knows it");
+    }
+
+    #[test]
+    fn a_hook_keeps_asking_while_lilad_is_away() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let p2 = Paths { config: paths.config.clone(), data: paths.data.clone(), state: paths.state.clone(), isolated: true };
+        // lilad comes up only after the hook has been asking for a while.
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            scripted(&p2, vec![json!({"decision": "deny", "message": "no"})]);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        let (decision, message) = wait_for_answer(&paths, "t1", "hook-1", &json!({}), std::time::Duration::from_millis(5));
+        assert_eq!((decision.as_deref(), message.as_deref()), (Some("deny"), Some("no")));
+        late.join().unwrap();
     }
 
     #[test]
