@@ -1,0 +1,11 @@
+node_modules
+dist
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
+# local state when LILA_HOME points into the repo
+/.lila-dev
+# left over from the Rust implementation on main
+/target
