@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How much the agent may do without asking (docs/product-v4.md §6). Per thread, switchable any time.
+/// How much the agent may do without asking. Per thread, switchable any time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {

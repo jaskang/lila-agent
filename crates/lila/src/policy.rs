@@ -1,4 +1,4 @@
-//! The permission tiers (docs/product-v4.md §6) as decisions: what lilad answers a
+//! The permission tiers as decisions: what lilad answers a
 //! permission request by itself, and what it leaves to the person.
 //!
 //! omp's requests are `lila_agent::PermissionRequest`s. The tier of the
@@ -8,7 +8,7 @@
 //! - full: everything goes, except four kinds of action, which are asked.
 //!
 //! The four kinds are recognised from what the request says (the tool's name, the command
-//! line, the files); that is a reading of text, not a sandbox: see docs/architecture-v4.md §7 for what it misses.
+//! line, the files); that is a reading of text, not a sandbox.
 
 use lila_agent::{PermissionRequest, ToolKind};
 use lila_core::Tier;

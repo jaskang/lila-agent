@@ -1,4 +1,4 @@
-//! "Always allow for this thread" (docs/architecture-v4.md §6): what a person's one click on a card of the
+//! "Always allow for this thread": what a person's one click on a card of the
 //! `confirm` tier lets through from then on, and which requests a thread's rules answer.
 //!
 //! A rule is one of:

@@ -1,6 +1,6 @@
 //! The main window: workspaces (projects) and their threads on the left; the shown thread's
 //! conversation in the middle. The window talks to lilad only
-//! through its socket (docs/architecture-v4.md); nothing here decides anything.
+//! through its socket; nothing here decides anything.
 
 use crate::data::{self, Project, Snapshot};
 use gpui::component::{resizable_panel, v_flex};

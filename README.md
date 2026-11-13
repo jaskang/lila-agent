@@ -40,8 +40,6 @@ Lila 是一个有自己界面的 agent：在工作区（一个文件夹）里开
 
 输入框里：`@` 选工作区里的文件，`/` 选命令和 skill（omp 声明的），`+` 菜单、拖进来或粘贴来添加附件；框是空的时候 ↑ 取回上一条话。
 
-右侧的 diff、文件和 GitHub 面板是后面的阶段，还没有。接口见 [docs/architecture-v4.md](docs/architecture-v4.md)。
-
 ## 命令行
 
 窗口能做的，命令行都能做，走同一个 socket：
@@ -79,7 +77,7 @@ cargo clippy --workspace --all-targets
 | `hc-client` | herdr-core 客户端 |
 | `lila-app` | 桌面应用（GPUI） |
 
-架构见 [docs/architecture-v4.md](docs/architecture-v4.md)，界面见 [DESIGN.md](DESIGN.md)，接手开发先读 [docs/HANDOFF.md](docs/HANDOFF.md)。第三方代码见 [THIRD-PARTY.md](THIRD-PARTY.md)。
+架构见 [docs/architecture.md](docs/architecture.md)，开发计划见 [docs/plan.md](docs/plan.md)，界面规范见 [DESIGN.md](DESIGN.md)，截图自查和真 omp 的跑法见 [docs/development.md](docs/development.md)。第三方代码见 [THIRD-PARTY.md](THIRD-PARTY.md)。
 
 ## 参考
 

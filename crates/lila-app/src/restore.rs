@@ -1,4 +1,4 @@
-//! Going back to a message (A1, docs/architecture-v4.md §11): the person takes one of their own messages and
+//! Going back to a message: the person takes one of their own messages and
 //! the thread's files go back to how they were just before it was sent; the conversation stays. The window
 //! only asks and draws: lilad is asked what that would change (`thread.restore` with `dry_run`), the answer
 //! is shown, and only on a yes are the files put back.

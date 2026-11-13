@@ -1,4 +1,4 @@
-//! Permission requests (architecture v3 D4, tiers in docs/product-v4.md §6). omp's requests are
+//! Permission requests (tiers in docs/architecture.md §7). omp's requests are
 //! `PermissionRequest`s; lilad answers each by the tier of the thread (`policy`), and what is
 //! left becomes a card on the thread for the person.
 

@@ -3,7 +3,7 @@
 //! syntax colors) and the changes (what differs from HEAD, with each file's diff, and the buttons that
 //! commit them and, for a thread in a worktree of its own, merge it back). Everything here is read from
 //! lilad (`thread.files/file/changes/diff`) and done through it (`thread.commit/merge`); the
-//! panel only draws (docs/architecture-v4.md §4, §10).
+//! panel only draws.
 
 use crate::app::LilaApp;
 use crate::style::{self, Control as _, card, muted, muted2};

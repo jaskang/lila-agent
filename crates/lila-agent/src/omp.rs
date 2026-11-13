@@ -1,5 +1,5 @@
 //! omp over its RPC mode (`omp --mode rpc-ui`: one JSON object per line on stdin and stdout, docs/rpc.md in oh-my-pi),
-//! for `lila host omp` (docs/architecture-v4.md §3). Pure translation, no IO: what omp sends goes in as lines, and
+//! for `lila host omp`. Pure translation, no IO: what omp sends goes in as lines, and
 //! comes out as the frames to answer with and the events lilad gets.
 //!
 //! What it takes care of:

@@ -1,5 +1,4 @@
 //! What lilad answers: every request from the CLI, the window and the hosts (`Daemon::handle`).
-//! The methods and their parameters are written down in docs/architecture-v4.md §4.
 
 use super::*;
 

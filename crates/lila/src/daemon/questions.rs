@@ -1,4 +1,4 @@
-//! Questions (docs/architecture-v4.md §6): what an agent asks the person, which is not a permission — omp's `ask` tool,
+//! Questions: what an agent asks the person, which is not a permission — omp's `ask` tool,
 //! or anything else that opens a dialog. A question is a card on the thread, like a permission card: the thread waits for
 //! the person's answer (`thread.answer`), which the host hands to omp.
 

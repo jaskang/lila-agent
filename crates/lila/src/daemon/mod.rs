@@ -2,7 +2,7 @@
 //! Unix socket, terminal facts from herdr-core's event stream; both are handled one at a time
 //! on one thread, so there is no locking.
 //!
-//! The model is projects and their threads (docs/architecture-v4.md). A thread is a
+//! The model is projects and their threads. A thread is a
 //! conversation with omp; omp runs behind `lila host omp` in an hc terminal of its own, so a lilad
 //! restart does not end it.
 
