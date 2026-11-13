@@ -12,6 +12,5 @@
 
 ## 项目
 
-- 开发前先读 `docs/plan.md`（任务单，从「下一个任务」开始）和 `docs/architecture.md`；验证界面和用真 omp 跑的方法在 `docs/development.md`。
-- 提交前跑 `cargo build --workspace`、`cargo test --workspace`、`cargo clippy --workspace --all-targets`。
-- 提交和推送都等用户说。
+- 开发前先读 `docs/architecture.md` 和 `docs/plan.md`（从「下一个任务」开始）。
+- 界面优先用 shadcn/ui（Base UI 版本）的现成组件，包括它的 AI 组件，不要自己重写。

@@ -1,172 +1,65 @@
 # Lila 架构
 
-2026-11-13 定。这份文档写的是**目标架构**；和现在代码不一样的地方在每节末尾的「现状」里注明，对应的工作在 `plan.md`。
+Lila 是个人用的 Agent harness，主打编程和个人助理。界面完全自己掌控，Agent 能力复用现成运行时。
 
-## 1. 定位
+## 总体结构
 
-Lila 是建在 oh-my-pi（omp）上的个人 agent 桌面应用：一个原生窗口（GPUI），在工作区（一个文件夹）里开会话让 agent 干活。
+Lila 是一个运行在 Mac mini 上的 Electron 应用。应用自己就是后端：主进程持有 Agent 进程和数据，窗口只负责显示。
 
-- **omp 是唯一的引擎。** agent 循环、工具、子 agent、MCP、技能、压缩、会话存储都用 omp 的，Lila 不重做。
-- **Lila 做 omp 没有的部分**：界面、权限判定、检查点和回退、改动和提交、通知、定时任务，以及把邮件、日历这类能力配好交给 omp。
-- 模型走订阅，不用 API key。Claude 订阅通过本机的 magpie 网关接到 omp，这是 omp 的 provider 配置，不是 Lila 的代码。
-
-## 2. 总体结构
-
-```
-┌──────────────────────── lila（一个进程）────────────────────────┐
-│                                                                  │
-│   窗口（GPUI）──────► 服务核心 ◄────── socket ◄── lila 命令行    │
-│                       │  会话、权限、检查点、改动、               │
-│                       │  通知、定时任务、存储（SQLite）           │
-│                       │                                          │
-│                       ▼                                          │
-│              omp 连接（每个会话一个）                             │
-└───────────────────────┬──────────────────────────────────────────┘
-                        │ stdin/stdout，每行一个 JSON
-              ┌─────────┴─────────┐
-              │ omp --mode rpc-ui │  每个会话一个子进程
-              └─────────┬─────────┘
-                        │
-              模型（magpie 等）、工具、MCP server、技能
+```text
+Electron 应用（Mac mini）
+  ├─ 窗口：React 界面
+  │        ↕ IPC（事件协议）
+  └─ 主进程（Node，TypeScript）
+       └─ core
+            ├─ 会话、事件日志、待审批项（SQLite）
+            ├─ omp RPC 子进程（每个会话一个）
+            └─ WebSocket 服务（以后给手机端，经 Tailscale 访问）
 ```
 
-- **一个进程。** 窗口和服务核心在同一个程序里，窗口直接调用核心，不经过 socket。
-- **关窗口不退出。** 程序留在后台，会话继续跑，定时任务照常触发；真正退出时结束所有 omp 子进程。会话历史在 omp 的会话文件里，重开后能接上，跑到一半的那一轮会断。
-- **socket 只给命令行用。** `lila thread send …` 这类命令连到正在运行的程序。程序没在运行时，命令行报错并提示先启动。
-- **每个会话一个 omp 子进程**，第一次用到时启动，由核心里的一个线程读写。
+## 设计约束
 
-**现状**：还是两个程序（窗口 `lila-app` 和后台的 lilad），lilad 跑在 herdr-core 的终端里，窗口经 socket 调 lilad。每个会话的 omp 已经是 lilad 的子进程，由 lilad 里的一个线程读写（`crates/lila/src/daemon/runner.rs`），没有宿主进程了；lilad 退出时 omp 一起结束。合并成一个程序是 `plan.md` 的 P1.2 起。
+- **关窗口不等于退出。** 关掉窗口后应用留在菜单栏，任务继续跑。重新打开窗口时从事件日志恢复显示。
+- **`core` 不依赖 Electron。** 它对外只暴露事件协议。窗口通过 IPC 用它，手机端以后通过 WebSocket 用它。需要时可以把它拆成独立的后台服务。
+- **界面只认 Lila 自己的事件协议。** omp 的 RPC 消息在 `core` 的适配层里翻译成 Lila 事件。以后换运行时或加第二个运行时，只改适配层。
+- **事件日志是唯一事实来源。** 每个事件有会话内递增的序号并落库。客户端连接时带上最后收到的序号，`core` 补发之后的事件。
+- **审批走 `rpc-ui` 模式。** omp 以 `--mode rpc-ui` 启动，审批请求由 `core` 落库并转给界面，用户的选择再回传给 omp。
+- **界面组件用现成的。** 会话界面用 shadcn/ui 自带的 AI 组件拼装，不自己重写一套。
 
-## 3. 谁做什么
+## 技术栈
 
-| 能力 | omp | Lila |
-|---|---|---|
-| agent 循环、调用模型、流式输出 | ✔ | 显示 |
-| 内置工具（读写文件、bash、搜索） | ✔ | 显示成卡片 |
-| 子 agent、待办和计划 | ✔ 有查询和订阅的接口 | 显示 |
-| MCP、技能、扩展 | ✔ 加载和执行 | 管配置（§6） |
-| 上下文压缩、会话文件、用量统计、分页取历史 | ✔ | 只记会话目录在哪 |
-| 对话的回退和分支 | ✔ | 界面 |
-| 搜索、浏览器、GitHub（包着 `gh`）、记忆 | ✔ 内置工具 | 显示成卡片 |
-| 创建 worktree | ✔ `omp worktree` | 调用它 |
-| 模型列表和切换 | ✔ | 菜单 |
-| 要不要问用户 | 每次写和执行都来问 | **判定**：自动答，或出卡片 |
-| agent 向用户提问 | 发出提问 | 卡片 |
-| 工作区、会话列表、标题、归档 | | ✔ |
-| 每轮的文件检查点和回退 | | ✔ |
-| 改动列表、diff、提交、合并 worktree | | ✔ |
-| 系统通知 | | ✔ |
-| 定时任务 | | ✔ |
-
-omp 的回退只回退对话（回到某一点，或把一段探索压成小结），不恢复文件；恢复文件靠 Lila 的检查点。两者在界面上是同一个「回到这里」，一起做。
-
-原则：一件事 omp 已经能做，就不在 Lila 里再做一份；Lila 需要的信息 omp 不给时，先看能不能用 omp 的扩展或配置解决，再考虑自己写。
-
-## 4. 代码结构
-
-Rust workspace，目标是五个 crate：
-
-| crate | 内容 | IO |
-|---|---|---|
-| `lila-core` | 工作区、会话、权限档这些类型和规则 | 无 |
-| `lila-omp` | omp RPC 的翻译：一行 JSON 进，事件和要发的帧出；对话的数据模型 | 无 |
-| `lila-store` | SQLite | 文件 |
-| `lila-service` | 服务核心：会话的生命周期、omp 子进程、权限判定、检查点、改动、通知、定时任务、socket | 全部 |
-| `lila` | 程序入口：带窗口启动，或作为命令行连 socket；GPUI 界面 | 窗口 |
-
-翻译层不做 IO，所以能用录下来的帧做单元测试；服务核心的测试用一个假 omp（按脚本回帧的小程序）。
-
-**现状**：`lila-omp` 现在叫 `lila-agent`；服务核心在 `lila` crate 的 `daemon/` 里，和命令行混在一起；界面是单独的 `lila-app`；还有 `hc-client`（herdr-core 客户端）。改名和拆分随 P1 做。
-
-## 5. omp 连接
-
-**启动**
-
-```
-omp --mode rpc-ui --approval-mode always-ask --session-dir <会话目录> [--continue] [--model <provider/id>]
-```
-
-- `rpc-ui` 而不是 `rpc`：omp 的提问工具只在 `rpc-ui` 下存在。
-- 会话目录里已经有会话文件时加 `--continue`，接着上次的聊。
-- 工作目录是工作区的文件夹（或会话自己的 worktree）。
-
-**协议**：标准输入输出上每行一个 JSON。omp 先发 `ready`，Lila 协商协议第 2 版，之后超过 1 MiB 的帧会拆成 `rpc_chunk` 分块送来，Lila 拼回去。命令带 `id`，omp 用 `response` 回。主要用到：
-
-| 方向 | 帧 | 用途 |
-|---|---|---|
-| → omp | `prompt`、`abort` | 发消息、中断 |
-| → omp | `get_available_models`、`set_model`、`set_thinking_level` | 模型和思考程度 |
-| → omp | `extension_ui_response` | 回答权限或提问 |
-| ← omp | `agent_start/end`、`message_start/update/end`、`tool_execution_*` | 一轮的开始结束、流式文字和思考、工具调用和结果 |
-| ← omp | `extension_ui_request`、`cancel` | 权限或提问，以及 omp 撤回它 |
-
-还没接、后面要用的：子 agent（`set_subagent_subscription`、`get_subagents`、`get_subagent_messages`、`cancel_subagent`）、待办（`set_todos`）、用量（`get_session_stats`）、分页取历史（`get_messages_page`）、压缩（`compact`）、对话分支（`branch`、`fork`、`navigate_tree`）、会话命名（`set_session_name`）、登录模型账号（`login`）。完整清单在 omp 仓库的 `docs/rpc.md`。
-
-**翻译成 Lila 的对话模型**：消息、思考、工具调用（带结果和 diff）、错误，各是对话里的一条；另有权限请求和提问两种待答的东西。窗口和命令行只认这个模型，不认 omp 的帧。omp 给每个工具参数加的 `i`（模型自述的意图）单独取出，不当作参数显示。
-
-**出错**：模型请求失败是对话里的一条错误；omp 进程意外退出，会话变为已结束，错误里带退出码和它最后几行输出。
-
-## 6. omp 的配置归 Lila 管
-
-omp 从一个配置目录读模型来源、MCP server、技能、扩展和各项设置。Lila 用**自己的**一份，放在 `LILA_HOME/omp/`，启动 omp 时用 `PI_CODING_AGENT_DIR` 指过去，不用你在终端里用 omp 的那份（`~/.omp`）。
-
-理由：
-
-- 权限不会被绕过。omp 的设置里可以把某个工具设成「总是允许」，那样它就不来问 Lila 了；配置归 Lila 管，这个口子就关上了。
-- Lila 加的 MCP server 和技能不会跑到你终端里的 omp 去，反过来也一样。
-- 之后做「在设置里开关一个集成」，改的就是这份配置。
-
-模型来源：第一次启动时发现本机的 magpie 在运行，就自动把它配成模型来源（只是几行配置，不需要密钥）；`~/.omp` 里还有别的模型来源时，问一次要不要复制过来。在 `~/.omp` 里登录过的账号不会带过来，要在 Lila 里重新登录。
-
-**现状**：还在用 `~/.omp`，`plan.md` 的 P2.1 改。
-
-## 7. 权限
-
-每个会话三档，随时可切：
-
-| 档 | 行为 |
+| 部分 | 选择 |
 |---|---|
-| 只读 | 写和执行类的调用一律拒绝 |
-| 改动前确认 | 写和执行类的调用出卡片 |
-| 全自动（默认） | 自动允许，但四类操作仍然出卡片：改工作区以外的文件、`git push`、对外发出的动作、破坏性命令 |
+| 仓库 | pnpm workspace：`packages/protocol`、`packages/core`、`apps/desktop` |
+| 桌面壳 | Electron + electron-vite，打包用 electron-builder |
+| Agent 运行时 | omp（`--mode rpc-ui`），作为子进程 |
+| 协议 | Zod 定义事件类型，IPC 和 WebSocket 共用 |
+| 存储 | better-sqlite3 + drizzle-orm `1.0.0-rc.5`（drizzle-kit 同版本，版本号写死） |
+| 界面 | React + Tailwind + shadcn/ui（Base UI 版本） |
+| 状态 | Zustand，接收主进程事件 |
+| 路由 | 第一版不用；以后需要时用 TanStack Router |
 
-- omp 以 `always-ask` 运行，每个写和执行类调用都来问；Lila 按档位和规则回答，或者出卡片等你。
-- **判定用结构化的信息**：omp 的询问本身只有一段标题文字，所以 Lila 把它和刚才那个工具调用对上，用调用里的工具名和参数（命令、路径）来判。只有标题里也出现同样的命令或路径时才信这些参数；对不上就退回去读标题的文字。
-- **本会话总是允许**：卡片上可以选，规则是「某个程序加子命令」「某个文件夹里的改动」「某个 MCP 工具」三种，存在库里，可收回。`rm`、解释器、包装器这类不提供。omp 自己的「本会话都允许」不用。
-- 拒绝时 omp 只告诉模型「用户拒绝了」，带不了理由。要带理由，就在拒绝之后把理由作为一条附言发给 agent。
+### 会话界面用到的 shadcn 组件
 
-## 8. 数据
+| 用途 | 组件 |
+|---|---|
+| 消息滚动、流式跟随、历史加载 | Message Scroller |
+| 消息与气泡 | Message、Bubble |
+| 思考过程、工具调用 | Trace |
+| 代码、终端输出、diff | Code Block（高亮用 shiki） |
+| Agent 向用户提问、审批选项 | Questionnaire |
+| 状态提示、分隔 | Marker |
+| 文件和图片附件 | Attachment |
+| Markdown 排版 | Typeset |
 
-```
-LILA_HOME（默认 ~/.lila）
-├── lila.db            工作区、会话、对话条目、权限规则、检查点、定时任务
-├── lila.sock          给命令行的 socket
-├── omp/               Lila 自己的 omp 配置（§6）
-└── sessions/<会话 id>/  omp 的会话文件，一个会话一个目录
-```
+文档地址形如 `https://ui.shadcn.com/docs/components/base/message-scroller`。写界面前先看对应组件的文档，缺的能力优先找 shadcn 里有没有，再考虑自己写。
 
-- 工作区自己的设置在它文件夹里的 `.lila/project.toml`：名称、新会话默认的模型和权限档。
-- 对话存两份，各有用处：omp 的会话文件是给模型的上下文；`lila.db` 里的对话条目是给窗口画的，也让会话在 omp 没启动时能打开看。
-- 检查点是 git 的引用，放在工作区的仓库里，不动 index、HEAD 和分支。
-- 删除会话时，库里的记录和它的 omp 会话目录一起删。
+## 范围
 
-**现状**：对话回退和 worktree 创建还是 Lila 自己做的，没有换成 omp 的。omp 会话目录在 `data/omp/<会话 id>/`，删除会话时没有清；库里还有旧引擎留下的 `legacy` 列。
+- **第一版：编程流程。** 选项目 → 选模型 → 发任务 → 看工具输出和 diff → 审批 → 关窗口再打开后接着看。
+- **之后：个人助理。** 定时任务、通知、个人工具，以及原生手机端。手机端通过 WebSocket 接入同一套事件协议。
 
-## 9. 加能力的顺序
+## 待验证
 
-给 agent 加一种新能力（邮件、日历、Asana、浏览器……）时，按这个顺序选：
-
-1. **omp 内置的工具**。搜索、浏览器、GitHub、记忆已经有了，先试它们。
-2. **现成的命令行**。agent 直接用 bash 调。什么都不用装。
-3. **现成的 MCP server**。写进 Lila 的 omp 配置，按工作区开关。
-4. **omp 技能**。一段说明加脚本，教 agent 怎么做一类事。
-5. **omp 扩展**。需要改 omp 行为时用。
-6. **Lila 自己的代码**。只在需要界面、需要在没有会话时运行（定时任务、通知）时写。
-
-## 10. 不做的
-
-- 不支持 omp 以外的引擎，不留引擎抽象。
-- 不自己写 agent 循环和工具。
-- 不内嵌终端。
-- 不做网页界面和 Electron 外壳。
-- 手机端和远程访问现在不做；socket 保留，以后要做从这里接。
+- omp 用 Claude 和 ChatGPT 订阅登录后，在 RPC 模式下能否正常对话、额度如何扣除。见任务单第 1 项。
+- drizzle-orm v1 的 API 和 0.x 不同，写代码时以 rc.5 的官方文档为准。
