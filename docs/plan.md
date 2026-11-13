@@ -21,7 +21,7 @@
 
 ### 2. 搭仓库骨架
 
-pnpm workspace，三个包：`packages/protocol`、`packages/core`、`apps/desktop`。Electron 窗口能打开，shadcn/ui（Base UI）初始化完成，lint、类型检查、测试命令可用。
+Bun workspace，三个包：`packages/protocol`、`packages/core`、`apps/desktop`。`core` 用 Bun 能启动并监听本机 WebSocket，Electron 窗口能打开并连上它，shadcn/ui（Base UI）初始化完成，lint、类型检查、测试命令可用。
 
 ### 3. 事件协议
 
@@ -31,14 +31,16 @@ pnpm workspace，三个包：`packages/protocol`、`packages/core`、`apps/deskt
 
 - 用 drizzle 建表：项目、会话、事件、待审批项。
 - 启动和看护 omp 子进程，把 RPC 消息翻译成 Lila 事件并落库。
-- 提供订阅接口：从指定序号开始补发并持续推送。
+- 通过 WebSocket 提供订阅：从指定序号开始补发并持续推送。
+- 定时记录自身内存占用，用来观察 Bun 常驻是否稳定。
 - 测试用录制的 omp 输出回放，不依赖真实模型。
 
 ### 5. 桌面界面：会话
 
-- 主进程把 `core` 通过 IPC 暴露给窗口。
+- 窗口通过 WebSocket 连接 `core`，断开后自动重连并从最后的序号续上。
 - 用 Message Scroller、Message、Bubble、Trace、Code Block 拼出会话界面，流式显示文本、工具输出和 diff。
 - 输入框发送消息，可以中断运行。
+- 流式增量按帧合并，只更新正在输出的那条消息；代码高亮放在 Worker 里。
 
 ### 6. 审批
 
@@ -50,8 +52,19 @@ pnpm workspace，三个包：`packages/protocol`、`packages/core`、`apps/deskt
 
 ### 8. 常驻与恢复
 
-关窗口后应用留在菜单栏，任务继续。重新打开窗口从事件日志恢复。应用重启后，未完成的运行标记为中断，可以从已保存的会话继续。
+- 关窗口时窗口隐藏而不销毁，应用留在菜单栏。
+- 应用启动时，`core` 已在运行就直接连上，否则拉起它；应用退出后 `core` 继续跑。
+- `core` 自己重启后，未完成的运行标记为中断，可以从已保存的会话继续。
+- 发布时把 `core` 编译成单个可执行文件，放进应用包。
 
-### 9. 用它干一件真事
+### 9. 用它干一件真事，并验收响应速度
 
 用 Lila 给 Lila 自己做一个小改动，记录不顺手的地方，决定下一步。
+
+同时按架构文档的三条标准实测：
+
+- 窗口从菜单栏重新打开，感觉不到延迟。
+- 流式输出时，滚动和输入不掉帧。
+- 几百条消息的长会话，打开不卡。
+
+达不到就先查应用代码；确认是 Electron 本身的限制，再讨论换壳。
