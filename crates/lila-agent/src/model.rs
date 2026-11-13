@@ -1,22 +1,18 @@
-//! The conversation model every runtime is translated into (architecture v3 §5).
+//! The conversation model omp is translated into (architecture v3 §5).
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 /// Who a message came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "from", rename_all = "snake_case")]
 pub enum Origin {
-    /// Typed by the person (in the window or the terminal).
+    /// Typed by the person.
     Person,
     /// Delivered by Lila: a task (its id) or a note, an answer, a reminder.
     Lila { task: Option<String> },
-    /// What Claude Code wrote down when it compacted the context: the CLI's own, not a message.
-    Summary,
-    /// What a slash command printed in the CLI itself (`/compact`'s "Not enough messages"): a note, not a message.
-    Local,
-    /// Claude Code's mark that the person stopped the turn (`[Request interrupted by user]`): a note, not a message.
-    Interrupted,
-    /// Lila put the folder's files back to a checkpoint here (written by lilad, not by an engine): a quiet mark, not a message.
+    /// Lila put the folder's files back to a checkpoint here (written by lilad, not by omp): a quiet mark, not a message.
     /// `undo` is the checkpoint of the state before, which a restore to it would undo this with.
     Restored {
         checkpoint: i64,
@@ -32,15 +28,13 @@ pub enum AttachmentKind {
     Image,
     #[default]
     File,
-    /// A skill the message calls (Codex takes it as an input item, not as text).
-    Skill,
 }
 
-/// A file (or image, or skill) that goes with a message: an absolute path.
+/// A file (or image) that goes with a message: an absolute path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: String,
-    /// What to call it (a skill's name; else the file's name).
+    /// What to call it (else the file's name).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     #[serde(default)]
@@ -92,7 +86,7 @@ fn file_name(path: &str) -> String {
     path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path).to_owned()
 }
 
-/// The media type of an image file, by its extension (the ones every runtime takes).
+/// The media type of an image file, by its extension.
 pub fn image_mime(path: &str) -> Option<&'static str> {
     let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
     match ext.as_str() {
@@ -104,7 +98,7 @@ pub fn image_mime(path: &str) -> Option<&'static str> {
     }
 }
 
-/// What kind of tool ran: the window picks its icon from this (ACP's kinds).
+/// What kind of tool ran: the window picks its icon from this, and the permission tiers read it (`Omp` sorts omp's tools by name).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
@@ -150,7 +144,7 @@ pub enum ItemKind {
     Thought { text: String },
     ToolCall {
         tool: ToolKind,
-        /// The tool's own name (`Bash`, `Edit`, …).
+        /// The tool's own name as omp gives it (`bash`, `edit`, `mcp__server__tool`).
         name: String,
         /// One line: the command, the file, the pattern.
         title: String,
@@ -159,6 +153,8 @@ pub enum ItemKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         diffs: Vec<FileDiff>,
     },
+    /// Something went wrong that the person should see where it happened: a model request that failed, omp that stopped.
+    Error { text: String },
 }
 
 /// One entry of a conversation. Items are keyed by `id`: a later version of
@@ -175,10 +171,10 @@ pub struct Item {
     pub kind: ItemKind,
 }
 
-/// A runtime asks the person before doing something (running a command, changing files).
+/// omp asks the person before doing something (running a command, changing files).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
-    /// The runtime's own id for the request; the answer names it.
+    /// omp's own id for the request; the answer names it.
     pub id: String,
     pub tool: ToolKind,
     /// What it wants to do: the command, the files.
@@ -188,13 +184,13 @@ pub struct PermissionRequest {
     pub detail: String,
     /// The answers it takes, first the one to suggest.
     pub options: Vec<PermOption>,
-    /// The tool's own name (`Bash`, `Edit`, `mcp__github__create_pull_request`); empty when the runtime gives none.
+    /// The tool's own name as omp gives it (`bash`, `edit`, `mcp__server__tool`); empty for a request that names none.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// The shell command, when the tool is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// The files it changes or deletes, as the runtime names them (absolute, or relative to `cwd`).
+    /// The files it changes or deletes, as the model named them (absolute, or relative to `cwd`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
     /// The folder the command or tool runs in.
@@ -209,7 +205,7 @@ impl PermissionRequest {
         self.options.iter().find(|o| o.kind == once).or_else(|| self.options.iter().find(|o| o.kind == always))
     }
 
-    /// A request with only what every runtime gives; the rest is filled in with struct update syntax.
+    /// A request with only what is always there; the rest is filled in with struct update syntax.
     pub fn new(id: impl Into<String>, tool: ToolKind, title: impl Into<String>, detail: impl Into<String>, options: Vec<PermOption>) -> Self {
         PermissionRequest { id: id.into(), tool, title: title.into(), detail: detail.into(), options, name: String::new(), command: None, paths: Vec::new(), cwd: None }
     }
@@ -219,7 +215,7 @@ impl PermissionRequest {
 pub struct PermOption {
     pub id: String,
     pub label: String,
-    /// What choosing it means; lilad answers by the kind, not the runtime's ids.
+    /// What choosing it means; lilad answers by the kind, not omp's ids.
     #[serde(default)]
     pub kind: PermKind,
 }
@@ -242,16 +238,64 @@ impl PermKind {
     }
 }
 
-/// A host (`lila host <runtime>`) → lilad. One JSON line each.
+/// What an agent asks the person (omp's `ask` tool, or anything that opens a dialog): not a permission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Question {
+    /// omp's own id for the dialog; the reply names it.
+    pub id: String,
+    /// The question, which may run over several lines.
+    pub title: String,
+    /// More words under it (a confirmation's message).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    pub kind: QuestionKind,
+    /// The choices of a `Choice`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    /// What a `Text` starts with (a placeholder or a draft).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefill: String,
+    /// A `Text` that is a secret: its words are not shown while typed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionKind {
+    /// One of `options`.
+    Choice,
+    /// Yes or no.
+    Confirm,
+    /// Words of the person's own.
+    Text,
+}
+
+/// The person's answer to a question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Reply {
+    Choice { value: String },
+    Confirm { yes: bool },
+    Text { value: String },
+    /// No answer: the agent goes on without one.
+    Cancel,
+}
+
+/// A host (`lila host omp`) → lilad. One JSON line each.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentEvent {
-    /// The conversation's id, once the runtime has one (a new thread, or the one resumed).
+    /// The conversation's id, once omp has one (a new thread, or the one resumed).
     Session { id: String },
     Item { item: Item },
     Permission { request: PermissionRequest },
     /// Answered (by the person, or it went away with its turn).
     PermissionResolved { id: String },
+    /// The agent asks the person something.
+    Question { question: Question },
+    /// Answered, or taken back by the agent (or it went away with its turn).
+    QuestionResolved { id: String },
     TurnStarted { turn: String },
     TurnEnded {
         turn: String,
@@ -260,15 +304,9 @@ pub enum AgentEvent {
     },
     /// Tokens the session has used so far.
     Usage { input: u64, output: u64, cached: u64 },
-    /// The account's usage window.
-    Limits {
-        used_percent: f64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        resets_ms: Option<i64>,
-    },
-    /// Something the person should hear (not signed in, the runtime stopped…).
+    /// Something that happened outside the conversation (omp retries a request, a command it declares failed…).
     Notice { text: String },
-    /// The model and effort the session runs on now, and the ones it offers when the runtime lists them (ACP).
+    /// The model and effort the session runs on now, and the ones it offers.
     Config {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
@@ -279,7 +317,7 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         efforts: Vec<Choice>,
     },
-    /// The slash commands the agent declares (ACP's `available_commands_update`).
+    /// The slash commands omp declares.
     Commands { commands: Vec<SlashCommand> },
 }
 
@@ -316,14 +354,14 @@ impl Config {
     }
 }
 
-/// One thing a runtime offers to pick: an id to send back, a name to show.
+/// One thing omp offers to pick: an id to send back, a name to show.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {
     pub id: String,
     pub name: String,
 }
 
-/// A slash command an agent declares.
+/// A slash command omp declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashCommand {
     pub name: String,
@@ -338,8 +376,8 @@ pub struct SlashCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
-    /// Words for the member: a task, a note, the person's message. While it works,
-    /// they join the running turn where the runtime can (`Caps::steer`), else wait.
+    /// Words for the agent: the person's message, with notes in front. omp takes them one turn at a time:
+    /// words sent while it works wait for the turn to end.
     Prompt {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -347,15 +385,12 @@ pub enum Command {
     },
     Interrupt,
     Answer { permission: String, option: String },
+    /// The person's answer to a question.
+    Reply { question: String, reply: Reply },
     /// Run on this model from now on, in this session only.
     SetModel { model: String },
     /// Think at this effort from now on, in this session only.
     SetEffort { effort: String },
-    /// Compact the context (Codex: `thread/compact/start`; the others take `/compact` as words).
-    Compact,
-    /// The thread's permission tier changed: for a runtime that sets approvals and a sandbox itself
-    /// (Codex, from its next turn on). The others decide per request in lilad and ignore it.
-    SetPermission { approval: String, sandbox: String },
 }
 
 /// What a host reports to hc (OSC 7501), and so lilad's dispatch sees.
@@ -385,39 +420,10 @@ impl HostStatus {
         }
         body.push_str(&format!(":app={app}"));
         if let Some(m) = msg.map(|m| m.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|m| !m.is_empty()) {
-            body.push_str(&format!(":msg={}", base64(clip(&m, 2000).as_bytes())));
+            body.push_str(&format!(":msg={}", STANDARD.encode(clip(&m, 2000))));
         }
         format!("\x1b]7501;{body}\x1b\\")
     }
-}
-
-/// Standard base64 with padding (OSC 7501's `msg`).
-pub fn base64(bytes: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// What a runtime can do; the window and lilad decide by these, not by names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Caps {
-    /// Its terminal can be shown instead (Claude Code: the TUI keeps running).
-    pub tui: bool,
-    /// Lila draws a conversation for it.
-    pub gui: bool,
-    /// A message sent while it works reaches the running turn.
-    pub steer: bool,
 }
 
 /// Who wrote a message: Lila's deliveries open with `<lila task="T3" …>`, `<lila note …>`, `<lila answer …>`.
@@ -442,7 +448,7 @@ pub fn without_notes(text: &str) -> &str {
     if rest.is_empty() { text } else { rest }
 }
 
-/// Longest tool output kept on an item; the rest is in the CLI's own record.
+/// Longest tool output kept on an item.
 pub const MAX_OUTPUT: usize = 8000;
 
 /// `text` cut to `max` bytes on a character boundary, marked when cut.
@@ -469,10 +475,8 @@ mod tests {
         let mentioned = Attachment { name: "src/a.rs".into(), ..Attachment::file("/r/src/a.rs") };
         assert!(mentioned.is_mentioned_in("look at @src/a.rs") && !mentioned.is_mentioned_in("look at src/a.rs"));
         assert!(Attachment::file("/x/notes.md").is_mentioned_in("see @notes.md") && !Attachment::file("/x/notes.md").is_mentioned_in("see @other.md"));
-        // A picture or a skill is never "in the words".
+        // A picture is never "in the words".
         assert!(!Attachment::file("/x/p.png").is_mentioned_in("@p.png"));
-        let skill = Attachment { path: "/s".into(), name: "tdd".into(), kind: AttachmentKind::Skill };
-        assert!(!skill.is_mentioned_in("@tdd"));
     }
 
     #[test]
@@ -491,9 +495,8 @@ mod tests {
 
     #[test]
     fn host_status_is_an_osc_7501_record() {
-        assert_eq!(HostStatus::Idle.osc("lila-codex"), "\x1b]7501;state=idle:app=lila-codex\x1b\\");
+        assert_eq!(HostStatus::Idle.osc("lila-omp"), "\x1b]7501;state=idle:app=lila-omp\x1b\\");
         assert_eq!(HostStatus::Blocked { why: "waiting on Q7".into() }.osc("x"), "\x1b]7501;state=blocked:kind=permission:app=x:msg=d2FpdGluZyBvbiBRNw==\x1b\\");
-        assert_eq!(base64(b"ab"), "YWI=");
         let ev: AgentEvent = serde_json::from_str(r#"{"event":"session","id":"t1"}"#).unwrap();
         assert_eq!(ev, AgentEvent::Session { id: "t1".into() });
         assert_eq!(serde_json::to_string(&Command::Prompt { text: "hi".into(), attachments: Vec::new() }).unwrap(), r#"{"command":"prompt","text":"hi"}"#);

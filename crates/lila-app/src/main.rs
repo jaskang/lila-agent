@@ -1,5 +1,5 @@
 //! lila-app: Lila's window. Projects and their threads on the left, the shown thread's
-//! conversation (or Claude Code's terminal) in the middle.
+//! conversation in the middle.
 
 mod app;
 mod composer;
@@ -14,21 +14,17 @@ mod settings;
 mod sidebar;
 mod style;
 mod ui;
-mod usage;
 
 use gpui::*;
 
 fn main() {
-    // lilad and the engines it starts inherit this PATH: give them the shell's,
+    // lilad and the omp it starts inherit this PATH: give them the shell's,
     // before any thread runs.
     // SAFETY: nothing else runs yet.
-    unsafe { std::env::set_var("PATH", usage::login_path()) };
+    unsafe { std::env::set_var("PATH", login_path()) };
     // The component icons (Lucide) come from gpui-kit's bundled assets, Lila's own from assets/lila.
     gpui::application().with_assets(style::Assets).run(|cx: &mut App| {
         gpui::init(cx);
-        lila_term::view::init(cx);
-        // Terminals sit on the glass cards, so they leave their background unpainted.
-        lila_term::theme::set_transparent(true);
         style::install(cx);
         // `--features shots`: `LILA_APP_SIZE=1000x700` opens the window that size, to look at narrow ones.
         #[allow(unused_mut)]
@@ -89,7 +85,7 @@ fn main() {
                         })
                         .detach();
                 }
-                // A new session's box in a project, with choices made: `LILA_APP_NEW=shop,engine=codex,effort=low,permission=confirm`.
+                // A new session's box in a project, with choices made: `LILA_APP_NEW=shop,permission=confirm`.
                 if let Ok(spec) = std::env::var("LILA_APP_NEW") {
                     let view = view.clone();
                     window
@@ -171,24 +167,13 @@ fn main() {
                         })
                         .detach();
                 }
-                // Add an account (`claude:<name>`): the usage page, its login started.
-                if let Ok(spec) = std::env::var("LILA_APP_SIGNIN") {
+                // Open the global settings (`LILA_APP_PREFS=1`).
+                if std::env::var_os("LILA_APP_PREFS").is_some() {
                     let view = view.clone();
                     window
                         .spawn(cx, async move |cx| {
                             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|window, cx| view.update(cx, |v, cx| v.dev_signin(&spec, window, cx)));
-                        })
-                        .detach();
-                }
-                // Open the global settings: `usage` or `about`.
-                if let Ok(page) = std::env::var("LILA_APP_PREFS") {
-                    let view = view.clone();
-                    let page = if page == "about" { crate::prefs::PrefPage::About } else { crate::prefs::PrefPage::Usage };
-                    window
-                        .spawn(cx, async move |cx| {
-                            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
-                            let _ = cx.update(|_, cx| view.update(cx, |v, cx| v.open_prefs(page, cx)));
+                            let _ = cx.update(|_, cx| view.update(cx, |v, cx| v.open_prefs(cx)));
                         })
                         .detach();
                 }
@@ -260,4 +245,28 @@ mod shots {
             let _ = w.write_image_data(&pixels);
         }
     }
+}
+
+/// The PATH the person's shell has: an app opened from the Finder gets a bare one,
+/// and omp lives where the shell puts it. Interactive as well as login, since
+/// installers (pnpm, nvm, …) often add their folder in `.zshrc`; the markers keep
+/// whatever the rc files print out of it.
+fn login_path() -> String {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        const MARK: &str = "__LILA_PATH__";
+        let sh = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
+        let shell = std::process::Command::new(sh).args(["-ilc", &format!("printf '{MARK}%s{MARK}' \"$PATH\"")]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output();
+        let found = shell.ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|out| out.split(MARK).nth(1).map(str::to_owned)).filter(|p| !p.trim().is_empty());
+        let mut p = found.unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+        let home = std::env::var("HOME").unwrap_or_default();
+        for extra in [format!("{home}/.local/bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into()] {
+            if !p.split(':').any(|d| d == extra) {
+                p = format!("{p}:{extra}");
+            }
+        }
+        p
+    })
+    .clone()
 }

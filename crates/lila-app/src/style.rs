@@ -5,10 +5,13 @@
 //! The gpui-kit theme is set from the same palette (see [`install`]), so the
 //! kit's buttons, inputs, menus and selects match the hand-built parts.
 
-use gpui::component::{Icon, IconName, Sizable, StyledExt, Theme, ThemeConfig, ThemeMode, h_flex};
+use gpui::component::{Icon, StyledExt, Theme, ThemeConfig, ThemeMode};
 use gpui::prelude::*;
 use gpui::*;
 use std::borrow::Cow;
+
+/// The monospace font for commands, paths and code.
+pub const MONO: &str = "Menlo";
 
 /// Window padding, and the gutter between cards (also the resize handle).
 pub const GAP: f32 = 8.;
@@ -53,10 +56,6 @@ pub fn red() -> Hsla {
 }
 pub fn yellow() -> Hsla {
     c(0xffd60aff)
-}
-/// Claude Code's own orange (its row in the usage page).
-pub fn claude() -> Hsla {
-    c(0xf0905fff)
 }
 
 // ---- fills: white/black at low alpha so they sit on any glass ----
@@ -150,20 +149,6 @@ pub fn pill(color: Hsla, text: impl Into<SharedString>) -> Div {
 /// An icon from Lila's own set (see [`Assets`]).
 pub fn icon(name: &'static str) -> Icon {
     Icon::empty().path(name)
-}
-
-/// A text action like "+ 新建": the accent color, no chrome.
-pub fn link(id: impl Into<ElementId>, text: impl Into<SharedString>, plus: bool) -> Stateful<Div> {
-    h_flex()
-        .id(id)
-        .flex_none()
-        .gap(px(3.))
-        .text_color(blue())
-        .font_medium()
-        .cursor_pointer()
-        .hover(|d| d.text_color(c(0x409cffff)))
-        .when(plus, |d| d.child(Icon::new(IconName::Plus).xsmall()))
-        .child(text.into())
 }
 
 /// The kit's Lucide subset, plus Lila's own icons under `lila/`.

@@ -1,10 +1,9 @@
-//! Threads whose agent runs through a protocol (architecture v3 §7.2): their terminal runs
-//! `lila host <engine>`, which attaches to lilad. Words for them go to the host as commands;
-//! what they do comes back as events.
+//! A thread's omp runs over its RPC mode (architecture v3 §7.2): its terminal runs `lila host omp`,
+//! which attaches to lilad. Words for it go to the host as commands; what it does comes back as events.
 
 use super::permissions::Decided;
 use super::*;
-use lila_agent::{AgentEvent, Attachment, AttachmentKind, Command};
+use lila_agent::{AgentEvent, Attachment, Command};
 use std::sync::mpsc::Sender;
 
 impl<T: Terminals> Daemon<T> {
@@ -14,13 +13,6 @@ impl<T: Terminals> Daemon<T> {
         }
         self.hosts.insert(tid.to_owned(), tx);
         self.say(format!("thread {tid}'s host attached"));
-        // The tier may have changed while it was away (a new host starts on the stored one, a surviving one is told).
-        if let Ok(Some(t)) = self.store.thread(tid) {
-            let (approval, sandbox) = lila_core::runtime::codex_settings(t.tier);
-            if t.engine == Runtime::Codex {
-                let _ = self.host_command(tid, &Command::SetPermission { approval: approval.into(), sandbox: sandbox.into() });
-            }
-        }
         self.pump(now);
     }
 
@@ -28,7 +20,7 @@ impl<T: Terminals> Daemon<T> {
         self.hosts.remove(tid);
     }
 
-    /// A command for a hosted thread.
+    /// A command for a thread's host.
     pub(super) fn host_command(&mut self, tid: &str, cmd: &Command) -> Result<()> {
         let tx = self.hosts.get(tid).ok_or_else(|| anyhow!("{tid} is starting (its host has not attached yet)"))?;
         if tx.send(serde_json::to_string(cmd)?).is_err() {
@@ -38,15 +30,9 @@ impl<T: Terminals> Daemon<T> {
         Ok(())
     }
 
-    /// Words with files: a host gets them as the engine's own inputs; Claude Code's terminal gets
-    /// them as `@path` mentions after the words, which it reads (images too) when the message is sent.
-    /// `guard`: only while the terminal has that status.
-    pub(super) fn tell_with(&mut self, t: &Thread, terminal: &str, text: &str, files: &[Attachment], guard: Option<&str>) -> Result<()> {
-        if t.engine.hosted() {
-            self.host_command(&t.id, &Command::Prompt { text: text.to_owned(), attachments: files.to_vec() })
-        } else {
-            self.term.send(terminal, &claude_text(text, files), guard)
-        }
+    /// Words with files, to the host.
+    pub(super) fn tell_with(&mut self, tid: &str, text: &str, files: &[Attachment]) -> Result<()> {
+        self.host_command(tid, &Command::Prompt { text: text.to_owned(), attachments: files.to_vec() })
     }
 
     pub fn host_event(&mut self, tid: &str, ev: AgentEvent, now: i64) {
@@ -70,7 +56,7 @@ impl<T: Terminals> Daemon<T> {
             AgentEvent::Permission { request } => {
                 let id = request.id.clone();
                 match self.ask_permission(tid, request, now) {
-                    Ok(Decided::Answer { option, .. }) => {
+                    Ok(Decided::Answer { option }) => {
                         let _ = self.host_command(tid, &Command::Answer { permission: id, option });
                     }
                     Ok(Decided::Card) => {}
@@ -78,18 +64,14 @@ impl<T: Terminals> Daemon<T> {
                 }
             }
             AgentEvent::PermissionResolved { id } => self.request_resolved(tid, &id),
+            AgentEvent::Question { question } => self.open_question(tid, question, now),
+            AgentEvent::QuestionResolved { id } => self.question_resolved(tid, &id),
             AgentEvent::TurnEnded { failed, .. } => {
                 if let Some(why) = failed {
                     let _ = self.store.event(tid, "host", "turn_failed", &why, now);
                     self.mark(tid);
                 }
                 self.refresh_changes(tid);
-            }
-            AgentEvent::Limits { used_percent, resets_ms } => {
-                if used_percent >= 100.0 {
-                    let _ = self.store.event(tid, "host", "limit", &format!("usage window used up; resets at {}", resets_ms.unwrap_or(0)), now);
-                    self.mark(tid);
-                }
             }
             AgentEvent::Notice { text } => {
                 self.say(format!("thread {tid}: {text}"));
@@ -110,19 +92,4 @@ impl<T: Terminals> Daemon<T> {
             AgentEvent::TurnStarted { .. } | AgentEvent::Usage { .. } => {}
         }
     }
-}
-
-/// The words as Claude Code's terminal gets them: the files after them as `@/absolute/path` mentions
-/// (quoted when the path has spaces), which it reads when the message is sent. A skill is called by its words.
-pub(super) fn claude_text(text: &str, files: &[Attachment]) -> String {
-    let mut out = text.trim().to_owned();
-    for f in files.iter().filter(|f| f.kind != AttachmentKind::Skill) {
-        out.push(' ');
-        if f.path.contains(char::is_whitespace) {
-            out.push_str(&format!("@\"{}\"", f.path));
-        } else {
-            out.push_str(&format!("@{}", f.path));
-        }
-    }
-    out.trim_start().to_owned()
 }

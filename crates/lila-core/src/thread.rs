@@ -2,7 +2,6 @@
 //! The state it can be in, the permission tier it runs under, and what the
 //! terminal's status words mean for it.
 
-use crate::config::Runtime;
 use serde::{Deserialize, Serialize};
 
 /// How much the agent may do without asking (docs/product-v4.md §6). Per thread, switchable any time.
@@ -45,7 +44,7 @@ pub enum ThreadState {
     Starting,
     /// Working on a turn.
     Running,
-    /// Waits for the person: a permission card, or a dialog in the terminal.
+    /// Waits for the person: a permission card.
     Waiting,
     /// At the prompt; takes a message.
     Idle,
@@ -72,7 +71,7 @@ pub enum AgentStatus {
     Unknown,
     Idle,
     Working,
-    /// Waiting for a person in its terminal (permission, question, login).
+    /// Waiting for a person (a permission card).
     Blocked,
     /// Finished a turn while nobody looked; as free as idle.
     Done,
@@ -110,11 +109,6 @@ impl AgentStatus {
         matches!(self, AgentStatus::Idle | AgentStatus::Done)
     }
 
-    /// Can receive a message: queued input is safe while working, but not into a dialog.
-    pub fn accepts_input(self) -> bool {
-        matches!(self, AgentStatus::Idle | AgentStatus::Done | AgentStatus::Working)
-    }
-
     /// The thread's state for this status. `waiting_card`: a permission card is open for it.
     pub fn thread_state(self, waiting_card: bool) -> ThreadState {
         match self {
@@ -134,7 +128,8 @@ pub struct Thread {
     pub id: String,
     pub project: String,
     pub title: String,
-    pub engine: Runtime,
+    /// The engine of a thread from before omp was the only one (`claude`, `codex`). Its conversation is kept; it cannot be resumed.
+    pub legacy: Option<String>,
     pub model: String,
     pub effort: Option<String>,
     pub tier: Tier,

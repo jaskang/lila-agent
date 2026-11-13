@@ -1,6 +1,5 @@
 //! A thread's conversation, drawn natively (architecture v3 §10): what it was
-//! asked, what it said and did, and a box to write to it. Claude Code's TUI keeps
-//! running underneath; the header switches to it (`tui`).
+//! asked, what it said and did, and a box to write to it.
 //!
 //! The list is gpui-kit's `MessageScroller`, a virtual list: only the rows in view
 //! are laid out, so a few hundred items cost the same as a few. What it shows is
@@ -11,7 +10,6 @@ use crate::app::LilaApp;
 use crate::data;
 use crate::style::{self, muted, muted2};
 use crate::ui::s;
-use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::clipboard::Clipboard;
 use gpui::component::collapsible::Collapsible;
 use gpui::component::message_scroller::{MessageScroller, MessageScrollerState};
@@ -32,11 +30,9 @@ pub struct Conv {
     /// How many times `items[i]` was replaced (a tool call that finished): rows measured
     /// before that are measured again.
     ver: Vec<u32>,
-    /// The reply being written now, before it is an item (Claude Code's `MessageDisplay`).
-    pub writing: Option<String>,
     /// The model and effort it runs on, and what the person may change (`thread.read`'s `config`).
     pub config: Value,
-    /// The permission cards it waits on (`thread.read`'s `permissions`).
+    /// The cards it waits on: its permissions and its questions (`thread.read`'s `permissions` and `questions`; a question has `"ask": "question"`).
     pub cards: Vec<Value>,
     /// The folder's checkpoints, newest first (`thread.read`'s `checkpoints`): a message of the person's
     /// is the one whose `item` is its id. Whole in every read, so each read replaces them.
@@ -47,7 +43,7 @@ pub struct Conv {
 
 impl Conv {
     pub fn new(thread: String) -> Self {
-        Conv { thread, session: None, seq: 0, items: Vec::new(), ver: Vec::new(), writing: None, config: Value::Null, cards: Vec::new(), checkpoints: Vec::new(), rules: Vec::new() }
+        Conv { thread, session: None, seq: 0, items: Vec::new(), ver: Vec::new(), config: Value::Null, cards: Vec::new(), checkpoints: Vec::new(), rules: Vec::new() }
     }
 
     /// Folds a `thread.read` reply in: a new session starts over; items
@@ -73,9 +69,8 @@ impl Conv {
             }
         }
         self.seq = self.seq.max(v["seq"].as_i64().unwrap_or(0));
-        self.writing = v["writing"].as_str().map(String::from);
         self.config = v["config"].clone();
-        self.cards = v["permissions"].as_array().cloned().unwrap_or_default();
+        self.cards = v["permissions"].as_array().into_iter().chain(v["questions"].as_array()).flatten().cloned().collect();
         self.checkpoints = v["checkpoints"].as_array().cloned().unwrap_or_default();
         self.rules = v["rules"].as_array().cloned().unwrap_or_default();
     }
@@ -124,13 +119,10 @@ pub fn is_in_record(pending: &[&Pending], items: &[Value]) -> Vec<bool> {
         .collect()
 }
 
-/// Does the end of the conversation already show that the agent works? (A reply being written, or a step
-/// under way, which its row shows turning.) Otherwise a running turn gets its own turning mark at the end.
+/// Does the end of the conversation already show that the agent works? (A step under way, which its row shows
+/// turning.) Otherwise a running turn gets its own turning mark at the end.
 fn shows_work(conv: Option<&Conv>) -> bool {
     let Some(c) = conv else { return false };
-    if c.writing.is_some() {
-        return true;
-    }
     let last = c.items.iter().rposition(|i| i["kind"] == "user_message" && i["from"] == "person");
     c.items.iter().skip(last.map_or(0, |l| l + 1)).any(|i| i["kind"] == "tool_call" && i["state"] == "running")
 }
@@ -150,7 +142,6 @@ enum RowKind {
     Item(usize),
     /// A run of tool calls and thoughts between two messages, by the index of its first.
     Steps(usize),
-    Writing,
     /// A message just sent, not in the record yet (its id).
     Pending(u64),
     /// Only a spinner: the thread works and has put nothing down since the person's last message.
@@ -160,8 +151,8 @@ enum RowKind {
 }
 
 /// The rows the list shows: one per message, one per run of steps between messages,
-/// the messages just sent, the reply being written (or just a spinner while the thread works and has
-/// said nothing yet), and the cards the thread waits on.
+/// the messages just sent (or just a spinner while the thread works and has said nothing yet),
+/// and the cards the thread waits on.
 fn build_rows(conv: Option<&Conv>, pending: &[&Pending], running: bool, asks: &[String]) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     if let Some(c) = conv {
@@ -176,12 +167,9 @@ fn build_rows(conv: Option<&Conv>, pending: &[&Pending], running: bool, asks: &[
                     }
                     _ => rows.push(Row { kind: RowKind::Steps(i), span: i..i + 1, ver: ver + 1 }),
                 },
-                Some("user_message" | "agent_message") => rows.push(Row { kind: RowKind::Item(i), span: i..i + 1, ver }),
+                Some("user_message" | "agent_message" | "error") => rows.push(Row { kind: RowKind::Item(i), span: i..i + 1, ver }),
                 _ => {}
             }
-        }
-        if let Some(w) = &c.writing {
-            rows.push(Row { kind: RowKind::Writing, span: 0..0, ver: w.len() as u64 });
         }
     }
     rows.extend(pending.iter().map(|p| Row { kind: RowKind::Pending(p.id), span: 0..0, ver: p.text.len() as u64 + p.files.len() as u64 }));
@@ -230,49 +218,9 @@ fn tool_icon(tool: Option<&str>) -> IconName {
 }
 
 impl LilaApp {
-    /// The thread is shown as its conversation (else its terminal).
-    pub fn shows_gui(&self, t: &Value) -> bool {
-        t["caps"]["gui"] == true && !self.tui.contains(&s(t, "id"))
-    }
-
-    pub fn set_view(&mut self, thread: &str, tui: bool, cx: &mut Context<Self>) {
-        if tui { self.tui.insert(thread.to_owned()) } else { self.tui.remove(thread) };
-        data::save_views(self.paths(), &self.tui);
-        self.refresh_now();
-        cx.notify();
-    }
-
-    /// The header's two-way switch: the conversation Lila draws, or the CLI's own terminal.
-    pub fn view_switch(&self, t: &Value, cx: &mut Context<Self>) -> impl IntoElement {
-        let quiet = style::quiet(cx);
-        let gui = self.shows_gui(t);
-        let thread = s(t, "id");
-        let side = |id: &'static str, icon: IconName, tip: &'static str, on: bool, tui: bool| {
-            let thread = thread.clone();
-            Button::new(id)
-                .custom(quiet)
-                .xsmall()
-                .icon(Icon::new(icon).text_color(if on { style::fg() } else { muted() }))
-                .when(on, |b| b.bg(gpui::Hsla::from(rgba(0xffffff14))))
-                .tooltip(tip)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_view(&thread, tui, cx)))
-        };
-        h_flex()
-            .gap(px(2.))
-            .p(px(2.))
-            .rounded(px(style::R_CTL))
-            .border_1()
-            .border_color(style::divider())
-            .child(side("view-gui", IconName::GalleryVerticalEnd, "对话", gui, false))
-            .child(side("view-tui", IconName::SquareTerminal, "终端", !gui, true))
-    }
-
-    /// What the next fetch reads of the shown thread's conversation, if it is shown as one.
+    /// What the next fetch reads of the shown thread's conversation.
     pub fn conv_want(&self) -> Option<data::Want> {
         let t = self.shown_thread()?;
-        if !self.shows_gui(&t) {
-            return None;
-        }
         let thread = s(&t, "id");
         let after = self.conv.as_ref().filter(|c| c.thread == thread).map_or(0, |c| c.seq);
         Some(data::Want { thread, after })
@@ -393,11 +341,10 @@ impl LilaApp {
         cx.new(|cx| MessageScrollerState::new(0, cx))
     }
 
-    /// The center card's body for a thread shown as its conversation.
+    /// The center card's body for a thread: its conversation and the box under it.
     pub fn conversation_view(&mut self, t: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let thread = s(t, "id");
-        let ask = self.terminal_ask(t, cx);
-        let composer = self.composer_view(t, ask, window, cx);
+        let composer = self.composer_view(t, window, cx);
         self.sync_conv(cx);
         // The rows draw themselves out of the app's state, when the list asks for them.
         let app = cx.entity();
@@ -425,14 +372,13 @@ impl LilaApp {
         let body = match &row.kind {
             RowKind::Item(i) => self.item_row(*i, cx),
             RowKind::Steps(_) => Some(self.steps_row(row.span.clone(), window, cx)),
-            RowKind::Writing => self.conv.as_ref().and_then(|c| c.writing.clone()).map(writing_row),
             RowKind::Pending(id) => self.pending.iter().find(|p| p.id == *id).map(pending_row),
             RowKind::Busy => Some(busy_row()),
             RowKind::Ask(id) => {
                 let thread = self.thread.clone().unwrap_or_default();
                 let found = self.conv.as_ref().and_then(|c| c.cards.iter().find(|k| k["id"] == id.as_str()).cloned());
                 found.map(|k| {
-                    let card = self.permission_card(&thread, &k, cx);
+                    let card = if k["ask"] == "question" { self.question_card(&thread, &k, window, cx) } else { self.permission_card(&thread, &k, cx) };
                     div().w_full().px_1().rounded(px(style::R_BLOCK)).border_1().border_color(style::yellow().opacity(0.35)).bg(style::yellow().opacity(0.06)).child(card).into_any_element()
                 })
             }
@@ -445,9 +391,8 @@ impl LilaApp {
         let id = s(i, "id");
         let text = s(i, "text");
         Some(match i["kind"].as_str()? {
-            "user_message" if i["from"] == "lila" || i["from"] == "local" => self.lila_row(at, &id, &text, cx),
-            "user_message" if i["from"] == "summary" => self.summary_row(at, &id, &text, cx),
-            "user_message" if i["from"] == "interrupted" => interrupted_row(),
+            "error" => h_flex().w_full().gap(px(7.)).items_start().child(div().pt(px(2.)).child(Icon::new(IconName::CircleX).size(px(13.)).text_color(style::red()))).child(div().flex_1().min_w_0().text_size(px(12.)).line_height(relative(1.5)).text_color(style::tint(style::red(), 0.2)).child(text)).into_any_element(),
+            "user_message" if i["from"] == "lila" => self.lila_row(at, &id, &text, cx),
             "user_message" if i["from"] == "restored" => self.restored_row(&id, i["undo"].as_i64(), cx),
             "user_message" => {
                 let (body, more) = self.folded(at, &id, &text, div().px_3().py_2().rounded(px(style::R_CTL)).bg(style::fill()).text_size(px(13.)).line_height(relative(1.55)), cx);
@@ -536,47 +481,6 @@ impl LilaApp {
         v_flex().w_full().child(body).children(more).into_any_element()
     }
 
-    /// What Claude Code wrote down when it compacted the context: a quiet mark, the whole text on asking.
-    fn summary_row(&self, at: usize, id: &str, text: &str, cx: &mut Context<Self>) -> AnyElement {
-        let open = self.conv_open.contains(id);
-        let key = id.to_owned();
-        v_flex()
-            .w_full()
-            .gap_1()
-            .child(
-                h_flex()
-                    .id(SharedString::from(format!("summary-{id}")))
-                    .h(px(24.))
-                    .gap_2()
-                    .px_1()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(style::hover()))
-                    .child(style::icon("lila/archive.svg").size(px(13.)).text_color(muted2()))
-                    .child(div().text_xs().text_color(muted2()).child("上下文已压缩"))
-                    .child(div().flex_1().h(px(1.)).bg(style::divider()))
-                    .child(Icon::new(if open { IconName::ChevronUp } else { IconName::ChevronDown }).size(px(12.)).text_color(muted2()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_open(&key, at, cx))),
-            )
-            .when(open, |d| {
-                d.child(
-                    div()
-                        .id(SharedString::from(format!("summary-text-{id}")))
-                        .max_h(px(320.))
-                        .overflow_y_scroll()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(6.))
-                        .bg(style::well())
-                        .text_xs()
-                        .line_height(relative(1.55))
-                        .text_color(muted())
-                        .child(text.to_owned()),
-                )
-            })
-            .into_any_element()
-    }
-
     /// A run of tool calls and thoughts between two messages: one line that counts them by kind
     /// (or names the step under way), and under it, opened, each as its own row.
     fn steps_row(&self, span: Range<usize>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -614,7 +518,7 @@ impl LilaApp {
             .when_some(running, |d, r| {
                 // The step under way, by its own words, and a spinner.
                 d.child(Icon::new(tool_icon(r["tool"].as_str())).size(px(13.)).text_color(muted()))
-                    .child(div().flex_1().min_w_0().truncate().font_family(lila_term::theme::FONT).text_size(px(12.)).text_color(muted()).child(s(r, "title")))
+                    .child(div().flex_1().min_w_0().truncate().font_family(crate::style::MONO).text_size(px(12.)).text_color(muted()).child(s(r, "title")))
                     .child(Spinner::new().xsmall().color(style::blue()))
             })
             .when(running.is_none(), |d| {
@@ -652,13 +556,13 @@ impl LilaApp {
             .rounded(px(6.))
             .when(has_more, |d| d.cursor_pointer().hover(|d| d.bg(style::hover())))
             .child(Icon::new(icon).size(px(13.)).text_color(muted()))
-            .child(div().flex_1().min_w_0().truncate().font_family(lila_term::theme::FONT).text_size(px(12.)).text_color(muted()).child(s(i, "title")))
+            .child(div().flex_1().min_w_0().truncate().font_family(crate::style::MONO).text_size(px(12.)).text_color(muted()).child(s(i, "title")))
             .when(added + removed > 0, |d| {
                 d.child(
                     h_flex()
                         .flex_none()
                         .gap(px(6.))
-                        .font_family(lila_term::theme::FONT)
+                        .font_family(crate::style::MONO)
                         .text_size(px(11.))
                         .child(div().text_color(style::tint(style::green(), 0.3)).child(format!("+{added}")))
                         .child(div().text_color(style::tint(style::red(), 0.3)).child(format!("−{removed}"))),
@@ -688,7 +592,7 @@ impl LilaApp {
                                     .py_2()
                                     .rounded(px(6.))
                                     .bg(style::well())
-                                    .font_family(lila_term::theme::FONT)
+                                    .font_family(crate::style::MONO)
                                     .text_size(px(12.))
                                     .text_color(muted())
                                     .child(o),
@@ -736,17 +640,6 @@ fn busy_row() -> AnyElement {
     h_flex().w_full().h(px(20.)).items_start().child(div().pt(px(3.)).child(Spinner::new().xsmall().color(style::blue()))).into_any_element()
 }
 
-/// The reply as it is written, until it is in the record: a spinner, and the text as it stands.
-fn writing_row(text: String) -> AnyElement {
-    h_flex()
-        .w_full()
-        .gap_2()
-        .items_start()
-        .child(div().pt(px(3.)).child(Spinner::new().xsmall().color(style::blue())))
-        .child(div().flex_1().min_w_0().text_size(px(13.)).child(markdown("msg-writing".into(), text)))
-        .into_any_element()
-}
-
 /// The diff of a tool call, in gpui-kit's viewer: the files as one unified patch.
 pub(crate) fn diff_view(id: &str, diffs: &[Value], window: &mut Window, cx: &mut App) -> AnyElement {
     use gpui::component::ActiveTheme as _;
@@ -787,7 +680,7 @@ fn diff_block(d: &Value) -> AnyElement {
         .rounded(px(6.))
         .overflow_hidden()
         .bg(style::well())
-        .font_family(lila_term::theme::FONT)
+        .font_family(crate::style::MONO)
         .text_size(px(12.))
         .child(div().px_3().py_1().text_color(muted()).border_b_1().border_color(style::divider()).child(s(d, "path")))
         .children(lines.into_iter().map(|l| {
@@ -803,18 +696,6 @@ fn diff_block(d: &Value) -> AnyElement {
 }
 
 /// Where the person stopped a turn: a quiet mark, not a message.
-fn interrupted_row() -> AnyElement {
-    h_flex()
-        .w_full()
-        .h(px(24.))
-        .gap_2()
-        .px_1()
-        .child(Icon::new(IconName::Square).size(px(11.)).text_color(muted2()))
-        .child(div().text_xs().text_color(muted2()).child("已中断"))
-        .child(div().flex_1().h(px(1.)).bg(style::divider()))
-        .into_any_element()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Conv, Pending, RowKind, build_rows, diff_counts, is_in_record, is_long};
@@ -876,9 +757,7 @@ mod tests {
         c.merge(&read(json!([step, item("agent_message", "r")])));
         assert_eq!(kinds(&c, &[], true).last(), Some(&RowKind::Busy), "done steps and a word said: it still works");
         assert_eq!(kinds(&c, &[&p], true), [RowKind::Item(0), RowKind::Steps(1), RowKind::Item(2), RowKind::Pending(7), RowKind::Busy], "and after a new message");
-        // The reply being written has its own spinner; a card means it waits for the person.
-        c.merge(&json!({"thread": {"id": "t", "session": "s"}, "seq": 2, "items": [], "writing": "Chec"}));
-        assert_eq!(kinds(&c, &[], true).last(), Some(&RowKind::Writing));
+        // A card means it waits for the person.
         assert!(build_rows(Some(&c), &[&p], true, &["card".into()]).iter().all(|r| r.kind != RowKind::Busy));
     }
 
@@ -900,9 +779,8 @@ mod tests {
         let grown = build_rows(Some(&c), &[], false, &[]);
         assert_eq!((grown[1].kind.clone(), grown[1].span.clone()), (RowKind::Steps(1), 1..3));
         assert_ne!(after[1].ver, grown[1].ver);
-        // The reply being written, and a new session starting over.
-        c.merge(&json!({"thread": {"id": "t", "session": "s"}, "seq": 3, "items": [], "writing": "Chec"}));
-        assert_eq!(build_rows(Some(&c), &[], false, &[]).last().map(|r| r.kind.clone()), Some(RowKind::Writing));
+        // A new session starting over.
+        c.merge(&json!({"thread": {"id": "t", "session": "s"}, "seq": 3, "items": []}));
         c.merge(&json!({"thread": {"id": "t", "session": "s2"}, "seq": 1, "items": [item("agent_message", "x")]}));
         assert_eq!(c.items.len(), 1);
         assert_eq!(build_rows(Some(&c), &[], false, &[]).len(), 1);

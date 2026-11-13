@@ -1,5 +1,5 @@
-//! The main window: workspaces (projects) and their threads on the left; the shown thread in the
-//! middle (its conversation, or Claude Code's terminal). The window talks to lilad only
+//! The main window: workspaces (projects) and their threads on the left; the shown thread's
+//! conversation in the middle. The window talks to lilad only
 //! through its socket (docs/architecture-v4.md); nothing here decides anything.
 
 use crate::data::{self, Project, Snapshot};
@@ -7,48 +7,33 @@ use gpui::component::{resizable_panel, v_flex};
 use gpui::prelude::*;
 use gpui::*;
 use lila::paths::Paths;
-use lila_term::{Core, TerminalView};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// What the person chose for a new session, over the project's defaults. A choice is kept
 /// until the session is started.
 #[derive(Clone, Default, Debug)]
 pub struct Draft {
-    pub engine: Option<String>,
+    /// A model other than the project's (empty: omp's own default).
     pub model: Option<String>,
-    pub effort: Option<String>,
     pub permission: Option<String>,
     /// The session gets a worktree of its own (only offered where the folder is a repository).
     pub worktree: bool,
 }
 
 impl Draft {
-    /// What a session started now would run: `(engine, model, effort, permission)`; model and effort are
-    /// empty for the engine's own default. Another engine than the project's does not inherit its model and effort.
-    pub fn effective(&self, p: &Project) -> (String, String, String, String) {
-        let engine = self.engine.clone().unwrap_or_else(|| p.engine.clone());
-        let same = engine == p.engine;
-        let model = self.model.clone().unwrap_or_else(|| if same { p.model.clone() } else { String::new() });
-        let effort = self.effort.clone().unwrap_or_else(|| if same { p.effort.clone() } else { String::new() });
-        let effort = if crate::engines::has_effort(&engine) { effort } else { String::new() };
-        (engine, model, effort, self.permission.clone().unwrap_or_else(|| p.permission.clone()))
-    }
-
-    pub fn set_engine(&mut self, engine: &str) {
-        self.engine = Some(engine.to_owned());
-        self.model = None;
-        self.effort = None;
+    /// What a session started now would run: `(model, permission)`; the model is the project's, empty for omp's own default.
+    pub fn effective(&self, p: &Project) -> (String, String) {
+        (self.model.clone().unwrap_or_else(|| p.model.clone()), self.permission.clone().unwrap_or_else(|| p.permission.clone()))
     }
 }
 
 /// What a notification says when a thread went from `was` to `state`, or nothing: it began waiting for
-/// the person (a card, or its terminal), or finished a turn (`recently`: it said so a moment ago, so a state that flickers is not repeated).
-fn what_to_say(was: Option<&str>, state: &str, terminal: bool, recently: bool) -> Option<&'static str> {
+/// the person (a card), or finished a turn (`recently`: it said so a moment ago, so a state that flickers is not repeated).
+fn what_to_say(was: Option<&str>, state: &str, recently: bool) -> Option<&'static str> {
     match (was, state) {
-        (w, "waiting") if w != Some("waiting") => Some(if terminal { "终端里在等你" } else { "要你允许" }),
+        (w, "waiting") if w != Some("waiting") => Some("要你允许"),
         (Some("running"), "idle") if !recently => Some("这一轮做完了"),
         _ => None,
     }
@@ -74,7 +59,7 @@ pub struct Rename {
 pub struct LilaApp {
     paths: Paths,
     /// The window's own focus. Keys only reach `shortcut` along the focused
-    /// element's path, so with no terminal focused the window holds focus itself,
+    /// element's path, so with nothing focused the window holds focus itself,
     /// or ⌘, and the other shortcuts would go nowhere.
     focus: FocusHandle,
     pub snap: Snapshot,
@@ -94,6 +79,11 @@ pub struct LilaApp {
     pub settings: Option<crate::settings::Form>,
     /// The thread being renamed, while its dialog is open.
     pub renaming: Option<Rename>,
+    /// The models omp offers, `(id, name)`, asked once when a choice of them is first shown (`ensure_models`).
+    pub models: Vec<(String, String)>,
+    pub models_asked: bool,
+    /// The boxes the question cards take an answer in, by card (`ui::question_card`).
+    pub question_inputs: std::collections::HashMap<String, Entity<gpui::component::input::InputState>>,
     /// Projects folded in the sidebar, and those showing every thread instead of the latest few.
     pub folded: std::collections::HashSet<String>,
     pub unfolded: std::collections::HashSet<String>,
@@ -111,31 +101,22 @@ pub struct LilaApp {
     pub just_made: Option<String>,
     /// When each thread last notified that a turn was done, so a flickering state doesn't repeat it.
     notified: HashMap<String, i64>,
-    /// Threads whose "trust this folder" is on its way to lilad (the strip's button turns).
-    pub trusting: std::collections::HashSet<String>,
     /// The right panel: files and changes of the shown thread.
     pub panel: crate::panel::Panel,
     /// Going back to a message: the question being asked, and what is under way.
     pub restore: crate::restore::Restore,
-    /// The global settings (usage, about), while open.
-    pub prefs: Option<crate::prefs::Prefs>,
-    /// The 用量 section: accounts and their windows, read in the background.
-    pub usage: crate::usage::UsageState,
+    /// The global settings (about), while open.
+    pub prefs: bool,
     /// Where the open dialog was dragged to, from the window's center.
     pub dialog_offset: Point<Pixels>,
     /// While dragging a dialog: where the press was and the offset then.
     pub dialog_drag: Option<(Point<Pixels>, Point<Pixels>)>,
-    core: Option<Arc<Core>>,
-    pub core_error: Option<String>,
-    terminals: HashMap<String, Entity<TerminalView>>,
     /// The last action's error, shown until the next one.
     pub notice: Option<String>,
     /// A press on a top bar that becomes a window drag once the mouse moves.
     pub drag_armed: bool,
     /// The project "remove from the list" asks about.
     pub removing: Option<Project>,
-    /// Threads shown as their terminal instead of their conversation (thread ids).
-    pub tui: std::collections::HashSet<String>,
     /// The shown thread's conversation, as far as it was read.
     pub conv: Option<crate::conversation::Conv>,
     /// Messages just sent to a thread that its record does not show yet.
@@ -209,17 +190,6 @@ impl LilaApp {
                 while kicked.try_recv().is_ok() {}
             }
         });
-        cx.spawn(async move |this, cx| {
-            let core = cx.background_executor().spawn(async { Core::connect() }).await;
-            let _ = this.update(cx, |this, cx| {
-                match core {
-                    Ok(c) => this.core = Some(c),
-                    Err(e) => this.core_error = Some(format!("连不上 herdr-core（hc）：{e:#}")),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
         // lilad is the only writer: the window starts it when it is not running.
         let start = paths.clone();
         // `LILA_APP_FAKE` (screenshots) stands in for lilad: none is started.
@@ -238,13 +208,11 @@ impl LilaApp {
             });
         })
         .detach();
-        let tui = data::load_views(&paths);
         let sidebar_hidden = data::load_sidebar_hidden(&paths);
         let panel = crate::panel::Panel::new(&paths, cx);
         let mut app = LilaApp {
             paths,
             focus: cx.focus_handle(),
-            usage: Default::default(),
             snap: Snapshot::default(),
             restart: Restart::Idle,
             thread: None,
@@ -254,6 +222,9 @@ impl LilaApp {
             restored: false,
             settings: None,
             renaming: None,
+            models: Vec::new(),
+            models_asked: false,
+            question_inputs: std::collections::HashMap::new(),
             folded: Default::default(),
             unfolded: Default::default(),
             archived_shown: Default::default(),
@@ -263,19 +234,14 @@ impl LilaApp {
             seen: None,
             just_made: None,
             notified: HashMap::new(),
-            trusting: Default::default(),
             panel,
             restore: Default::default(),
-            prefs: None,
+            prefs: false,
             dialog_offset: Point::default(),
             dialog_drag: None,
-            core: None,
-            core_error: None,
-            terminals: HashMap::new(),
             notice: None,
             drag_armed: false,
             removing: None,
-            tui,
             conv: None,
             pending: Vec::new(),
             next_pending: 0,
@@ -289,7 +255,6 @@ impl LilaApp {
             kick,
             _poll: poll,
         };
-        app.start_usage(window, cx);
         cx.observe_window_activation(window, |this, window, cx| {
             // `--features shots`: `LILA_APP_INACTIVE=1` acts as a window that is never in front.
             this.active = window.is_window_active() && !(cfg!(feature = "shots") && std::env::var_os("LILA_APP_INACTIVE").is_some());
@@ -414,7 +379,7 @@ impl LilaApp {
                 let id = crate::ui::s(t, "id");
                 let Some((state, _)) = now.get(&id) else { continue };
                 let recently = self.notified.get(&id).is_some_and(|n| at - n <= 10_000);
-                if let Some(body) = what_to_say(before.get(&id).map(|(s, _)| s.as_str()), state, t["waiting"] == "terminal", recently) {
+                if let Some(body) = what_to_say(before.get(&id).map(|(s, _)| s.as_str()), state, recently) {
                     self.notified.insert(id, at);
                     let project = snap.projects.iter().find(|p| t["project"] == p.id.as_str()).map(|p| p.label()).unwrap_or_default();
                     data::notify(&format!("{project} · {}", crate::ui::s(t, "title")), body);
@@ -468,6 +433,25 @@ impl LilaApp {
 
     pub fn project(&self, id: &str) -> Option<Project> {
         self.snap.projects.iter().find(|p| p.id == id).cloned()
+    }
+
+    /// Asks lilad for the models omp offers, once (it asks an omp of its own, which takes a moment), for the menus that choose among them.
+    pub fn ensure_models(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.models_asked, true) {
+            return;
+        }
+        let paths = self.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { data::act(&paths, "models.list", json!({}), false) }).await;
+            let _ = this.update(cx, |this, cx| {
+                // Without them the menus show the plain words.
+                if let Ok(v) = r {
+                    this.models = v["models"].as_array().into_iter().flatten().map(|m| (crate::ui::s(m, "id"), crate::ui::s(m, "name"))).collect();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Fetches everything again right away.
@@ -581,26 +565,6 @@ impl LilaApp {
         })
         .detach();
     }
-
-    pub fn terminal(&mut self, address: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
-        let core = self.core.clone()?;
-        // A view whose stream ended while its thread still runs (a lost
-        // connection) is replaced on the next look.
-        let alive = self.snap.threads.iter().any(|t| t["terminal"] == address && t["state"] != "ended");
-        let stale = self.terminals.get(address).is_some_and(|v| v.read(cx).ended().is_some() && alive);
-        if stale || !self.terminals.contains_key(address) {
-            let cwd = self.shown_thread().and_then(|t| t["cwd"].as_str().map(std::path::PathBuf::from));
-            let view = cx.new(|cx| {
-                let mut view = TerminalView::new(core, address.to_owned(), false, window, cx);
-                if let Some(cwd) = cwd {
-                    view.set_working_directory(cwd);
-                }
-                view
-            });
-            self.terminals.insert(address.to_owned(), view);
-        }
-        self.terminals.get(address).cloned()
-    }
 }
 
 impl Render for LilaApp {
@@ -653,18 +617,18 @@ pub fn gutter() -> gpui::base::ResizeHandleRenderer {
 impl LilaApp {
     /// A dialog is open over the window.
     fn modal(&self) -> bool {
-        self.prefs.is_some() || self.settings.is_some() || self.renaming.is_some() || self.removing.is_some() || self.panel.merge_confirm.is_some() || self.restore.ask.is_some()
+        self.prefs || self.settings.is_some() || self.renaming.is_some() || self.removing.is_some() || self.panel.merge_confirm.is_some() || self.restore.ask.is_some()
     }
 
     /// Closes the topmost dialog; false when none is open.
     fn close_dialog(&mut self) -> bool {
-        if self.restore.ask.take().is_some() || self.panel.merge_confirm.take().is_some() || self.removing.take().is_some() || self.renaming.take().is_some() || self.settings.take().is_some() || self.prefs.take().is_some() {
+        if self.restore.ask.take().is_some() || self.panel.merge_confirm.take().is_some() || self.removing.take().is_some() || self.renaming.take().is_some() || self.settings.take().is_some() || std::mem::take(&mut self.prefs) {
             return true;
         }
         false
     }
 
-    /// Window-wide keys. The terminal handles copy, paste and find; other ⌘ chords bubble here.
+    /// Window-wide keys.
     fn shortcut(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         if k.key == "escape" && self.close_dialog() {
@@ -691,16 +655,10 @@ impl LilaApp {
                 }
                 self.toggle_panel(if k.key == "e" { crate::panel::View::Files } else { crate::panel::View::Changes }, cx);
             }
-            (",", false) => self.open_prefs(crate::prefs::PrefPage::Usage, cx),
+            (",", false) => self.open_prefs(cx),
             (",", true) | ("<", _) => {
                 if let Some(p) = self.current_project() {
                     self.open_settings(p, window, cx);
-                }
-            }
-            // Back from a terminal to the conversation.
-            ("[", false) => {
-                if let Some(id) = self.thread.clone() {
-                    self.set_view(&id, false, cx);
                 }
             }
             // Stops the turn under way, as ⌘. does everywhere on the Mac.
@@ -726,16 +684,13 @@ impl LilaApp {
 
 #[cfg(feature = "shots")]
 impl LilaApp {
-    /// `--features shots`: a new session's box in a project (`LILA_APP_NEW=shop,engine=codex,model=…,effort=…,permission=…`).
+    /// `--features shots`: a new session's box in a project (`LILA_APP_NEW=shop,permission=…`).
     pub fn dev_new(&mut self, spec: &str, window: &mut Window, cx: &mut Context<Self>) {
         let mut parts = spec.split(',');
         let project = parts.next().unwrap_or_default().to_owned();
         let mut d = Draft::default();
         for kv in parts {
             match kv.split_once('=') {
-                Some(("engine", v)) => d.set_engine(v),
-                Some(("model", v)) => d.model = Some(v.to_owned()),
-                Some(("effort", v)) => d.effort = Some(v.to_owned()),
                 Some(("permission", v)) => d.permission = Some(v.to_owned()),
                 _ => {}
             }
@@ -750,36 +705,27 @@ mod tests {
     use super::{Draft, what_to_say};
     use crate::data::Project;
 
-    fn project(engine: &str, model: &str, effort: &str) -> Project {
-        Project { id: "shop".into(), cwd: "/x".into(), label: "shop".into(), engine: engine.into(), model: model.into(), effort: effort.into(), permission: "full".into(), ..Default::default() }
+    fn project(model: &str) -> Project {
+        Project { id: "shop".into(), cwd: "/x".into(), label: "shop".into(), model: model.into(), permission: "full".into(), ..Default::default() }
     }
 
     #[test]
     fn a_new_session_starts_on_the_projects_defaults_until_told_otherwise() {
-        let p = project("claude", "claude-haiku-5-5", "low");
-        assert_eq!(Draft::default().effective(&p), ("claude".into(), "claude-haiku-5-5".into(), "low".into(), "full".into()));
-        let mut d = Draft { effort: Some("high".into()), permission: Some("confirm".into()), ..Default::default() };
-        assert_eq!(d.effective(&p), ("claude".into(), "claude-haiku-5-5".into(), "high".into(), "confirm".into()));
-        // Another engine does not inherit the project's model and effort, and omp has no effort at all.
-        d.set_engine("codex");
-        assert_eq!(d.effective(&p), ("codex".into(), String::new(), String::new(), "confirm".into()));
-        d.set_engine("omp");
-        d.effort = Some("high".into());
-        assert_eq!(d.effective(&p).2, "");
-        // Back on the project's own engine: its defaults again.
-        d.set_engine("claude");
-        assert_eq!(d.effective(&p).1, "claude-haiku-5-5");
+        let p = project("deepseek/deepseek-v4");
+        assert_eq!(Draft::default().effective(&p), ("deepseek/deepseek-v4".into(), "full".into()));
+        let d = Draft { permission: Some("confirm".into()), ..Default::default() };
+        assert_eq!(d.effective(&p), ("deepseek/deepseek-v4".into(), "confirm".into()));
+        assert_eq!(Draft::default().effective(&project("")).0, "", "omp's own default");
     }
 
     #[test]
     fn it_notifies_when_a_thread_starts_waiting_or_finishes_a_turn() {
-        assert_eq!(what_to_say(Some("running"), "waiting", false, false), Some("要你允许"));
-        assert_eq!(what_to_say(Some("idle"), "waiting", true, false), Some("终端里在等你"));
-        assert_eq!(what_to_say(None, "waiting", false, false), Some("要你允许"), "a thread that began while the window was away");
-        assert_eq!(what_to_say(Some("waiting"), "waiting", false, false), None, "still the same wait");
-        assert_eq!(what_to_say(Some("running"), "idle", false, false), Some("这一轮做完了"));
-        assert_eq!(what_to_say(Some("running"), "idle", false, true), None, "not twice in a flicker");
-        assert_eq!(what_to_say(Some("idle"), "running", false, false), None);
-        assert_eq!(what_to_say(Some("running"), "ended", false, false), None);
+        assert_eq!(what_to_say(Some("running"), "waiting", false), Some("要你允许"));
+        assert_eq!(what_to_say(None, "waiting", false), Some("要你允许"), "a thread that began while the window was away");
+        assert_eq!(what_to_say(Some("waiting"), "waiting", false), None, "still the same wait");
+        assert_eq!(what_to_say(Some("running"), "idle", false), Some("这一轮做完了"));
+        assert_eq!(what_to_say(Some("running"), "idle", true), None, "not twice in a flicker");
+        assert_eq!(what_to_say(Some("idle"), "running", false), None);
+        assert_eq!(what_to_say(Some("running"), "ended", false), None);
     }
 }

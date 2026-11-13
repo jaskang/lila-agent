@@ -56,7 +56,7 @@ pub fn at_text(path: &str) -> String {
 pub enum Kind {
     /// `@`: a file of the thread's folder.
     File,
-    /// `/` (Codex also `$`): a command or a skill.
+    /// `/`: a command or a skill.
     Command,
 }
 
@@ -68,8 +68,8 @@ pub struct Trigger {
     pub query: String,
 }
 
-/// `@…` anywhere, `/…` (and `$…` for `dollar`) as the first word: the word the cursor ends.
-pub fn detect(text: &str, cursor: usize, dollar: bool) -> Option<Trigger> {
+/// `@…` anywhere, `/…` as the first word: the word the cursor ends.
+pub fn detect(text: &str, cursor: usize) -> Option<Trigger> {
     let cursor = cursor.min(text.len());
     if !text.is_char_boundary(cursor) {
         return None;
@@ -88,13 +88,10 @@ pub fn detect(text: &str, cursor: usize, dollar: bool) -> Option<Trigger> {
     if let Some(q) = word.strip_prefix('@') {
         return found(Kind::File, q);
     }
-    if start == 0 {
-        if let Some(q) = word.strip_prefix('/') {
-            return found(Kind::Command, q);
-        }
-        if let (true, Some(q)) = (dollar, word.strip_prefix('$')) {
-            return found(Kind::Command, q);
-        }
+    if start == 0
+        && let Some(q) = word.strip_prefix('/')
+    {
+        return found(Kind::Command, q);
     }
     None
 }
@@ -193,11 +190,8 @@ fn included(query: &str, text: &str) -> Vec<Range<usize>> {
 pub enum Pick {
     /// Puts these words where the trigger was (a file's `@path`, a command's name); `send`: and sends.
     Put { text: String, send: bool },
-    /// Lila's own: stops the turn, shows the terminal.
+    /// Lila's own: stops the turn.
     Stop,
-    Terminal,
-    /// A request of the runtime's protocol instead of words (`thread.run`).
-    Run(String),
 }
 
 #[derive(Clone)]
@@ -278,16 +272,8 @@ impl LilaApp {
         self.composers.get(&key).map(|c| c.input.read(cx).focus_handle(cx))
     }
 
-    /// Does the runtime take `$name` for a skill (Codex)?
-    fn dollar(&self, target: &str) -> bool {
-        match new_project(target) {
-            Some(p) => self.draft_of(p).is_some_and(|d| d.0 == "codex"),
-            None => self.snap.threads.iter().any(|m| m["id"] == target && m["engine"] == "codex"),
-        }
-    }
-
-    /// What a session started in `project` now would run: `(engine, model, effort, permission)`.
-    pub fn draft_of(&self, project: &str) -> Option<(String, String, String, String)> {
+    /// What a session started in `project` now would run: `(model, permission)`.
+    pub fn draft_of(&self, project: &str) -> Option<(String, String)> {
         let p = self.project(project)?;
         Some(self.drafts.get(project).cloned().unwrap_or_default().effective(&p))
     }
@@ -295,7 +281,6 @@ impl LilaApp {
     /// The words or the cursor moved: opens, moves or closes the menu.
     fn composer_changed(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         let target = key.to_owned();
-        let dollar = self.dollar(&target);
         let Some(c) = self.composers.get_mut(key) else { return };
         let (text, cursor) = c.input.read_with(cx, |i, _| (i.value().to_string(), i.cursor()));
         // Typing after a recalled message makes it the person's own words again.
@@ -307,7 +292,7 @@ impl LilaApp {
             c.error = None;
             c.seen = text.clone();
         }
-        let raw = detect(&text, cursor, dollar);
+        let raw = detect(&text, cursor);
         if raw.is_none() {
             c.dismissed = None;
         }
@@ -360,7 +345,7 @@ impl LilaApp {
     }
 
     /// The rows the menu shows for what was typed.
-    pub fn menu_rows(&self, target: &str, working: bool, tui: bool, menu: &Menu) -> Vec<Row> {
+    pub fn menu_rows(&self, target: &str, working: bool, menu: &Menu) -> Vec<Row> {
         let key = self.composer_key(target);
         let q = menu.trigger.query.as_str();
         match menu.trigger.kind {
@@ -378,18 +363,11 @@ impl LilaApp {
                     .collect()
             }
             Kind::Command => {
-                let sigil = if self.dollar(target) { '$' } else { '/' };
                 let query = Query::new(q);
                 // (score, row): those whose name matches, then those that only mention it in their description.
                 let (mut named, mut described): (Vec<(u32, Row)>, Vec<Row>) = (Vec::new(), Vec::new());
-                let own = [
-                    (Icon::new(IconName::Square), "停止", Pick::Stop, working),
-                    (Icon::new(IconName::SquareTerminal), "终端", Pick::Terminal, tui),
-                ];
-                for (icon, name, pick, offered) in own {
-                    if let (true, Some(hit)) = (offered, query.hit(name, false)) {
-                        named.push((hit.score, Row { icon, name: name.to_owned(), detail: String::new(), name_at: hit.at, detail_at: Vec::new(), pick }));
-                    }
+                if let (true, Some(hit)) = (working, query.hit("停止", false)) {
+                    named.push((hit.score, Row { icon: Icon::new(IconName::Square), name: "停止".to_owned(), detail: String::new(), name_at: hit.at, detail_at: Vec::new(), pick: Pick::Stop }));
                 }
                 for c in self.menu_commands.get(&key).into_iter().flatten() {
                     let (name, detail, kind) = (s(c, "name"), s(c, "description"), s(c, "kind"));
@@ -408,15 +386,12 @@ impl LilaApp {
                     let shift = if hint.is_empty() { 0 } else { hint.len() + 2 };
                     let detail_at = by_words.iter().map(|r| r.start + shift..r.end + shift).collect();
                     let detail = if hint.is_empty() { detail } else { format!("{hint}  {detail}") };
-                    let pick = match (c["action"].as_str(), c["insert"].as_str()) {
-                        (Some(a), _) => Pick::Run(a.to_owned()),
-                        // Words that take arguments (a hint, or any skill) wait for them in the box; the rest go at once.
-                        (None, Some(t)) => Pick::Put { text: t.replace(['/', '$'], &sigil.to_string()), send: hint.is_empty() && kind != "skill" },
-                        _ => continue,
-                    };
+                    // Words that take arguments (a hint, or any skill) wait for them in the box; the rest go at once.
+                    let Some(t) = c["insert"].as_str() else { continue };
+                    let pick = Pick::Put { text: t.to_owned(), send: hint.is_empty() && kind != "skill" };
                     // The sign is part of what is drawn, so the highlight moves past it.
                     let name_at = by_name.iter().flat_map(|h| h.at.iter()).map(|r| r.start + 1..r.end + 1).collect();
-                    let row = Row { icon, name: format!("{sigil}{name}"), detail, name_at, detail_at, pick };
+                    let row = Row { icon, name: format!("/{name}"), detail, name_at, detail_at, pick };
                     match by_name {
                         Some(h) => named.push((h.score, row)),
                         None => described.push(row),
@@ -445,12 +420,12 @@ impl LilaApp {
     /// Returns whether the key was used.
     fn composer_key_press(&mut self, target: &str, key: MenuKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let ck = self.composer_key(target);
-        let (working, tui) = self.snap.threads.iter().find(|m| m["id"] == target).map(|m| (m["state"] == "running", m["caps"]["tui"] == true)).unwrap_or_default();
+        let working = self.snap.threads.iter().any(|m| m["id"] == target && m["state"] == "running");
         let Some(c) = self.composers.get(&ck) else { return false };
         let Some(menu) = c.menu.as_ref() else {
             return self.history_key(target, key, window, cx);
         };
-        let rows = self.menu_rows(target, working, tui, menu);
+        let rows = self.menu_rows(target, working, menu);
         match key {
             MenuKey::Up | MenuKey::Down => {
                 self.menu_move(&ck, rows.len(), key == MenuKey::Down);
@@ -501,8 +476,6 @@ impl LilaApp {
                 let to = target.to_owned();
                 match own {
                     Pick::Stop => self.request("thread.interrupt", json!({"thread": to}), cx, |this, _, _| this.refresh_now()),
-                    Pick::Terminal => self.set_view(target, true, cx),
-                    Pick::Run(action) => self.request("thread.run", json!({"thread": to, "action": action}), cx, |this, _, _| this.refresh_now()),
                     Pick::Put { .. } => {}
                 }
             }
@@ -533,7 +506,7 @@ impl LilaApp {
         c.back = Some((to, text.clone()));
         // A recalled `/compact` is a message, not a word being typed: no menu over it.
         c.menu = None;
-        c.dismissed = detect(&text, text.len(), false).map(|t| (t.kind, t.range.start));
+        c.dismissed = detect(&text, text.len()).map(|t| (t.kind, t.range.start));
         c.input.update(cx, |st, cx| {
             st.set_value(text.clone(), window, cx);
             st.set_selected_range(text.len()..text.len(), cx);
@@ -548,7 +521,7 @@ impl LilaApp {
     }
 
     /// Sends the box's words and files: to the thread, or, for a new session's box, as its first message
-    /// (which makes the thread, on the engine, model, effort and tier the box shows). To a thread they go
+    /// (which makes the thread, on the model and tier the box shows). To a thread they go
     /// at once: the box empties and the message shows at the end of the conversation (`Pending`) until the
     /// record has it, and if the send fails they come back into the box, with the reason. A new session's
     /// box keeps them until it is made.
@@ -567,8 +540,8 @@ impl LilaApp {
         let sent = files.len();
         let (method, params, pending) = match new_project(&target) {
             Some(project) => {
-                let (engine, model, effort, permission) = self.draft_of(project).unwrap_or_default();
-                let mut p = json!({"project": project, "text": text, "attachments": files, "engine": engine, "effort": effort, "permission": permission});
+                let (model, permission) = self.draft_of(project).unwrap_or_default();
+                let mut p = json!({"project": project, "text": text, "attachments": files, "permission": permission});
                 if !model.is_empty() {
                     p["model"] = json!(model);
                 }
@@ -748,37 +721,19 @@ impl LilaApp {
         });
     }
 
-    /// The button on the right of the tool row for a session: the model, the engine and its effort. A menu of models
-    /// and efforts where the session can change them (the engine never changes), else the plain words.
-    /// Claude Code can't while it lives: its `/model` and `/effort` save the person's defaults (`thread.model`);
-    /// ended, it can. A yellow dot when they are not the workspace's.
+    /// The button on the right of the tool row for a session: the model and its effort. A menu of what omp lists once it
+    /// runs, else the plain words. A yellow dot when they are not the workspace's.
     fn thread_spec(&mut self, target: &str, m: &Value, cfg: &Value, cx: &mut Context<Self>) -> AnyElement {
         let quiet = style::quiet(cx);
-        let engine = s(m, "engine");
         let known = |key: &str| Some(s(cfg, key)).filter(|v| !v.is_empty()).unwrap_or_else(|| s(m, key));
         let (model, effort) = (known("model"), known("effort"));
-        let label = crate::engines::engine_spec(&engine, &model, &effort);
-        let switch = match engine.as_str() {
-            "claude" => m["state"] == "ended",
-            // omp changes only what it lists, once it runs.
-            "omp" => cfg["switch"] == true,
-            _ => true,
-        };
-        if !switch {
+        let label = crate::engines::spec_label(&model, &effort);
+        // omp changes only what it lists, once it runs.
+        if cfg["switch"] != true {
             return spec_text(label);
         }
-        // The choices: the engine lists its own (omp), else those the settings offer.
         let pairs = |list: &Value| -> Vec<(String, String)> { list.as_array().into_iter().flatten().map(|c| (s(c, "id"), s(c, "name"))).collect() };
-        let (mut models, mut efforts) = (pairs(&cfg["models"]), pairs(&cfg["efforts"]));
-        if models.is_empty() {
-            models = crate::engines::models(&engine).iter().map(|m| (m.to_string(), crate::engines::short_model(m))).collect();
-            if !model.is_empty() && !models.iter().any(|(id, _)| *id == model) {
-                models.insert(0, (model.clone(), crate::engines::short_model(&model)));
-            }
-        }
-        if efforts.is_empty() && crate::engines::has_effort(&engine) {
-            efforts = crate::engines::EFFORTS.iter().map(|e| (e.to_string(), e.to_string())).collect();
-        }
+        let (models, efforts) = (pairs(&cfg["models"]), pairs(&cfg["efforts"]));
         let weak = cx.entity().downgrade();
         let to = target.to_owned();
         let button = Button::new("conv-model").custom(quiet).xsmall().label(label).dropdown_caret(true).tooltip("模型").dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
@@ -802,8 +757,8 @@ impl LilaApp {
         h_flex().gap(px(2.)).items_center().when(differs(cfg), |d| d.child(div().size(px(6.)).flex_none().rounded_full().bg(style::yellow()))).child(button).into_any_element()
     }
 
-    /// The box under a thread's conversation, on a bar of its own, with `ask` (the engine waits in its terminal) above it.
-    pub fn composer_view(&mut self, m: &Value, ask: Option<AnyElement>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The box under a thread's conversation, on a bar of its own.
+    pub fn composer_view(&mut self, m: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // Merged: nothing more is said to it.
         if m["merged_ms"].is_number() {
             let id = s(m, "id");
@@ -811,8 +766,13 @@ impl LilaApp {
             let text = format!("已合并到 {}{}", s(m, "base_branch"), sha.map(|s| format!(" · {s}")).unwrap_or_default());
             return h_flex().flex_none().justify_center().py_3().border_t_1().border_color(style::divider()).child(div().w_full().max_w(px(760.)).px_5().text_size(px(13.)).text_color(muted()).child(text)).into_any_element();
         }
+        // From before omp was the only engine: its conversation stays, nothing more is said to it.
+        if let Some(old) = m["legacy"].as_str() {
+            let name = if old == "codex" { "Codex" } else { "Claude Code" };
+            return h_flex().flex_none().justify_center().py_3().border_t_1().border_color(style::divider()).child(div().w_full().max_w(px(760.)).px_5().text_size(px(13.)).text_color(muted()).child(format!("{name} 会话，不能继续"))).into_any_element();
+        }
         let boxed = self.composer_box(&s(m, "id"), Some(m), window, cx);
-        h_flex().flex_none().justify_center().pb_3().pt_2().border_t_1().border_color(style::divider()).child(v_flex().w_full().max_w(px(760.)).px_5().gap_2().children(ask).child(boxed)).into_any_element()
+        h_flex().flex_none().justify_center().pb_3().pt_2().border_t_1().border_color(style::divider()).child(v_flex().w_full().max_w(px(760.)).px_5().gap_2().child(boxed)).into_any_element()
     }
 
     /// The box that starts a session in `project`: the same box, with the choices a session starts on.
@@ -825,7 +785,6 @@ impl LilaApp {
         let target = target.to_owned();
         let working = m.is_some_and(|m| s(m, "state") == "running");
         let waiting = m.is_some_and(|m| m["state"] == "waiting");
-        let tui = m.is_some_and(|m| m["caps"]["tui"] == true);
         self.composer(&target, window, cx);
         let cfg = self.conv.as_ref().filter(|c| c.thread == target).map(|c| c.config.clone()).unwrap_or(Value::Null);
         let ck = self.composer_key(&target);
@@ -840,7 +799,7 @@ impl LilaApp {
         let can_send = !busy && !waiting && !restoring && has_content;
         let menu = if has_menu {
             let menu = self.composers[&ck].menu.as_ref().expect("has one");
-            let rows = self.menu_rows(&target, working, tui, menu);
+            let rows = self.menu_rows(&target, working, menu);
             let (selected, scroll) = (menu.selected.min(rows.len().saturating_sub(1)), menu.scroll.clone());
             (!rows.is_empty()).then(|| self.menu_view(&target, rows, selected, scroll, cx))
         } else {
@@ -983,66 +942,38 @@ impl LilaApp {
             .into_any_element()
     }
 
-    /// The button on the right of a new session's tool row: the model, the engine and its effort, as one menu: the
-    /// engines, then the models, then the efforts (the effort where the engine takes one).
+    /// What a new session's tool row says on the right: the model it starts on, and where omp has listed them, a menu of them
+    /// (the first, 默认, is the workspace's).
     fn new_spec(&mut self, project: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (model, _) = self.draft_of(project)?;
+        self.ensure_models(cx);
+        let label = crate::engines::spec_label(&model, "");
+        if self.models.is_empty() {
+            return Some(spec_text(label));
+        }
         let quiet = style::quiet(cx);
-        let (engine, model, effort, _) = self.draft_of(project)?;
-        let weak = cx.entity().downgrade();
-        let models: Vec<String> = {
-            let mut m: Vec<String> = crate::engines::models(&engine).iter().map(|m| m.to_string()).collect();
-            if !model.is_empty() && !m.contains(&model) {
-                m.insert(0, model.clone());
+        let (weak, project, models) = (cx.entity().downgrade(), project.to_owned(), self.models.clone());
+        let chosen = self.drafts.get(&project).and_then(|d| d.model.clone());
+        let button = Button::new("new-model").custom(quiet).xsmall().label(label).dropdown_caret(true).tooltip("模型").dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
+            let (w, p) = (weak.clone(), project.clone());
+            menu = menu.item(PopupMenuItem::new("默认").checked(chosen.is_none()).on_click(move |_, _, cx| {
+                let _ = w.update(cx, |this, cx| {
+                    this.drafts.entry(p.clone()).or_default().model = None;
+                    cx.notify();
+                });
+            }));
+            for (id, name) in &models {
+                let (w, p, id2) = (weak.clone(), project.clone(), id.clone());
+                menu = menu.item(PopupMenuItem::new(name.clone()).checked(chosen.as_deref() == Some(id.as_str())).on_click(move |_, _, cx| {
+                    let _ = w.update(cx, |this, cx| {
+                        this.drafts.entry(p.clone()).or_default().model = Some(id2.clone());
+                        cx.notify();
+                    });
+                }));
             }
-            m
-        };
-        let shown_model = if model.is_empty() { crate::engines::default_model(&engine).to_owned() } else { model.clone() };
-        let (now_engine, project) = (engine.clone(), project.to_owned());
-        Some(
-            Button::new("new-spec")
-                .custom(quiet)
-                .xsmall()
-                .label(crate::engines::engine_spec(&engine, &model, &effort))
-                .dropdown_caret(true)
-                .tooltip("模型")
-                .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
-                    for (id, name) in crate::engines::ENGINES {
-                        let (weak, project) = (weak.clone(), project.clone());
-                        menu = menu.item(PopupMenuItem::new(name).checked(id == now_engine).on_click(move |_, _, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.drafts.entry(project.clone()).or_default().set_engine(id);
-                                cx.notify();
-                            });
-                        }));
-                    }
-                    if !models.is_empty() {
-                        menu = menu.separator();
-                    }
-                    for m in &models {
-                        let (weak, project, id) = (weak.clone(), project.clone(), m.clone());
-                        menu = menu.item(PopupMenuItem::new(crate::engines::short_model(m)).checked(*m == shown_model).on_click(move |_, _, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.drafts.entry(project.clone()).or_default().model = Some(id.clone());
-                                cx.notify();
-                            });
-                        }));
-                    }
-                    if crate::engines::has_effort(&now_engine) {
-                        menu = menu.separator();
-                        for e in std::iter::once("").chain(crate::engines::EFFORTS) {
-                            let (weak, project) = (weak.clone(), project.clone());
-                            menu = menu.item(PopupMenuItem::new(if e.is_empty() { "默认" } else { e }).checked(e == effort).on_click(move |_, _, cx| {
-                                let _ = weak.update(cx, |this, cx| {
-                                    this.drafts.entry(project.clone()).or_default().effort = Some(e.to_owned());
-                                    cx.notify();
-                                });
-                            }));
-                        }
-                    }
-                    menu
-                })
-                .into_any_element(),
-        )
+            menu
+        });
+        Some(button.into_any_element())
     }
 
     /// The `+` at the start of the tool row. A session: a menu of what can be added (a file; the commands, which
@@ -1217,16 +1148,16 @@ impl LilaApp {
     }
 }
 
-/// The model, engine and effort as plain words, where the session can't change them.
+/// The model and effort as plain words, where the session can't change them.
 fn spec_text(label: String) -> AnyElement {
     h_flex().h(px(style::CTL_SM)).px_2().min_w_0().overflow_hidden().whitespace_nowrap().items_center().text_size(px(12.)).text_color(muted2()).child(label).into_any_element()
 }
 
-/// Is the model or effort not the project's? (Claude Code's model is read from its replies, as an id: only an id can differ for certain.)
+/// Is the model or effort not the project's?
 pub fn differs(cfg: &Value) -> bool {
     let (m, dm) = (cfg["model"].as_str().unwrap_or_default(), cfg["default_model"].as_str().unwrap_or_default());
     let (e, de) = (cfg["effort"].as_str().unwrap_or_default(), cfg["default_effort"].as_str().unwrap_or_default());
-    let model = !dm.is_empty() && m != dm && (cfg["switch"] == true || dm.starts_with("claude-"));
+    let model = !dm.is_empty() && m != dm && cfg["switch"] == true;
     let effort = !de.is_empty() && !e.is_empty() && e != de;
     model || effort
 }
@@ -1247,27 +1178,26 @@ mod tests {
     use super::{Kind, Query, detect, differs, included, rank_files, within};
     use serde_json::json;
 
-    fn word(text: &str, dollar: bool) -> Option<(Kind, std::ops::Range<usize>, String)> {
-        detect(text, text.len(), dollar).map(|t| (t.kind, t.range, t.query))
+    fn word(text: &str) -> Option<(Kind, std::ops::Range<usize>, String)> {
+        detect(text, text.len()).map(|t| (t.kind, t.range, t.query))
     }
 
     #[test]
     fn at_opens_the_files_anywhere_and_slash_the_commands_only_first() {
-        assert_eq!(word("@", false), Some((Kind::File, 0..1, String::new())));
-        assert_eq!(word("look at @src/ma", false), Some((Kind::File, 8..15, "src/ma".into())));
-        assert_eq!(word("look at @\"my fi", false), Some((Kind::File, 8..15, "my fi".into())), "a quote opened for a path with spaces");
-        assert_eq!(word("/com", false), Some((Kind::Command, 0..4, "com".into())));
-        assert_eq!(word("fix /etc/hosts", false), None, "a path in the middle is a path");
-        assert_eq!(word("mail me@x.com", false), None, "an @ inside a word is not a mention");
-        assert_eq!(word("$tdd", false), None);
-        assert_eq!(word("$tdd", true), Some((Kind::Command, 0..4, "tdd".into())), "Codex calls skills with a dollar");
-        assert_eq!(word("done ", false), None);
+        assert_eq!(word("@"), Some((Kind::File, 0..1, String::new())));
+        assert_eq!(word("look at @src/ma"), Some((Kind::File, 8..15, "src/ma".into())));
+        assert_eq!(word("look at @\"my fi"), Some((Kind::File, 8..15, "my fi".into())), "a quote opened for a path with spaces");
+        assert_eq!(word("/com"), Some((Kind::Command, 0..4, "com".into())));
+        assert_eq!(word("fix /etc/hosts"), None, "a path in the middle is a path");
+        assert_eq!(word("mail me@x.com"), None, "an @ inside a word is not a mention");
+        assert_eq!(word("$tdd"), None);
+        assert_eq!(word("done "), None);
         // The cursor decides, not the end: in the middle of the first word.
-        assert_eq!(detect("/compact now", 4, false).map(|t| t.query), Some("com".into()));
-        assert_eq!(detect("/compact now", 9, false), None, "past the word");
+        assert_eq!(detect("/compact now", 4).map(|t| t.query), Some("com".into()));
+        assert_eq!(detect("/compact now", 9), None, "past the word");
         // Wide characters: byte offsets stay on boundaries.
-        assert_eq!(word("看看 @文档", false), Some((Kind::File, 7..14, "文档".into())));
-        assert_eq!(detect("看看", 1, false), None, "inside a character");
+        assert_eq!(word("看看 @文档"), Some((Kind::File, 7..14, "文档".into())));
+        assert_eq!(detect("看看", 1), None, "inside a character");
     }
 
     /// The matched pieces of `text` for `query`, as text.
@@ -1356,11 +1286,10 @@ mod tests {
     #[test]
     fn the_dot_marks_a_model_or_effort_that_is_not_the_projects() {
         let cfg = |model: &str, default: &str, effort: &str, switch: bool| json!({"model": model, "default_model": default, "effort": effort, "default_effort": "high", "switch": switch});
-        assert!(!differs(&cfg("gpt-6.1-sol", "gpt-6.1-sol", "high", true)));
-        assert!(differs(&cfg("gpt-6-luna", "gpt-6.1-sol", "high", true)));
-        assert!(differs(&cfg("gpt-6.1-sol", "gpt-6.1-sol", "low", true)));
-        // Claude Code reports ids; a project that wrote an alias can't be compared.
-        assert!(differs(&cfg("claude-haiku-5-5", "claude-sonnet-5-5", "high", false)));
-        assert!(!differs(&cfg("claude-haiku-5-5", "haiku", "high", false)));
+        assert!(!differs(&cfg("openai/gpt-6", "openai/gpt-6", "high", true)));
+        assert!(differs(&cfg("openai/gpt-6-luna", "openai/gpt-6", "high", true)));
+        assert!(differs(&cfg("openai/gpt-6", "openai/gpt-6", "low", true)));
+        // A thread that cannot switch has nothing to differ in.
+        assert!(!differs(&cfg("openai/gpt-6-luna", "openai/gpt-6", "high", false)));
     }
 }

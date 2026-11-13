@@ -2,8 +2,7 @@
 //! (start, send, stop, resume, archive, tier).
 
 use super::*;
-use lila_agent::Command;
-use lila_core::runtime::{self, Session, Spec};
+use lila_core::runtime;
 use super::jobs::{Begin, Plan};
 use lila_store::NewThread;
 
@@ -33,19 +32,19 @@ impl<T: Terminals> Daemon<T> {
 
     // ---------------- projects ----------------
 
-    pub(super) fn project_json(&self, id: &str, now: i64) -> Result<Value> {
+    pub(super) fn project_json(&self, id: &str) -> Result<Value> {
         let p = self.projects.get(id).ok_or_else(|| anyhow!("unknown project {id}"))?;
         let threads = self.store.threads(id, false)?;
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for t in &threads {
-            *counts.entry(self.state_of(t, now).0.as_str()).or_default() += 1;
+            *counts.entry(self.state_of(t).0.as_str()).or_default() += 1;
         }
         let d = &p.config.defaults;
         Ok(json!({
             "id": id, "cwd": p.cwd, "title": p.config.title, "label": p.config.title.clone().unwrap_or_else(|| id.to_owned()), "error": p.error, "repo": p.repo,
-            "defaults": {"engine": d.engine.as_str(), "model": d.model_or_default(), "effort": d.effort, "permission": d.permission.as_str()},
+            "defaults": {"model": d.model, "permission": d.permission.as_str()},
             "threads": threads.len(), "states": counts,
-            "waiting": self.asking.iter().filter(|a| threads.iter().any(|t| t.id == a.thread)).count(),
+            "waiting": self.asking.iter().filter(|a| threads.iter().any(|t| t.id == a.thread)).count() + self.questions.iter().filter(|a| threads.iter().any(|t| t.id == a.thread)).count(),
         }))
     }
 
@@ -58,7 +57,7 @@ impl<T: Terminals> Daemon<T> {
         self.store.upsert_project(&cfg.name, &root_s, now)?;
         self.load_project(&cfg.name, &root);
         self.say(format!("project {}: added ({})", cfg.name, root.display()));
-        let mut v = self.project_json(&cfg.name, now)?;
+        let mut v = self.project_json(&cfg.name)?;
         v["created_config"] = json!(made);
         Ok(v)
     }
@@ -68,10 +67,9 @@ impl<T: Terminals> Daemon<T> {
         let pid = self.resolve_project(params)?;
         let mut stopped = Vec::new();
         for t in self.store.threads(&pid, true)? {
-            if self.stop_engine(&t, "project removed", now) {
+            if self.stop_thread(&t, "project removed", now) {
                 stopped.push(t.id.clone());
             }
-            self.tails.remove(&t.id);
             self.failed_sends.remove(&t.id);
         }
         // Their checkpoints' refs are in the project's repository (a worktree's too: the refs are shared).
@@ -87,16 +85,16 @@ impl<T: Terminals> Daemon<T> {
     }
 
     /// `project.reload {project}`: reads `.lila/project.toml` again (the person edited it).
-    pub(super) fn project_reload(&mut self, params: &Value, now: i64) -> Result<Value> {
+    pub(super) fn project_reload(&mut self, params: &Value) -> Result<Value> {
         let pid = self.resolve_project(params)?;
         let cwd = self.projects[&pid].cwd.clone();
         self.load_project(&pid, &cwd);
-        self.project_json(&pid, now)
+        self.project_json(&pid)
     }
 
-    /// `project.set {project, title?, defaults?: {engine?, model?, effort?, permission?}}`: writes the project's
-    /// defaults (an empty `effort` or `model` clears it) and returns the project.
-    pub(super) fn project_set(&mut self, params: &Value, now: i64) -> Result<Value> {
+    /// `project.set {project, title?, defaults?: {model?, permission?}}`: writes the project's
+    /// defaults (an empty `model` clears it) and returns the project.
+    pub(super) fn project_set(&mut self, params: &Value) -> Result<Value> {
         let pid = self.resolve_project(params)?;
         let p = &self.projects[&pid];
         let mut cfg = p.config.clone();
@@ -105,48 +103,28 @@ impl<T: Terminals> Daemon<T> {
             cfg.title = Some(t.trim().to_owned()).filter(|t| !t.is_empty());
         }
         let d = &params["defaults"];
-        if let Some(e) = d.get("engine").and_then(Value::as_str) {
-            cfg.defaults.engine = Runtime::parse(e).ok_or_else(|| anyhow!("unknown engine {e:?} (claude, codex or omp)"))?;
-        }
         if let Some(m) = d.get("model").and_then(Value::as_str) {
             cfg.defaults.model = m.trim().to_owned();
-        }
-        if let Some(e) = d.get("effort").and_then(Value::as_str) {
-            cfg.defaults.effort = Some(e.trim().to_owned()).filter(|e| !e.is_empty());
         }
         if let Some(t) = d.get("permission").and_then(Value::as_str) {
             cfg.defaults.permission = Tier::parse(t).ok_or_else(|| anyhow!("unknown permission {t:?} (read_only, confirm or full)"))?;
         }
         crate::project::save(&cwd, &cfg)?;
         self.load_project(&pid, &cwd);
-        self.project_json(&pid, now)
+        self.project_json(&pid)
     }
 
     // ---------------- threads ----------------
 
-    /// `thread.new {project|cwd, text?, attachments?, title?, engine?, model?, effort?, permission?, worktree?}`: a new thread
-    /// in a project, on what the project's defaults say unless told otherwise, and its engine started. The
-    /// first message waits for the engine to take it. With `worktree`, the thread gets a worktree of its own
+    /// `thread.new {project|cwd, text?, attachments?, title?, model?, permission?, worktree?}`: a new thread
+    /// in a project, on what the project's defaults say unless told otherwise, and omp started. The
+    /// first message waits for omp to take it. With `worktree`, the thread gets a worktree of its own
     /// first (`worktree.rs`), made off the loop: the answer comes when the thread has started.
     pub(super) fn thread_new(&mut self, params: &Value, now: i64) -> Result<Begin> {
         let pid = self.resolve_project(params)?;
         let proj = &self.projects[&pid];
         let defaults = proj.config.defaults.clone();
-        let engine = match s(params, "engine") {
-            Some(e) => Runtime::parse(e).ok_or_else(|| anyhow!("unknown engine {e:?} (claude, codex or omp)"))?,
-            None => defaults.engine,
-        };
-        // A model chosen for the project is for the project's engine: another engine starts on its own default.
-        let model = match s(params, "model") {
-            Some(m) => m.to_owned(),
-            None if engine == defaults.engine => defaults.model_or_default(),
-            None => engine.default_model().to_owned(),
-        };
-        let effort = match params.get("effort").and_then(Value::as_str) {
-            Some(e) => Some(e.to_owned()).filter(|e| !e.is_empty()),
-            None if engine == defaults.engine => defaults.effort.clone(),
-            None => None,
-        };
+        let model = s(params, "model").map(String::from).unwrap_or(defaults.model);
         let tier = match s(params, "permission") {
             Some(t) => Tier::parse(t).ok_or_else(|| anyhow!("unknown permission {t:?} (read_only, confirm or full)"))?,
             None => defaults.permission,
@@ -156,64 +134,46 @@ impl<T: Terminals> Daemon<T> {
             bail!("the project folder {cwd} is gone");
         }
         let main = proj.cwd.clone();
-        // Every program first, so a missing one doesn't leave half a thread behind.
-        self.engine_env(engine)?;
+        // The program first, so a missing one doesn't leave half a thread behind.
+        self.omp_env()?;
         let text = s(params, "text").unwrap_or_default().trim().to_owned();
         let files = self.attachments_of(params)?;
         let title = s(params, "title").map(String::from).unwrap_or_else(|| title_of(&text));
         let id = lila_core::new_thread_id(uuid::Uuid::new_v4().as_u128() as u32);
-        // Claude Code takes the id Lila picks, so the session is known from the start.
-        let session = (engine == Runtime::Claude).then(sessions::new_uuid);
-        let plan = Plan { new: NewThread { id, project: pid, title, engine, model, effort, tier, cwd, session, worktree: None }, text, files };
+        let plan = Plan { new: NewThread { id, project: pid, title, model, effort: None, tier, cwd, worktree: None }, text, files };
         if params["worktree"].as_bool().unwrap_or(false) {
             return Ok(Begin::Job(self.worktree_job(plan, main)));
         }
         Ok(Begin::Done(self.start_new(plan, now)?))
     }
 
-    /// Makes the thread of a plan and starts its engine (in the worktree, when it has one).
+    /// Makes the thread of a plan and starts omp (in the worktree, when it has one).
     pub(super) fn start_new(&mut self, plan: Plan, now: i64) -> Result<Value> {
         let Plan { new, text, files } = plan;
-        let (id, engine) = (new.id.clone(), new.engine);
-        let session = Session::New(new.session.clone());
+        let id = new.id.clone();
         let t = self.store.create_thread(new, now)?;
-        if let Err(e) = self.start_thread(&t, &session, now) {
+        if let Err(e) = self.start_thread(&t, now) {
             let _ = self.store.remove_thread(&id);
-            return Err(e.context(format!("start {engine}")));
+            return Err(e.context("start omp"));
         }
         if !text.is_empty() || !files.is_empty() {
             let mut files = files;
-            if engine.hosted() {
-                files.extend(mentioned_files_of(&text, Path::new(&t.cwd), &files));
-            }
+            files.extend(mentioned_files_of(&text, Path::new(&t.cwd), &files));
             self.store.push_outbox(&id, &text, &serde_json::to_string(&files)?, now)?;
         }
         self.pump(now);
         self.refresh_changes(&id);
         let t = self.store.thread(&id)?.expect("just made");
-        Ok(self.thread_json(&t, now))
+        Ok(self.thread_json(&t))
     }
 
-    /// Starts a thread's engine in a terminal of its own.
-    pub(super) fn start_thread(&mut self, t: &Thread, session: &Session, now: i64) -> Result<String> {
-        let dir = self.paths.thread_dir(&t.id);
-        std::fs::create_dir_all(&dir)?;
-        let spec = Spec { engine: t.engine, model: &t.model, effort: t.effort.as_deref(), tier: t.tier, session, prompt_file: None };
-        let mut launch = runtime::launch(&spec);
-        if t.engine == Runtime::Claude {
-            // Its hooks report to lilad (permission requests, the reply as it is written).
-            let settings = dir.join("settings.json");
-            std::fs::write(&settings, serde_json::to_string_pretty(&hooks::settings(&self.lila_bin))?)?;
-            launch.argv.extend(["--settings".to_owned(), settings.to_string_lossy().to_string()]);
-        }
-        let (program, mut env) = self.engine_env(t.engine)?;
-        if launch.argv[0] == "lila" {
-            // Driven through its protocol by `lila host <engine>`, which starts the CLI.
-            launch.argv[0] = self.lila_bin.to_string_lossy().to_string();
-            launch.argv.splice(3..3, ["--program".to_owned(), program.to_string_lossy().to_string()]);
-        } else {
-            launch.argv[0] = program.to_string_lossy().to_string();
-        }
+    /// Starts a thread's omp in a terminal of its own.
+    pub(super) fn start_thread(&mut self, t: &Thread, now: i64) -> Result<String> {
+        let mut launch = runtime::launch(&t.model, &self.paths.omp_sessions(&t.id));
+        let (program, mut env) = self.omp_env()?;
+        // Driven over omp's RPC mode by `lila host omp`, which starts omp.
+        launch.argv[0] = self.lila_bin.to_string_lossy().to_string();
+        launch.argv.splice(3..3, ["--program".to_owned(), program.to_string_lossy().to_string()]);
         env.insert("LILA_PROJECT".into(), t.project.clone());
         env.insert("LILA_THREAD".into(), t.id.clone());
         env.insert("LILA_ROOT".into(), t.cwd.clone());
@@ -238,8 +198,8 @@ impl<T: Terminals> Daemon<T> {
         Ok(addr)
     }
 
-    /// Kills a thread's terminal and marks it ended. Returns whether there was an engine running.
-    pub(super) fn stop_engine(&mut self, t: &Thread, why: &str, now: i64) -> bool {
+    /// Kills a thread's terminal and marks it ended. Returns whether there was a host running.
+    pub(super) fn stop_thread(&mut self, t: &Thread, why: &str, now: i64) -> bool {
         let Some(terminal) = t.terminal.clone() else { return false };
         if let Err(e) = self.term.kill(&terminal) {
             self.say(format!("{}: kill {} ({terminal}): {e:#}", t.project, t.id));
@@ -248,20 +208,24 @@ impl<T: Terminals> Daemon<T> {
         true
     }
 
-    /// `thread.stop {thread}`: ends the engine. The conversation stays and `thread.resume` goes on with it.
+    /// `thread.stop {thread}`: ends omp. The conversation stays and `thread.resume` goes on with it.
     pub(super) fn thread_stop(&mut self, params: &Value, now: i64) -> Result<Value> {
         let t = self.thread_of(params)?;
-        if !self.stop_engine(&t, "stopped by the person", now) {
+        if !self.stop_thread(&t, "stopped by the person", now) {
             bail!("{} is not running", t.id);
         }
         let t = self.thread_of(params)?;
-        Ok(self.thread_json(&t, now))
+        Ok(self.thread_json(&t))
     }
 
-    /// `thread.resume {thread, text?, model?, effort?, permission?}`: starts an ended thread's engine on the session
-    /// it had; Claude Code's with `--resume`, Codex's `thread/resume`, ACP's `session/load`.
+    /// `thread.resume {thread, text?, model?, permission?}`: starts an ended thread's omp on the session
+    /// it had (the last in the thread's folder of omp sessions); a thread from before that folder, or one that never got
+    /// as far as a session, starts a new omp session and keeps its conversation.
     pub(super) fn thread_resume(&mut self, params: &Value, now: i64) -> Result<Value> {
         let mut t = self.thread_of(params)?;
+        if let Some(old) = &t.legacy {
+            bail!("{} ran on {old}, which Lila no longer runs; its conversation stays, start a new thread to go on", t.id);
+        }
         if t.terminal.is_some() {
             bail!("{} is running", t.id);
         }
@@ -282,29 +246,18 @@ impl<T: Terminals> Daemon<T> {
         if t.worktree && !Path::new(&t.cwd).is_dir() {
             bail!("the worktree {} is gone", t.cwd);
         }
-        self.engine_env(t.engine)?;
+        self.omp_env()?;
         if let Some(m) = s(params, "model") {
-            self.store.set_model(&t.id, m, params.get("effort").and_then(Value::as_str).or(t.effort.as_deref()))?;
-        } else if let Some(e) = params.get("effort").and_then(Value::as_str) {
-            self.store.set_model(&t.id, &t.model, Some(e).filter(|e| !e.is_empty()))?;
+            self.store.set_model(&t.id, m, t.effort.as_deref())?;
         }
         if let Some(p) = s(params, "permission") {
             self.store.set_tier(&t.id, Tier::parse(p).ok_or_else(|| anyhow!("unknown permission {p:?}"))?)?;
         }
         t = self.thread_of(params)?;
-        let session = match (&t.session, t.engine) {
-            // A Claude Code thread that ended before its first message has no transcript to resume: it starts under the same id.
-            (Some(id), Runtime::Claude) if !sessions::claude_file(&self.live_sources(), &t.cwd, id).is_file() => Session::New(Some(id.clone())),
-            (Some(id), _) => Session::Resume(id.clone()),
-            (None, Runtime::Claude) => {
-                let id = sessions::new_uuid();
-                self.store.set_session(&t.id, &id)?;
-                Session::New(Some(id))
-            }
-            (None, _) => Session::New(None),
-        };
-        self.start_thread(&t, &session, now)?;
-        self.store.event(&t.id, "human", "resumed", &format!("{session:?}"), now)?;
+        let dir = self.paths.omp_sessions(&t.id);
+        let detail = if crate::host::has_session(&dir) { format!("goes on with the omp session in {}", dir.display()) } else { format!("no omp session in {}: a new one", dir.display()) };
+        self.start_thread(&t, now)?;
+        self.store.event(&t.id, "human", "resumed", &detail, now)?;
         let text = s(params, "text").unwrap_or_default().trim().to_owned();
         let files = self.attachments_of(params)?;
         if !text.is_empty() || !files.is_empty() {
@@ -312,15 +265,15 @@ impl<T: Terminals> Daemon<T> {
         }
         self.pump(now);
         let t = self.thread_of(params)?;
-        Ok(self.thread_json(&t, now))
+        Ok(self.thread_json(&t))
     }
 
     /// `thread.archive {thread}` / `thread.unarchive`: an archived thread is left out of lists (and its
-    /// engine ended).
+    /// omp ended).
     pub(super) fn thread_archive(&mut self, params: &Value, archive: bool, now: i64) -> Result<Value> {
         let t = self.thread_of(params)?;
         if archive {
-            self.stop_engine(&t, "archived", now);
+            self.stop_thread(&t, "archived", now);
         }
         self.store.set_archived(&t.id, archive)?;
         self.mark(&t.id);
@@ -328,22 +281,21 @@ impl<T: Terminals> Daemon<T> {
             self.refresh_changes(&t.id);
         }
         let t = self.thread_of(params)?;
-        Ok(self.thread_json(&t, now))
+        Ok(self.thread_json(&t))
     }
 
     /// `thread.rename {thread, title}`.
-    pub(super) fn thread_rename(&mut self, params: &Value, now: i64) -> Result<Value> {
+    pub(super) fn thread_rename(&mut self, params: &Value) -> Result<Value> {
         let t = self.thread_of(params)?;
         let title = req(params, "title")?.trim();
         self.store.set_title(&t.id, title)?;
         self.mark(&t.id);
         let t = self.thread_of(params)?;
-        Ok(self.thread_json(&t, now))
+        Ok(self.thread_json(&t))
     }
 
     /// `thread.permission {thread, permission}`: another tier from now on. Takes effect at once: lilad answers
-    /// by it, and a Codex thread has its approval policy and sandbox changed for its next turn. Requests
-    /// already asked stay as they are.
+    /// by it. Requests already asked stay as they are.
     pub(super) fn thread_permission(&mut self, params: &Value, now: i64) -> Result<Value> {
         let t = self.thread_of(params)?;
         let p = req(params, "permission")?;
@@ -357,17 +309,13 @@ impl<T: Terminals> Daemon<T> {
                 self.store.event(&t.id, "lilad", "rules_dropped", &dropped.iter().map(|r| r.key.clone()).collect::<Vec<_>>().join(", "), now)?;
             }
         }
-        if t.engine == Runtime::Codex && self.hosts.contains_key(&t.id) {
-            let (approval, sandbox) = runtime::codex_settings(tier);
-            self.host_command(&t.id, &Command::SetPermission { approval: approval.into(), sandbox: sandbox.into() })?;
-        }
         self.mark(&t.id);
         let t = self.thread_of(params)?;
-        Ok(self.thread_json(&t, now))
+        Ok(self.thread_json(&t))
     }
 
     /// `thread.list {project|cwd?, archived?}`: a project's threads, the most recently active first (every project's when none is named).
-    pub(super) fn thread_list(&self, params: &Value, now: i64) -> Result<Value> {
+    pub(super) fn thread_list(&self, params: &Value) -> Result<Value> {
         let archived = params["archived"].as_bool().unwrap_or(false);
         let projects: Vec<String> = if s(params, "project").is_some() || s(params, "cwd").is_some() { vec![self.resolve_project(params)?] } else { self.projects.keys().cloned().collect() };
         let mut out: Vec<Thread> = Vec::new();
@@ -375,7 +323,7 @@ impl<T: Terminals> Daemon<T> {
             out.extend(self.store.threads(&p, archived)?);
         }
         out.sort_by(|a, b| b.active_ms.cmp(&a.active_ms).then(a.id.cmp(&b.id)));
-        Ok(Value::Array(out.iter().map(|t| self.thread_json(t, now)).collect()))
+        Ok(Value::Array(out.iter().map(|t| self.thread_json(t)).collect()))
     }
 
     /// `thread.log {thread, limit?}`: what lilad did on its own for the thread: starts and ends, answers it gave
@@ -395,7 +343,7 @@ impl<T: Terminals> Daemon<T> {
         }
     }
 
-    /// The words waiting for a thread, as one message, once its engine takes input.
+    /// The words waiting for a thread, as one message, once omp takes input.
     fn deliver(&mut self, tid: &str, now: i64) {
         self.deliver_with(tid, now, false);
     }
@@ -408,9 +356,10 @@ impl<T: Terminals> Daemon<T> {
             }
             return;
         };
-        let (Some(terminal), Some(live)) = (t.terminal.clone(), self.live.get(tid)) else { return };
+        let (Some(_), Some(live)) = (t.terminal.as_ref(), self.live.get(tid)) else { return };
         let status = live.status;
-        if self.merging.contains(tid) || self.restoring.contains(tid) || self.snapshotting.contains(tid) || !status.accepts_input() || (t.engine.hosted() && !self.hosts.contains_key(tid)) {
+        // omp takes words one turn at a time: they go when it is free, which is when their turn begins.
+        if self.merging.contains(tid) || self.restoring.contains(tid) || self.snapshotting.contains(tid) || !status.is_free() || !self.hosts.contains_key(tid) {
             return;
         }
         let msgs = self.store.outbox(tid).unwrap_or_default();
@@ -419,26 +368,16 @@ impl<T: Terminals> Daemon<T> {
         if words.is_empty() {
             return;
         }
-        // A host that cannot take words while it works (omp) gets them when it is free: that is when their turn begins.
-        if t.engine.hosted() && !Self::caps(t.engine).steer && !status.is_free() {
-            return;
-        }
         let said = words.iter().map(|m| m.text.as_str()).filter(|x| !x.is_empty()).collect::<Vec<_>>().join("\n\n");
-        // These words begin a turn: the folder is saved first, and they go when that is done. (Claude Code's turns are saved by its hook.)
-        if !checkpointed
-            && t.engine.hosted()
-            && status.is_free()
-            && let Some(job) = self.checkpoint_job(&t, said.clone(), true, now)
-        {
+        // These words begin a turn: the folder is saved first, and they go when that is done.
+        if !checkpointed && let Some(job) = self.checkpoint_job(&t, said.clone(), now) {
             self.snapshotting.insert(tid.to_owned());
             self.jobs.push(job);
             return;
         }
         let text = notes.iter().map(|m| m.text.as_str()).chain(std::iter::once(said.as_str())).filter(|x| !x.is_empty()).collect::<Vec<_>>().join("\n\n");
         let files: Vec<lila_agent::Attachment> = words.iter().flat_map(|m| serde_json::from_str::<Vec<lila_agent::Attachment>>(&m.attachments).unwrap_or_default()).collect();
-        // Type only if it is still idle. hc's `if` knows `idle` and `working` only; `done` (finished while unseen) takes input like idle, unguarded.
-        let guard = (status == AgentStatus::Idle && !t.engine.hosted()).then_some("idle");
-        match self.tell_with(&t, &terminal, &text, &files, guard) {
+        match self.tell_with(tid, &text, &files) {
             Ok(()) => {
                 for m in &msgs {
                     let _ = self.store.pop_outbox(m.id);

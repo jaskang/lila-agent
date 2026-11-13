@@ -1,8 +1,8 @@
 //! SQLite persistence. Only the daemon writes. Projects hold threads; a thread
-//! holds the conversation items its engine produced and the words waiting to be delivered.
+//! holds the conversation items omp produced and the words waiting to be delivered.
 
 use anyhow::{Context, Result, bail};
-use lila_core::{Runtime, Thread, Tier};
+use lila_core::{Thread, Tier};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::Path;
 
@@ -12,10 +12,12 @@ use std::path::Path;
 /// 5: threads got `worktree`, `base_branch`, `base_commit`, `merged_ms`.
 /// 6: the `checkpoints` table, and `outbox.hold` (a note that goes out only with a message).
 /// 7: the `thread_rules` table (what a person allowed "always" for a thread).
-const VERSION: i64 = 7;
+/// 8: omp is the only engine: `threads.engine` is gone; a thread that ran on another (Claude Code, Codex) keeps its name in `legacy`, ended.
+const VERSION: i64 = 8;
 
 /// Columns added to a table after it first existed: an older database gets them by `ALTER TABLE`.
-const ADDED_COLUMNS: [(&str, &str, &str); 5] = [
+const ADDED_COLUMNS: [(&str, &str, &str); 6] = [
+    ("threads", "legacy", "TEXT"),
     ("threads", "worktree", "INTEGER NOT NULL DEFAULT 0"),
     ("threads", "base_branch", "TEXT"),
     ("threads", "base_commit", "TEXT"),
@@ -33,7 +35,7 @@ CREATE TABLE IF NOT EXISTS threads (
     id TEXT PRIMARY KEY,
     project TEXT NOT NULL,
     title TEXT NOT NULL,
-    engine TEXT NOT NULL,
+    legacy TEXT,
     model TEXT NOT NULL,
     effort TEXT,
     tier TEXT NOT NULL,
@@ -117,12 +119,10 @@ pub struct NewThread {
     pub id: String,
     pub project: String,
     pub title: String,
-    pub engine: Runtime,
     pub model: String,
     pub effort: Option<String>,
     pub tier: Tier,
     pub cwd: String,
-    pub session: Option<String>,
     /// The thread works in a worktree of its own: the branch the project folder was on and its commit then.
     pub worktree: Option<Base>,
 }
@@ -226,6 +226,17 @@ fn migrate(db: &Connection) -> Result<()> {
             db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {ddl}"))?;
         }
     }
+    // A database from when threads chose an engine: the ones that did not run on omp are ended and cannot be resumed.
+    let have: Vec<String> = db.prepare("SELECT name FROM pragma_table_info('threads')")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    if have.iter().any(|c| c == "engine") {
+        db.execute_batch(
+            "BEGIN;
+             UPDATE threads SET legacy = engine WHERE engine <> 'omp' AND legacy IS NULL;
+             UPDATE threads SET terminal = NULL, ended_ms = COALESCE(ended_ms, active_ms) WHERE legacy IS NOT NULL AND terminal IS NOT NULL;
+             ALTER TABLE threads DROP COLUMN engine;
+             COMMIT;",
+        )?;
+    }
     db.pragma_update(None, "user_version", VERSION)?;
     Ok(())
 }
@@ -238,13 +249,12 @@ fn is_v3(db: &Connection) -> Result<bool> {
 }
 
 fn thread_from(r: &Row) -> rusqlite::Result<Thread> {
-    let engine: String = r.get(3)?;
     let tier: String = r.get(6)?;
     Ok(Thread {
         id: r.get(0)?,
         project: r.get(1)?,
         title: r.get(2)?,
-        engine: Runtime::parse(&engine).unwrap_or(Runtime::Claude),
+        legacy: r.get(3)?,
         model: r.get(4)?,
         effort: r.get(5)?,
         tier: Tier::parse(&tier).unwrap_or_default(),
@@ -263,7 +273,7 @@ fn thread_from(r: &Row) -> rusqlite::Result<Thread> {
     })
 }
 
-const THREAD_COLS: &str = "id, project, title, engine, model, effort, tier, cwd, session, terminal, created_ms, active_ms, started_ms, ended_ms, archived, worktree, base_branch, base_commit, merged_ms";
+const THREAD_COLS: &str = "id, project, title, legacy, model, effort, tier, cwd, session, terminal, created_ms, active_ms, started_ms, ended_ms, archived, worktree, base_branch, base_commit, merged_ms";
 
 impl Store {
     /// Opens (making it if needed) the database. A v3 one is moved to `<name>.v3.bak` first: its
@@ -359,8 +369,8 @@ impl Store {
 
     pub fn create_thread(&self, new: NewThread, now: i64) -> Result<Thread> {
         self.db.execute(
-            "INSERT INTO threads (id, project, title, engine, model, effort, tier, cwd, session, created_ms, active_ms, worktree, base_branch, base_commit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13)",
-            params![new.id, new.project, new.title, new.engine.as_str(), new.model, new.effort, new.tier.as_str(), new.cwd, new.session, now, new.worktree.is_some(), new.worktree.as_ref().map(|b| &b.branch), new.worktree.as_ref().map(|b| &b.commit)],
+            "INSERT INTO threads (id, project, title, model, effort, tier, cwd, created_ms, active_ms, worktree, base_branch, base_commit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11)",
+            params![new.id, new.project, new.title, new.model, new.effort, new.tier.as_str(), new.cwd, now, new.worktree.is_some(), new.worktree.as_ref().map(|b| &b.branch), new.worktree.as_ref().map(|b| &b.commit)],
         )?;
         Ok(self.thread(&new.id)?.expect("just inserted"))
     }
@@ -383,13 +393,13 @@ impl Store {
         Ok(st.query_map([], thread_from)?.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Its engine runs in `terminal` now (started at `now`); a new run clears `ended_ms`.
+    /// omp runs in `terminal` now (started at `now`); a new run clears `ended_ms`.
     pub fn set_running(&self, id: &str, terminal: &str, now: i64) -> Result<()> {
         self.db.execute("UPDATE threads SET terminal = ?2, started_ms = ?3, ended_ms = NULL WHERE id = ?1", params![id, terminal, now])?;
         Ok(())
     }
 
-    /// Its engine process is gone.
+    /// Its omp process is gone.
     pub fn set_ended(&self, id: &str, now: i64) -> Result<()> {
         self.db.execute("UPDATE threads SET terminal = NULL, ended_ms = ?2 WHERE id = ?1", params![id, now])?;
         Ok(())
@@ -634,7 +644,7 @@ mod tests {
     }
 
     fn new(id: &str) -> NewThread {
-        NewThread { id: id.into(), project: "shop".into(), title: "first".into(), engine: Runtime::Codex, model: "gpt".into(), effort: Some("low".into()), tier: Tier::Full, cwd: "/repo/shop".into(), session: None, worktree: None }
+        NewThread { id: id.into(), project: "shop".into(), title: "first".into(), model: "gpt".into(), effort: Some("low".into()), tier: Tier::Full, cwd: "/repo/shop".into(), worktree: None }
     }
 
     #[test]
@@ -650,7 +660,7 @@ mod tests {
     fn a_thread_lives_from_start_to_end_and_back() {
         let s = store();
         let t = s.create_thread(new("t00000001"), 10).unwrap();
-        assert_eq!((t.engine, t.tier, t.terminal.clone(), t.session.clone()), (Runtime::Codex, Tier::Full, None, None));
+        assert_eq!((t.legacy.clone(), t.tier, t.terminal.clone(), t.session.clone()), (None, Tier::Full, None, None));
         s.set_running(&t.id, "t5", 20).unwrap();
         s.set_session(&t.id, "sess-1").unwrap();
         let t = s.thread("t00000001").unwrap().unwrap();
@@ -721,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_4_database_gains_the_worktree_columns() {
+    fn a_version_4_database_gains_the_worktree_columns_and_loses_the_engines_that_are_gone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lila.db");
         {
@@ -731,7 +741,9 @@ mod tests {
                  CREATE TABLE threads (id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL, engine TEXT NOT NULL, model TEXT NOT NULL, effort TEXT, tier TEXT NOT NULL,
                     cwd TEXT NOT NULL, session TEXT, terminal TEXT, created_ms INTEGER NOT NULL, active_ms INTEGER NOT NULL, started_ms INTEGER, ended_ms INTEGER, archived INTEGER NOT NULL DEFAULT 0);
                  INSERT INTO projects VALUES ('shop', '/repo/shop', 1);
-                 INSERT INTO threads (id, project, title, engine, model, tier, cwd, created_ms, active_ms) VALUES ('t00000001', 'shop', 'old', 'claude', 'm', 'full', '/repo/shop', 1, 1);
+                 INSERT INTO threads (id, project, title, engine, model, tier, cwd, terminal, created_ms, active_ms) VALUES ('t00000001', 'shop', 'old', 'claude', 'm', 'full', '/repo/shop', 'term-1', 1, 7);
+                 INSERT INTO threads (id, project, title, engine, model, tier, cwd, terminal, created_ms, active_ms) VALUES ('t00000003', 'shop', 'codex', 'codex', 'm', 'full', '/repo/shop', NULL, 1, 1);
+                 INSERT INTO threads (id, project, title, engine, model, tier, cwd, terminal, created_ms, active_ms) VALUES ('t00000004', 'shop', 'mine', 'omp', 'm', 'full', '/repo/shop', 'term-4', 1, 1);
                  PRAGMA user_version = 4;",
             )
             .unwrap();
@@ -739,6 +751,11 @@ mod tests {
         let s = Store::open(&path).unwrap();
         let t = s.thread("t00000001").unwrap().unwrap();
         assert_eq!((t.title.as_str(), t.worktree, t.base_branch, t.merged_ms), ("old", false, None, None), "the old thread is as it was");
+        // Claude Code's and Codex's threads are ended for good (their terminals are not theirs to keep); omp's go on.
+        assert_eq!((t.legacy.as_deref(), t.terminal, t.ended_ms), (Some("claude"), None, Some(7)));
+        assert_eq!(s.thread("t00000003").unwrap().unwrap().legacy.as_deref(), Some("codex"));
+        let omp = s.thread("t00000004").unwrap().unwrap();
+        assert_eq!((omp.legacy, omp.terminal.as_deref(), omp.ended_ms), (None, Some("term-4"), None));
         s.create_thread(NewThread { worktree: Some(Base { branch: "main".into(), commit: "c".into() }), ..new("t00000002") }, 2).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();

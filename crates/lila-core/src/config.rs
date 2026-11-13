@@ -2,96 +2,19 @@
 //! in it starts with. Everything else a project has (its threads) is in the database.
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 use crate::thread::Tier;
 
-/// Which agent runs a thread: the official CLIs, or an ACP agent (omp, which
-/// can reach any provider's model, is the one built in).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Runtime {
-    Claude,
-    Codex,
-    /// An ACP agent, run by `lila host omp`.
-    Omp,
-}
-
-impl fmt::Display for Runtime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl Runtime {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Runtime::Claude => "claude",
-            Runtime::Codex => "codex",
-            Runtime::Omp => "omp",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Runtime> {
-        match s.trim() {
-            "claude" => Some(Runtime::Claude),
-            "codex" => Some(Runtime::Codex),
-            "omp" => Some(Runtime::Omp),
-            _ => None,
-        }
-    }
-
-    /// The agent runs through a protocol, hosted by `lila host` (not a TUI Lila reads from the side).
-    pub fn hosted(self) -> bool {
-        !matches!(self, Runtime::Claude)
-    }
-
-    /// The model a thread starts on when nobody chose one.
-    pub fn default_model(self) -> &'static str {
-        match self {
-            Runtime::Claude => "claude-sonnet-5-5",
-            Runtime::Codex => "gpt-6.1-sol",
-            // omp takes any `provider/model` it knows: an empty model is its own default.
-            Runtime::Omp => "",
-        }
-    }
-}
-
-/// Whose models a thread runs on: two with the same answer are one opinion. omp
-/// runs any provider's model, so there it is the model itself.
-pub fn model_source(runtime: Runtime, model: &str) -> String {
-    match runtime {
-        Runtime::Omp => format!("omp:{}", model.trim()),
-        r => r.to_string(),
-    }
-}
-
 /// What a new thread in a project starts with, unless it is told otherwise.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Defaults {
-    pub engine: Runtime,
-    /// Empty: the engine's own default (`Runtime::default_model`).
+    /// A `provider/model` omp knows; empty: omp's own default.
     pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
     pub permission: Tier,
 }
 
-impl Default for Defaults {
-    fn default() -> Self {
-        Defaults { engine: Runtime::Claude, model: String::new(), effort: None, permission: Tier::Full }
-    }
-}
-
-impl Defaults {
-    /// The model to start with: the chosen one, else the engine's default.
-    pub fn model_or_default(&self) -> String {
-        if self.model.trim().is_empty() { self.engine.default_model().to_owned() } else { self.model.clone() }
-    }
-}
-
-/// `.lila/project.toml`. Unknown keys (a v3 file still lists members) are ignored.
+/// `.lila/project.toml`. Unknown keys (a v3 file still lists members, an older one an engine and an effort) are ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectConfig {
     /// The project's id: terminal names, the database, `lila` commands. Fixed once registered.
@@ -109,7 +32,14 @@ impl ProjectConfig {
     }
 
     pub fn parse(text: &str) -> Result<ProjectConfig, String> {
-        let cfg: ProjectConfig = toml::from_str(text).map_err(|e| format!("project.toml: {e}"))?;
+        let mut table: toml::Table = toml::from_str(text).map_err(|e| format!("project.toml: {e}"))?;
+        // A file from when projects chose an engine: its model was Claude's or Codex's, which omp would not know.
+        if let Some(defaults) = table.get_mut("defaults").and_then(toml::Value::as_table_mut)
+            && defaults.get("engine").and_then(toml::Value::as_str).is_some_and(|e| e != "omp")
+        {
+            defaults.remove("model");
+        }
+        let cfg: ProjectConfig = table.try_into().map_err(|e| format!("project.toml: {e}"))?;
         validate_id(&cfg.name).map_err(|e| format!("project name {:?}: {e}", cfg.name))?;
         Ok(cfg)
     }
@@ -139,16 +69,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_project_file_holds_defaults_and_ignores_what_v3_wrote() {
-        let c = ProjectConfig::parse("name = \"shop\"\n[defaults]\nengine = \"codex\"\nmodel = \"gpt-6.1-sol\"\neffort = \"low\"\npermission = \"confirm\"\n[[members]]\nid = \"pm\"\nrole = \"pm\"\n").unwrap();
-        assert_eq!((c.defaults.engine, c.defaults.permission, c.defaults.effort.as_deref()), (Runtime::Codex, Tier::Confirm, Some("low")));
+    fn a_project_file_holds_defaults_and_ignores_what_older_versions_wrote() {
+        let c = ProjectConfig::parse("name = \"shop\"\n[defaults]\nmodel = \"openai/gpt-6\"\neffort = \"low\"\npermission = \"confirm\"\n[[members]]\nid = \"pm\"\nrole = \"pm\"\n").unwrap();
+        assert_eq!((c.defaults.model.as_str(), c.defaults.permission), ("openai/gpt-6", Tier::Confirm));
         let bare = ProjectConfig::parse("name = \"shop\"").unwrap();
         assert_eq!(bare.defaults, Defaults::default());
         assert_eq!(bare.defaults.permission, Tier::Full, "full auto unless the project says otherwise");
-        assert_eq!(bare.defaults.model_or_default(), "claude-sonnet-5-5");
+        assert_eq!(bare.defaults.model, "", "omp's own default");
         assert!(ProjectConfig::parse("name = \"Shop Name\"").is_err());
         assert_eq!(ProjectConfig::parse(&c.to_toml()).unwrap(), c, "what lilad writes it reads back");
         assert_eq!(ProjectConfig::parse(&bare.to_toml()).unwrap(), bare);
+    }
+
+    #[test]
+    fn a_model_chosen_for_another_engine_is_dropped() {
+        let old = ProjectConfig::parse("name = \"shop\"\n[defaults]\nengine = \"claude\"\nmodel = \"claude-opus-5-5\"\npermission = \"confirm\"\n").unwrap();
+        assert_eq!((old.defaults.model.as_str(), old.defaults.permission), ("", Tier::Confirm));
+        let omp = ProjectConfig::parse("name = \"shop\"\n[defaults]\nengine = \"omp\"\nmodel = \"openai/gpt-6\"\n").unwrap();
+        assert_eq!(omp.defaults.model, "openai/gpt-6");
     }
 
     #[test]
@@ -157,7 +95,5 @@ mod tests {
         for bad in ["", "Shop", "2shop", "a b", "lilad", &"x".repeat(25)] {
             assert!(validate_id(bad).is_err(), "{bad:?}");
         }
-        assert_eq!(Runtime::parse("omp"), Some(Runtime::Omp));
-        assert!(Runtime::Codex.hosted() && !Runtime::Claude.hosted());
     }
 }

@@ -1,21 +1,8 @@
-//! Threads' conversations for the window (architecture v3 §9): each runtime's
-//! records translated into `lila_agent` items and kept in the store, read back
-//! by seq. Claude Code's come from its transcript, followed as it grows.
+//! Threads' conversations for the window (architecture v3 §9): what omp does, translated by its host into
+//! `lila_agent` items, kept in the store and read back by seq; and the words that go to it.
 
 use super::*;
-use lila_agent::claude::Transcript;
-use lila_agent::{Attachment, AttachmentKind, Command, Item};
-use std::io::{Read, Seek, SeekFrom};
-
-/// How far a thread's transcript has been read.
-pub(super) struct Tail {
-    session: String,
-    file: PathBuf,
-    offset: u64,
-    /// The end of the file when it stopped mid-line.
-    partial: String,
-    parser: Transcript,
-}
+use lila_agent::{Attachment, Command};
 
 /// Most items a read returns: the latest ones.
 const READ_LIMIT: usize = 400;
@@ -55,56 +42,9 @@ pub(super) fn mentioned(text: &str, cwd: &Path) -> Vec<Attachment> {
 }
 
 impl<T: Terminals> Daemon<T> {
-    /// Reads what running Claude Code threads added to their transcripts since last time.
-    pub(super) fn follow_transcripts(&mut self) {
-        let src = self.live_sources();
-        let mut wanted: Vec<(String, String, PathBuf)> = Vec::new();
-        for t in self.store.live_threads().unwrap_or_default() {
-            if t.engine != Runtime::Claude || !self.live.contains_key(&t.id) {
-                continue;
-            }
-            let Some(session) = t.session.clone() else { continue };
-            wanted.push((t.id.clone(), session.clone(), sessions::claude_file(&src, &t.cwd, &session)));
-        }
-        for (tid, session, file) in wanted {
-            // A new session (or file): read it from the start.
-            if self.tails.get(&tid).is_none_or(|t| t.session != session || t.file != file) {
-                self.tails.insert(tid.clone(), Tail { session: session.clone(), file: file.clone(), offset: 0, partial: String::new(), parser: Transcript::new() });
-            }
-            let tail = self.tails.get_mut(&tid).unwrap();
-            let items = read_more(tail);
-            // What it really runs on, from the model that wrote its latest reply (also after a change made in its terminal).
-            if let Some(model) = tail.parser.model().map(String::from)
-                && let Some(live) = self.live.get_mut(&tid)
-                && live.config.model.as_deref() != Some(model.as_str())
-            {
-                live.config.model = Some(model);
-                self.mark(&tid);
-            }
-            if items.is_empty() {
-                continue;
-            }
-            // The reply being written is in the transcript now.
-            if items.iter().any(|i| matches!(i.kind, lila_agent::ItemKind::AgentMessage { .. })) {
-                self.writing.remove(&tid);
-            }
-            let rows: Vec<(String, i64, String)> = items.iter().map(|i| (i.id.clone(), i.at_ms, serde_json::to_string(i).unwrap_or_default())).collect();
-            let before = self.store.last_seq(&tid).unwrap_or(0);
-            match self.store.put_items(&tid, &rows) {
-                Ok(after) if after != before => {
-                    let latest = items.iter().map(|i| i.at_ms).max().unwrap_or(0);
-                    let _ = self.store.touch_thread(&tid, latest.min(now_ms()));
-                    self.mark(&tid);
-                }
-                Ok(_) => {}
-                Err(e) => self.say(format!("conversation of {tid}: {e:#}")),
-            }
-        }
-    }
-
     /// `thread.read {thread, after?}`: the thread's items after a seq (the latest when there are
-    /// many), the cards it waits on, the reply being written, and what its engine offers.
-    pub(super) fn thread_read(&mut self, params: &Value, now: i64) -> Result<Value> {
+    /// many), the cards it waits on (`permissions`, `questions`), and what omp offers.
+    pub(super) fn thread_read(&mut self, params: &Value) -> Result<Value> {
         let t = self.thread_of(params)?;
         let after = params["after"].as_i64().unwrap_or(0);
         let limit = params["limit"].as_u64().map(|n| n as usize).unwrap_or(READ_LIMIT);
@@ -112,15 +52,16 @@ impl<T: Terminals> Daemon<T> {
         let seq = rows.iter().map(|(n, _)| *n).max().unwrap_or(after);
         let items: Vec<Value> = rows.into_iter().filter_map(|(_, body)| serde_json::from_str(&body).ok()).collect();
         let cards: Vec<Value> = self.asking.iter().filter(|a| a.thread == t.id).map(super::permissions::card_json).collect();
+        let questions: Vec<Value> = self.questions.iter().filter(|a| a.thread == t.id).map(super::questions::card_json).collect();
         Ok(json!({
-            "thread": self.thread_json(&t, now), "seq": seq, "items": items, "permissions": cards,
-            "writing": self.writing_of(&t.id), "config": self.config_json(&t), "checkpoints": self.checkpoint_rows(&t, now)?, "rules": self.rules_json(&t.id),
+            "thread": self.thread_json(&t), "seq": seq, "items": items, "permissions": cards, "questions": questions,
+            "config": self.config_json(&t), "checkpoints": self.checkpoint_rows(&t)?, "rules": self.rules_json(&t.id),
         }))
     }
 
     /// `thread.send {thread, text, attachments?}`: the person's words to a thread, with files (absolute
     /// paths) that go along. Words for a thread still starting wait and go when it takes them; a thread
-    /// that waits on a card or a dialog takes none (they would answer it); an ended one must be resumed.
+    /// that waits on a card takes none; an ended one must be resumed.
     pub(super) fn thread_send(&mut self, params: &Value, now: i64) -> Result<Value> {
         let t = self.thread_of(params)?;
         let text = s(params, "text").unwrap_or_default().trim().to_owned();
@@ -147,7 +88,7 @@ impl<T: Terminals> Daemon<T> {
         Ok(files)
     }
 
-    /// Words from the person to `t`: now, or queued until its engine takes them.
+    /// Words from the person to `t`: now, or queued until omp takes them.
     pub(super) fn send_to(&mut self, t: &Thread, text: &str, mut files: Vec<Attachment>, now: i64) -> Result<()> {
         let Some(live) = self.live.get(&t.id).filter(|_| t.terminal.is_some()) else {
             bail!("{} has ended; resume it first", t.id);
@@ -158,23 +99,16 @@ impl<T: Terminals> Daemon<T> {
         if self.restoring.contains(&t.id) {
             bail!("{} is having its files put back", t.id);
         }
-        match live.status {
-            AgentStatus::Blocked => bail!("{} is waiting for an answer (its card, or its terminal): give it first", t.id),
-            AgentStatus::Error => bail!("{} can't take a message now (error)", t.id),
-            _ => {}
-        }
-        if self.asking.iter().any(|a| a.thread == t.id) && !t.engine.hosted() {
+        if live.status == AgentStatus::Blocked || self.asking.iter().any(|a| a.thread == t.id) || self.questions.iter().any(|a| a.thread == t.id) {
             bail!("{} is waiting for an answer to its card: give it first", t.id);
         }
-        // A hosted engine has no `@` of its own to read a mention with: the files named in the words go along as files.
-        if t.engine.hosted() {
-            for f in mentioned(text, Path::new(&t.cwd)) {
-                if !files.iter().any(|a| a.path == f.path) {
-                    files.push(f);
-                }
-            }
-            if t.engine == Runtime::Codex {
-                files.extend(self.called_skills(t, text));
+        if live.status == AgentStatus::Error {
+            bail!("{} can't take a message now (error)", t.id);
+        }
+        // omp has no `@` of its own to read a mention with: the files named in the words go along as files.
+        for f in mentioned(text, Path::new(&t.cwd)) {
+            if !files.iter().any(|a| a.path == f.path) {
+                files.push(f);
             }
         }
         let attachments = serde_json::to_string(&files)?;
@@ -185,65 +119,26 @@ impl<T: Terminals> Daemon<T> {
         Ok(())
     }
 
-    /// The skills a Codex thread's words call (`$name`), as the inputs Codex takes them by.
-    fn called_skills(&self, t: &Thread, text: &str) -> Vec<Attachment> {
-        let names: Vec<&str> = text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '$' || c == ':')).filter_map(|w| w.strip_prefix('$')).collect();
-        self.palette(t)
-            .into_iter()
-            .filter(|e| e.kind == crate::commands::Kind::Skill && names.contains(&e.name.as_str()))
-            .map(|e| Attachment { path: e.path.to_string_lossy().to_string(), name: e.name, kind: AttachmentKind::Skill })
-            .collect()
-    }
-
-    /// The skills and custom commands a thread's CLI finds on disk, for the folder it works in.
-    fn palette(&self, t: &Thread) -> Vec<crate::commands::Entry> {
-        let (src, cwd) = (self.live_sources(), PathBuf::from(&t.cwd));
-        match t.engine {
-            Runtime::Claude => crate::commands::claude(&src.claude, &cwd),
-            Runtime::Codex => {
-                let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-                crate::commands::codex(&src.codex, &home, &cwd)
-            }
-            // omp lists its own over ACP.
-            Runtime::Omp => Vec::new(),
-        }
-    }
-
-    /// `thread.commands {thread}`: what the `/` menu offers for this thread's engine (besides Lila's
-    /// own actions): the built-in commands that finish without asking anything in a terminal, then its
-    /// skills and custom commands. Each has `insert` (the words it puts in the box) or `action`
-    /// (what `thread.run` does for it).
+    /// `thread.commands {thread}`: what the `/` menu offers (besides Lila's own actions): the commands and skills omp
+    /// declared for the thread, each with `insert`, the words it puts in the box.
     pub(super) fn thread_commands(&mut self, params: &Value) -> Result<Value> {
         let t = self.thread_of(params)?;
-        let entry = |name: &str, description: &str, kind: &str, hint: Option<&str>, insert: Option<String>, action: Option<&str>| {
-            json!({"name": name, "description": description, "kind": kind, "hint": hint, "insert": insert, "action": action})
-        };
-        let mut out: Vec<Value> = Vec::new();
-        match t.engine {
-            // Claude Code's other built-ins ask in its terminal (/config, /mcp, /usage…), or change something
-            // beyond this session (/model and /effort save the person's defaults, /clear starts a session Lila does not follow).
-            Runtime::Claude => out.push(entry("compact", "压缩上下文", "builtin", Some("[要保留的重点]"), Some("/compact ".into()), None)),
-            Runtime::Codex => out.push(entry("compact", "压缩上下文", "builtin", None, None, Some("compact"))),
-            Runtime::Omp => {
-                for c in self.live.get(&t.id).map(|l| l.commands.clone()).unwrap_or_default() {
-                    let (kind, name) = match c.name.strip_prefix("skill:") {
-                        Some(skill) => ("skill", skill.to_owned()),
-                        None => ("builtin", c.name.clone()),
-                    };
-                    // ACP's generic "arguments" hint only says it takes some.
-                    let hint = c.hint.as_deref().map(|h| if h == "arguments" { "[参数]" } else { h });
-                    out.push(entry(&name, &c.description, kind, hint, Some(format!("/{} ", c.name)), None));
-                }
-            }
-        }
-        let sigil = if t.engine == Runtime::Codex { '$' } else { '/' };
-        for e in self.palette(&t) {
-            let kind = match e.kind {
-                crate::commands::Kind::Skill => "skill",
-                crate::commands::Kind::Command => "command",
-            };
-            out.push(entry(&e.name, &e.description, kind, e.hint.as_deref(), Some(format!("{sigil}{} ", e.name)), None));
-        }
+        let out: Vec<Value> = self
+            .live
+            .get(&t.id)
+            .map(|l| l.commands.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| {
+                let (kind, name) = match c.name.strip_prefix("skill:") {
+                    Some(skill) => ("skill", skill.to_owned()),
+                    None => ("builtin", c.name.clone()),
+                };
+                // omp's generic "arguments" hint only says it takes some.
+                let hint = c.hint.as_deref().map(|h| if h == "arguments" { "[参数]" } else { h });
+                json!({"name": name, "description": c.description, "kind": kind, "hint": hint, "insert": format!("/{} ", c.name)})
+            })
+            .collect();
         Ok(json!({"commands": out}))
     }
 
@@ -263,20 +158,14 @@ impl<T: Terminals> Daemon<T> {
     }
 
     /// `thread.model {thread, model?, effort?}`: the thread runs on another model or effort from now
-    /// on, and from now on when it is resumed. A running Codex or ACP thread changes at once (each turn
-    /// carries them; ACP agents have `session/set_config_option`). Claude Code's `/model` and `/effort`
-    /// save the person's defaults, so a running Claude thread is not changed: end it, change this, resume it.
+    /// on, and from now on when it is resumed. A running thread changes at once (`set_model`, `set_thinking_level`).
     pub(super) fn thread_model(&mut self, params: &Value) -> Result<Value> {
         let t = self.thread_of(params)?;
         let (model, effort) = (s(params, "model"), s(params, "effort"));
         if model.is_none() && effort.is_none() {
             bail!("missing model or effort");
         }
-        let running = self.live.contains_key(&t.id) && t.terminal.is_some();
-        if running && t.engine == Runtime::Claude {
-            bail!("Claude Code can't change its model for one session: its /model and /effort save the defaults for every session. End the thread, change this, and resume it");
-        }
-        if running {
+        if self.live.contains_key(&t.id) && t.terminal.is_some() {
             if let Some(m) = model {
                 self.host_command(&t.id, &Command::SetModel { model: m.to_owned() })?;
             }
@@ -289,83 +178,32 @@ impl<T: Terminals> Daemon<T> {
         Ok(json!({"set": true}))
     }
 
-    /// `thread.run {thread, action}`: what an engine does by a request of its protocol instead of words.
-    pub(super) fn thread_run(&mut self, params: &Value) -> Result<Value> {
-        let t = self.thread_of(params)?;
-        match (req(params, "action")?, t.engine) {
-            ("compact", Runtime::Codex) => self.host_command(&t.id, &Command::Compact)?,
-            (action, _) => bail!("{} has no {action} to run", t.id),
-        }
-        Ok(json!({"ran": true}))
-    }
-
     /// The model and effort for the box under the conversation: what it runs on now (else the stored ones), the
-    /// stored ones, whether the person can change them here, and the choices when the engine lists them.
+    /// stored ones, whether the person can change them here (omp changes only what it lists), and the choices.
     fn config_json(&self, t: &Thread) -> Value {
         let live = self.live.get(&t.id).filter(|_| t.terminal.is_some());
         let cfg = live.map(|l| l.config.clone()).unwrap_or_default();
-        // omp changes only what it lists; Codex takes any of its models each turn; Claude Code can't (see `thread_model`).
-        let switch = live.is_some()
-            && match t.engine {
-                Runtime::Claude => false,
-                Runtime::Codex => true,
-                Runtime::Omp => !cfg.models.is_empty(),
-            };
+        // The thread's own omp names the choices once it has; until then, those omp was last asked for.
+        let models = if cfg.models.is_empty() { self.models.as_ref().map(|(_, m)| m.clone()).unwrap_or_default() } else { cfg.models.clone() };
         json!({
             "model": cfg.model.clone().unwrap_or_else(|| t.model.clone()),
             "effort": cfg.effort.clone().or_else(|| t.effort.clone()),
             "default_model": t.model, "default_effort": t.effort,
-            "switch": switch, "models": cfg.models, "efforts": cfg.efforts,
+            "switch": live.is_some() && !models.is_empty(), "models": models, "efforts": cfg.efforts,
         })
     }
 
-    /// `thread.interrupt {thread}`: stops what the thread is doing this turn. A hosted
-    /// engine (Codex, omp) is told to; Claude Code's TUI gets Esc, its own stop key. Only
-    /// while it works: Esc at an idle prompt would clear what is typed there.
+    /// `thread.interrupt {thread}`: stops what the thread is doing this turn. Only while it works.
     pub(super) fn thread_interrupt(&mut self, params: &Value) -> Result<Value> {
         let t = self.thread_of(params)?;
-        let terminal = t.terminal.clone().ok_or_else(|| anyhow!("{} is not running", t.id))?;
+        if t.terminal.is_none() {
+            bail!("{} is not running", t.id);
+        }
         let status = self.live.get(&t.id).map_or(AgentStatus::Gone, |l| l.status);
         if status != AgentStatus::Working {
             bail!("{} is not working ({})", t.id, status.as_str());
         }
-        if t.engine.hosted() {
-            self.host_command(&t.id, &Command::Interrupt)?;
-        } else {
-            self.term.keys(&terminal, &["esc"])?;
-        }
+        self.host_command(&t.id, &Command::Interrupt)?;
         Ok(json!({"interrupted": true, "thread": t.id}))
     }
-}
-
-/// The items the lines appended since the last read give.
-fn read_more(tail: &mut Tail) -> Vec<Item> {
-    let Ok(mut f) = std::fs::File::open(&tail.file) else { return Vec::new() };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if len < tail.offset {
-        // Rewritten from scratch: read it again.
-        tail.offset = 0;
-        tail.partial.clear();
-        tail.parser = Transcript::new();
-    }
-    if len == tail.offset || f.seek(SeekFrom::Start(tail.offset)).is_err() {
-        return Vec::new();
-    }
-    let mut bytes = Vec::new();
-    if f.take(len - tail.offset).read_to_end(&mut bytes).is_err() {
-        return Vec::new();
-    }
-    tail.offset += bytes.len() as u64;
-    tail.partial.push_str(&String::from_utf8_lossy(&bytes));
-    let Some(cut) = tail.partial.rfind('\n') else { return Vec::new() };
-    let complete: String = tail.partial.drain(..=cut).collect();
-    let mut out: Vec<Item> = Vec::new();
-    for line in complete.lines() {
-        for item in tail.parser.feed(line) {
-            // A tool call and its result in one read: keep the last version.
-            out.retain(|i| i.id != item.id);
-            out.push(item);
-        }
-    }
-    out
 }

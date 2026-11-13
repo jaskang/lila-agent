@@ -1,5 +1,43 @@
 # 交接说明（给接手的模型）
 
+## 2026-11-13（晚）：omp 走 RPC 模式，不再走 ACP（分支 `omp-harness`，没提交）
+
+`acp.rs` 和 `agent-client-protocol-schema` 删了，换成 `crates/lila-agent/src/omp.rs`（纯翻译，约 800 行含测试：一行进，`Step {send, events}` 出）；`crates/lila/src/host.rs` 起 `omp --mode rpc-ui --approval-mode always-ask --session-dir <目录> [--continue]`；`lila-core::runtime::Session` 没了。细节在 `architecture-v4.md` §2（启动、会话目录）、§6（权限对话怎么对回工具调用、提问）。要点：
+
+- **权限还是 Lila 的**：`always-ask` 让 omp 对每个写和执行类调用发 `select` 对话；host 用 `toolcall_end` / `tool_execution_start` 里结构化的工具名和参数对出 `tool`、`name`（现在是 `bash`、`edit`、`mcp__server__tool` 这种稳定的名字）、`command`、`paths`、`cwd`，只在对话标题里也有同样的话时才信；对不上就从标题的文字读。`edit` 的参数是补丁文本，路径读 omp 自己写的 `File:` 行。不给 omp 自己的「for this session」。**拒绝不能带原因**：RPC 的回答只有选项文字，omp 给模型的拒绝错误是固定的（`Verdict::Deny` 的文字仍然没人用）。
+- **agent 的提问成了卡片**（A2 后半的第一件事）：`ask` 工具要 `--mode rpc-ui`（`rpc` 里没有这个工具，所以没按任务单写的 `rpc`）；所有不是权限的 `select/confirm/input/editor` 对话是 `Question`，lilad 开 `q…` 卡片，`thread.answer {value｜yes｜cancel}`，命令行 `lila thread answer <id> <q…> <答案>`（`--cancel`），窗口 `question_card`。
+- **会话目录** `<data>/omp/<会话 id>/`，里面有 `*.jsonl` 就 `--continue`；恢复不重放历史，所以对话不重复。**旧的 ACP 会话**没有目录，恢复时开新的 omp 会话（对话留着，omp 不记得）。没有数据库迁移（版本还是 8）。
+- **模型**：`models.list`（短命的 `omp --mode rpc --no-session …` 问 `get_available_models`，记 10 分钟）；新会话的模型菜单和工作区设置的模型一行回来了；会话里的菜单用它自己的 omp 报的列表（`set_model`、`set_thinking_level`）。
+- 失败的模型请求、omp 退出（带退出码和 stderr 最后几行）成了对话里的 `error` 条目；协议版本 5；`lila models`。
+- 验证：`cargo build/test/clippy --workspace` 过；`crates/lila/tests/host.rs` 用假 omp 和假 lilad 跑真的 `lila host omp`（参数、`--continue`、分块的帧、提问往返、omp 崩溃）；真 omp（隔离的 `LILA_HOME` 和 `HC_SESSION`，模型 `magpie/claude/claude-sonnet-5-5`）跑了三句：回一个词、`confirm` 档的 `echo ok`（出卡片、允许、执行）、停止后恢复再问上下文（答对，对话没重复）。**没验证**：真的提问卡片（`ask` 工具）、真 MCP 工具的名字、`edit`/`write` 的真实对话文字（只有按 omp 源码写的单元测试）、并行的同名调用、窗口接真 lilad 点（只有 `--features shots` 的假数据截图）。
+- **留给下一步（去掉 hc、lilad 进窗口进程）**：host 现在和 lilad 的唯一接口是 socket 上的 `AgentEvent`/`Command`，状态走 OSC 7501（`HostStatus`）；换掉 hc 时 host 可以保持独立进程（会话要在 lilad 重启时不断），或者把 `Omp` 直接放进 lilad 进程里用线程跑 omp 子进程（`Omp` 是纯的，`host.rs` 里的 IO 循环约 150 行可以搬）。omp 的 `--session-dir` 已经按会话分，不依赖 hc。会话的 omp 进程崩溃时 host 退出、会话变 `ended`，这个语义要保留。
+
+## 2026-11-13：定位改了，Lila 是自己的 harness，只跑 omp
+
+用户把定位改成「自己的 harness，建在 oh-my-pi（omp）上，omp 是唯一的引擎」。Claude 订阅仍可用，但要走 omp 自己的 provider 配置，不是 Lila 的事。这一轮（分支 `omp-harness`，从 `main` 切出，没提交）先做了删减；换 omp 的 RPC 在上面一节。
+
+**删掉的**（`cargo build/test/clippy --workspace` 都过；测试从 281 个降到 164 个，删的是被删功能的测试，其余改成了 omp 的）：
+- 引擎：`lila-agent` 的 `claude.rs`（读会话记录）、`codex.rs`（app-server）；`lila host codex`；`Runtime` 枚举（`lila-core`）、`Thread.engine`、项目默认值里的 `engine`、`effort`；`codex_settings`、`SetPermission`、`Compact`、`Caps`、`AgentEvent::Limits`、`AttachmentKind::Skill`、`Origin::Summary|Local|Interrupted`。
+- Claude 的 hook 和信任对话框：`lila hook`、`daemon/hooks.rs`（`PreToolUse`、`PermissionRequest` 等六个 hook、`judged`、`hook.answer`）、`daemon/trust.rs` 和屏幕文字样本、`thread.trust`、`waiting: "terminal"`、`waiting_for`、`trust_folder`、`writing`（MessageDisplay）、会话记录跟读（`follow_transcripts`）、`Terminals` 里的 `send/keys/read`。
+- 账号、用量、magpie：`accounts.rs`、`signin.rs`、`magpie.rs`、`usage.rs`、`sessions.rs`、`lila usage`、`lila accounts`、`status` 的 `magpie`；窗口的用量页和添加账号。
+- `commands.rs`（找 Claude、Codex 的 skill 和自定义命令；omp 的命令由它自己通过 ACP 声明）、`thread.run`、`Paths.config`（只放过 `accounts.toml`）。
+- 终端栈：crate `lila-term`、`ghostty-sys`（含预编译的 libghostty-vt）、窗口里的终端视图、对话/终端切换、「打开终端」、「在终端里回答」、`app-views.json`。
+- 窗口：引擎选择（新会话的模型按钮、工作区设置的引擎、模型、努力程度行）、`$` 命令、总结行、「已中断」行、`⌘[`、`⌘F`。
+- 依赖：`strip-ansi-escapes`、`linkify`、`wait-timeout`、`yaml-rust2`（lila 和 lila-agent）。
+
+**留着的**（任务单里的候选，核实后没删）：
+- **`hc-client` 和 herdr-core**：omp 的 host 也跑在 hc 终端里，lilad 自己也是；会话在 lilad 重启时不断、状态走 OSC 7501 事件、重启后按标签找回会话，都靠它。换成 lilad 的子进程要同时改：`Terminals` 和 `HcTerminals`、`start_thread`、`on_terminal`/`on_event`/`reconcile`（hc 事件）、host 的 OSC 状态上报（改成 host 与 lilad 之间的消息）、lilad 自己的启动（`client::start_daemon`）、重启后找回；而且会话会随 lilad 一起死，除非 host 仍是独立进程。远超 300 行，所以没做。
+- `lila host omp`、`host.attach`、`policy.rs`、`rules.rs`、检查点、改动、worktree、通知：照旧。
+- `github.rs`、`daemon/sources.rs`：早就没人调用（P4），和这次无关。
+
+**旧数据**：库的版本 8 把 `threads.engine` 删了；`claude`、`codex` 的会话记在 `legacy`，已结束，对话、检查点留着，窗口里输入框换成「Claude Code 会话，不能继续」；lilad 在 hc 里看到它们的终端就杀掉。`.lila/project.toml` 里的 `engine`、`effort` 读时忽略，`engine` 不是 `omp` 时 `model` 也丢掉。细节在 `architecture-v4.md` §1。协议版本 4。
+
+**（已做，见上一节）ACP 换成 omp 的 RPC 模式。** 下面是当时的任务描述： 要换的是 `crates/lila-agent/src/acp.rs`（纯翻译，`Acp::on_message/command/tick/status`，输出 `Step {send, events}`）和 `crates/lila/src/host.rs`（现在直接用 `Acp`，没有 trait）；`lila_agent::model` 的 `AgentEvent`、`Command`、`PermissionRequest` 是 lilad 和窗口看到的接口，尽量不动。权限判定（`policy.rs`、`rules.rs`）和卡片依赖 `PermissionRequest` 里的 `tool`（种类）、`name`（工具名）、`command`、`paths`、`cwd`：ACP 里这些是从 `rawInput`、`locations`、`title` 里拼的，`name` 实际是 title，不是稳定的工具名；换 RPC 时要拿到结构化的工具名和参数，`policy` 里按 `mcp__server__tool` 认 MCP 的写法没核实过 omp 的真实名字。ACP 的拒绝不能带文字，RPC 如果能带，`Verdict::Deny` 的文字就有用了。新会话开始前 omp 还没报告模型列表，所以窗口新会话和工作区设置里选不了模型（只能写 `.lila/project.toml` 或 `lila project set --model`）；RPC 能先列模型的话这里要补。
+
+**以下各节是 2026-11-11 的状态，写到 Claude Code、Codex、终端、账号、信任对话框、hook 的地方已经不是现状**；现状看 `architecture-v4.md`（已改）、`DESIGN.md`（已改）和上面这一节。
+
+---
+
 更新于 2026-11-11。用户用中文交流，回复也用中文。用户在两台电脑上轮流工作，另一台电脑上没有这一台的 Claude 记忆，所以该知道的都写在这里。
 
 先读这份。需要细节时再读：

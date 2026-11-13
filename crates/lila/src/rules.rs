@@ -9,8 +9,7 @@
 //!   names: wrappers (`sudo`, `env`, `xargs`, `bash -c`, ...), interpreters (`python`, `node`, ...), `find`, a line that
 //!   starts with `VAR=value`, command substitution, here-documents, and the few programs whose name says what they do
 //!   to files (`rm`, `chmod`, ...).
-//! - **edits** inside the thread's folder: the editing tools of the engines (Claude Code's `Edit`/`Write`, Codex's
-//!   patches, ACP edits), when every file they name is inside the folder.
+//! - **edits** inside the thread's folder: omp's edit tools, when every file they name is inside the folder.
 //! - one **tool**: an MCP tool by its exact name.
 //!
 //! A rule never answers what the tier would call dangerous (`policy::danger`: outside the folder, `git push`, outward

@@ -1,19 +1,14 @@
 use super::*;
-use lila_agent::{AgentEvent, Command, Item, ItemKind, ItemState, PermKind, PermOption, PermissionRequest, ToolKind};
+use lila_agent::{AgentEvent, Command, Item, ItemKind, ItemState, PermKind, PermOption, PermissionRequest, Question, QuestionKind, Reply, SlashCommand, ToolKind};
 use std::os::unix::fs::PermissionsExt;
 
 #[derive(Default)]
 struct Fake {
+    /// Terminals made by a lilad before this one: their addresses are not made again.
+    made: usize,
     runs: Vec<Value>,
-    sends: Vec<(String, String, Option<String>)>,
     kills: Vec<String>,
-    keys: Vec<(String, Vec<String>)>,
-    refuse_sends: bool,
     refuse_runs: bool,
-    /// What each terminal's screen shows (`read`).
-    screens: HashMap<String, String>,
-    /// The dialogs on the screens ignore Down.
-    stuck_cursor: bool,
 }
 
 impl Terminals for Fake {
@@ -26,76 +21,47 @@ impl Terminals for Fake {
             bail!("no terminal");
         }
         self.runs.push(req);
-        Ok(format!("t{}", self.runs.len()))
+        Ok(format!("t{}", self.made + self.runs.len()))
     }
-    fn send(&mut self, terminal: &str, text: &str, only_if: Option<&str>) -> Result<()> {
-        if self.refuse_sends {
-            bail!("unavailable");
-        }
-        // Like hc: `if` takes `idle` or `working` only.
-        if let Some(word) = only_if
-            && !matches!(word, "idle" | "working")
-        {
-            bail!("unknown variant `{word}`, expected `idle` or `working` (invalid_params)");
-        }
-        self.sends.push((terminal.into(), text.into(), only_if.map(Into::into)));
-        Ok(())
-    }
+
     fn kill(&mut self, terminal: &str) -> Result<()> {
         self.kills.push(terminal.into());
         Ok(())
     }
-    fn keys(&mut self, terminal: &str, keys: &[&str]) -> Result<()> {
-        self.keys.push((terminal.into(), keys.iter().map(|k| k.to_string()).collect()));
-        // A trust dialog on the screen answers keys like Claude Code's does: Down moves the cursor, Enter on "Yes" goes on.
-        if let Some(screen) = self.screens.get_mut(terminal) {
-            for key in keys {
-                match *key {
-                    "down" if !self.stuck_cursor && screen.contains("❯ No, exit") => *screen = screen.replace("❯ No, exit", "  No, exit").replace("  Yes, I trust this folder", "❯ Yes, I trust this folder"),
-                    "enter" if screen.contains("❯ Yes, I trust this folder") => *screen = "\n ▐▛███▛█   Claude Code v2.1.322\n".into(),
-                    "enter" if screen.contains("❯ No, exit") => *screen = "$ ".into(),
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn read(&mut self, terminal: &str) -> Result<String> {
-        self.screens.get(terminal).cloned().ok_or_else(|| anyhow!("no screen for {terminal}"))
-    }
 }
 
-/// A stand-in host: what lilad sends it, and what was read so far.
-type StandIn = (std::sync::mpsc::Receiver<String>, Vec<Command>);
+/// A stand-in host: the terminal it runs in, what lilad sends it, and what was read so far.
+type StandIn = (String, std::sync::mpsc::Receiver<String>, Vec<Command>);
 
 struct World {
     d: Daemon<Fake>,
     repo: PathBuf,
     _tmp: tempfile::TempDir,
     now: i64,
-    /// Stand-in hosts of Codex and ACP threads (`lila host …`): the commands lilad sent them.
+    /// Stand-in hosts of the threads (`lila host omp`): the commands lilad sent them.
     hosts: std::cell::RefCell<BTreeMap<String, StandIn>>,
 }
 
 fn world() -> World {
+    world_over(|_, _| {})
+}
+
+/// A world whose database `prepare` has written first, given the paths and the repo folder (an existing database from an earlier version).
+fn world_over(prepare: impl FnOnce(&Paths, &Path)) -> World {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let paths = Paths { config: root.join("config"), data: root.join("data"), state: root.join("state"), isolated: true };
+    let paths = Paths { data: root.join("data"), state: root.join("state"), isolated: true };
     paths.ensure().unwrap();
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    for prog in ["claude", "codex", "omp"] {
-        let p = bin.join(prog);
-        std::fs::write(&p, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let p = bin.join("omp");
+    std::fs::write(&p, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     let repo = std::fs::canonicalize(root).unwrap().join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
+    prepare(&paths, &repo);
     let store = Store::open(&paths.db()).unwrap();
-    let mut d = Daemon::new(store, Fake::default(), paths, bin.to_string_lossy().to_string(), PathBuf::from("/opt/lila/bin/lila"));
-    // The CLIs' session records, here instead of the real ~/.claude and ~/.codex.
-    d.sources = Sources { claude: root.join("claude-home"), codex: root.join("codex-home") };
+    let d = Daemon::new(store, Fake::default(), paths, bin.to_string_lossy().to_string(), PathBuf::from("/opt/lila/bin/lila"));
     World { d, repo, _tmp: tmp, now: 1_000_000, hosts: Default::default() }
 }
 
@@ -107,7 +73,7 @@ impl World {
         r
     }
 
-    /// The checkpoint jobs lilad queued run now, and the words of a hosted thread that waited for one go (lilad's server runs them at once);
+    /// The checkpoint jobs lilad queued run now, and the words that waited for one go (lilad's server runs them at once);
     /// the other jobs stay queued for `settle`.
     fn settle_checkpoints(&mut self) {
         loop {
@@ -146,23 +112,22 @@ impl World {
         self.d.store.thread(tid).unwrap().unwrap().terminal.unwrap()
     }
 
-    fn hosted(&self, tid: &str) -> bool {
-        self.d.store.thread(tid).unwrap().unwrap().engine.hosted()
-    }
-
-    /// A hosted thread's host attaches when it first reports (as `lila host` does once running).
+    /// A thread's host attaches when it first reports (as `lila host` does once running), and again when the thread runs in another terminal.
     fn attach(&mut self, tid: &str) {
-        if self.hosted(tid) && !self.hosts.borrow().contains_key(tid) {
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.hosts.borrow_mut().insert(tid.to_owned(), (rx, Vec::new()));
-            self.d.host_attach(tid, tx, self.now);
+        let terminal = self.terminal(tid);
+        if self.hosts.borrow().get(tid).is_some_and(|h| h.0 == terminal) {
+            return;
         }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let before = self.hosts.borrow_mut().remove(tid).map(|h| h.2).unwrap_or_default();
+        self.hosts.borrow_mut().insert(tid.to_owned(), (terminal, rx, before));
+        self.d.host_attach(tid, tx, self.now);
     }
 
-    /// The commands a hosted thread's host got so far.
+    /// The commands a thread's host got so far.
     fn commands(&self, tid: &str) -> Vec<Command> {
         let mut hosts = self.hosts.borrow_mut();
-        let Some((rx, got)) = hosts.get_mut(tid) else { return Vec::new() };
+        let Some((_, rx, got)) = hosts.get_mut(tid) else { return Vec::new() };
         got.extend(rx.try_iter().filter_map(|l| serde_json::from_str(&l).ok()));
         got.clone()
     }
@@ -181,16 +146,15 @@ impl World {
         self.d.on_event(&ev, self.now);
     }
 
-    /// What a thread was given: typed into its terminal, or its host's prompts.
+    /// What a thread was given: its host's prompts.
     fn sends_to(&self, tid: &str) -> Vec<String> {
-        if self.hosted(tid) {
-            return self.commands(tid).into_iter().filter_map(|c| match c {
+        self.commands(tid)
+            .into_iter()
+            .filter_map(|c| match c {
                 Command::Prompt { text, .. } => Some(text),
                 _ => None,
-            }).collect();
-        }
-        let t = self.terminal(tid);
-        self.d.term.sends.iter().filter(|(to, _, _)| *to == t).map(|(_, text, _)| text.clone()).collect()
+            })
+            .collect()
     }
 
     fn state(&mut self, tid: &str) -> String {
@@ -226,9 +190,41 @@ impl World {
         self.d.host_event(tid, ev, self.now);
     }
 
-    /// A Claude Code hook event for a thread.
-    fn hook(&mut self, tid: &str, event: &str, payload: Value) -> Value {
-        self.ok("hook", json!({"thread": tid, "event": event, "payload": payload}))
+    /// omp asks for `request`: the option lilad answered with at once, or none when a card is open.
+    fn raise(&mut self, tid: &str, request: PermissionRequest) -> Option<String> {
+        let id = request.id.clone();
+        self.host_event(tid, AgentEvent::Permission { request });
+        self.answer_to(tid, &id)
+    }
+
+    /// The option the host was told for a request, if it was.
+    fn answer_to(&self, tid: &str, id: &str) -> Option<String> {
+        self.commands(tid).into_iter().rev().find_map(|c| match c {
+            Command::Answer { permission, option } if permission == id => Some(option),
+            _ => None,
+        })
+    }
+
+    /// What lilad decides for a command, as `allow` or `ask`; an `ask` is taken back (omp moved on), so no card stays.
+    fn verdict(&mut self, tid: &str, command: &str) -> &'static str {
+        let id = format!("v{}", self.now);
+        match self.raise(tid, ask(&id, "shell", command)) {
+            Some(_) => "allow",
+            None => {
+                self.host_event(tid, AgentEvent::PermissionResolved { id });
+                "ask"
+            }
+        }
+    }
+
+    /// lilad is stopped and started again: a new one over the same database, which presumes the threads alive until herdr-core's snapshot says.
+    fn restart(&mut self) {
+        let paths = self.d.paths.clone();
+        let store = Store::open(&paths.db()).unwrap();
+        let term = Fake { made: self.d.term.made + self.d.term.runs.len(), ..Fake::default() };
+        self.d = Daemon::new(store, term, paths, self.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
+        self.hosts.borrow_mut().clear();
+        self.now += 5000;
     }
 }
 
@@ -255,7 +251,11 @@ fn ask(id: &str, name: &str, command: &str) -> PermissionRequest {
 }
 
 fn edit_ask(id: &str, path: &str) -> PermissionRequest {
-    PermissionRequest { name: "apply_patch".into(), paths: vec![path.into()], ..PermissionRequest { tool: ToolKind::Edit, ..ask(id, "apply_patch", "") } }
+    PermissionRequest { name: "edit".into(), paths: vec![path.into()], ..PermissionRequest { tool: ToolKind::Edit, ..ask(id, "edit", "") } }
+}
+
+fn read_ask(id: &str, path: &str) -> PermissionRequest {
+    PermissionRequest { name: "read".into(), command: None, paths: vec![path.into()], ..PermissionRequest { tool: ToolKind::Read, ..ask(id, "read", path) } }
 }
 
 // ---------------- projects ----------------
@@ -266,7 +266,7 @@ fn a_project_is_a_folder_with_defaults_that_new_threads_start_with() {
     let p = w.project();
     assert_eq!(p["id"], "shop");
     assert_eq!(p["created_config"], true);
-    assert_eq!(p["defaults"], json!({"engine": "claude", "model": "claude-sonnet-5-5", "effort": null, "permission": "full"}), "full auto unless the project says otherwise");
+    assert_eq!(p["defaults"], json!({"model": "", "permission": "full"}), "omp's own model, and full auto unless the project says otherwise");
     assert!(w.repo.join(".lila/project.toml").is_file());
     // Added twice: the same project.
     assert_eq!(w.project()["created_config"], false);
@@ -278,19 +278,22 @@ fn a_project_is_a_folder_with_defaults_that_new_threads_start_with() {
     assert!(w.call("thread.list", json!({"project": "nope"})).is_err());
 
     // The defaults are written to the file and used.
-    let p = w.ok("project.set", json!({"project": "shop", "title": "The Shop", "defaults": {"engine": "codex", "model": "gpt-6.1-sol", "effort": "low", "permission": "confirm"}}));
-    assert_eq!((p["label"].as_str(), p["defaults"]["engine"].as_str(), p["defaults"]["permission"].as_str()), (Some("The Shop"), Some("codex"), Some("confirm")));
+    let p = w.ok("project.set", json!({"project": "shop", "title": "The Shop", "defaults": {"model": "deepseek/deepseek-v4", "permission": "confirm"}}));
+    assert_eq!((p["label"].as_str(), p["defaults"]["model"].as_str(), p["defaults"]["permission"].as_str()), (Some("The Shop"), Some("deepseek/deepseek-v4"), Some("confirm")));
     let on_disk = crate::project::load(&w.repo).unwrap();
-    assert_eq!((on_disk.defaults.engine, on_disk.defaults.effort.as_deref(), on_disk.defaults.permission), (Runtime::Codex, Some("low"), Tier::Confirm));
+    assert_eq!((on_disk.defaults.model.as_str(), on_disk.defaults.permission), ("deepseek/deepseek-v4", Tier::Confirm));
     let tid = w.new_thread(json!({}));
     let t = w.ok("thread.show", json!({"thread": tid}));
-    assert_eq!((t["engine"].as_str(), t["model"].as_str(), t["effort"].as_str(), t["permission"].as_str()), (Some("codex"), Some("gpt-6.1-sol"), Some("low"), Some("confirm")));
-    // Told otherwise, a thread differs; another engine does not inherit the project's model.
-    let tid = w.new_thread(json!({"engine": "claude", "permission": "read_only"}));
+    assert_eq!((t["model"].as_str(), t["permission"].as_str(), t["legacy"].is_null()), (Some("deepseek/deepseek-v4"), Some("confirm"), true));
+    // Told otherwise, a thread differs.
+    let tid = w.new_thread(json!({"model": "openai/gpt-6", "permission": "read_only"}));
     let t = w.ok("thread.show", json!({"thread": tid}));
-    assert_eq!((t["engine"].as_str(), t["model"].as_str(), t["permission"].as_str()), (Some("claude"), Some("claude-sonnet-5-5"), Some("read_only")));
+    assert_eq!((t["model"].as_str(), t["permission"].as_str()), (Some("openai/gpt-6"), Some("read_only")));
     assert!(w.call("project.set", json!({"project": "shop", "defaults": {"permission": "yolo"}})).is_err());
-    assert!(w.call("project.set", json!({"project": "shop", "defaults": {"engine": "gemini"}})).is_err());
+    assert!(w.call("thread.new", json!({"project": "shop", "permission": "yolo"})).is_err());
+    // Cleared, it is omp's again.
+    let p = w.ok("project.set", json!({"project": "shop", "defaults": {"model": ""}}));
+    assert_eq!(p["defaults"]["model"], "");
 }
 
 #[test]
@@ -311,45 +314,66 @@ fn removing_a_project_stops_its_threads_and_forgets_them() {
 // ---------------- a thread's life ----------------
 
 #[test]
-fn a_claude_thread_starts_hooked_and_asks_in_manual_mode() {
+fn a_thread_runs_omp_through_its_host_and_its_first_message_waits_for_the_host() {
     let mut w = world();
     w.project();
-    let tid = w.new_thread(json!({"text": "make a file", "model": "claude-haiku-5-5", "effort": "low"}));
-    let t = w.d.store.thread(&tid).unwrap().unwrap();
-    let session = t.session.clone().expect("Claude Code takes the id Lila picks");
+    let tid = w.new_thread(json!({"model": "deepseek/deepseek-v4", "text": "hello", "permission": "confirm"}));
     let run = &w.d.term.runs[0];
     assert_eq!(run["labels"], json!({"lila.project": "shop", "lila.thread": tid}));
     assert_eq!(run["name"], format!("lila-{tid}"));
     assert_eq!(run["cwd"], w.repo.to_string_lossy().as_ref());
     assert_eq!((run["env"]["LILA_THREAD"].as_str(), run["env"]["LILA_PROJECT"].as_str()), (Some(tid.as_str()), Some("shop")));
     let args = argv(&w, 0);
-    assert!(args[0].ends_with("/bin/claude"), "{args:?}");
-    assert_eq!(args[1..9], ["--model", "claude-haiku-5-5", "--session-id", session.as_str(), "--effort", "low", "--permission-mode", "manual"]);
-    let at = args.iter().position(|a| a == "--settings").expect("--settings");
-    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&args[at + 1]).unwrap()).unwrap();
-    assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], "'/opt/lila/bin/lila' hook PermissionRequest");
-    assert_eq!(settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], super::hooks::PERMISSION_WAIT_SECS);
-    assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "*", "every tool call is judged");
-    assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/opt/lila/bin/lila' hook PreToolUse");
-
-    // Starting: the first message waits for the prompt, and goes where it is idle.
+    assert_eq!(args[0], "/opt/lila/bin/lila");
+    assert_eq!(args[1..4], ["host", "omp", "--program"]);
+    assert!(args[4].ends_with("/bin/omp"), "{args:?}");
+    assert_eq!(args[5..], ["--model", "deepseek/deepseek-v4", "--session-dir", w.d.paths.omp_sessions(&tid).to_str().unwrap()], "the thread's own folder of omp sessions");
+    assert_eq!(w.d.store.thread(&tid).unwrap().unwrap().session, None, "omp's session id comes from its host");
+    // Starting: nothing goes before the host is attached; then the first message does, once omp is free.
     assert_eq!(w.state(&tid), "starting");
-    assert!(w.d.term.sends.is_empty());
+    assert!(w.sends_to(&tid).is_empty());
+    assert_eq!(w.d.store.outbox(&tid).unwrap().len(), 1, "kept until the host takes it");
     w.status(&tid, "idle");
-    assert_eq!(w.d.term.sends, [(w.terminal(&tid), "make a file".into(), Some("idle".into()))]);
+    assert_eq!(w.sends_to(&tid), ["hello"]);
+    assert!(w.d.store.outbox(&tid).unwrap().is_empty());
     assert_eq!(w.state(&tid), "idle");
-    assert_eq!(t.title, "make a file");
-    // A message while it works goes in too (Claude queues it); one at a time as a unit.
+    w.host_event(&tid, AgentEvent::Session { id: "s1".into() });
+    assert_eq!(w.ok("thread.show", json!({"thread": tid}))["session"], "s1");
+    // Items are stored and read back by seq.
+    let said = Item { id: "m1".into(), turn: None, at_ms: 5, state: ItemState::Done, kind: ItemKind::AgentMessage { text: "hi there".into() } };
+    w.host_event(&tid, AgentEvent::Item { item: said });
+    let r = w.ok("thread.read", json!({"thread": tid}));
+    assert_eq!((r["items"][0]["text"].as_str(), r["seq"].as_i64()), (Some("hi there"), Some(1)));
+    assert!(w.ok("thread.read", json!({"thread": tid, "after": 1}))["items"].as_array().unwrap().is_empty());
+    assert!(r["thread"].get("caps").is_none() && r["thread"].get("engine").is_none());
+    // The watchers hear which thread changed, and how far its conversation goes.
+    let ev = w.d.thread_event(&tid, 7).unwrap();
+    assert_eq!((ev["event"].as_str(), ev["items_seq"].as_i64(), ev["state"].as_str()), (Some("thread"), Some(1), Some("idle")));
+    // omp takes words one turn at a time: a message while it works waits for the turn to end.
     w.status(&tid, "working");
     assert_eq!(w.state(&tid), "running");
     w.ok("thread.send", json!({"thread": tid, "text": "and a second one"}));
-    assert_eq!(w.sends_to(&tid), ["make a file", "and a second one"]);
-    assert_eq!(w.d.term.sends[1].2, None, "not guarded while it works");
+    assert_eq!(w.sends_to(&tid), ["hello"]);
+    w.status(&tid, "idle");
+    assert_eq!(w.sends_to(&tid), ["hello", "and a second one"]);
     assert!(w.call("thread.send", json!({"thread": tid, "text": " "})).is_err(), "nothing to send");
 }
 
 #[test]
-fn files_named_with_at_go_to_a_hosted_engine_as_files() {
+fn interrupting_goes_to_the_host_only_while_the_thread_works() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({}));
+    w.status(&tid, "idle");
+    let err = w.call("thread.interrupt", json!({"thread": tid})).unwrap_err();
+    assert!(err.to_string().contains("not working"), "{err:#}");
+    w.status(&tid, "working");
+    w.ok("thread.interrupt", json!({"thread": tid}));
+    assert_eq!(w.commands(&tid).last(), Some(&Command::Interrupt));
+}
+
+#[test]
+fn files_named_with_at_go_to_omp_as_files() {
     let mut w = world();
     w.project();
     std::fs::write(w.repo.join("README.md"), "# shop").unwrap();
@@ -358,62 +382,24 @@ fn files_named_with_at_go_to_a_hosted_engine_as_files() {
         Command::Prompt { attachments, .. } => attachments.iter().map(|a| (a.path.clone(), a.name.clone())).collect::<Vec<_>>(),
         other => panic!("{other:?}"),
     };
-    for engine in ["codex", "omp"] {
-        // The first message and a later one: the mentioned file that exists goes along, the one that does not stays words.
-        let tid = w.new_thread(json!({"engine": engine, "text": "read @README.md and @nothing.md"}));
-        w.status(&tid, "idle");
-        w.ok("thread.send", json!({"thread": tid, "text": "again @README.md"}));
-        let got: Vec<_> = w.commands(&tid).iter().filter(|c| matches!(c, Command::Prompt { .. })).map(attached).collect();
-        let file = vec![(path.clone(), "README.md".to_owned())];
-        assert_eq!(got, [file.clone(), file], "{engine}");
-    }
+    // The first message and a later one: the mentioned file that exists goes along, the one that does not stays words.
+    let tid = w.new_thread(json!({"text": "read @README.md and @nothing.md"}));
+    w.status(&tid, "idle");
+    w.ok("thread.send", json!({"thread": tid, "text": "again @README.md"}));
+    let got: Vec<_> = w.commands(&tid).iter().filter(|c| matches!(c, Command::Prompt { .. })).map(attached).collect();
+    let file = vec![(path, "README.md".to_owned())];
+    assert_eq!(got, [file.clone(), file]);
 }
 
 #[test]
-fn a_codex_thread_runs_through_its_host_under_the_tiers_sandbox() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({"engine": "codex", "model": "gpt-6.1-sol", "effort": "low", "text": "hello", "permission": "confirm"}));
-    let args = argv(&w, 0);
-    assert_eq!(args[0], "/opt/lila/bin/lila");
-    assert_eq!(args[1..6], ["host", "codex", "--program", args[4].as_str(), "--model"]);
-    assert!(args[4].ends_with("/bin/codex"), "{args:?}");
-    assert_eq!(args[6..], ["gpt-6.1-sol", "--effort", "low", "--sandbox", "workspace-write", "--approval", "untrusted"]);
-    assert_eq!(w.d.store.thread(&tid).unwrap().unwrap().session, None, "Codex picks its own");
-    // Nothing goes before the host is attached; then the first message does.
-    assert!(w.sends_to(&tid).is_empty() && w.d.term.sends.is_empty());
-    w.status(&tid, "working");
-    assert_eq!(w.sends_to(&tid), ["hello"]);
-    assert!(w.d.term.sends.is_empty(), "never typed into the terminal");
-    w.host_event(&tid, AgentEvent::Session { id: "th1".into() });
-    assert_eq!(w.ok("thread.show", json!({"thread": tid}))["session"], "th1");
-    // Items are stored and read back by seq.
-    let said = Item { id: "m1".into(), turn: None, at_ms: 5, state: ItemState::Done, kind: ItemKind::AgentMessage { text: "hi there".into() } };
-    w.host_event(&tid, AgentEvent::Item { item: said });
-    let r = w.ok("thread.read", json!({"thread": tid}));
-    assert_eq!((r["items"][0]["text"].as_str(), r["seq"].as_i64()), (Some("hi there"), Some(1)));
-    assert!(w.ok("thread.read", json!({"thread": tid, "after": 1}))["items"].as_array().unwrap().is_empty());
-    assert_eq!(r["thread"]["caps"]["tui"], false);
-    // Interrupt goes to the host.
-    w.ok("thread.interrupt", json!({"thread": tid}));
-    assert_eq!(w.commands(&tid).last(), Some(&Command::Interrupt));
-    // omp is an ACP agent behind the same host.
-    let omp = w.new_thread(json!({"engine": "omp", "model": "deepseek/deepseek-v4"}));
-    let args = argv(&w, 1);
-    assert_eq!(args[1..3], ["host", "omp"]);
-    assert_eq!(args[args.len() - 2..], ["--model", "deepseek/deepseek-v4"]);
-    assert_eq!(w.state(&omp), "starting");
-}
-
-#[test]
-fn an_ended_thread_is_resumed_on_its_session() {
+fn an_ended_thread_is_resumed_on_its_omp_session() {
     let mut w = world();
     w.project();
     let tid = w.new_thread(json!({"text": "first"}));
-    let session = w.d.store.thread(&tid).unwrap().unwrap().session.unwrap();
     w.status(&tid, "idle");
+    w.host_event(&tid, AgentEvent::Session { id: "s9".into() });
     assert!(w.call("thread.resume", json!({"thread": tid})).is_err(), "it is running");
-    // The engine ends by itself (hc says its terminal finished).
+    // omp ends by itself (hc says its terminal finished).
     let t = w.terminal(&tid);
     w.now += 1000;
     w.d.on_event(&json!({"method": "event", "params": {"type": "finished", "terminal": t, "data": {"reason": "exited"}}}), w.now);
@@ -423,36 +409,31 @@ fn an_ended_thread_is_resumed_on_its_session() {
     assert!(w.call("thread.send", json!({"thread": tid, "text": "hello?"})).unwrap_err().to_string().contains("resume"));
     assert!(w.call("thread.stop", json!({"thread": tid})).is_err(), "nothing runs");
 
-    // Its transcript is there: resumed on it, with a message.
-    let file = sessions::claude_file(&w.d.live_sources(), &w.repo.to_string_lossy(), &session);
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, "").unwrap();
-    let r = w.ok("thread.resume", json!({"thread": tid, "text": "go on"}));
-    assert_eq!(r["state"], "starting");
+    // Resumed on its session, with a message and another tier and model: in the same folder of omp sessions, which the host goes on with.
+    let dir = w.d.paths.omp_sessions(&tid);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("2026-11-13_s9.jsonl"), "{}\n").unwrap();
+    let r = w.ok("thread.resume", json!({"thread": tid, "text": "go on", "model": "openai/gpt-6", "permission": "read_only"}));
+    assert_eq!((r["state"].as_str(), r["permission"].as_str(), r["model"].as_str()), (Some("starting"), Some("read_only"), Some("openai/gpt-6")));
     let args = argv(&w, 1);
-    assert_eq!(args[args.iter().position(|a| a == "--resume").unwrap() + 1], session);
-    assert!(!args.contains(&"--session-id".to_string()));
+    assert_eq!(args[args.iter().position(|a| a == "--session-dir").unwrap() + 1], dir.to_str().unwrap());
+    assert_eq!(args[args.iter().position(|a| a == "--model").unwrap() + 1], "openai/gpt-6");
+    let resumed = |w: &World, tid: &str| w.d.store.events(tid, 50).unwrap().into_iter().find(|e| e.kind == "resumed").map(|e| e.detail).unwrap_or_default();
+    assert!(resumed(&w, &tid).starts_with("goes on with the omp session in"), "{}", resumed(&w, &tid));
     w.status(&tid, "idle");
     assert_eq!(w.sends_to(&tid).last().map(String::as_str), Some("go on"));
     // Stopped by the person: ended too, and the terminal is killed.
     w.ok("thread.stop", json!({"thread": tid}));
     assert_eq!(w.d.term.kills.last(), Some(&"t2".to_string()));
     assert_eq!(w.state(&tid), "ended");
-    // Ended before its engine wrote anything: started under the same id, not resumed (there is nothing to resume).
-    std::fs::remove_file(&file).unwrap();
-    w.ok("thread.resume", json!({"thread": tid}));
-    let args = argv(&w, 2);
-    assert_eq!(args[args.iter().position(|a| a == "--session-id").unwrap() + 1], session);
 
-    // Codex goes on with its thread id.
-    let cx = w.new_thread(json!({"engine": "codex", "model": "gpt-6.1-sol"}));
-    w.status(&cx, "idle");
-    w.host_event(&cx, AgentEvent::Session { id: "th9".into() });
-    w.ok("thread.stop", json!({"thread": cx}));
-    w.ok("thread.resume", json!({"thread": cx, "effort": "high", "permission": "read_only"}));
-    let args = argv(&w, 4);
-    assert!(args.windows(2).any(|p| p == ["--thread", "th9"]), "{args:?}");
-    assert!(args.windows(2).any(|p| p == ["--effort", "high"]) && args.windows(2).any(|p| p == ["--sandbox", "read-only"]), "{args:?}");
+    // One that ended before omp made a session starts a new one, in a folder of its own.
+    let early = w.new_thread(json!({}));
+    w.ok("thread.stop", json!({"thread": early}));
+    w.ok("thread.resume", json!({"thread": early}));
+    assert!(resumed(&w, &early).starts_with("no omp session in"), "{}", resumed(&w, &early));
+    assert_ne!(argv(&w, 3), argv(&w, 1)[..4].to_vec());
+    assert!(argv(&w, 3).contains(&w.d.paths.omp_sessions(&early).to_string_lossy().to_string()));
 }
 
 #[test]
@@ -468,7 +449,7 @@ fn threads_list_by_activity_and_archived_ones_leave_the_list() {
     w.ok("thread.archive", json!({"thread": a}));
     assert_eq!(ids(&mut w, false), std::slice::from_ref(&b));
     assert_eq!(ids(&mut w, true).len(), 2);
-    assert_eq!(w.state(&a), "ended", "archiving ends its engine");
+    assert_eq!(w.state(&a), "ended", "archiving ends omp");
     w.ok("thread.unarchive", json!({"thread": a}));
     assert_eq!(ids(&mut w, false).len(), 2);
     w.ok("thread.rename", json!({"thread": a, "title": "renamed"}));
@@ -489,7 +470,7 @@ fn lilad_finds_its_threads_again_after_a_restart() {
     let store = Store::open(&paths.db()).unwrap();
     let mut d = Daemon::new(store, Fake::default(), paths, w.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
     let t_alive = w.d.store.thread(&alive).unwrap().unwrap().terminal.unwrap();
-    let state = |d: &Daemon<Fake>, id: &str| d.thread_json(&d.store.thread(id).unwrap().unwrap(), 5_000_000)["state"].as_str().unwrap().to_owned();
+    let state = |d: &Daemon<Fake>, id: &str| d.thread_json(&d.store.thread(id).unwrap().unwrap())["state"].as_str().unwrap().to_owned();
     assert_eq!(state(&d, &alive), "starting", "alive, nothing known yet");
     d.reconcile(std::slice::from_ref(&t_alive), 5_000_000, 5_000_000);
     assert_eq!(state(&d, &alive), "starting");
@@ -499,14 +480,227 @@ fn lilad_finds_its_threads_again_after_a_restart() {
     assert_eq!(state(&d, &alive), "running");
 }
 
-// ---------------- tiers and permission requests ----------------
-
-fn claude_ask(w: &mut World, tid: &str, tool: &str, input: Value) -> Value {
-    w.hook(tid, "PermissionRequest", json!({"tool_name": tool, "tool_input": input, "cwd": w.repo.to_string_lossy()}))
+#[test]
+fn a_blocked_thread_waits_and_takes_no_words_until_it_is_free() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({"text": "hi"}));
+    w.status(&tid, "blocked");
+    let j = w.d.thread_json(&w.d.store.thread(&tid).unwrap().unwrap());
+    assert_eq!((j["state"].as_str(), j["waiting"].as_str()), (Some("waiting"), Some("card")));
+    assert!(w.call("thread.send", json!({"thread": tid, "text": "x"})).is_err());
+    assert!(w.sends_to(&tid).is_empty(), "nothing goes into a thread that waits");
+    w.status(&tid, "idle");
+    assert_eq!(w.d.thread_json(&w.d.store.thread(&tid).unwrap().unwrap())["waiting"], Value::Null);
+    assert_eq!(w.sends_to(&tid), ["hi"]);
 }
 
 #[test]
-fn claude_requests_are_answered_by_the_threads_tier() {
+fn the_model_changes_at_once_in_a_running_thread_and_on_resume_in_an_ended_one() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({"model": "deepseek/deepseek-v4"}));
+    w.status(&tid, "idle");
+    w.ok("thread.model", json!({"thread": tid, "model": "openai/gpt-6", "effort": "low"}));
+    assert_eq!(w.commands(&tid), [Command::SetModel { model: "openai/gpt-6".into() }, Command::SetEffort { effort: "low".into() }]);
+    let t = w.d.store.thread(&tid).unwrap().unwrap();
+    assert_eq!((t.model.as_str(), t.effort.as_deref()), ("openai/gpt-6", Some("low")), "and on resume too");
+    assert!(w.call("thread.model", json!({"thread": tid})).is_err(), "nothing to change");
+    // What omp reports it runs on, and what it lists, is what the box under the conversation shows.
+    w.host_event(&tid, AgentEvent::Config { model: Some("openai/gpt-6-luna".into()), effort: None, models: vec![lila_agent::Choice { id: "openai/gpt-6-luna".into(), name: "Luna".into() }], efforts: vec![] });
+    let config = w.ok("thread.read", json!({"thread": tid}))["config"].clone();
+    assert_eq!((config["model"].as_str(), config["switch"].as_bool(), config["default_model"].as_str()), (Some("openai/gpt-6-luna"), Some(true), Some("openai/gpt-6")));
+    // An ended thread starts on it next time.
+    w.ok("thread.stop", json!({"thread": tid}));
+    w.ok("thread.model", json!({"thread": tid, "model": "deepseek/deepseek-v4"}));
+    w.ok("thread.resume", json!({"thread": tid}));
+    assert!(argv(&w, 1).windows(2).any(|p| p == ["--model", "deepseek/deepseek-v4"]));
+}
+
+#[test]
+fn the_slash_menu_offers_what_omp_declared() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({}));
+    w.status(&tid, "idle");
+    assert!(w.ok("thread.commands", json!({"thread": tid}))["commands"].as_array().unwrap().is_empty());
+    let command = |name: &str, hint: Option<&str>| SlashCommand { name: name.into(), description: "d".into(), hint: hint.map(Into::into) };
+    w.host_event(&tid, AgentEvent::Commands { commands: vec![command("compact", Some("arguments")), command("skill:tdd", None)] });
+    let menu = w.ok("thread.commands", json!({"thread": tid}))["commands"].clone();
+    assert_eq!((menu[0]["name"].as_str(), menu[0]["kind"].as_str(), menu[0]["insert"].as_str(), menu[0]["hint"].as_str()), (Some("compact"), Some("builtin"), Some("/compact "), Some("[参数]")));
+    assert_eq!((menu[1]["name"].as_str(), menu[1]["kind"].as_str(), menu[1]["insert"].as_str()), (Some("tdd"), Some("skill"), Some("/skill:tdd ")));
+}
+
+#[test]
+fn unknown_requests_and_threads_are_errors() {
+    let mut w = world();
+    w.project();
+    assert!(w.call("task.new", json!({})).is_err());
+    assert!(w.call("hook", json!({"thread": "t00000000", "event": "Stop"})).is_err(), "Claude Code's hooks are gone");
+    assert!(w.call("thread.show", json!({"thread": "t00000000"})).is_err());
+    assert!(w.call("thread.new", json!({"project": "shop", "permission": "yolo"})).is_err());
+    assert!(w.d.term.runs.is_empty(), "nothing was started");
+    let status = w.ok("status", json!({}));
+    assert_eq!(status["projects"], 1);
+}
+
+#[test]
+fn ping_and_status_report_the_version_and_protocol() {
+    let mut w = world();
+    for method in ["ping", "status"] {
+        let r = w.ok(method, json!({}));
+        assert_eq!((r["version"].as_str(), r["protocol"].as_u64()), (Some(env!("CARGO_PKG_VERSION")), Some(u64::from(crate::PROTOCOL))), "{method}: {r}");
+    }
+    assert_eq!(w.ok("ping", json!({}))["pong"], true);
+}
+
+// ---------------- threads from before omp was the only engine ----------------
+
+#[test]
+fn threads_of_claude_code_and_codex_in_an_existing_database_are_kept_ended_and_cannot_be_resumed() {
+    let mut w = world_over(|paths, repo| {
+        // A database as the last version with engines left it: a running Claude Code thread, an ended Codex one, one of omp's.
+        let db = rusqlite::Connection::open(paths.db()).unwrap();
+        db.execute_batch(&format!(
+            "CREATE TABLE projects (id TEXT PRIMARY KEY, cwd TEXT NOT NULL UNIQUE, created_ms INTEGER NOT NULL);
+             CREATE TABLE threads (id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL, engine TEXT NOT NULL, model TEXT NOT NULL, effort TEXT, tier TEXT NOT NULL,
+                cwd TEXT NOT NULL, session TEXT, terminal TEXT, created_ms INTEGER NOT NULL, active_ms INTEGER NOT NULL, started_ms INTEGER, ended_ms INTEGER, archived INTEGER NOT NULL DEFAULT 0,
+                worktree INTEGER NOT NULL DEFAULT 0, base_branch TEXT, base_commit TEXT, merged_ms INTEGER);
+             INSERT INTO projects VALUES ('shop', '{cwd}', 1);
+             INSERT INTO threads (id, project, title, engine, model, tier, cwd, session, terminal, created_ms, active_ms, started_ms) VALUES ('t00000001', 'shop', 'claude', 'claude', 'claude-sonnet-5-5', 'full', '{cwd}', 'sid-1', 'old-1', 1, 5, 2);
+             INSERT INTO threads (id, project, title, engine, model, tier, cwd, session, terminal, created_ms, active_ms, ended_ms) VALUES ('t00000002', 'shop', 'codex', 'codex', 'gpt-6.1-sol', 'full', '{cwd}', 'th-1', NULL, 1, 4, 4);
+             INSERT INTO threads (id, project, title, engine, model, tier, cwd, session, terminal, created_ms, active_ms, ended_ms) VALUES ('t00000003', 'shop', 'omp', 'omp', 'deepseek/deepseek-v4', 'full', '{cwd}', 's-1', NULL, 1, 3, 3);
+             PRAGMA user_version = 7;",
+            cwd = repo.display()
+        ))
+        .unwrap();
+    });
+    let list = w.ok("thread.list", json!({}));
+    let by_id = |id: &str| list.as_array().unwrap().iter().find(|t| t["id"] == id).unwrap().clone();
+    // Both are ended, whatever they were doing, and say which engine they ran on; omp's is as it was.
+    for id in ["t00000001", "t00000002"] {
+        assert_eq!((by_id(id)["state"].as_str(), by_id(id)["legacy"].as_str(), by_id(id)["terminal"].is_null()), (Some("ended"), Some(if id == "t00000001" { "claude" } else { "codex" }), true), "{id}");
+    }
+    assert_eq!((by_id("t00000003")["state"].as_str(), by_id("t00000003")["legacy"].is_null()), (Some("ended"), true));
+    // Nothing is running here, and the Claude Code terminal still alive in herdr-core is closed when it shows up.
+    w.d.on_terminal(&json!({"state": "live", "address": "old-1", "labels": {"lila.project": "shop", "lila.thread": "t00000001"}, "reported": true, "status": {"state": "idle"}}), w.now);
+    assert_eq!(w.d.term.kills, ["old-1"]);
+    assert_eq!(w.state("t00000001"), "ended");
+    // Their conversations can be read, but they take no words and cannot be resumed; omp's can.
+    w.ok("thread.read", json!({"thread": "t00000001"}));
+    let err = w.call("thread.resume", json!({"thread": "t00000001"})).unwrap_err().to_string();
+    assert!(err.contains("claude") && err.contains("no longer"), "{err}");
+    assert!(w.call("thread.resume", json!({"thread": "t00000002"})).is_err());
+    assert!(w.call("thread.send", json!({"thread": "t00000002", "text": "x"})).is_err());
+    assert!(w.d.term.runs.is_empty());
+    w.ok("thread.resume", json!({"thread": "t00000003"}));
+    // It had an ACP session id and no folder of omp sessions: it starts a new omp session, its conversation kept.
+    assert_eq!(w.d.store.thread("t00000003").unwrap().unwrap().session.as_deref(), Some("s-1"));
+    assert!(argv(&w, 0).contains(&w.d.paths.omp_sessions("t00000003").to_string_lossy().to_string()));
+    assert!(w.d.store.events("t00000003", 50).unwrap().iter().any(|e| e.kind == "resumed" && e.detail.starts_with("no omp session in")));
+    // They can be archived and renamed like any.
+    w.ok("thread.archive", json!({"thread": "t00000001"}));
+    // The line `lila thread list` prints says why they will not start.
+    assert_eq!(w.ok("thread.show", json!({"thread": "t00000002"}))["legacy"], "codex");
+}
+
+// ---------------- questions ----------------
+
+fn question(id: &str, kind: QuestionKind, options: &[&str]) -> Question {
+    Question { id: id.into(), title: "Which database?\nFor the new service.".into(), detail: String::new(), kind, options: options.iter().map(|o| o.to_string()).collect(), prefill: String::new(), secret: false }
+}
+
+impl World {
+    /// The reply the host was told for a question, if it was.
+    fn reply_to(&self, tid: &str, id: &str) -> Option<Reply> {
+        self.commands(tid).into_iter().rev().find_map(|c| match c {
+            Command::Reply { question, reply } if question == id => Some(reply),
+            _ => None,
+        })
+    }
+}
+
+#[test]
+fn a_question_is_a_card_the_thread_waits_on_until_the_person_answers_it() {
+    let mut w = world();
+    w.project();
+    let tid = w.new_thread(json!({}));
+    w.status(&tid, "idle");
+    w.host_event(&tid, AgentEvent::Question { question: question("u1", QuestionKind::Choice, &["Postgres", "SQLite"]) });
+    assert_eq!(w.state(&tid), "waiting", "a question holds the thread like a permission");
+    let read = w.ok("thread.read", json!({"thread": tid}));
+    let card = read["questions"][0].clone();
+    assert_eq!((card["kind"].as_str(), card["title"].as_str(), card["options"].clone()), (Some("choice"), Some("Which database?\nFor the new service."), json!(["Postgres", "SQLite"])));
+    assert!(read["permissions"].as_array().unwrap().is_empty());
+    assert_eq!(w.ok("thread.show", json!({"thread": tid}))["cards"], 1);
+    assert_eq!(w.ok("status", json!({}))["cards"], 1);
+    assert!(w.call("thread.send", json!({"thread": tid, "text": "hey"})).is_err(), "a message would not answer it");
+    // Asked again (the host came back): still one card.
+    w.host_event(&tid, AgentEvent::Question { question: question("u1", QuestionKind::Choice, &["Postgres", "SQLite"]) });
+    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["questions"].as_array().unwrap().len(), 1);
+    // A choice is not one that was not offered; it is given by its words or its number.
+    assert!(w.call("thread.answer", json!({"thread": tid, "card": card["id"], "value": "Mongo"})).is_err());
+    assert!(w.call("thread.answer", json!({"thread": tid, "card": card["id"]})).is_err());
+    assert!(w.call("thread.answer", json!({"thread": tid, "card": card["id"], "value": "3"})).is_err());
+    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "value": "2"}));
+    assert_eq!(w.reply_to(&tid, "u1"), Some(Reply::Choice { value: "SQLite".into() }));
+    assert_eq!(w.state(&tid), "idle");
+    assert!(w.call("thread.answer", json!({"thread": tid, "card": card["id"], "value": "1"})).is_err(), "answered once");
+    assert!(w.events(&tid).iter().any(|e| e == "answered Which database? · SQLite"), "{:?}", w.events(&tid));
+
+    // Yes or no; words of the person's own; no answer at all.
+    w.host_event(&tid, AgentEvent::Question { question: question("u2", QuestionKind::Confirm, &[]) });
+    let id = w.ok("thread.read", json!({"thread": tid}))["questions"][0]["id"].clone();
+    assert!(w.call("thread.answer", json!({"thread": tid, "card": id, "value": "maybe"})).is_err());
+    w.ok("thread.answer", json!({"thread": tid, "card": id, "value": "no"}));
+    assert_eq!(w.reply_to(&tid, "u2"), Some(Reply::Confirm { yes: false }));
+    w.host_event(&tid, AgentEvent::Question { question: Question { secret: true, ..question("u3", QuestionKind::Text, &[]) } });
+    let id = w.ok("thread.read", json!({"thread": tid}))["questions"][0]["id"].clone();
+    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["questions"][0]["secret"], true);
+    w.ok("thread.answer", json!({"thread": tid, "card": id, "value": "hunter2"}));
+    assert_eq!(w.reply_to(&tid, "u3"), Some(Reply::Text { value: "hunter2".into() }));
+    assert!(w.events(&tid).iter().all(|e| !e.contains("hunter2")), "a secret is not logged");
+    w.host_event(&tid, AgentEvent::Question { question: question("u4", QuestionKind::Text, &[]) });
+    let id = w.ok("thread.read", json!({"thread": tid}))["questions"][0]["id"].clone();
+    w.ok("thread.answer", json!({"thread": tid, "card": id, "cancel": true}));
+    assert_eq!(w.reply_to(&tid, "u4"), Some(Reply::Cancel));
+
+    // omp takes a question back, or the thread ends with one open: no card is left.
+    w.host_event(&tid, AgentEvent::Question { question: question("u5", QuestionKind::Choice, &["a"]) });
+    w.host_event(&tid, AgentEvent::QuestionResolved { id: "u5".into() });
+    assert!(w.ok("thread.read", json!({"thread": tid}))["questions"].as_array().unwrap().is_empty());
+    w.host_event(&tid, AgentEvent::Question { question: question("u6", QuestionKind::Choice, &["a"]) });
+    w.ok("thread.stop", json!({"thread": tid}));
+    assert!(w.ok("thread.read", json!({"thread": tid}))["questions"].as_array().unwrap().is_empty());
+    assert_eq!(w.ok("thread.show", json!({"thread": tid}))["cards"], 0);
+}
+
+#[test]
+fn the_models_omp_offers_are_asked_of_an_omp_of_its_own_and_remembered() {
+    let mut w = world();
+    w.project();
+    // A stand-in omp: says it is ready and, as the request for the models goes out, names two.
+    let omp = w._tmp.path().join("bin/omp");
+    std::fs::write(&omp, "#!/bin/sh\necho '{\"type\":\"ready\",\"supportedProtocolVersions\":[1,2]}'\necho '{\"type\":\"response\",\"id\":\"l3\",\"success\":true,\"data\":{\"models\":[{\"provider\":\"openai\",\"id\":\"gpt-6\",\"name\":\"GPT-6\"},{\"provider\":\"magpie\",\"id\":\"claude/sonnet\",\"name\":\"Sonnet\"}]}}'\nsleep 30\n").unwrap();
+    let r = w.ok("models.list", json!({}));
+    assert_eq!(r["models"], json!([{"id": "openai/gpt-6", "name": "GPT-6"}, {"id": "magpie/claude/sonnet", "name": "Sonnet"}]));
+    // Remembered: omp is not started again (it is gone now, and the answer is the same).
+    std::fs::remove_file(&omp).unwrap();
+    assert_eq!(w.ok("models.list", json!({})), r);
+    assert!(w.call("models.list", json!({"refresh": true})).is_err());
+    std::fs::write(&omp, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A thread whose omp has not named its models yet is offered these.
+    let tid = w.new_thread(json!({}));
+    w.status(&tid, "idle");
+    let cfg = w.ok("thread.read", json!({"thread": tid}))["config"].clone();
+    assert_eq!((cfg["switch"].clone(), cfg["models"].as_array().unwrap().len()), (json!(true), 2));
+}
+
+// ---------------- tiers and permission requests ----------------
+
+#[test]
+fn requests_are_answered_by_the_threads_tier() {
     let mut w = world();
     w.project();
     let repo = w.repo.to_string_lossy().to_string();
@@ -514,398 +708,65 @@ fn claude_requests_are_answered_by_the_threads_tier() {
     w.status(&tid, "idle");
     assert_eq!(w.ok("thread.show", json!({"thread": tid}))["permission"], "full");
 
-    // Full auto: ordinary work goes without anyone being asked.
-    assert_eq!(claude_ask(&mut w, &tid, "Bash", json!({"command": "cargo test"}))["decision"], "allow");
-    assert_eq!(claude_ask(&mut w, &tid, "Write", json!({"file_path": format!("{repo}/src/a.rs")}))["decision"], "allow");
-    assert!(w.events(&tid).iter().any(|e| e == "auto_allowed full · Bash: cargo test"), "{:?}", w.events(&tid));
+    // Full auto: ordinary work goes without anyone being asked, the first allow option (once, not for the session).
+    assert_eq!(w.raise(&tid, ask("r1", "shell", "cargo test")).as_deref(), Some("accept"));
+    assert_eq!(w.raise(&tid, edit_ask("r2", &format!("{repo}/src/a.rs"))).as_deref(), Some("accept"));
+    assert!(w.events(&tid).iter().any(|e| e == "auto_allowed full · shell: cargo test"), "{:?}", w.events(&tid));
     assert_eq!(w.state(&tid), "idle");
     // … but not a push, a write outside the folder, a pull request or computer use.
-    for (tool, input) in [
-        ("Bash", json!({"command": "git push origin main"})),
-        ("Write", json!({"file_path": "/etc/hosts"})),
-        ("Bash", json!({"command": "gh pr create --title x --body y"})),
-        ("mcp__computer-use__left_click", json!({})),
-    ] {
-        let r = claude_ask(&mut w, &tid, tool, input.clone());
-        let id = r["wait"].as_str().unwrap_or_else(|| panic!("{tool} {input} should wait: {r}")).to_owned();
+    for (i, request) in [
+        ask("d1", "shell", "git push origin main"),
+        edit_ask("d2", "/etc/hosts"),
+        ask("d3", "shell", "gh pr create --title x --body y"),
+        PermissionRequest { tool: ToolKind::Other, command: None, ..ask("d4", "mcp__computer-use__left_click", "") },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = request.id.clone();
+        assert_eq!(w.raise(&tid, request.clone()), None, "{request:?} should wait");
         assert_eq!(w.state(&tid), "waiting");
         let read = w.ok("thread.read", json!({"thread": tid}));
         let card = &read["permissions"][0];
         assert!(card["why"].as_str().unwrap().starts_with("全自动档仍需确认"), "{card}");
-        assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id})), json!({"pending": true}));
         // A message into a waiting thread would answer its card: refused.
         assert!(w.call("thread.send", json!({"thread": tid, "text": "hey"})).is_err());
+        // Asked again (lilad came back, the host repeated it): still one card.
+        w.host_event(&tid, AgentEvent::Permission { request });
+        assert_eq!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().len(), 1);
         // The person says yes, or no.
-        let allow = tool == "Write";
+        let allow = i == 1;
         w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": allow}));
-        let a = w.ok("hook.answer", json!({"thread": tid, "id": id}));
-        assert_eq!(a["decision"], if allow { "allow" } else { "deny" });
+        assert_eq!(w.answer_to(&tid, &id).as_deref(), Some(if allow { "accept" } else { "decline" }));
         assert_eq!(w.state(&tid), "idle");
         assert!(w.call("thread.answer", json!({"thread": tid, "card": card["id"], "allow": true})).is_err(), "answered once");
     }
+    // The request omp took back closes its card.
+    assert_eq!(w.raise(&tid, edit_ask("d5", "/Users/someone/.zshrc")), None);
+    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["permissions"][0]["danger"], "outside_workspace");
+    w.host_event(&tid, AgentEvent::PermissionResolved { id: "d5".into() });
+    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
+    assert_eq!(w.state(&tid), "idle");
 
-    // Read-only: reads go, changes are refused with the reason.
+    // Read-only: reads go, changes are refused.
     w.ok("thread.permission", json!({"thread": tid, "permission": "read_only"}));
-    assert_eq!(claude_ask(&mut w, &tid, "Read", json!({"file_path": "/etc/hosts"}))["decision"], "allow");
-    let r = claude_ask(&mut w, &tid, "Edit", json!({"file_path": format!("{repo}/src/a.rs")}));
-    assert_eq!(r["decision"], "deny");
-    assert!(r["message"].as_str().unwrap().contains("read-only"), "{r}");
-    assert_eq!(claude_ask(&mut w, &tid, "Bash", json!({"command": "touch x"}))["decision"], "deny");
-    // Confirm: everything that changes asks.
+    assert_eq!(w.raise(&tid, read_ask("o1", "/etc/hosts")).as_deref(), Some("accept"));
+    assert_eq!(w.raise(&tid, edit_ask("o2", &format!("{repo}/src/a.rs"))).as_deref(), Some("decline"));
+    assert_eq!(w.raise(&tid, ask("o3", "shell", "touch x")).as_deref(), Some("decline"));
+    // Confirm: everything that changes asks, and says why.
     w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
-    let r = claude_ask(&mut w, &tid, "Bash", json!({"command": "ls -la"}));
-    let id = r["wait"].as_str().expect("asks for a command").to_owned();
+    assert_eq!(w.raise(&tid, ask("c1", "shell", "ls -la")), None);
     let card = w.ok("thread.read", json!({"thread": tid}))["permissions"][0].clone();
     assert_eq!((card["why"].as_str(), card["danger"].is_null()), (Some("改动前确认"), true));
-    // Left to the terminal: the card is closed without an answer.
-    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "dismiss": true}));
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id})), json!({"decision": null}));
-    // And back to full: what was asked stays, the next goes by itself.
+    w.ok("thread.answer", json!({"thread": tid, "permission": "c1", "option": "拒绝"}));
+    assert_eq!(w.answer_to(&tid, "c1").as_deref(), Some("decline"));
+    assert!(w.call("thread.answer", json!({"thread": tid, "card": card["id"]})).is_err(), "no card is open any more");
+    // And back to full: the next goes by itself.
     w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
-    assert_eq!(claude_ask(&mut w, &tid, "Bash", json!({"command": "npm install"}))["decision"], "allow");
+    assert_eq!(w.raise(&tid, ask("f1", "shell", "npm install")).as_deref(), Some("accept"));
     assert!(w.call("thread.permission", json!({"thread": tid, "permission": "yolo"})).is_err());
     let log = w.events(&tid);
     assert!(log.iter().any(|e| e.starts_with("auto_denied read_only")) && log.iter().any(|e| e.starts_with("permission full → read_only")) && log.iter().any(|e| e.starts_with("asked ")), "{log:?}");
-}
-
-impl World {
-    /// lilad is stopped and started again: a new one over the same database, which presumes the threads alive until herdr-core's snapshot says.
-    fn restart(&mut self) {
-        let paths = self.d.paths.clone();
-        let store = Store::open(&paths.db()).unwrap();
-        let sources = Sources { claude: self.d.sources.claude.clone(), codex: self.d.sources.codex.clone() };
-        let mut d = Daemon::new(store, Fake::default(), paths, self.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
-        d.sources = sources;
-        self.d = d;
-        // Another moment, as the id of a request is made of the moment lilad started.
-        self.now += 5000;
-        self.d.boot = self.now;
-    }
-}
-
-#[test]
-fn a_card_waits_as_long_as_its_hook_asks_after_it() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({"permission": "confirm"}));
-    w.status(&tid, "idle");
-    let id = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch x"}))["wait"].as_str().unwrap().to_owned();
-    // Hours pass; the hook asks every half second and the card is as it was.
-    for _ in 0..40 {
-        w.now += 600_000;
-        assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id})), json!({"pending": true}));
-        w.d.tick(w.now);
-    }
-    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().len(), 1);
-    assert_eq!(w.state(&tid), "waiting");
-    let card = w.ok("thread.read", json!({"thread": tid}))["permissions"][0]["id"].clone();
-    w.ok("thread.answer", json!({"thread": tid, "card": card, "allow": true}));
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id}))["decision"], "allow");
-}
-
-#[test]
-fn a_card_whose_hook_stopped_asking_goes_and_so_does_one_when_the_turn_ends() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({"permission": "confirm"}));
-    w.status(&tid, "idle");
-    // The hook was killed (the person answered in the terminal): nobody asks after the card any more.
-    let id = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch x"}))["wait"].as_str().unwrap().to_owned();
-    w.now += 20_000;
-    w.d.tick(w.now);
-    assert_eq!(w.state(&tid), "waiting", "not yet");
-    w.now += 20_000;
-    w.d.tick(w.now);
-    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
-    assert!(w.events(&tid).iter().any(|e| e.starts_with("dismissed touch x · its hook stopped asking")), "{:?}", w.events(&tid));
-    // A hook that is alive after all (lilad was slow) asks, and the card comes back when it sends the request again.
-    let payload = json!({"tool_name": "Bash", "tool_input": {"command": "touch x"}, "cwd": w.repo.to_string_lossy()});
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id})), json!({"decision": null, "unknown": true}));
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id, "payload": payload})), json!({"wait": id}));
-    assert_eq!(w.state(&tid), "waiting");
-    // The turn ended: no dialog can be open.
-    w.hook(&tid, "Stop", json!({}));
-    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
-    // The thread ended: its cards go with it, and a hook asking for one gets nothing back, whatever it sends.
-    let id2 = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch y"}))["wait"].as_str().unwrap().to_owned();
-    w.ok("thread.stop", json!({"thread": tid}));
-    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
-    let payload = json!({"tool_name": "Bash", "tool_input": {"command": "touch y"}, "cwd": w.repo.to_string_lossy()});
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id2, "payload": payload})), json!({"decision": null, "unknown": true}));
-    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
-}
-
-#[test]
-fn a_card_comes_back_when_lilad_is_restarted_while_its_hook_waits() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({"permission": "confirm"}));
-    w.status(&tid, "idle");
-    let payload = json!({"tool_name": "Bash", "tool_input": {"command": "touch x"}, "cwd": w.repo.to_string_lossy()});
-    let before = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch x"}))["wait"].as_str().unwrap().to_owned();
-
-    w.restart();
-    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty(), "lilad forgot the card");
-    // A request of the new lilad does not take the id of the old one's.
-    let other = claude_ask(&mut w, &tid, "Bash", json!({"command": "touch other"}))["wait"].as_str().unwrap().to_owned();
-    assert_ne!(other, before);
-    let card = w.ok("thread.read", json!({"thread": tid}))["permissions"][0]["id"].clone();
-    w.ok("thread.answer", json!({"thread": tid, "card": card, "allow": false}));
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": other}))["decision"], "deny");
-
-    // The hook that waited through the restart asks: lilad does not know the request, and says so.
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before})), json!({"decision": null, "unknown": true}));
-    // It sends the request again; the card is back, as it was (the tier asks, and says why).
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before, "payload": payload})), json!({"wait": before}));
-    assert_eq!(w.state(&tid), "waiting");
-    let read = w.ok("thread.read", json!({"thread": tid}));
-    assert_eq!((read["permissions"].as_array().unwrap().len(), read["permissions"][0]["why"].as_str()), (1, Some("改动前确认")));
-    assert_eq!(read["permissions"][0]["command"], "touch x");
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before})), json!({"pending": true}));
-    let card = read["permissions"][0]["id"].clone();
-    w.ok("thread.answer", json!({"thread": tid, "card": card, "allow": true}));
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before}))["decision"], "allow");
-    // Sent again after it was answered (a second restart, say): the same story, never a card for an answered question twice in a row.
-    w.restart();
-    // The tier may have changed in the meantime; the new answer is the tier's.
-    w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": before, "payload": payload}))["decision"], "allow", "the tier answers by itself now");
-}
-
-/// What Claude Code sends `PreToolUse` for a tool call (`PermissionRequest` has the same, without `tool_use_id`).
-fn pre(w: &mut World, tid: &str, tool: &str, input: Value) -> Value {
-    w.hook(tid, "PreToolUse", json!({"tool_name": tool, "tool_input": input, "tool_use_id": "toolu_1", "cwd": w.repo.to_string_lossy()}))
-}
-
-#[test]
-fn every_tool_call_is_judged_before_it_runs_by_the_threads_tier() {
-    let mut w = world();
-    w.project();
-    let repo = w.repo.to_string_lossy().to_string();
-    let tid = w.new_thread(json!({}));
-    w.status(&tid, "idle");
-    let logged = |w: &mut World| w.events(&tid).into_iter().filter(|e| e.starts_with("auto_") || e.starts_with("asked")).collect::<Vec<_>>();
-
-    // Full auto: ordinary work is let through and logged once; looking at files is let through without a word.
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "cargo test"})), json!({"verdict": "allow"}));
-    assert_eq!(pre(&mut w, &tid, "Write", json!({"file_path": format!("{repo}/a.rs"), "content": "x"})), json!({"verdict": "allow"}));
-    for (tool, input) in [("Read", json!({"file_path": "/etc/hosts"})), ("Grep", json!({"pattern": "x"})), ("Glob", json!({"pattern": "*.rs"})), ("TaskCreate", json!({})), ("AskUserQuestion", json!({}))] {
-        assert_eq!(pre(&mut w, &tid, tool, input), json!({"verdict": "allow"}), "{tool}");
-    }
-    assert_eq!(logged(&mut w), ["auto_allowed full · Bash: cargo test".to_owned(), format!("auto_allowed full · Write: {repo}/a.rs")]);
-    // The dangerous four are asked, not answered: no card yet (the dialog that follows opens it), nothing logged.
-    for (tool, input) in [("Bash", json!({"command": "git push origin main"})), ("Write", json!({"file_path": "/etc/hosts"})), ("Bash", json!({"command": "gh pr create --title x"}))] {
-        let r = pre(&mut w, &tid, tool, input);
-        assert_eq!(r["verdict"], "ask");
-        assert!(r["reason"].as_str().unwrap().starts_with("全自动档仍需确认"), "{r}");
-    }
-    assert_eq!(logged(&mut w).len(), 2);
-    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty(), "nothing waits inside PreToolUse");
-    assert_eq!(w.state(&tid), "idle");
-
-    // Read-only: reads go, the rest is refused with the reason the agent is told, logged once.
-    w.ok("thread.permission", json!({"thread": tid, "permission": "read_only"}));
-    assert_eq!(pre(&mut w, &tid, "Read", json!({"file_path": "x"})), json!({"verdict": "allow"}));
-    let r = pre(&mut w, &tid, "Bash", json!({"command": "touch x"}));
-    assert_eq!(r["verdict"], "deny");
-    assert!(r["reason"].as_str().unwrap().contains("read-only"), "{r}");
-    assert_eq!(pre(&mut w, &tid, "Edit", json!({"file_path": format!("{repo}/a.rs")}))["verdict"], "deny");
-    assert_eq!(pre(&mut w, &tid, "SomethingNew", json!({}))["verdict"], "deny");
-    assert_eq!(logged(&mut w).iter().filter(|e| e.starts_with("auto_denied read_only")).count(), 3);
-
-    // Confirm: reads go, everything else is asked.
-    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
-    assert_eq!(pre(&mut w, &tid, "Grep", json!({"pattern": "x"})), json!({"verdict": "allow"}));
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "ls"})), json!({"verdict": "ask", "reason": "改动前确认"}));
-}
-
-#[test]
-fn an_ask_from_pre_tool_use_becomes_the_card_of_the_permission_request_that_follows_without_being_judged_twice() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({}));
-    w.status(&tid, "idle");
-    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
-    let input = json!({"command": "touch x", "description": "make x"});
-    let asked = |w: &mut World| w.events(&tid).into_iter().filter(|e| e.starts_with("asked") || e.starts_with("auto_")).collect::<Vec<_>>();
-
-    // Asked by PreToolUse; Claude Code shows its dialog although a rule of the person's would allow the call.
-    assert_eq!(pre(&mut w, &tid, "Bash", input.clone())["verdict"], "ask");
-    let r = claude_ask(&mut w, &tid, "Bash", input.clone());
-    let id = r["wait"].as_str().expect("the card opens at once").to_owned();
-    assert_eq!(asked(&mut w), ["asked Bash: touch x · 改动前确认"], "logged once");
-    let read = w.ok("thread.read", json!({"thread": tid}));
-    let card = &read["permissions"][0];
-    assert_eq!((card["why"].as_str(), card["danger"].is_null()), (Some("改动前确认"), true));
-    assert_eq!(w.state(&tid), "waiting");
-    // Both answers travel the hook.answer path as before.
-    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": true}));
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": id}))["decision"], "allow");
-
-    // Full auto: a push is asked by PreToolUse and keeps its danger on the card; the person says no.
-    w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
-    let push = json!({"command": "git push"});
-    assert_eq!(pre(&mut w, &tid, "Bash", push.clone())["verdict"], "ask");
-    let id = claude_ask(&mut w, &tid, "Bash", push)["wait"].as_str().unwrap().to_owned();
-    let card = w.ok("thread.read", json!({"thread": tid}))["permissions"][0].clone();
-    assert_eq!(card["danger"], "git_push");
-    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": false}));
-    let a = w.ok("hook.answer", json!({"thread": tid, "id": id}));
-    assert_eq!((a["decision"].as_str(), a["message"].is_string()), (Some("deny"), true));
-
-    // The verdict is used once: a second dialog for the same call is judged on its own, by the tier.
-    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
-    assert_eq!(pre(&mut w, &tid, "Bash", input.clone())["verdict"], "ask");
-    assert!(claude_ask(&mut w, &tid, "Bash", input.clone())["wait"].is_string());
-    let card = w.ok("thread.read", json!({"thread": tid}))["permissions"][0]["id"].clone();
-    w.ok("thread.answer", json!({"thread": tid, "card": card, "dismiss": true}));
-    let before = asked(&mut w).len();
-    w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
-    assert_eq!(claude_ask(&mut w, &tid, "Bash", input.clone())["decision"], "allow", "no verdict kept: today's behaviour");
-    assert_eq!(asked(&mut w).len(), before + 1, "and logged by the permission request itself");
-
-    // A call PreToolUse let through that Claude Code still asks about (it has checks of its own): let through again, not logged again.
-    let outside = json!({"command": "ls /etc"});
-    assert_eq!(pre(&mut w, &tid, "Bash", outside.clone()), json!({"verdict": "allow"}));
-    let n = asked(&mut w).len();
-    assert_eq!(claude_ask(&mut w, &tid, "Bash", outside)["decision"], "allow");
-    assert_eq!(asked(&mut w).len(), n, "judged once");
-
-    // A different call is not mistaken for it: the same tool with other input is judged again.
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "ls"})), json!({"verdict": "allow"}));
-    w.ok("thread.permission", json!({"thread": tid, "permission": "read_only"}));
-    assert_eq!(claude_ask(&mut w, &tid, "Bash", json!({"command": "ls -la"}))["decision"], "deny");
-}
-
-// ---------------- the trust dialog ----------------
-
-const TRUST_SCREEN: &str = include_str!("fixtures/claude-trust-2.1.322.txt");
-const LOGIN_SCREEN: &str = include_str!("fixtures/claude-login-2.1.322.txt");
-
-impl World {
-    fn screen(&mut self, tid: &str, text: &str) {
-        let t = self.terminal(tid);
-        self.d.term.screens.insert(t, text.to_owned());
-    }
-
-    /// A moment passes in which lilad looks at the screens.
-    fn look(&mut self) {
-        self.now += 2000;
-        self.d.look_at(self.now);
-    }
-
-    fn keys_to(&self, tid: &str) -> Vec<String> {
-        let t = self.terminal(tid);
-        self.d.term.keys.iter().filter(|(to, _)| *to == t).flat_map(|(_, k)| k.clone()).collect()
-    }
-}
-
-#[test]
-fn a_thread_at_the_trust_dialog_says_so_with_its_folder_and_trusting_it_sends_what_waited() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({"text": "hello"}));
-    // Claude Code has started and shows the dialog; it reports nothing.
-    w.screen(&tid, TRUST_SCREEN);
-    assert_eq!(w.state(&tid), "starting");
-    w.look();
-    let t = w.ok("thread.show", json!({"thread": tid}));
-    assert_eq!((t["state"].as_str(), t["waiting"].as_str(), t["waiting_for"].as_str(), t["trust_folder"].as_str()), (Some("waiting"), Some("terminal"), Some("trust"), Some("/tmp/shop")), "at once, not after 20 s: {t}");
-    // lilad does not trust by itself, however long it waits.
-    for _ in 0..5 {
-        w.look();
-    }
-    assert!(w.keys_to(&tid).is_empty());
-    assert!(w.sends_to(&tid).is_empty());
-    // Words sent meanwhile wait with the first, like any words to a thread that is still starting; nothing is typed into the dialog.
-    w.ok("thread.send", json!({"thread": tid, "text": "more"}));
-    assert!(w.sends_to(&tid).is_empty());
-
-    // The person trusts the folder: the cursor is moved to "Yes" and seen there, then Enter.
-    let r = w.ok("thread.trust", json!({"thread": tid}));
-    assert_eq!((r["trusted"].as_bool(), r["folder"].as_str()), (Some(true), Some("/tmp/shop")));
-    assert_eq!(w.keys_to(&tid), ["down", "enter"]);
-    assert!(w.events(&tid).iter().any(|e| e == "trusted /tmp/shop"), "{:?}", w.events(&tid));
-    let t = w.ok("thread.show", json!({"thread": tid}));
-    assert_eq!((t["waiting_for"].is_null(), t["trust_folder"].is_null()), (true, true));
-    // Claude Code goes on and reports idle: the first message is typed.
-    w.status(&tid, "idle");
-    assert_eq!(w.sends_to(&tid), ["hello\n\nmore"]);
-    w.look();
-    assert_eq!(w.state(&tid), "idle");
-}
-
-#[test]
-fn trusting_sends_nothing_unless_the_screen_just_read_is_the_dialog() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({}));
-    // No screen, a sign-in screen, a shell, a dialog changed in a detail: no keys, an error that says so.
-    assert!(w.call("thread.trust", json!({"thread": tid})).is_err(), "no screen to read");
-    for screen in [LOGIN_SCREEN.to_owned(), "$ ".to_owned(), TRUST_SCREEN.replace("I trust", "I do not trust"), String::new()] {
-        w.screen(&tid, &screen);
-        let e = w.call("thread.trust", json!({"thread": tid})).unwrap_err().to_string();
-        assert!(e.contains("not at Claude Code's trust dialog"), "{e}");
-    }
-    assert!(w.keys_to(&tid).is_empty());
-    // Not a Claude thread, not running.
-    let codex = w.new_thread(json!({"engine": "codex", "model": "gpt-6.1-sol"}));
-    assert!(w.call("thread.trust", json!({"thread": codex})).unwrap_err().to_string().contains("not a Claude Code thread"));
-    w.screen(&tid, TRUST_SCREEN);
-    let terminal = w.terminal(&tid);
-    w.ok("thread.stop", json!({"thread": tid}));
-    assert!(w.call("thread.trust", json!({"thread": tid})).is_err());
-    assert!(w.d.term.keys.iter().all(|(to, _)| *to != terminal));
-}
-
-#[test]
-fn a_dialog_that_is_not_recognised_leaves_the_thread_waiting_in_its_terminal_as_before() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({}));
-    w.screen(&tid, LOGIN_SCREEN);
-    w.look();
-    let t = w.ok("thread.show", json!({"thread": tid}));
-    assert_eq!((t["state"].as_str(), t["waiting_for"].is_null()), (Some("starting"), true), "nothing is known yet");
-    // After the usual 20 s without a status it waits in the terminal, and that is all it says.
-    w.now += 25_000;
-    w.look();
-    let t = w.ok("thread.show", json!({"thread": tid}));
-    assert_eq!((t["state"].as_str(), t["waiting"].as_str(), t["waiting_for"].is_null(), t["trust_folder"].is_null()), (Some("waiting"), Some("terminal"), true, true));
-    // The dialog then appears (the person was asked to sign in first, and has): it is told apart.
-    w.screen(&tid, TRUST_SCREEN);
-    w.look();
-    assert_eq!(w.ok("thread.show", json!({"thread": tid}))["waiting_for"], "trust");
-    // And is gone when the person answered it in the terminal themself: Claude Code reports, the mark goes.
-    w.screen(&tid, "\n ▐▛███▛█   Claude Code v2.1.322\n");
-    w.status(&tid, "idle");
-    w.look();
-    let t = w.ok("thread.show", json!({"thread": tid}));
-    assert_eq!((t["state"].as_str(), t["waiting_for"].is_null()), (Some("idle"), true));
-    // A thread that is working is never looked at.
-    let reads = |w: &World| w.d.term.screens.len();
-    w.status(&tid, "working");
-    w.look();
-    assert_eq!(reads(&w), 1);
-}
-
-#[test]
-fn the_cursor_is_checked_before_enter_so_a_dialog_that_does_not_move_is_not_answered() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({}));
-    // A dialog that ignores Down: Enter would be pressed on "No, exit", which ends Claude Code.
-    w.d.term.stuck_cursor = true;
-    w.screen(&tid, TRUST_SCREEN);
-    let e = w.call("thread.trust", json!({"thread": tid})).unwrap_err().to_string();
-    assert!(e.contains("could not move the cursor"), "{e}");
-    assert_eq!(w.keys_to(&tid), ["down"], "Down only; never Enter");
-    // A dialog that was answered in the terminal while lilad moved the cursor: it is not the dialog any more.
-    w.d.term.stuck_cursor = false;
-    w.d.term.keys.clear();
-    w.screen(&tid, "$ ");
-    assert!(w.call("thread.trust", json!({"thread": tid})).is_err());
-    assert!(w.keys_to(&tid).is_empty());
 }
 
 // ---------------- "always allow for this thread" ----------------
@@ -926,52 +787,48 @@ fn rule_keys(w: &mut World, tid: &str) -> Vec<String> {
 }
 
 #[test]
-fn always_allow_on_a_claude_card_is_a_rule_of_the_thread_that_answers_the_next_one() {
+fn always_allow_is_a_rule_of_the_thread_that_answers_the_next_one_and_replaces_omps_own() {
     let mut w = world();
     w.project();
     let tid = w.new_thread(json!({"permission": "confirm"}));
     w.status(&tid, "idle");
-    let cmd = |c: &str| json!({"command": c});
 
-    // The first `cargo test` asks, and the card offers the rule it would make (and says what that allows).
-    assert_eq!(pre(&mut w, &tid, "Bash", cmd("cargo test -p lila"))["verdict"], "ask");
-    let id = claude_ask(&mut w, &tid, "Bash", cmd("cargo test -p lila"))["wait"].as_str().unwrap().to_owned();
+    // The first `cargo test` asks, and the card offers the rule it would make (and says what that allows); omp's own "for the session" is not shown.
+    assert_eq!(w.raise(&tid, ask("c1", "shell", "cargo test -p lila")), None);
     let card = the_card(&mut w, &tid);
     assert_eq!(labels(&card), ["允许", "本会话总是允许 cargo test", "拒绝"]);
     assert_eq!((card["options"][1]["id"].as_str(), card["options"][1]["kind"].as_str(), card["danger"].is_null()), (Some("always"), Some("allow_always"), true));
     assert!(rule_keys(&mut w, &tid).is_empty());
     w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
-    let a = w.ok("hook.answer", json!({"thread": tid, "id": id}));
-    assert_eq!((a["decision"].as_str(), a["message"].is_null()), (Some("allow"), true), "Claude Code is told a plain allow: the option is Lila's own");
+    assert_eq!(w.answer_to(&tid, "c1").as_deref(), Some("accept"), "omp is told a plain allow, so it asks again next time and Lila answers");
     assert_eq!(rule_keys(&mut w, &tid), ["cargo test"]);
     let shown = w.ok("thread.show", json!({"thread": tid}))["rules"][0].clone();
     assert_eq!((shown["kind"].as_str(), shown["label"].as_str()), (Some("command"), Some("cargo test")));
     assert_eq!(w.ok("thread.read", json!({"thread": tid}))["rules"].as_array().unwrap().len(), 1);
 
-    // The same program and sub-command now goes without a card, in PreToolUse and in a PermissionRequest, and the log names the rule.
-    assert_eq!(pre(&mut w, &tid, "Bash", cmd("cargo test --lib"))["verdict"], "allow");
-    assert_eq!(claude_ask(&mut w, &tid, "Bash", cmd("cargo test --doc"))["decision"], "allow");
-    assert!(w.events(&tid).iter().any(|e| e == "auto_allowed confirm · Bash: cargo test --lib · rule: cargo test"), "{:?}", w.events(&tid));
+    // The same program and sub-command now goes without a card, and the log names the rule.
+    assert_eq!(w.verdict(&tid, "cargo test --lib"), "allow");
+    assert!(w.events(&tid).iter().any(|e| e == "auto_allowed confirm · shell: cargo test --lib · rule: cargo test"), "{:?}", w.events(&tid));
     // Another sub-command, another program, a chain with a part that is not covered, a wrapper: asked.
     for c in ["cargo build", "ls", "cargo test && ls", "sudo cargo test", "bash -c 'cargo test'", "cargo test $(ls)", "FOO=1 cargo test"] {
-        assert_eq!(pre(&mut w, &tid, "Bash", cmd(c))["verdict"], "ask", "{c}");
+        assert_eq!(w.verdict(&tid, c), "ask", "{c}");
     }
-    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty(), "nothing waits inside PreToolUse");
+    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
 
     // A chain: `cargo test` is covered, `tail` is offered; and `git commit`, once ruled, still does not let a push through.
-    claude_ask(&mut w, &tid, "Bash", cmd("cargo test 2>&1 | tail -5"));
+    w.raise(&tid, ask("c2", "shell", "cargo test 2>&1 | tail -5"));
     let card = the_card(&mut w, &tid);
     assert_eq!(labels(&card)[1], "本会话总是允许 tail");
     w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "本会话总是允许 tail"}));
     assert_eq!(rule_keys(&mut w, &tid), ["cargo test", "tail"]);
-    assert_eq!(pre(&mut w, &tid, "Bash", cmd("cargo test | tail"))["verdict"], "allow");
-    claude_ask(&mut w, &tid, "Bash", cmd("git commit -am x"));
+    assert_eq!(w.verdict(&tid, "cargo test | tail"), "allow");
+    w.raise(&tid, ask("c3", "shell", "git commit -am x"));
     let card = the_card(&mut w, &tid);
     w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
-    assert_eq!(pre(&mut w, &tid, "Bash", cmd("git commit -m y"))["verdict"], "allow");
-    for c in ["git commit -m y && git push", "git push", "cargo test; git push origin main", "git branch -D x"] {
-        assert_eq!(pre(&mut w, &tid, "Bash", cmd(c))["verdict"], "ask", "{c}");
-        claude_ask(&mut w, &tid, "Bash", cmd(c));
+    assert_eq!(w.verdict(&tid, "git commit -m y"), "allow");
+    for (i, c) in ["git commit -m y && git push", "git push", "cargo test; git push origin main", "git branch -D x"].into_iter().enumerate() {
+        assert_eq!(w.verdict(&tid, c), "ask", "{c}");
+        w.raise(&tid, ask(&format!("p{i}"), "shell", c));
         let card = the_card(&mut w, &tid);
         assert_eq!(labels(&card), ["允许", "拒绝"], "a push never gets an always: {c}");
         assert!(w.call("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"})).is_err());
@@ -979,12 +836,12 @@ fn always_allow_on_a_claude_card_is_a_rule_of_the_thread_that_answers_the_next_o
     }
     // Not even in the full tier: the danger is asked, with no "always" on its card.
     w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
-    assert_eq!(pre(&mut w, &tid, "Bash", cmd("git push"))["verdict"], "ask");
-    claude_ask(&mut w, &tid, "Bash", cmd("git push"));
+    assert_eq!(w.verdict(&tid, "git push"), "ask");
+    w.raise(&tid, ask("p9", "shell", "git push"));
     let card = the_card(&mut w, &tid);
     assert_eq!((labels(&card), card["danger"].as_str()), (vec!["允许".to_owned(), "拒绝".to_owned()], Some("git_push")));
     w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": false}));
-    // And what was ruled stays for when the tier asks again (the full tier asks nothing it can judge harmless).
+    // And what was ruled stays for when the tier asks again.
     assert_eq!(rule_keys(&mut w, &tid), ["cargo test", "tail", "git commit"]);
 }
 
@@ -994,21 +851,22 @@ fn rules_survive_a_restart_and_a_resume_go_when_the_tier_is_read_only_and_can_be
     w.project();
     let tid = w.new_thread(json!({"permission": "confirm"}));
     w.status(&tid, "idle");
-    claude_ask(&mut w, &tid, "Bash", json!({"command": "touch a"}));
+    w.raise(&tid, ask("a1", "shell", "touch a"));
     let card = the_card(&mut w, &tid);
     w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch b"}))["verdict"], "allow");
+    assert_eq!(w.verdict(&tid, "touch b"), "allow");
 
     // lilad restarted: the rule is there and answers.
     w.restart();
+    w.status(&tid, "idle");
     assert_eq!(rule_keys(&mut w, &tid), ["touch"]);
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch c"}))["verdict"], "allow");
+    assert_eq!(w.verdict(&tid, "touch c"), "allow");
     // The thread ended and resumed: still there.
     w.ok("thread.stop", json!({"thread": tid}));
     w.ok("thread.resume", json!({"thread": tid}));
     w.status(&tid, "idle");
     assert_eq!(rule_keys(&mut w, &tid), ["touch"]);
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch d"}))["verdict"], "allow");
+    assert_eq!(w.verdict(&tid, "touch d"), "allow");
 
     // Full and back: kept, and answering again. Read-only: forgotten, and logged.
     w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
@@ -1017,17 +875,17 @@ fn rules_survive_a_restart_and_a_resume_go_when_the_tier_is_read_only_and_can_be
     assert!(rule_keys(&mut w, &tid).is_empty());
     assert!(w.events(&tid).iter().any(|e| e == "rules_dropped touch"), "{:?}", w.events(&tid));
     w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch e"}))["verdict"], "ask", "not kept for later");
+    assert_eq!(w.verdict(&tid, "touch e"), "ask", "not kept for later");
 
     // A rule taken back asks again; a rule that is not there is an error.
-    claude_ask(&mut w, &tid, "Bash", json!({"command": "ls"}));
+    w.raise(&tid, ask("a2", "shell", "ls"));
     let card = the_card(&mut w, &tid);
     w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
     let rules = w.ok("thread.show", json!({"thread": tid}))["rules"].clone();
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "ls -la"}))["verdict"], "allow");
+    assert_eq!(w.verdict(&tid, "ls -la"), "allow");
     let r = w.ok("thread.rule.remove", json!({"thread": tid, "rule": rules[0]["id"]}));
     assert_eq!((r["removed"].as_bool(), r["rules"].as_array().unwrap().len()), (Some(true), 0));
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "ls -la"}))["verdict"], "ask");
+    assert_eq!(w.verdict(&tid, "ls -la"), "ask");
     assert!(w.call("thread.rule.remove", json!({"thread": tid, "rule": rules[0]["id"]})).is_err());
     assert!(w.call("thread.rule.remove", json!({"thread": tid})).is_err());
     let log = w.events(&tid);
@@ -1040,15 +898,17 @@ fn always_on_one_of_several_open_cards_answers_the_others_the_rule_covers() {
     w.project();
     let tid = w.new_thread(json!({"permission": "confirm"}));
     w.status(&tid, "idle");
-    let ids: Vec<String> = ["touch a", "touch b", "ls"].iter().map(|c| claude_ask(&mut w, &tid, "Bash", json!({"command": c}))["wait"].as_str().unwrap().to_owned()).collect();
+    for (id, c) in [("k1", "touch a"), ("k2", "touch b"), ("k3", "ls")] {
+        assert_eq!(w.raise(&tid, ask(id, "shell", c)), None);
+    }
     let read = w.ok("thread.read", json!({"thread": tid}));
     assert_eq!(read["permissions"].as_array().unwrap().len(), 3);
     w.ok("thread.answer", json!({"thread": tid, "card": read["permissions"][0]["id"], "option": "always"}));
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": ids[0]}))["decision"], "allow");
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": ids[1]}))["decision"], "allow", "the same rule answers it");
-    assert_eq!(w.ok("hook.answer", json!({"thread": tid, "id": ids[2]})), json!({"pending": true}), "another program still waits");
+    assert_eq!(w.answer_to(&tid, "k1").as_deref(), Some("accept"));
+    assert_eq!(w.answer_to(&tid, "k2").as_deref(), Some("accept"), "the same rule answers it");
+    assert_eq!(w.answer_to(&tid, "k3"), None, "another program still waits");
     assert_eq!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().len(), 1);
-    assert!(w.events(&tid).iter().any(|e| e == "auto_allowed confirm · Bash: touch b · rule: touch"), "{:?}", w.events(&tid));
+    assert!(w.events(&tid).iter().any(|e| e == "auto_allowed confirm · shell: touch b · rule: touch"), "{:?}", w.events(&tid));
 }
 
 #[test]
@@ -1056,300 +916,57 @@ fn edits_inside_the_folder_can_be_allowed_always_and_nothing_outside_and_no_mcp_
     let mut w = world();
     w.project();
     let repo = w.repo.to_string_lossy().to_string();
+    let inside = format!("{repo}/src/a.rs");
     let tid = w.new_thread(json!({"permission": "confirm"}));
     w.status(&tid, "idle");
-    claude_ask(&mut w, &tid, "Edit", json!({"file_path": format!("{repo}/src/a.rs")}));
+    // What cannot be ruled has no always at all, not even omp's.
+    w.raise(&tid, ask("e0", "shell", "bash -c 'rm x'"));
+    assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"]);
+    w.host_event(&tid, AgentEvent::PermissionResolved { id: "e0".into() });
+    // A patch inside the folder: the edit rule.
+    w.raise(&tid, edit_ask("e1", &inside));
     let card = the_card(&mut w, &tid);
     assert_eq!(labels(&card)[1], "本会话总是允许改动此文件夹里的文件");
     w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
-    for tool in ["Edit", "Write", "NotebookEdit"] {
-        let input = if tool == "NotebookEdit" { json!({"notebook_path": format!("{repo}/n.ipynb")}) } else { json!({"file_path": format!("{repo}/src/b.rs")}) };
-        assert_eq!(pre(&mut w, &tid, tool, input)["verdict"], "allow", "{tool}");
-    }
+    assert_eq!(w.raise(&tid, edit_ask("e2", &format!("{repo}/src/b.rs"))).as_deref(), Some("accept"));
     // Outside the folder it asks, in confirm too, and offers nothing "always".
-    assert_eq!(pre(&mut w, &tid, "Write", json!({"file_path": "/etc/hosts"}))["verdict"], "ask");
-    claude_ask(&mut w, &tid, "Write", json!({"file_path": "/etc/hosts"}));
-    let card = the_card(&mut w, &tid);
-    assert_eq!(labels(&card), ["允许", "拒绝"]);
-    w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "allow": false}));
+    assert_eq!(w.raise(&tid, edit_ask("e3", "/Users/someone/.zshrc")), None);
+    assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"]);
+    w.host_event(&tid, AgentEvent::PermissionResolved { id: "e3".into() });
     // A command is not an edit.
-    assert_eq!(pre(&mut w, &tid, "Bash", json!({"command": "touch x"}))["verdict"], "ask");
+    assert_eq!(w.verdict(&tid, "touch x"), "ask");
 
     // An MCP tool that only looks is let through by the tier (nothing to ask); one that writes to the outside world is a
     // danger, and has no "always". (A rule for one exact tool exists for tools the tier cannot tell: `rules` has its tests.)
-    assert_eq!(pre(&mut w, &tid, "mcp__github__get_pull_request", json!({"number": 4}))["verdict"], "allow");
-    claude_ask(&mut w, &tid, "mcp__github__create_pull_request", json!({}));
+    let tool = |id: &str, name: &str| PermissionRequest { tool: ToolKind::Other, command: None, ..ask(id, name, "") };
+    assert_eq!(w.raise(&tid, tool("m1", "mcp__github__get_pull_request")).as_deref(), Some("accept"));
+    assert_eq!(w.raise(&tid, tool("m2", "mcp__github__create_pull_request")), None);
     assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"]);
-}
-
-#[test]
-fn codex_and_acp_own_always_answers_give_way_to_the_one_of_lila() {
-    let mut w = world();
-    w.project();
-    for (engine, model) in [("codex", "gpt-6.1-sol"), ("omp", "deepseek/deepseek-v4")] {
-        let tid = w.new_thread(json!({"engine": engine, "model": model, "permission": "confirm"}));
-        w.status(&tid, "idle");
-        let answer = |w: &World, id: &str| w.commands(&tid).into_iter().rev().find_map(|c| match c {
-            Command::Answer { permission, option } if permission == id => Some(option),
-            _ => None,
-        });
-        // The engine's "for the session" is not shown: one "always", and it is Lila's.
-        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c1", "shell", "cargo test") });
-        let card = the_card(&mut w, &tid);
-        assert_eq!(labels(&card), ["允许", "本会话总是允许 cargo test", "拒绝"], "{engine}");
-        w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
-        assert_eq!(answer(&w, "c1").as_deref(), Some("accept"), "the engine is told a plain allow, so it asks again next time and Lila answers");
-        // The next one is answered by the rule, with the log naming it.
-        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c2", "shell", "cargo test --lib") });
-        assert_eq!(answer(&w, "c2").as_deref(), Some("accept"));
-        assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
-        assert!(w.events(&tid).iter().any(|e| e.ends_with("· rule: cargo test") && e.starts_with("auto_allowed confirm")), "{:?}", w.events(&tid));
-        // What cannot be ruled has no always at all, not even the engine's.
-        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c3", "shell", "bash -c 'rm x'") });
-        assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"], "{engine}");
-        w.host_event(&tid, AgentEvent::PermissionResolved { id: "c3".into() });
-        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c4", "shell", "git push origin main") });
-        assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"]);
-        w.host_event(&tid, AgentEvent::PermissionResolved { id: "c4".into() });
-        // A patch inside the folder: the edit rule; the same patch outside it, in the full tier, a danger without "always".
-        let inside = w.repo.join("src/a.rs").to_string_lossy().to_string();
-        w.host_event_ask(&tid, AgentEvent::Permission { request: edit_ask("c5", &inside) });
-        let card = the_card(&mut w, &tid);
-        assert_eq!(labels(&card)[1], "本会话总是允许改动此文件夹里的文件");
-        w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
-        w.host_event_ask(&tid, AgentEvent::Permission { request: edit_ask("c6", &inside) });
-        assert_eq!(answer(&w, "c6").as_deref(), Some("accept"));
-        w.host_event_ask(&tid, AgentEvent::Permission { request: edit_ask("c7", "/Users/someone/.zshrc") });
-        assert_eq!(labels(&the_card(&mut w, &tid)), ["允许", "拒绝"]);
-        w.host_event(&tid, AgentEvent::PermissionResolved { id: "c7".into() });
-        w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
-        w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c8", "shell", "git push origin main") });
-        let card = the_card(&mut w, &tid);
-        assert_eq!((labels(&card), card["danger"].as_str()), (vec!["允许".to_owned(), "拒绝".to_owned()], Some("git_push")), "{engine}: not even the engine's own, which would answer the next push by itself");
-        w.host_event(&tid, AgentEvent::PermissionResolved { id: "c8".into() });
-    }
-}
-
-#[test]
-fn the_verdicts_kept_for_permission_requests_are_few_and_expire() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({}));
-    w.status(&tid, "idle");
-    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
-    for i in 0..100 {
-        pre(&mut w, &tid, "Bash", json!({"command": format!("touch {i}")}));
-    }
-    assert_eq!(w.d.judged[&tid].len(), 64);
-    // A verdict of long ago is gone, and the request is judged on its own (still asked, logged once).
-    w.now += 700_000;
-    pre(&mut w, &tid, "Bash", json!({"command": "touch late"}));
-    assert_eq!(w.d.judged[&tid].len(), 1);
-}
-
-#[test]
-fn codex_requests_are_answered_by_the_tier_and_a_switch_reaches_the_host() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({"engine": "codex", "model": "gpt-6.1-sol"}));
-    w.status(&tid, "idle");
-    let answer = |w: &World, id: &str| w.commands(&tid).into_iter().rev().find_map(|c| match c {
-        Command::Answer { permission, option } if permission == id => Some(option),
-        _ => None,
-    });
-    // Full: a command that needs the network or a folder goes; a push does not.
-    w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c1", "shell", "npm install") });
-    assert_eq!(answer(&w, "c1").as_deref(), Some("accept"), "the first allow option: once, not for the session");
-    w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c2", "shell", "git push -u origin HEAD") });
-    assert_eq!(answer(&w, "c2"), None);
-    assert_eq!(w.state(&tid), "waiting");
-    // Asked again (lilad came back, the host repeated it): still one card.
-    w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c2", "shell", "git push -u origin HEAD") });
-    let read = w.ok("thread.read", json!({"thread": tid}));
-    assert_eq!(read["permissions"].as_array().unwrap().len(), 1);
-    assert_eq!(read["permissions"][0]["danger"], "git_push");
-    w.ok("thread.answer", json!({"thread": tid, "permission": "c2", "option": "拒绝"}));
-    assert_eq!(answer(&w, "c2").as_deref(), Some("decline"));
-    // A patch outside the workspace asks; the request the turn took back closes its card.
-    w.host_event_ask(&tid, AgentEvent::Permission { request: edit_ask("c3", "/Users/someone/.zshrc") });
-    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["permissions"][0]["danger"], "outside_workspace");
-    w.host_event(&tid, AgentEvent::PermissionResolved { id: "c3".into() });
-    assert!(w.ok("thread.read", json!({"thread": tid}))["permissions"].as_array().unwrap().is_empty());
-    assert_eq!(w.state(&tid), "idle");
-
-    // Read-only is a sandbox too: the host is told, and whatever it still asks to escape is declined.
-    w.ok("thread.permission", json!({"thread": tid, "permission": "read_only"}));
-    assert_eq!(w.commands(&tid).last(), Some(&Command::SetPermission { approval: "on-request".into(), sandbox: "read-only".into() }));
-    w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c4", "shell", "touch x") });
-    assert_eq!(answer(&w, "c4").as_deref(), Some("decline"));
-    w.ok("thread.permission", json!({"thread": tid, "permission": "confirm"}));
-    assert_eq!(w.commands(&tid).last(), Some(&Command::SetPermission { approval: "untrusted".into(), sandbox: "workspace-write".into() }));
-    w.host_event_ask(&tid, AgentEvent::Permission { request: ask("c5", "shell", "ls") });
-    assert_eq!(answer(&w, "c5"), None, "confirm asks");
+    // In the full tier a push is a danger without "always" too.
+    w.host_event(&tid, AgentEvent::PermissionResolved { id: "m2".into() });
     w.ok("thread.permission", json!({"thread": tid, "permission": "full"}));
-    assert_eq!(w.commands(&tid).last(), Some(&Command::SetPermission { approval: "on-request".into(), sandbox: "workspace-write".into() }));
-}
-
-impl World {
-    /// A request from a host: lilad answers it, or opens a card.
-    fn host_event_ask(&mut self, tid: &str, ev: AgentEvent) {
-        self.host_event(tid, ev);
-    }
+    w.raise(&tid, ask("g1", "shell", "git push origin main"));
+    let card = the_card(&mut w, &tid);
+    assert_eq!((labels(&card), card["danger"].as_str()), (vec!["允许".to_owned(), "拒绝".to_owned()], Some("git_push")));
 }
 
 // ---------------- conversation ----------------
 
 #[test]
-fn a_claude_threads_transcript_becomes_its_conversation() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({}));
-    w.status(&tid, "idle");
-    let session = w.d.store.thread(&tid).unwrap().unwrap().session.unwrap();
-    let file = sessions::claude_file(&w.d.live_sources(), &w.repo.to_string_lossy(), &session);
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let line = |v: Value| v.to_string() + "\n";
-    let mut text = line(json!({"type": "user", "uuid": "u1", "timestamp": "2026-11-10T01:00:00.000Z", "message": {"role": "user", "content": "make a.txt"}}));
-    // The reply being written shows before the transcript has it.
-    w.hook(&tid, "MessageDisplay", json!({"message_id": "m1", "delta": "Creating "}));
-    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["writing"], "Creating ");
-    text.push_str(&line(json!({"type": "assistant", "uuid": "a1", "timestamp": "2026-11-10T01:00:05.000Z", "message": {"id": "m1", "role": "assistant", "model": "claude-haiku-5-5", "content": [{"type": "text", "text": "Created a.txt"}]}})));
-    std::fs::write(&file, text).unwrap();
-    w.d.take_dirty();
-    w.d.follow_transcripts();
-    let r = w.ok("thread.read", json!({"thread": tid}));
-    let kinds: Vec<&str> = r["items"].as_array().unwrap().iter().map(|i| i["kind"].as_str().unwrap()).collect();
-    assert_eq!(kinds, ["user_message", "agent_message"]);
-    assert!(r["writing"].is_null(), "the reply is in the transcript now");
-    assert_eq!(r["thread"]["model"], "claude-haiku-5-5", "what it really runs on");
-    // The watchers hear which thread changed, and how far its conversation goes.
-    let (dirty, _) = w.d.take_dirty();
-    assert_eq!(dirty, std::slice::from_ref(&tid));
-    let ev = w.d.thread_event(&tid, 7).unwrap();
-    assert_eq!((ev["event"].as_str(), ev["items_seq"].as_i64(), ev["state"].as_str()), (Some("thread"), Some(2), Some("idle")));
-    // Nothing new: nothing changed.
-    w.d.follow_transcripts();
-    assert!(w.d.take_dirty().0.is_empty());
-    // Activity moves the thread up the list.
-    assert!(w.d.store.thread(&tid).unwrap().unwrap().active_ms > w.d.store.thread(&tid).unwrap().unwrap().created_ms);
-}
-
-#[test]
-fn the_turns_end_reads_the_transcript_at_once() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({}));
-    w.status(&tid, "working");
-    let session = w.d.store.thread(&tid).unwrap().unwrap().session.unwrap();
-    let file = sessions::claude_file(&w.d.live_sources(), &w.repo.to_string_lossy(), &session);
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    let line = |v: Value| v.to_string() + "\n";
-    let mut text = line(json!({"type": "user", "uuid": "u1", "timestamp": "2026-11-10T01:00:00.000Z", "message": {"role": "user", "content": "hi"}}));
-    text.push_str(&line(json!({"type": "assistant", "uuid": "a1", "timestamp": "2026-11-10T01:00:01.000Z", "message": {"id": "m1", "role": "assistant", "model": "claude-haiku-5-5", "content": [{"type": "text", "text": "Hello"}]}})));
-    std::fs::write(&file, text).unwrap();
-    w.d.take_dirty();
-    // No round of following in between: the hook that ends the turn reads the transcript itself.
-    w.hook(&tid, "Stop", json!({}));
-    let kinds: Vec<String> = w.ok("thread.read", json!({"thread": tid}))["items"].as_array().unwrap().iter().map(|i| i["kind"].as_str().unwrap().to_owned()).collect();
-    assert_eq!(kinds, ["user_message", "agent_message"]);
-    assert_eq!(w.d.take_dirty().0, std::slice::from_ref(&tid), "one change, heard once");
-    // The same for the turn's start: the message that began it.
-    let more = line(json!({"type": "user", "uuid": "u2", "timestamp": "2026-11-10T01:01:00.000Z", "message": {"role": "user", "content": "again"}}));
-    let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
-    std::io::Write::write_all(&mut f, more.as_bytes()).unwrap();
-    w.hook(&tid, "UserPromptSubmit", json!({}));
-    assert_eq!(w.ok("thread.read", json!({"thread": tid}))["items"].as_array().unwrap().len(), 3);
-}
-
-#[test]
-fn a_thread_that_waits_in_its_terminal_says_so() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({"text": "hi"}));
-    // Claude Code asks "trust this folder?" and reports nothing.
-    assert_eq!(w.state(&tid), "starting");
-    w.now += 25_000;
-    let t = w.d.store.thread(&tid).unwrap().unwrap();
-    let j = w.d.thread_json(&t, w.now);
-    assert_eq!((j["state"].as_str(), j["waiting"].as_str()), (Some("waiting"), Some("terminal")));
-    // Blocked on a dialog it reports: the same.
-    w.status(&tid, "blocked");
-    let j = w.d.thread_json(&t, w.now);
-    assert_eq!((j["state"].as_str(), j["waiting"].as_str()), (Some("waiting"), Some("terminal")));
-    assert!(w.call("thread.send", json!({"thread": tid, "text": "x"})).is_err());
-    w.status(&tid, "idle");
-    assert_eq!(w.d.thread_json(&t, w.now)["waiting"], Value::Null);
-}
-
-#[test]
-fn a_message_that_cannot_be_typed_yet_is_not_lost() {
+fn a_message_waits_for_a_host_that_has_not_attached_and_a_host_that_went_away_is_waited_for() {
     let mut w = world();
     w.project();
     let tid = w.new_thread(json!({"text": "first"}));
-    w.d.term.refuse_sends = true;
     w.status(&tid, "idle");
-    assert!(w.d.term.sends.is_empty());
-    assert_eq!(w.d.store.outbox(&tid).unwrap().len(), 1, "kept for the next try");
-    w.d.term.refuse_sends = false;
-    w.now += 6000;
-    w.d.tick(w.now);
     assert_eq!(w.sends_to(&tid), ["first"]);
+    // The host went away (it reattaches when lilad is back): words wait in the outbox, and are not lost.
+    w.d.host_gone(&tid);
+    w.ok("thread.send", json!({"thread": tid, "text": "second"}));
+    assert_eq!(w.d.store.outbox(&tid).unwrap().len(), 1);
+    w.hosts.borrow_mut().remove(&tid);
+    w.attach(&tid);
+    assert_eq!(w.sends_to(&tid), ["second"]);
     assert!(w.d.store.outbox(&tid).unwrap().is_empty());
-}
-
-#[test]
-fn interrupting_presses_escape_only_while_a_claude_thread_works() {
-    let mut w = world();
-    w.project();
-    let tid = w.new_thread(json!({}));
-    w.status(&tid, "idle");
-    let err = w.call("thread.interrupt", json!({"thread": tid})).unwrap_err();
-    assert!(err.to_string().contains("not working"), "{err:#}");
-    assert!(w.d.term.keys.is_empty(), "Esc at an idle prompt would clear what is typed there");
-    w.status(&tid, "working");
-    w.ok("thread.interrupt", json!({"thread": tid}));
-    assert_eq!(w.d.term.keys, [(w.terminal(&tid), vec!["esc".to_string()])]);
-}
-
-#[test]
-fn the_model_changes_where_the_engine_allows_it() {
-    let mut w = world();
-    w.project();
-    let claude = w.new_thread(json!({}));
-    w.status(&claude, "idle");
-    assert!(w.call("thread.model", json!({"thread": claude, "model": "claude-haiku-5-5"})).is_err(), "its /model would save the person's defaults");
-    let codex = w.new_thread(json!({"engine": "codex", "model": "gpt-6.1-sol"}));
-    w.status(&codex, "idle");
-    w.ok("thread.model", json!({"thread": codex, "model": "gpt-6.1-luna", "effort": "low"}));
-    assert_eq!(w.commands(&codex)[1..], [Command::SetModel { model: "gpt-6.1-luna".into() }, Command::SetEffort { effort: "low".into() }]);
-    assert_eq!(w.d.store.thread(&codex).unwrap().unwrap().model, "gpt-6.1-luna", "and on resume too");
-    // An ended Claude Code thread can: it starts on it next time.
-    w.ok("thread.stop", json!({"thread": claude}));
-    w.ok("thread.model", json!({"thread": claude, "model": "claude-haiku-5-5"}));
-    w.ok("thread.resume", json!({"thread": claude}));
-    assert!(argv(&w, 2).windows(2).any(|p| p == ["--model", "claude-haiku-5-5"]));
-}
-
-#[test]
-fn unknown_requests_and_threads_are_errors() {
-    let mut w = world();
-    w.project();
-    assert!(w.call("task.new", json!({})).is_err());
-    assert!(w.call("thread.show", json!({"thread": "t00000000"})).is_err());
-    assert!(w.call("thread.new", json!({"project": "shop", "engine": "gemini"})).is_err());
-    assert!(w.d.term.runs.is_empty(), "nothing was started");
-    let status = w.ok("status", json!({}));
-    assert_eq!(status["projects"], 1);
-}
-
-#[test]
-fn ping_and_status_report_the_version_and_protocol() {
-    let mut w = world();
-    for method in ["ping", "status"] {
-        let r = w.ok(method, json!({}));
-        assert_eq!((r["version"].as_str(), r["protocol"].as_u64()), (Some(env!("CARGO_PKG_VERSION")), Some(u64::from(crate::PROTOCOL))), "{method}: {r}");
-    }
-    assert_eq!(w.ok("ping", json!({}))["pong"], true);
 }
 
 // ---------------- worktrees, changes, commit, merge (P2) ----------------
@@ -1361,16 +978,16 @@ mod p2 {
     /// The project `shop` in a git repository on `main` (its `.lila/project.toml` committed).
     pub(super) fn git_world() -> World {
         let mut w = world();
-        // The engines are the fake ones; git is the real one.
+        // omp is the fake one; git is the real one.
         w.d.path_env = format!("{}:{}", w.d.path_env, std::env::var("PATH").unwrap_or_default());
         w.project();
         repo(&w.repo);
         w
     }
 
-    /// A Codex thread (it reports through a host, so tests can make it idle), in a worktree.
+    /// A thread (it reports through a stand-in host, so tests can make it idle), in a worktree.
     pub(super) fn in_worktree(w: &mut World) -> String {
-        let tid = w.new_thread(json!({"engine": "codex", "worktree": true, "text": "start"}));
+        let tid = w.new_thread(json!({"worktree": true, "text": "start"}));
         w.status(&tid, "idle");
         tid
     }
@@ -1406,21 +1023,21 @@ mod p2 {
     fn a_thread_can_start_in_a_worktree_of_its_own() {
         let mut w = git_world();
         let head = sh(&w.repo, &["rev-parse", "HEAD"]);
-        let tid = w.new_thread(json!({"engine": "codex", "worktree": true, "text": "hello"}));
+        let tid = w.new_thread(json!({"worktree": true, "text": "hello"}));
         let wt = w.d.paths.data.join("worktrees/shop").join(&tid);
         let j = w.ok("thread.show", json!({"thread": tid}));
         assert_eq!((j["worktree"].clone(), j["base_branch"].clone(), j["base_commit"].clone(), j["merged_ms"].clone()), (json!(true), json!("main"), json!(head), Value::Null));
         assert_eq!(j["cwd"], wt.to_string_lossy().as_ref());
-        // The engine starts there.
+        // omp starts there.
         assert_eq!(w.d.term.runs[0]["cwd"], wt.to_string_lossy().as_ref());
         assert_eq!(w.d.term.runs[0]["env"]["LILA_ROOT"], wt.to_string_lossy().as_ref());
         assert_eq!(sh(&wt, &["symbolic-ref", "--short", "HEAD"]), format!("lila/{tid}"));
         assert_eq!(sh(&wt, &["rev-parse", "HEAD"]), head);
         assert_eq!(sh(&w.repo, &["symbolic-ref", "--short", "HEAD"]), "main", "the project folder stays where it was");
-        w.status(&tid, "working");
+        w.status(&tid, "idle");
         assert_eq!(w.sends_to(&tid), ["hello"]);
         // Not asked for: the project folder, as before.
-        let plain = w.new_thread(json!({"engine": "codex"}));
+        let plain = w.new_thread(json!({}));
         let j = w.ok("thread.show", json!({"thread": plain}));
         assert_eq!((j["worktree"].clone(), j["base_branch"].clone(), j["cwd"].clone()), (json!(false), Value::Null, json!(w.repo.to_string_lossy())));
         // It is the thread list's too.
@@ -1453,7 +1070,7 @@ mod p2 {
         // The engine cannot start: the worktree and its branch are not left behind.
         w.d.term.refuse_runs = true;
         let err = format!("{:#}", w.call("thread.new", json!({"project": "shop", "worktree": true})).unwrap_err());
-        assert!(err.contains("start claude"), "{err}");
+        assert!(err.contains("start omp"), "{err}");
         w.settle();
         assert!(w.ok("thread.list", json!({"archived": true})).as_array().unwrap().is_empty());
         assert!(sh(&w.repo, &["branch", "--list", "lila/*"]).is_empty());
@@ -1499,7 +1116,7 @@ mod p2 {
         let mut n = world();
         n.d.path_env = w.d.path_env.clone();
         n.project();
-        let plain = n.new_thread(json!({"engine": "codex"}));
+        let plain = n.new_thread(json!({}));
         let c = n.ok("thread.changes", json!({"thread": plain}));
         assert_eq!((c["repo"].clone(), c["files"].clone()), (json!(false), json!([])));
         assert_eq!(n.ok("thread.diff", json!({"thread": plain}))["diffs"], json!([]));
@@ -1540,8 +1157,6 @@ mod p2 {
         write(&wt, "new.txt", "1\n2\n");
         w.settle();
         assert!(w.d.take_jobs().is_empty());
-        w.d.follow_transcripts();
-        assert!(w.d.take_jobs().is_empty(), "following the transcripts does not run git");
         assert_eq!(summary(&mut w), json!({"files": 0, "add": 0, "del": 0}));
 
         w.d.take_dirty();
@@ -1567,24 +1182,9 @@ mod p2 {
         let mut n = world();
         n.d.path_env = w.d.path_env.clone();
         n.project();
-        let plain = n.new_thread(json!({"engine": "codex"}));
+        let plain = n.new_thread(json!({}));
         n.settle();
         assert_eq!(n.ok("thread.show", json!({"thread": plain}))["changes"], Value::Null);
-    }
-
-    #[test]
-    fn a_claude_threads_stop_hook_counts_the_changes() {
-        let mut w = git_world();
-        let tid = w.new_thread(json!({"text": "hi"}));
-        w.settle();
-        write(&w.repo, "x.txt", "x\n");
-        w.hook(&tid, "Stop", json!({}));
-        w.settle();
-        assert_eq!(w.ok("thread.show", json!({"thread": tid}))["changes"], json!({"files": 1, "add": 1, "del": 0}));
-        // Asked again while counting: once more after, not at once.
-        w.hook(&tid, "Stop", json!({}));
-        w.hook(&tid, "Stop", json!({}));
-        assert_eq!(w.d.take_jobs().len(), 1);
     }
 
     #[test]
@@ -1609,14 +1209,13 @@ mod p2 {
         assert_eq!(lila_agent::model::origin(text), lila_agent::model::Origin::Lila { task: None }, "a quiet line, not a person's bubble");
         assert!(w.events(&tid).iter().any(|e| e.starts_with("commit ")));
         // Not while it waits or is gone.
-        w.d.term.sends.clear();
         w.ok("thread.stop", json!({"thread": tid}));
         assert!(err(&mut w).contains("has ended"));
         // Outside git.
         let mut n = world();
         n.d.path_env = w.d.path_env.clone();
         n.project();
-        let plain = n.new_thread(json!({"engine": "codex"}));
+        let plain = n.new_thread(json!({}));
         n.status(&plain, "idle");
         assert!(format!("{:#}", n.call("thread.commit", json!({"thread": plain})).unwrap_err()).contains("not in a git repository"));
     }
@@ -1693,7 +1292,7 @@ mod p2 {
             assert_eq!(w.ok("thread.show", json!({"thread": tid}))["merging"], false);
         };
         // A thread that is not in a worktree.
-        let plain = w.new_thread(json!({"engine": "codex"}));
+        let plain = w.new_thread(json!({}));
         w.status(&plain, "idle");
         refused(&mut w, &plain, "does not work in a worktree");
         // No commits.
@@ -1789,7 +1388,7 @@ mod p2 {
             d.finish(job, r, 5).unwrap();
         }
         let t = d.store.thread(&tid).unwrap().unwrap();
-        assert_eq!(d.thread_json(&t, 6)["changes"], json!({"files": 1, "add": 1, "del": 0}));
+        assert_eq!(d.thread_json(&t)["changes"], json!({"files": 1, "add": 1, "del": 0}));
     }
 }
 
@@ -1800,9 +1399,6 @@ mod a1 {
     use super::*;
     use crate::worktree::tests::sh;
     use lila_agent::{Origin, model::without_notes};
-
-    /// 2026-11-10T01:00:00Z: transcripts carry real dates, so the world's clock is set near them.
-    const T0: i64 = 1_794_272_400_000;
 
     fn checkpoints(w: &mut World, tid: &str) -> Vec<Value> {
         w.ok("thread.checkpoints", json!({"thread": tid}))["checkpoints"].as_array().unwrap().clone()
@@ -1816,9 +1412,9 @@ mod a1 {
         sh(&w.repo, &["for-each-ref", "--format=%(refname)", "refs/lila"])
     }
 
-    /// A Codex thread in the project folder, idle, whose first message ("go") has been delivered and its turn is over.
+    /// A thread in the project folder, idle, whose first message ("go") has been delivered and its turn is over.
     fn after_first_turn(w: &mut World) -> String {
-        let tid = w.new_thread(json!({"engine": "codex", "text": "go"}));
+        let tid = w.new_thread(json!({"text": "go"}));
         w.status(&tid, "idle");
         w.status(&tid, "working");
         w.status(&tid, "idle");
@@ -1826,20 +1422,20 @@ mod a1 {
     }
 
     #[test]
-    fn a_hosted_turn_waits_for_its_checkpoint_which_holds_the_folder_as_it_was() {
+    fn a_turn_waits_for_its_checkpoint_which_holds_the_folder_as_it_was() {
         let mut w = git_world();
         write(&w.repo, "a.txt", "mine, before the turn\n");
         write(&w.repo, "fresh.txt", "untracked\n");
-        let tid = w.new_thread(json!({"engine": "codex", "text": "hello"}));
+        let tid = w.new_thread(json!({"text": "hello"}));
         w.status_raw(&tid, "idle");
         // The words are held while the folder is saved; lilad's loop is not the one that runs git.
-        assert!(w.sends_to(&tid).is_empty(), "the engine has not been given the words");
+        assert!(w.sends_to(&tid).is_empty(), "omp has not been given the words");
         assert!(w.d.snapshotting.contains(&tid));
         assert_eq!(w.d.store.outbox(&tid).unwrap().len(), 1);
         w.settle_checkpoints();
         assert_eq!(w.sends_to(&tid), ["hello"]);
         assert!(w.d.store.outbox(&tid).unwrap().is_empty() && w.d.snapshotting.is_empty());
-        // What the engine does next is not in it.
+        // What omp does next is not in it.
         write(&w.repo, "a.txt", "the agent's edit\n");
         let rows = checkpoints(&mut w, &tid);
         assert_eq!(rows.len(), 1);
@@ -1852,10 +1448,10 @@ mod a1 {
     }
 
     #[test]
-    fn a_hosted_checkpoint_is_attached_to_the_message_the_engine_echoes() {
+    fn a_checkpoint_is_attached_to_the_message_omp_echoes() {
         let mut w = git_world();
         let tid = after_first_turn(&mut w);
-        // The engine has not echoed the message yet: the checkpoint has no item.
+        // omp has not echoed the message yet: the checkpoint has no item.
         assert_eq!(checkpoints(&mut w, &tid)[0]["item"], Value::Null);
         let t = w.now;
         w.host_event(&tid, user_item("u1", "go", t + 500));
@@ -1874,19 +1470,9 @@ mod a1 {
     }
 
     #[test]
-    fn a_message_that_joins_a_turn_under_way_has_no_checkpoint_and_omp_waits_for_its_prompt() {
+    fn omp_takes_no_words_while_it_works_so_they_wait_for_their_checkpoint() {
         let mut w = git_world();
-        let tid = after_first_turn(&mut w);
-        w.ok("thread.send", json!({"thread": tid, "text": "second"}));
-        w.settle_checkpoints();
-        w.status(&tid, "working");
-        let before = checkpoints(&mut w, &tid).len();
-        w.ok("thread.send", json!({"thread": tid, "text": "also this"}));
-        w.settle_checkpoints();
-        assert_eq!(w.sends_to(&tid), ["go", "second", "also this"], "Codex takes it into the turn at once");
-        assert_eq!(checkpoints(&mut w, &tid).len(), before, "it begins no turn");
-        // omp takes no words while it works: they wait in lilad, and go with their checkpoint when it is free.
-        let omp = w.new_thread(json!({"engine": "omp", "text": "one"}));
+        let omp = w.new_thread(json!({"text": "one"}));
         w.status(&omp, "idle");
         w.status(&omp, "working");
         w.ok("thread.send", json!({"thread": omp, "text": "two"}));
@@ -1901,67 +1487,15 @@ mod a1 {
     }
 
     #[test]
-    fn a_claude_turn_is_saved_by_its_hook_and_finds_its_message_in_the_transcript() {
-        let mut w = git_world();
-        w.now = T0 - 5000;
-        let tid = w.new_thread(json!({"text": "make a.txt"}));
-        w.status(&tid, "idle");
-        // The words are typed at once: delivery takes no checkpoint for Claude Code, its hook does.
-        assert_eq!(w.sends_to(&tid), ["make a.txt"]);
-        assert!(checkpoints(&mut w, &tid).is_empty());
-        let session = w.d.store.thread(&tid).unwrap().unwrap().session.unwrap();
-        let file = sessions::claude_file(&w.d.live_sources(), &w.repo.to_string_lossy(), &session);
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let line = |v: Value| v.to_string() + "\n";
-        let say = |uuid: &str, text: &str, ms: i64| line(json!({"type": "user", "uuid": uuid, "timestamp": format!("2026-11-10T01:{:02}:{:02}.{:03}Z", ms / 60_000, ms / 1000 % 60, ms % 1000), "message": {"role": "user", "content": text}}));
-        let append = |text: &str| std::io::Write::write_all(&mut std::fs::OpenOptions::new().create(true).append(true).open(&file).unwrap(), text.as_bytes()).unwrap();
-
-        // Turn 1: the hook comes first, and the answer waits for the checkpoint.
-        write(&w.repo, "a.txt", "before turn one\n");
-        w.now = T0;
-        let Begin::Job(job) = w.d.begin("hook", &json!({"thread": tid, "event": "UserPromptSubmit", "payload": {"prompt": "make a.txt"}}), w.now).unwrap() else { panic!("the hook waits for the checkpoint") };
-        assert!(job.is_checkpoint());
-        let result = job.run();
-        write(&w.repo, "a.txt", "the agent's edit\n");
-        assert_eq!(w.d.finish(job, result, w.now).unwrap(), json!({}));
-        let sha = w.d.store.checkpoint(&tid, 1).unwrap().unwrap().sha;
-        assert_eq!(sh(&w.repo, &["show", &format!("{sha}:a.txt")]), "before turn one", "of the folder before the turn, not after");
-        assert_eq!(checkpoints(&mut w, &tid)[0]["item"], Value::Null, "the transcript has no message yet");
-        // The transcript catches up, 300 ms later.
-        append(&say("u1", "make a.txt", 300));
-        w.d.follow_transcripts();
-        assert_eq!(checkpoints(&mut w, &tid)[0]["item"], "u1");
-
-        // Turn 2: the same words again, with a file after them (as Lila types it), and a slash command that has no checkpoint.
-        w.now = T0 + 60_000;
-        w.hook(&tid, "UserPromptSubmit", json!({"prompt": "make a.txt @/tmp/x.png"}));
-        append(&say("u-compact", "/compact", 60_100));
-        append(&say("u2", "make a.txt", 60_300));
-        w.d.follow_transcripts();
-        let rows = checkpoints(&mut w, &tid);
-        assert_eq!(rows.iter().map(|c| (c["id"].as_i64().unwrap(), c["item"].as_str().unwrap_or("-").to_owned())).collect::<Vec<_>>(), [(2, "u2".to_owned()), (1, "u1".to_owned())]);
-        // Nothing changed between them: the same commit under two refs, each turn restorable.
-        assert_eq!(refs(&w).lines().count(), 2);
-        // A hook for a message that never became an item is given up on when a later one has found its own.
-        w.now = T0 + 120_000;
-        w.hook(&tid, "UserPromptSubmit", json!({"prompt": "rejected by Claude"}));
-        w.now = T0 + 180_000;
-        w.hook(&tid, "UserPromptSubmit", json!({"prompt": "third"}));
-        append(&say("u3", "third", 180_400));
-        w.d.follow_transcripts();
-        let rows = checkpoints(&mut w, &tid);
-        assert_eq!(rows.iter().map(|c| c["item"].as_str().map(String::from)).collect::<Vec<_>>(), [Some("u3".to_owned()), None, Some("u2".to_owned()), Some("u1".to_owned())]);
-        assert_eq!(w.d.store.checkpoint(&tid, 3).unwrap().unwrap().item.as_deref(), Some(""), "known to have no message");
-    }
-
-    #[test]
     fn at_most_fifty_checkpoints_are_kept_and_a_failure_never_stops_the_message() {
         let mut w = git_world();
         let tid = w.new_thread(json!({}));
         w.status(&tid, "idle");
         for i in 1..=52 {
             write(&w.repo, "f.txt", &format!("{i}\n"));
-            w.hook(&tid, "UserPromptSubmit", json!({"prompt": format!("turn {i}")}));
+            w.ok("thread.send", json!({"thread": tid, "text": format!("turn {i}")}));
+            w.status(&tid, "working");
+            w.status(&tid, "idle");
         }
         let rows = checkpoints(&mut w, &tid);
         assert_eq!((rows.len(), rows[0]["id"].clone(), rows[49]["id"].clone()), (50, json!(52), json!(3)));
@@ -1969,22 +1503,20 @@ mod a1 {
         assert!(w.d.store.checkpoint(&tid, 2).unwrap().is_none());
 
         // git cannot be run: recorded, and the words go.
-        let codex = w.new_thread(json!({"engine": "codex"}));
-        w.status(&codex, "idle");
+        let other = w.new_thread(json!({}));
+        w.status(&other, "idle");
         w.d.path_env = String::new();
-        w.ok("thread.send", json!({"thread": codex, "text": "still goes"}));
-        assert_eq!(w.sends_to(&codex), ["still goes"]);
-        assert!(checkpoints(&mut w, &codex).is_empty());
-        assert!(w.events(&codex).iter().any(|e| e.starts_with("checkpoint_failed ")), "{:?}", w.events(&codex));
-        // And the Claude hook answers all the same.
-        assert_eq!(w.hook(&tid, "UserPromptSubmit", json!({"prompt": "x"})), json!({}));
+        w.ok("thread.send", json!({"thread": other, "text": "still goes"}));
+        assert_eq!(w.sends_to(&other), ["still goes"]);
+        assert!(checkpoints(&mut w, &other).is_empty());
+        assert!(w.events(&other).iter().any(|e| e.starts_with("checkpoint_failed ")), "{:?}", w.events(&other));
     }
 
     #[test]
     fn a_folder_outside_git_has_no_checkpoints() {
         let mut w = world();
         w.project();
-        let tid = w.new_thread(json!({"engine": "codex", "text": "hi"}));
+        let tid = w.new_thread(json!({"text": "hi"}));
         w.status_raw(&tid, "idle");
         assert_eq!(w.sends_to(&tid), ["hi"], "no job, no wait");
         assert!(w.d.take_jobs().iter().all(|j| !j.is_checkpoint()));
@@ -2090,7 +1622,7 @@ mod a1 {
     fn a_restore_is_refused_while_anything_could_still_change_the_files() {
         let mut w = git_world();
         let tid = after_first_turn(&mut w);
-        let other = w.new_thread(json!({"engine": "codex"}));
+        let other = w.new_thread(json!({}));
         w.status(&other, "idle");
         let refused = |w: &mut World, tid: &str, expect: &str| {
             for dry_run in [true, false] {

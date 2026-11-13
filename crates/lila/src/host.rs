@@ -1,33 +1,36 @@
-//! `lila host <runtime>`: runs a thread's agent through its protocol (Codex's
-//! app-server, ACP for omp) inside the
-//! thread's hc terminal (architecture v3 §4 D1). It starts the agent, attaches
-//! to lilad over its socket (events out, commands in; reattaching when lilad
-//! comes back), reports its status to hc with OSC 7501 like any program, and
-//! prints a readable log: what the terminal shows.
+//! `lila host omp`: runs a thread's omp over its RPC mode inside the thread's hc terminal
+//! (architecture v3 §4 D1). It starts omp, attaches to lilad over its socket
+//! (events out, commands in; reattaching when lilad comes back), reports its
+//! status to hc with OSC 7501 like any program, and prints a readable log: what
+//! the terminal shows.
 
 use crate::paths::Paths;
 use anyhow::{Context, Result, anyhow};
-use lila_agent::codex::{AppServer, Step};
-use lila_agent::{AgentEvent, Command, HostStatus, Item, PermissionRequest};
+use lila_agent::omp::Omp;
+use lila_agent::{AgentEvent, Command, HostStatus, Item, PermissionRequest, Question};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
 /// What the host's loop waits on.
 enum In {
-    /// A line from the agent.
+    /// A line from omp.
     Agent(String),
-    AgentExited(String),
+    /// omp's output is closed: it has stopped.
+    AgentExited,
     /// lilad is attached; commands come from it, events go to this.
     Attached(UnixStream),
     Detached,
     Command(Command),
 }
+
+/// OSC 7501's `app`.
+const APP: &str = "lila-omp";
 
 /// What lilad gets again when it comes back: the session, the items so far, open questions.
 #[derive(Default)]
@@ -36,6 +39,7 @@ struct Kept {
     items: BTreeMap<String, Item>,
     order: Vec<String>,
     asking: Vec<PermissionRequest>,
+    questions: Vec<Question>,
     /// The latest model/effort and the commands the agent declared.
     config: lila_agent::Config,
     commands: Option<AgentEvent>,
@@ -52,6 +56,8 @@ impl Kept {
             }
             AgentEvent::Permission { request } => self.asking.push(request.clone()),
             AgentEvent::PermissionResolved { id } => self.asking.retain(|r| r.id != *id),
+            AgentEvent::Question { question } => self.questions.push(question.clone()),
+            AgentEvent::QuestionResolved { id } => self.questions.retain(|q| q.id != *id),
             AgentEvent::Config { .. } => self.config.apply(ev),
             AgentEvent::Commands { .. } => self.commands = Some(ev.clone()),
             _ => {}
@@ -66,99 +72,75 @@ impl Kept {
         }
         out.extend(self.commands.clone());
         out.extend(self.asking.iter().map(|r| AgentEvent::Permission { request: r.clone() }));
+        out.extend(self.questions.iter().map(|q| AgentEvent::Question { question: q.clone() }));
         out
     }
 }
 
-/// A protocol a host speaks with its agent: pure translation (`lila_agent`).
-pub trait Protocol {
-    /// For OSC 7501's `app`.
-    const APP: &'static str;
-    fn start(&mut self) -> Step;
-    fn on_message(&mut self, m: &Value, now_ms: i64) -> Step;
-    fn command(&mut self, c: Command, now_ms: i64) -> Step;
-    fn tick(&mut self, now_ms: i64) -> Step;
-    fn status(&self) -> HostStatus;
-}
-
-impl Protocol for AppServer {
-    const APP: &'static str = "lila-codex";
-    fn start(&mut self) -> Step {
-        AppServer::start(self)
-    }
-    fn on_message(&mut self, m: &Value, now_ms: i64) -> Step {
-        AppServer::on_message(self, m, now_ms)
-    }
-    fn command(&mut self, c: Command, _: i64) -> Step {
-        AppServer::command(self, c)
-    }
-    fn tick(&mut self, now_ms: i64) -> Step {
-        AppServer::tick(self, now_ms)
-    }
-    fn status(&self) -> HostStatus {
-        AppServer::status(self)
-    }
-}
-
-impl Protocol for lila_agent::acp::Acp {
-    const APP: &'static str = "lila-omp";
-    fn start(&mut self) -> Step {
-        lila_agent::acp::Acp::start(self)
-    }
-    fn on_message(&mut self, m: &Value, now_ms: i64) -> Step {
-        lila_agent::acp::Acp::on_message(self, m, now_ms)
-    }
-    fn command(&mut self, c: Command, now_ms: i64) -> Step {
-        lila_agent::acp::Acp::command(self, c, now_ms)
-    }
-    fn tick(&mut self, now_ms: i64) -> Step {
-        lila_agent::acp::Acp::tick(self, now_ms)
-    }
-    fn status(&self) -> HostStatus {
-        lila_agent::acp::Acp::status(self)
-    }
-}
-
-/// The agent's program, its arguments, and the folder it runs in.
+/// omp's program, its arguments, and the folder it runs in.
 pub struct Agent {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: String,
 }
 
-/// Runs a member's agent until it exits, translating with `proto`.
-pub fn run<P: Protocol>(paths: &Paths, agent: Agent, mut server: P) -> Result<()> {
+/// What `omp` is started with: its RPC mode with the tool dialogs (`ask` needs them), every write and every command
+/// asked about (Lila answers them: `policy`), the thread's own folder of sessions, and the last session in it when
+/// there is one. `extra` goes last.
+pub fn omp_args(model: Option<&str>, session_dir: &Path, extra: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = ["--mode", "rpc-ui", "--approval-mode", "always-ask"].map(String::from).into();
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        args.extend(["--model".to_owned(), m.to_owned()]);
+    }
+    args.extend(["--session-dir".to_owned(), session_dir.to_string_lossy().to_string()]);
+    if has_session(session_dir) {
+        args.push("--continue".into());
+    }
+    args.extend(extra.iter().cloned());
+    args
+}
+
+/// Does the thread's folder of sessions hold one (omp writes each session as a `.jsonl` file)?
+pub fn has_session(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "jsonl")))
+}
+
+/// Runs omp until it exits, translating with `server`.
+pub fn run(paths: &Paths, agent: Agent, mut server: Omp) -> Result<()> {
     let thread = std::env::var("LILA_THREAD").context("LILA_THREAD is not set: lilad starts hosts")?;
     let (tx, rx) = mpsc::channel::<In>();
-    let mut child = spawn_agent(paths, &agent, &thread, &tx)?;
+    let log = paths.state.join("hosts").join(format!("{thread}.log"));
+    let mut child = spawn_agent(&agent, &log, &tx)?;
     let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin for {}", agent.program.display()))?;
     attach_loop(paths.clone(), thread, tx.clone());
 
     let mut kept = Kept::default();
     let mut lilad: Option<UnixStream> = None;
     let mut shown = None;
-    let step = server.start();
-    send_all(&mut stdin, &step.send);
-    report(&server.status(), P::APP, &mut shown);
+    report(&server.status(), APP, &mut shown);
     loop {
-        let input = match rx.recv_timeout(Duration::from_secs(5)) {
+        let input = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(i) => Some(i),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let now = now_ms();
         let step = match input {
-            // Now and then: a stuck turn gets a word.
+            // Now and then: a reply being written is shown again.
             None => server.tick(now),
             Some(input) => match input {
-                In::Agent(line) => match serde_json::from_str::<Value>(&line) {
-                    Ok(m) => server.on_message(&m, now),
-                    Err(_) => continue,
-                },
-                In::AgentExited(why) => {
-                    report(&HostStatus::Error { why: why.clone() }, P::APP, &mut shown);
-                    println!("{} ended: {why}", agent.program.display());
-                    break;
+                In::Agent(line) => server.on_line(&line, now),
+                In::AgentExited => {
+                    let why = stopped(&mut child, &log);
+                    let step = server.exited(&why, now);
+                    for ev in &step.events {
+                        log_event(ev);
+                        kept.note(ev);
+                        emit(&mut lilad, ev);
+                    }
+                    report(&server.status(), APP, &mut shown);
+                    println!("{why}");
+                    return Ok(());
                 }
                 In::Attached(conn) => {
                     println!("· lilad attached");
@@ -185,23 +167,24 @@ pub fn run<P: Protocol>(paths: &Paths, agent: Agent, mut server: P) -> Result<()
             kept.note(ev);
             emit(&mut lilad, ev);
         }
-        report(&server.status(), P::APP, &mut shown);
+        report(&server.status(), APP, &mut shown);
     }
     let _ = child.kill();
     Ok(())
 }
 
-fn spawn_agent(paths: &Paths, agent: &Agent, thread: &str, tx: &mpsc::Sender<In>) -> Result<Child> {
-    // The server's own log goes to a file: the terminal shows what the agent does.
-    let logs = paths.state.join("hosts");
-    std::fs::create_dir_all(&logs)?;
-    let log = std::fs::File::create(logs.join(format!("{thread}.log")))?;
+fn spawn_agent(agent: &Agent, log: &Path, tx: &mpsc::Sender<In>) -> Result<Child> {
+    // omp's own log goes to a file: the terminal shows what the agent does.
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let stderr = std::fs::File::create(log)?;
     let mut child = std::process::Command::new(&agent.program)
         .args(&agent.args)
         .current_dir(&agent.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .with_context(|| format!("start {}", agent.program.display()))?;
     let out = child.stdout.take().ok_or_else(|| anyhow!("no stdout for {}", agent.program.display()))?;
@@ -212,9 +195,34 @@ fn spawn_agent(paths: &Paths, agent: &Agent, thread: &str, tx: &mpsc::Sender<In>
                 return;
             }
         }
-        let _ = tx.send(In::AgentExited("its output closed".into()));
+        let _ = tx.send(In::AgentExited);
     });
     Ok(child)
+}
+
+/// omp's output is over: how it ended, and what it said on its way out.
+fn stopped(child: &mut Child, log: &Path) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().map_or_else(|| "killed by a signal".to_owned(), |c| format!("code {c}")),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break "did not exit; killed".to_owned();
+            }
+        }
+    };
+    let tail = log_tail(log);
+    if tail.is_empty() { format!("omp stopped ({status})") } else { format!("omp stopped ({status}): {tail}") }
+}
+
+/// The last words in omp's log: up to six lines, 800 bytes.
+fn log_tail(log: &Path) -> String {
+    let text = std::fs::read(log).map(|b| String::from_utf8_lossy(&b[b.len().saturating_sub(800)..]).into_owned()).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines[lines.len().saturating_sub(6)..].join("\n")
 }
 
 /// Keeps a connection to lilad: attaches, reads commands, and tries again when it drops.
@@ -285,9 +293,8 @@ fn log_command(c: &Command) {
         Command::Interrupt => println!("» interrupt"),
         Command::SetModel { model } => println!("» model {model}"),
         Command::SetEffort { effort } => println!("» effort {effort}"),
-        Command::Compact => println!("» compact"),
-        Command::SetPermission { approval, sandbox } => println!("» permission {approval} / {sandbox}"),
         Command::Answer { permission, option } => println!("» {permission}: {option}"),
+        Command::Reply { question, reply } => println!("» {question}: {}", serde_json::to_string(reply).unwrap_or_default()),
     }
 }
 
@@ -298,9 +305,11 @@ fn log_event(ev: &AgentEvent) {
         AgentEvent::Item { item } if item.state != lila_agent::ItemState::Running => match &item.kind {
             AgentMessage { text } => println!("{}", one_line(text, 160)),
             ToolCall { title, .. } => println!("$ {}", one_line(title, 140)),
+            Error { text } => println!("✗ {}", one_line(text, 160)),
             _ => {}
         },
         AgentEvent::Permission { request } => println!("? {}", one_line(&request.title, 140)),
+        AgentEvent::Question { question } => println!("? {}", one_line(&question.title, 140)),
         AgentEvent::TurnEnded { failed: Some(why), .. } => println!("✗ {why}"),
         AgentEvent::Notice { text } => println!("! {text}"),
         _ => {}

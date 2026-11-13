@@ -14,9 +14,7 @@ pub struct Project {
     /// Why lilad could not read its `.lila/project.toml`.
     pub error: Option<String>,
     /// What a new session starts with (`project.list`'s `defaults`).
-    pub engine: String,
     pub model: String,
-    pub effort: String,
     pub permission: String,
     /// The folder is the top of a git repository: a session there can have a worktree of its own.
     pub repo: bool,
@@ -36,9 +34,7 @@ impl Project {
             label: s("label"),
             title: s("title"),
             error: v["error"].as_str().map(String::from),
-            engine: Some(d("engine")).filter(|e| !e.is_empty()).unwrap_or_else(|| "claude".into()),
             model: d("model"),
-            effort: d("effort"),
             permission: Some(d("permission")).filter(|e| !e.is_empty()).unwrap_or_else(|| "full".into()),
             repo: v["repo"] == true,
         }
@@ -177,22 +173,6 @@ pub fn load_last(paths: &Paths) -> (Option<String>, Option<String>) {
     (get("thread"), get("project"))
 }
 
-fn views_file(paths: &Paths) -> std::path::PathBuf {
-    paths.state.join("app-views.json")
-}
-
-/// Threads shown as their terminal rather than their conversation (thread ids).
-pub fn load_views(paths: &Paths) -> std::collections::HashSet<String> {
-    std::fs::read_to_string(views_file(paths)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["tui"].as_array().cloned()).into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect()
-}
-
-pub fn save_views(paths: &Paths, tui: &std::collections::HashSet<String>) {
-    let mut list: Vec<&String> = tui.iter().collect();
-    list.sort();
-    let _ = std::fs::create_dir_all(&paths.state);
-    let _ = std::fs::write(views_file(paths), json!({ "tui": list }).to_string());
-}
-
 fn sidebar_file(paths: &Paths) -> std::path::PathBuf {
     paths.state.join("app-sidebar.json")
 }
@@ -252,11 +232,11 @@ pub fn clock_ms() -> String {
 
 /// `--features shots`, with `LILA_APP_FAKE`: what the menus and the right panel list, and how a send goes
 /// (`LILA_APP_FAKE_SEND_MS` takes that long, `LILA_APP_FAKE_READ_MS` for the panel's reads, `LILA_APP_FAKE_SEND_ERR=<words>` fails with them). In the file:
-/// `files` and `commands` (the menus; `files` is also the file tree), `changes` (a thread's id to what `thread.changes`
+/// `files` and `commands` (the menus; `files` is also the file tree), `models` (`[{id, name}]`, the models omp offers), `changes` (a thread's id to what `thread.changes`
 /// says), `diffs` (a thread's id to its path to the `thread.diff` item), `file` (a path to what `thread.file` says),
 /// `commit` and `merge` (what those answer, or `{"error": "…"}`, after `LILA_APP_FAKE_SEND_MS`), `restore` (`{"dry_run": …, "restore": …}`,
 /// the replies of `thread.restore` with and without `dry_run`, or `{"error": "…"}`; under a checkpoint's number, `{"7": {"dry_run": …}}`, for that
-/// checkpoint alone), `trust` (what `thread.trust` answers, after `LILA_APP_FAKE_SEND_MS`); every other request is left to fail.
+/// checkpoint alone); every other request is left to fail.
 #[cfg(feature = "shots")]
 fn fake_act(method: &str, params: &Value) -> Option<anyhow::Result<Value>> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(std::env::var("LILA_APP_FAKE").ok()?).ok()?).ok()?;
@@ -272,6 +252,7 @@ fn fake_act(method: &str, params: &Value) -> Option<anyhow::Result<Value>> {
     match method {
         "thread.files" => Some(Ok(json!({"files": v["files"]}))),
         "thread.commands" => Some(Ok(json!({"commands": v["commands"]}))),
+        "models.list" if v["models"].is_array() => Some(Ok(json!({"models": v["models"]}))),
         "thread.changes" => {
             read();
             Some(match &v["changes"][thread] {
@@ -311,11 +292,6 @@ fn fake_act(method: &str, params: &Value) -> Option<anyhow::Result<Value>> {
             })
         }
         "thread.log" => Some(Ok(v["log"][thread].clone())),
-        // `trust` (what `thread.trust` answers, or `{"error": "…"}`) after `LILA_APP_FAKE_SEND_MS`.
-        "thread.trust" => {
-            slow();
-            Some(answer(&v["trust"]))
-        }
         "thread.new" if v["new"].is_object() => {
             slow();
             Some(match std::env::var("LILA_APP_FAKE_SEND_ERR") {
@@ -379,10 +355,10 @@ mod tests {
 
     #[test]
     fn a_projects_defaults_come_from_the_list_with_lilads_own_fallbacks() {
-        let p = Project::of(&json!({"id": "shop", "cwd": "/x", "label": "商店", "title": "商店", "defaults": {"engine": "codex", "model": "gpt-6-luna", "effort": "low", "permission": "confirm"}}));
-        assert_eq!((p.engine.as_str(), p.model.as_str(), p.effort.as_str(), p.permission.as_str()), ("codex", "gpt-6-luna", "low", "confirm"));
+        let p = Project::of(&json!({"id": "shop", "cwd": "/x", "label": "商店", "title": "商店", "defaults": {"model": "openai/gpt-6", "permission": "confirm"}}));
+        assert_eq!((p.model.as_str(), p.permission.as_str()), ("openai/gpt-6", "confirm"));
         let bare = Project::of(&json!({"id": "a", "cwd": "/a", "label": "a"}));
-        assert_eq!((bare.engine.as_str(), bare.permission.as_str()), ("claude", "full"));
+        assert_eq!((bare.model.as_str(), bare.permission.as_str()), ("", "full"));
         assert_eq!(bare.label(), "a");
         // Whether the folder can have worktrees is lilad's word; not said, no.
         assert!(!bare.repo);

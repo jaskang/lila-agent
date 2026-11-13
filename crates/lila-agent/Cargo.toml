@@ -1,17 +1,14 @@
 [package]
 name = "lila-agent"
-description = "Agent runtimes behind one conversation model: events, items, and each runtime's translation into them."
+description = "The conversation model and omp's RPC translation into it: events, items, permission requests, questions."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64 = "0.22"
 serde.workspace = true
 serde_json.workspace = true
-# ACP's own types (types only, no async runtime): what omp and other ACP agents send.
-agent-client-protocol-schema = { version = "1.16", default-features = false }
-# Unified diffs of the before/after text ACP gives for an edit.
+# Unified diffs of the before/after text omp gives for an edit.
 similar = "2"
-# Slash commands print terminal colors into the transcript.
-strip-ansi-escapes = "0.2"

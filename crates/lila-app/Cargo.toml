@@ -1,6 +1,6 @@
 [package]
 name = "lila-app"
-description = "Lila's desktop app: projects and their sessions with Claude Code, Codex and ACP agents."
+description = "Lila's desktop app: projects and their sessions with omp."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,7 +20,6 @@ lila = { path = "../lila" }
 lila-agent = { path = "../lila-agent" }
 lila-core = { path = "../lila-core" }
 lila-store = { path = "../lila-store" }
-lila-term = { path = "../lila-term" }
 walkdir = "2"
 serde.workspace = true
 serde_json.workspace = true

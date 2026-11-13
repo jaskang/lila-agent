@@ -50,11 +50,6 @@ fn row(id: impl Into<ElementId>, active: bool) -> Stateful<Div> {
         .when(!active, |d| d.hover(|d| d.bg(style::hover())))
 }
 
-/// What a waiting session waits for, in the words of its second line.
-pub fn waiting_words(t: &Value) -> &'static str {
-    if t["waiting"] == "terminal" { "终端在等你" } else { "要你允许" }
-}
-
 /// Which of a workspace's threads the sidebar lists: the latest `SHOWN`, and always those that need the person,
 /// run, are shown or archived. The rest count as `more`.
 pub fn visible(threads: &[Value], shown: Option<&str>, all: bool) -> (Vec<Value>, usize) {
@@ -98,7 +93,7 @@ impl LilaApp {
                     .min_w_0()
                     .gap(px(1.))
                     .child(div().text_size(px(13.)).font_medium().truncate().text_color(if dim { muted() } else { style::fg() }).child(s(t, "title")))
-                    .when(waiting, |d| d.child(div().text_xs().truncate().text_color(style::tint(style::red(), 0.25)).child(waiting_words(t)))),
+                    .when(waiting, |d| d.child(div().text_xs().truncate().text_color(style::tint(style::red(), 0.25)).child("要你允许"))),
             )
             .child(div().flex_none().child(mark))
             .on_click(cx.listener(move |this, _, _, cx| this.show_thread(click.clone(), cx)))
@@ -245,7 +240,7 @@ impl LilaApp {
                     .gap_2()
                     .border_t_1()
                     .border_color(style::divider())
-                    .child(Button::new("prefs").custom(quiet).xsmall().icon(IconName::Settings).tooltip("设置 (⌘,)").on_click(cx.listener(|this, _, _, cx| this.open_prefs(crate::prefs::PrefPage::Usage, cx))))
+                    .child(Button::new("prefs").custom(quiet).xsmall().icon(IconName::Settings).tooltip("设置 (⌘,)").on_click(cx.listener(|this, _, _, cx| this.open_prefs(cx))))
                     .children(self.daemon_notice(cx)),
             );
 

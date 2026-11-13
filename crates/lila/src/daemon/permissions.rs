@@ -1,5 +1,5 @@
-//! Permission requests (architecture v3 D4, tiers in docs/product-v4.md §6). Every engine's
-//! request is a `PermissionRequest`; lilad answers it by the tier of the thread (`policy`), and what is
+//! Permission requests (architecture v3 D4, tiers in docs/product-v4.md §6). omp's requests are
+//! `PermissionRequest`s; lilad answers each by the tier of the thread (`policy`), and what is
 //! left becomes a card on the thread for the person.
 
 use super::*;
@@ -7,7 +7,7 @@ use crate::policy::{self, Danger, Verdict};
 use crate::rules::{self, Rule};
 use lila_agent::{Command, PermKind, PermOption, PermissionRequest};
 
-/// The id of the option on a card that allows "always" (`rules`): Lila's own, whatever the engine offers.
+/// The id of the option on a card that allows "always" (`rules`): Lila's own, whatever omp offers.
 pub const ALWAYS: &str = "always";
 
 /// An open permission card: what a thread asks the person.
@@ -21,15 +21,12 @@ pub(super) struct Asking {
     pub why: String,
     pub danger: Option<Danger>,
     pub at_ms: i64,
-    /// A Claude Code hook waits for this card and asks after it every half second; when it was last heard from.
-    /// `None` for the hosted engines' cards, which the engine itself takes back.
-    pub polled_ms: Option<i64>,
 }
 
 /// What became of a request.
 pub(super) enum Decided {
-    /// Answered at once: the option (the runtime's own id) and, for a refusal, what the agent is told.
-    Answer { option: String, message: Option<String> },
+    /// Answered at once: the option (omp's own id).
+    Answer { option: String },
     /// A card is open: the person decides (`thread.answer`).
     Card,
 }
@@ -51,14 +48,14 @@ impl<T: Terminals> Daemon<T> {
             Verdict::Allow => {
                 if let Some(o) = request.pick(true) {
                     self.auto_event(tid, t.tier, "auto_allowed", &request, now)?;
-                    return Ok(Decided::Answer { option: o.id.clone(), message: None });
+                    return Ok(Decided::Answer { option: o.id.clone() });
                 }
                 self.open_card(tid, request, "没有可用的自动回答".to_owned(), None, now)
             }
-            Verdict::Deny(message) => {
+            Verdict::Deny(_) => {
                 if let Some(o) = request.pick(false) {
                     self.auto_event(tid, t.tier, "auto_denied", &request, now)?;
-                    return Ok(Decided::Answer { option: o.id.clone(), message: Some(message) });
+                    return Ok(Decided::Answer { option: o.id.clone() });
                 }
                 self.open_card(tid, request, "没有可用的自动回答".to_owned(), None, now)
             }
@@ -70,7 +67,7 @@ impl<T: Terminals> Daemon<T> {
                     && let Some(o) = request.pick(true)
                 {
                     self.rule_event(tid, t.tier, &request, &by, now)?;
-                    return Ok(Decided::Answer { option: o.id.clone(), message: None });
+                    return Ok(Decided::Answer { option: o.id.clone() });
                 }
                 self.open_card(tid, request, why, danger, now)
             }
@@ -111,8 +108,8 @@ impl<T: Terminals> Daemon<T> {
         self.store.event(tid, "lilad", "auto_allowed", &format!("{} · {} · rule: {}", tier.as_str(), what(request), names.join(", ")), now)
     }
 
-    /// The card's options as the person sees them: the engines' own "always" answers (Codex's for the session, ACP's) go,
-    /// because what they cover is the engine's to say and Lila cannot show it, nor take it back; in their place, when
+    /// The card's options as the person sees them: omp's own "always" answers go, because what they cover is
+    /// omp's to say and Lila cannot show it, nor take it back; in their place, when
     /// the tier itself is asking and a rule can say exactly what would be allowed, Lila's own (`ALWAYS`), whose label says it.
     pub(super) fn with_always(&self, t: &Thread, mut request: PermissionRequest, danger: Option<Danger>) -> PermissionRequest {
         let has = |request: &PermissionRequest, kind: PermKind| request.options.iter().any(|o| o.kind == kind);
@@ -148,36 +145,35 @@ impl<T: Terminals> Daemon<T> {
         } else {
             self.next_card += 1;
             self.store.event(tid, "lilad", "asked", &format!("{} · {why}", what(&request)), now)?;
-            let card = Asking { id: format!("p{}", self.next_card), thread: tid.to_owned(), request, why, danger, at_ms: now, polled_ms: None };
+            let card = Asking { id: format!("p{}", self.next_card), thread: tid.to_owned(), request, why, danger, at_ms: now };
             self.asking.push(card);
         }
         self.mark(tid);
         Ok(Decided::Card)
     }
 
-    /// The person's answer to a permission card: `thread.answer {thread, card | permission, option | allow, dismiss?}`.
-    /// A host gets it as a command; a Claude Code hook picks it up (`hook.answer`). `dismiss` closes the card
-    /// without an answer, which leaves a Claude Code question to its terminal. The option `always` adds the rules the card
-    /// said (`with_always`) to the thread and answers with the engine's plain allow; the thread's other cards that those
-    /// rules answer too are answered with it.
+    /// The person's answer to a permission card: `thread.answer {thread, card | permission, option | allow}`.
+    /// The host gets it as a command. The option `always` adds the rules the card said (`with_always`) to the thread
+    /// and answers with omp's plain allow; the thread's other cards that those rules answer too are answered with it.
     pub(super) fn thread_answer(&mut self, params: &Value, now: i64) -> Result<Value> {
         let t = self.thread_of(params)?;
+        if self.questions.iter().any(|a| a.thread == t.id && s(params, "card") == Some(a.id.as_str())) {
+            return self.answer_question(&t, params, now);
+        }
         let at = self
             .asking
             .iter()
             .position(|a| a.thread == t.id && (s(params, "card") == Some(a.id.as_str()) || s(params, "permission") == Some(a.request.id.as_str())))
-            // Answered already (a second click, a second window, or the engine moved on): nothing to do.
+            // Answered already (a second click, a second window, or omp moved on): nothing to do.
             .ok_or_else(|| anyhow!("no open permission card {} on {}", s(params, "card").or(s(params, "permission")).unwrap_or("?"), t.id))?;
         let card = self.asking[at].clone();
-        let dismiss = params["dismiss"].as_bool().unwrap_or(false);
         let mut picked = match (s(params, "option"), params["allow"].as_bool()) {
-            _ if dismiss => None,
-            (Some(o), _) => Some(card.request.options.iter().find(|x| x.id == o || x.label == o).ok_or_else(|| anyhow!("{o:?} is not one of the options"))?.id.clone()),
-            (None, Some(allow)) => Some(card.request.pick(allow).ok_or_else(|| anyhow!("the request has no such option"))?.id.clone()),
-            (None, None) => bail!("give option, allow or dismiss"),
+            (Some(o), _) => card.request.options.iter().find(|x| x.id == o || x.label == o).ok_or_else(|| anyhow!("{o:?} is not one of the options"))?.id.clone(),
+            (None, Some(allow)) => card.request.pick(allow).ok_or_else(|| anyhow!("the request has no such option"))?.id.clone(),
+            (None, None) => bail!("give option or allow"),
         };
         let mut note = None;
-        if picked.as_deref() == Some(ALWAYS) {
+        if picked == ALWAYS {
             // Asked again now, as the tier or the rules may have changed since the card was shown.
             let new = if card.danger.is_none() && t.tier == Tier::Confirm { rules::derive(Path::new(&t.cwd), &card.request, &self.rules_of(&t.id)) } else { None };
             let Some(new) = new else { bail!("\"always\" is not offered for this any more; allow it once") };
@@ -185,34 +181,22 @@ impl<T: Terminals> Daemon<T> {
                 self.store.add_rule(&t.id, r.kind.as_str(), &r.key, now)?;
             }
             self.store.event(&t.id, "human", "rule_added", &new.iter().map(Rule::text).collect::<Vec<_>>().join(", "), now)?;
-            picked = card.request.options.iter().find(|o| o.kind == PermKind::Allow).map(|o| o.id.clone());
+            picked = card.request.options.iter().find(|o| o.kind == PermKind::Allow).map(|o| o.id.clone()).ok_or_else(|| anyhow!("the request has no plain allow"))?;
             note = Some("always");
         }
-        self.deliver_answer(&t, &card, picked, dismiss, note, now)?;
+        self.deliver_answer(&t, &card, picked, note, now)?;
         if note.is_some() {
             self.answer_covered(&t.id, now);
         }
         Ok(json!({"thread": t.id, "card": card.id, "answered": true}))
     }
 
-    /// Hands the person's answer to the engine (a host as a command, a hook through `hook.answer`) and closes the card.
-    fn deliver_answer(&mut self, t: &Thread, card: &Asking, picked: Option<String>, dismiss: bool, note: Option<&str>, now: i64) -> Result<()> {
-        if t.engine.hosted() {
-            if let Some(option) = &picked {
-                self.host_command(&t.id, &Command::Answer { permission: card.request.id.clone(), option: option.clone() })?;
-            }
-            // Dismissing a hosted request has no meaning: the engine waits for an answer.
-            else {
-                bail!("{} has no terminal to leave the question to: answer it", t.id);
-            }
-        } else {
-            let allow = picked.as_ref().and_then(|o| card.request.options.iter().find(|x| &x.id == o)).is_some_and(|o| o.kind.allows());
-            let message = (!allow && picked.is_some()).then(|| "The person said no in Lila.".to_owned());
-            self.hook_answers.insert(card.request.id.clone(), picked.clone().map(|o| (o, message)));
-        }
+    /// Hands the person's answer to the host and closes the card.
+    fn deliver_answer(&mut self, t: &Thread, card: &Asking, picked: String, note: Option<&str>, now: i64) -> Result<()> {
+        self.host_command(&t.id, &Command::Answer { permission: card.request.id.clone(), option: picked.clone() })?;
         self.asking.retain(|a| a.id != card.id);
-        let detail = format!("{} · {}{}", card.request.title.lines().next().unwrap_or_default(), picked.as_deref().unwrap_or("left to the terminal"), note.map(|n| format!(" ({n})")).unwrap_or_default());
-        self.store.event(&t.id, "human", if dismiss { "dismissed" } else { "answered" }, &detail, now)?;
+        let detail = format!("{} · {picked}{}", card.request.title.lines().next().unwrap_or_default(), note.map(|n| format!(" ({n})")).unwrap_or_default());
+        self.store.event(&t.id, "human", "answered", &detail, now)?;
         self.mark(&t.id);
         Ok(())
     }
@@ -223,7 +207,7 @@ impl<T: Terminals> Daemon<T> {
         for card in self.asking.iter().filter(|a| a.thread == tid && a.danger.is_none()).cloned().collect::<Vec<_>>() {
             let Some(by) = self.rules_covering(&t, &card.request) else { continue };
             let Some(option) = card.request.options.iter().find(|o| o.kind == PermKind::Allow).map(|o| o.id.clone()) else { continue };
-            match self.deliver_answer(&t, &card, Some(option), false, None, now) {
+            match self.deliver_answer(&t, &card, option, None, now) {
                 Ok(()) => {
                     let _ = self.rule_event(tid, t.tier, &card.request, &by, now);
                 }
@@ -242,7 +226,7 @@ impl<T: Terminals> Daemon<T> {
         Ok(json!({"thread": t.id, "rule": id, "removed": true, "rules": self.rules_json(&t.id)}))
     }
 
-    /// The engine took a request back (answered in its terminal, or it went away with its turn).
+    /// omp took a request back (it went away with its turn).
     pub(super) fn request_resolved(&mut self, tid: &str, request: &str) {
         let before = self.asking.len();
         self.asking.retain(|a| !(a.thread == tid && a.request.id == request));

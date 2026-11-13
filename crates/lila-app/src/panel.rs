@@ -233,7 +233,7 @@ fn counts(add: i64, del: i64) -> Div {
     h_flex()
         .flex_none()
         .gap(px(6.))
-        .font_family(lila_term::theme::FONT)
+        .font_family(crate::style::MONO)
         .text_size(px(11.))
         .child(div().text_color(style::tint(style::green(), 0.3)).child(format!("+{add}")))
         .child(div().text_color(style::tint(style::red(), 0.3)).child(format!("−{del}")))
@@ -448,10 +448,6 @@ impl LilaApp {
 
     /// Puts `@path ` into the thread's box, where the cursor is, and goes there.
     fn at_file(&mut self, thread: &str, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // The box is under the conversation: not there while the thread shows as its terminal.
-        if self.tui.contains(thread) {
-            self.set_view(thread, false, cx);
-        }
         let text = crate::composer::at_text(path);
         let input = self.composer(thread, window, cx).input.clone();
         input.update(cx, |st, cx| {
@@ -654,7 +650,7 @@ impl LilaApp {
                     .h(px(24.))
                     .px_2()
                     .gap_2()
-                    .child(div().flex_none().font_family(lila_term::theme::FONT).text_size(px(11.)).text_color(muted2()).child(s(k, "sha")))
+                    .child(div().flex_none().font_family(crate::style::MONO).text_size(px(11.)).text_color(muted2()).child(s(k, "sha")))
                     .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(muted()).child(s(k, "subject")))
             }))
         });
@@ -733,7 +729,7 @@ impl LilaApp {
             .rounded(px(6.))
             .when(can_open, |d| d.cursor_pointer().hover(|d| d.bg(style::hover())))
             .when(is_open, |d| d.bg(style::fill()))
-            .child(div().w(px(12.)).flex_none().font_family(lila_term::theme::FONT).text_size(px(11.)).font_semibold().text_color(color).child(letter))
+            .child(div().w(px(12.)).flex_none().font_family(crate::style::MONO).text_size(px(11.)).font_semibold().text_color(color).child(letter))
             .child(
                 h_flex()
                     .flex_1()
@@ -804,7 +800,7 @@ impl LilaApp {
                 PreviewBody::Text(state) => div()
                     .flex_1()
                     .min_h_0()
-                    .child(Editor::new(state).readonly(true).appearance(false).bordered(false).h(relative(1.)).font_family(lila_term::theme::FONT).text_size(px(12.)))
+                    .child(Editor::new(state).readonly(true).appearance(false).bordered(false).h(relative(1.)).font_family(crate::style::MONO).text_size(px(12.)))
                     .into_any_element(),
             };
             return v_flex().size_full().child(bar).child(body).into_any_element();

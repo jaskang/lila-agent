@@ -1,6 +1,6 @@
 //! `lila`: the command line of Lila. The person uses it to add projects and talk to
-//! their threads (the window does the same through the same socket); the engines
-//! use it for their hooks and hosts.
+//! their threads (the window does the same through the same socket); lilad uses it
+//! to run omp (`lila host omp`).
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -27,28 +27,23 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProjectCmd,
     },
+    /// The models omp offers (`provider/model`, the ids `--model` and a thread's model take).
+    Models {
+        /// Ask omp again instead of using the list lilad remembers.
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Threads: conversations with an agent.
     Thread {
         #[command(subcommand)]
         cmd: ThreadCmd,
     },
-    /// Tokens each thread used, from the session records Claude Code and Codex keep here.
-    Usage {
-        /// Only the last N days (default: all).
-        #[arg(long)]
-        days: Option<u64>,
-    },
-    /// Subscription accounts and how much of each usage window is used.
-    Accounts,
-    /// lilad, the background process that keeps the state and runs the engines.
+    /// lilad, the background process that keeps the state and runs omp.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
-    /// A Claude Code hook in a thread's session (its settings file runs this).
-    #[command(hide = true)]
-    Hook { event: String },
-    /// Runs a thread's agent through its protocol (lilad starts it in the thread's terminal).
+    /// Runs a thread's omp over its RPC mode (lilad starts it in the thread's terminal).
     #[command(hide = true)]
     Host {
         #[command(subcommand)]
@@ -58,44 +53,17 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum HostCmd {
-    /// Codex through `codex app-server`, in the current folder.
-    Codex {
-        /// The codex program.
-        #[arg(long)]
-        program: std::path::PathBuf,
-        #[arg(long)]
-        model: String,
-        #[arg(long)]
-        effort: Option<String>,
-        #[arg(long)]
-        sandbox: Option<String>,
-        /// When Codex asks first: untrusted, on-request or never.
-        #[arg(long)]
-        approval: Option<String>,
-        /// A system prompt for the thread.
-        #[arg(long)]
-        prompt_file: Option<std::path::PathBuf>,
-        /// A thread to go on with.
-        #[arg(long)]
-        thread: Option<String>,
-        /// More arguments for `codex app-server`.
-        #[arg(last = true)]
-        extra: Vec<String>,
-    },
-    /// An ACP agent (omp: `omp acp`), in the current folder.
+    /// omp over its RPC mode (`omp --mode rpc-ui`), in the current folder.
     Omp {
         /// The omp program.
         #[arg(long)]
         program: std::path::PathBuf,
         #[arg(long)]
         model: Option<String>,
-        /// A system prompt for the thread.
+        /// The folder of the thread's omp sessions: omp goes on with the last one in it.
         #[arg(long)]
-        prompt_file: Option<std::path::PathBuf>,
-        /// A session to go on with.
-        #[arg(long)]
-        session: Option<String>,
-        /// More options for omp (before `acp`).
+        session_dir: std::path::PathBuf,
+        /// More options for omp.
         #[arg(last = true)]
         extra: Vec<String>,
     },
@@ -125,13 +93,8 @@ enum ProjectCmd {
         project: Option<String>,
         #[arg(long)]
         title: Option<String>,
-        /// claude, codex or omp.
-        #[arg(long)]
-        engine: Option<String>,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long)]
-        effort: Option<String>,
         /// read_only, confirm or full.
         #[arg(long)]
         permission: Option<String>,
@@ -148,13 +111,8 @@ enum ThreadCmd {
         project: Option<String>,
         #[arg(long)]
         title: Option<String>,
-        /// claude, codex or omp (default: the project's).
-        #[arg(long)]
-        engine: Option<String>,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long)]
-        effort: Option<String>,
         /// read_only, confirm or full (default: the project's).
         #[arg(long)]
         permission: Option<String>,
@@ -193,15 +151,13 @@ enum ThreadCmd {
     Interrupt { thread: String },
     /// End the agent; the conversation stays and can be resumed.
     Stop { thread: String },
-    /// Start an ended thread again, on the session it had.
+    /// Start an ended thread again, on the omp session it had.
     Resume {
         thread: String,
         /// A message to send once it is up.
         text: Option<String>,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long)]
-        effort: Option<String>,
         #[arg(long)]
         permission: Option<String>,
     },
@@ -211,11 +167,17 @@ enum ThreadCmd {
     Rename { thread: String, title: String },
     /// Switch a thread's permission tier: read_only, confirm or full.
     Permission { thread: String, tier: String },
-    /// Answer a permission card: allow, deny, always (allow what the card's option says for the rest of the thread), or dismiss (Claude Code then asks in its terminal).
-    Answer { thread: String, card: String, answer: String },
-    /// Trust the folder Claude Code asks about in its terminal (a new project, a new worktree): presses the keys that accept, only while the screen is that dialog.
-    Trust { thread: String },
-    /// Change the model or effort (a Codex or ACP thread at once; a Claude Code one when ended).
+    /// Answer a card. A permission card: allow, deny, always (allow what the card's option says for the rest of the thread), or one of its options.
+    /// A question card: a choice (its words or its number), yes or no, or words of your own; --cancel gives no answer.
+    Answer {
+        thread: String,
+        card: String,
+        answer: Option<String>,
+        /// Give no answer to a question.
+        #[arg(long)]
+        cancel: bool,
+    },
+    /// Change the model or effort (at once for a running thread, among the choices omp lists).
     Model {
         thread: String,
         #[arg(long)]
@@ -328,43 +290,26 @@ fn run() -> Result<()> {
             }
             ProjectCmd::Remove { project } => out(call("project.remove", at(project)?)?, &|v| format!("{} removed; stopped: {}", v["project"].as_str().unwrap_or("?"), list(&v["stopped"]))),
             ProjectCmd::Show { project } => out(call("project.show", at(project)?)?, &fmt_project),
-            ProjectCmd::Set { project, title, engine, model, effort, permission } => {
+            ProjectCmd::Set { project, title, model, permission } => {
                 let mut p = at(project)?;
                 p["title"] = json!(title);
-                let defaults: serde_json::Map<String, Value> = [("engine", engine), ("model", model), ("effort", effort), ("permission", permission)].into_iter().filter_map(|(k, v)| v.map(|v| (k.to_owned(), json!(v)))).collect();
+                let defaults: serde_json::Map<String, Value> = [("model", model), ("permission", permission)].into_iter().filter_map(|(k, v)| v.map(|v| (k.to_owned(), json!(v)))).collect();
                 p["defaults"] = Value::Object(defaults);
                 out(call("project.set", p)?, &fmt_project)
             }
         },
+        Cmd::Models { refresh } => out(call("models.list", json!({"refresh": refresh}))?, &|v| {
+            let rows: Vec<String> = v["models"].as_array().into_iter().flatten().map(|m| format!("{:<44} {}", m["id"].as_str().unwrap_or(""), m["name"].as_str().unwrap_or(""))).collect();
+            if rows.is_empty() { "no models".into() } else { rows.join("\n") }
+        }),
         Cmd::Thread { cmd } => thread(cmd, &call, &out)?,
-        Cmd::Usage { days } => usage(&paths, days, cli.json)?,
-        Cmd::Accounts => accounts(&paths, cli.json)?,
         Cmd::Daemon { cmd: DaemonCmd::Run } => lila::daemon::serve(paths.clone(), client::hc_bin())?,
-        Cmd::Hook { event } => client::hook(&paths, &event)?,
-        Cmd::Host { cmd: HostCmd::Codex { program, model, effort, sandbox, approval, prompt_file, thread, extra } } => {
-            let instructions = match prompt_file {
-                Some(f) => std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?,
-                None => String::new(),
-            };
+        Cmd::Host { cmd: HostCmd::Omp { program, model, session_dir, extra } } => {
             let cwd = cwd()?;
-            let args = std::iter::once("app-server".to_owned()).chain(extra).collect();
-            let opts = lila_agent::codex::Options { cwd: cwd.clone(), model, effort, sandbox, approval, instructions, thread };
-            lila::host::run(&paths, lila::host::Agent { program, args, cwd }, lila_agent::codex::AppServer::new(opts))?
-        }
-        Cmd::Host { cmd: HostCmd::Omp { program, model, prompt_file, session, extra } } => {
-            let cwd = cwd()?;
-            // omp's own options go before `acp` (P0 S3).
-            let mut args = Vec::new();
-            if let Some(f) = prompt_file {
-                args.extend(["--append-system-prompt".to_owned(), std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?]);
-            }
-            if let Some(m) = model.filter(|m| !m.is_empty()) {
-                args.extend(["--model".to_owned(), m]);
-            }
-            args.extend(extra);
-            args.push("acp".into());
-            let acp = lila_agent::acp::Acp::new(lila_agent::acp::Options { cwd: cwd.clone(), session });
-            lila::host::run(&paths, lila::host::Agent { program, args, cwd }, acp)?
+            std::fs::create_dir_all(&session_dir)?;
+            let args = lila::host::omp_args(model.as_deref(), &session_dir, &extra);
+            let run = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+            lila::host::run(&paths, lila::host::Agent { program, args, cwd: cwd.clone() }, lila_agent::omp::Omp::new(lila_agent::omp::Options { cwd, run }))?
         }
         Cmd::Daemon { cmd: DaemonCmd::Stop } => {
             if client::daemon_state(&paths)? {
@@ -431,13 +376,11 @@ fn files_of(files: Vec<std::path::PathBuf>) -> Result<Vec<String>> {
 
 fn thread(cmd: ThreadCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out) -> Result<()> {
     match cmd {
-        ThreadCmd::New { text, project, title, engine, model, effort, permission, files, worktree } => {
+        ThreadCmd::New { text, project, title, model, permission, files, worktree } => {
             let mut p = at(project)?;
             p["text"] = json!(text);
             p["title"] = json!(title);
-            p["engine"] = json!(engine);
             p["model"] = json!(model);
-            p["effort"] = json!(effort);
             p["permission"] = json!(permission);
             p["attachments"] = json!(files_of(files)?);
             p["worktree"] = json!(worktree);
@@ -458,22 +401,26 @@ fn thread(cmd: ThreadCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out
         ThreadCmd::Send { thread, text, files } => out(call("thread.send", json!({"thread": thread, "text": text, "attachments": files_of(files)?}))?, &|v| format!("sent to {}", v["thread"].as_str().unwrap_or("?"))),
         ThreadCmd::Interrupt { thread } => out(call("thread.interrupt", json!({"thread": thread}))?, &|v| format!("interrupted {}", v["thread"].as_str().unwrap_or("?"))),
         ThreadCmd::Stop { thread } => out(call("thread.stop", json!({"thread": thread}))?, &fmt_thread),
-        ThreadCmd::Resume { thread, text, model, effort, permission } => out(call("thread.resume", json!({"thread": thread, "text": text, "model": model, "effort": effort, "permission": permission}))?, &fmt_thread),
+        ThreadCmd::Resume { thread, text, model, permission } => out(call("thread.resume", json!({"thread": thread, "text": text, "model": model, "permission": permission}))?, &fmt_thread),
         ThreadCmd::Archive { thread } => out(call("thread.archive", json!({"thread": thread}))?, &fmt_thread),
         ThreadCmd::Unarchive { thread } => out(call("thread.unarchive", json!({"thread": thread}))?, &fmt_thread),
         ThreadCmd::Rename { thread, title } => out(call("thread.rename", json!({"thread": thread, "title": title}))?, &fmt_thread),
         ThreadCmd::Permission { thread, tier } => out(call("thread.permission", json!({"thread": thread, "permission": tier}))?, &fmt_thread),
-        ThreadCmd::Answer { thread, card, answer } => {
+        ThreadCmd::Answer { thread, card, answer, cancel } => {
             let mut p = json!({"thread": thread, "card": card});
-            match answer.as_str() {
-                "allow" => p["allow"] = json!(true),
-                "deny" => p["allow"] = json!(false),
-                "dismiss" => p["dismiss"] = json!(true),
-                other => p["option"] = json!(other),
+            if cancel {
+                p["cancel"] = json!(true);
+            } else if let Some(answer) = answer {
+                // A permission card takes `allow`, `deny` or an option; a question takes `value`. lilad reads the one the card is.
+                match answer.as_str() {
+                    "allow" => p["allow"] = json!(true),
+                    "deny" => p["allow"] = json!(false),
+                    other => p["option"] = json!(other),
+                }
+                p["value"] = json!(answer);
             }
             out(call("thread.answer", p)?, &|v| format!("{} answered", v["card"].as_str().unwrap_or("?")))
         }
-        ThreadCmd::Trust { thread } => out(call("thread.trust", json!({"thread": thread}))?, &|v| format!("trusted {}", v["folder"].as_str().unwrap_or("?"))),
         ThreadCmd::Rules { thread, remove } => {
             if let Some(rule) = remove {
                 out(call("thread.rule.remove", json!({"thread": thread, "rule": rule}))?, &|v| fmt_rules(&v["rules"]))
@@ -502,93 +449,6 @@ fn thread(cmd: ThreadCmd, call: &dyn Fn(&str, Value) -> Result<Value>, out: &Out
     Ok(())
 }
 
-fn accounts(paths: &Paths, as_json: bool) -> Result<()> {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let list = lila::accounts::load(&paths.accounts())?;
-    let rows: Vec<(lila::accounts::Account, lila::accounts::AccountUsage)> = list.into_iter().map(|a| {
-        let u = lila::accounts::usage(&a, &home);
-        (a, u)
-    }).collect();
-    if as_json {
-        let v: Vec<Value> = rows
-            .iter()
-            .map(|(a, u)| {
-                json!({"id": a.id, "runtime": a.runtime.to_string(), "name": a.name, "dir": a.dir, "current": a.current, "plan": u.plan, "seen_ms": u.seen_ms,
-                    "windows": u.windows.iter().map(|w| json!({"name": w.name, "used_percent": w.used_percent, "resets_ms": w.resets_ms})).collect::<Vec<_>>()})
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
-    }
-    for (a, u) in rows {
-        let mark = if a.current { "*" } else { " " };
-        println!("{mark} {:<16} {:<6} {} {}", a.id, a.runtime, a.name, u.plan.unwrap_or_default());
-        for w in &u.windows {
-            println!("      {:<8} {:>5.1}%  resets {}", w.name, w.used_percent, clock(w.resets_ms));
-        }
-        if u.windows.is_empty() {
-            println!("      no usage recorded yet");
-        }
-    }
-    // magpie's accounts, read through magpie (their tokens stay with it).
-    let path = std::env::var("PATH").unwrap_or_default();
-    if let Some(bin) = lila::magpie::find(&path) {
-        match lila::magpie::accounts(&bin) {
-            Ok(list) => {
-                for m in list {
-                    let mark = if m.active { "*" } else { " " };
-                    println!("{mark} {:<16} {:<6} {} {} (magpie)", m.user, m.runtime, m.usage.plan.unwrap_or_default(), if m.active { "signed in" } else { "" });
-                    for w in &m.usage.windows {
-                        println!("      {:<8} {:>5.1}%  resets {}", w.name, w.used_percent, clock(w.resets_ms));
-                    }
-                }
-            }
-            Err(e) => println!("magpie: {e:#}"),
-        }
-    }
-    Ok(())
-}
-
-fn usage(paths: &Paths, days: Option<u64>, as_json: bool) -> Result<()> {
-    use lila::usage::{Owners, Scanner, Sources, short};
-    let project = client::request(paths, "project.show", at(None)?, false)?;
-    let name = project["id"].as_str().context("no project")?.to_owned();
-    let root = project["cwd"].as_str().context("no folder")?.to_owned();
-    let threads = client::request(paths, "thread.list", json!({"project": name, "archived": true}), false)?;
-    let owners: Owners = threads.as_array().into_iter().flatten().filter_map(|t| Some((t["session"].as_str()?.to_owned(), (name.clone(), t["id"].as_str()?.to_owned())))).collect();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
-    let since = days.map(|d| now - d as i64 * 86_400_000);
-    // Threads that work in a worktree of their own ran in its folder.
-    let mut cwds: Vec<String> = vec![root];
-    cwds.extend(threads.as_array().into_iter().flatten().filter(|t| t["worktree"] == true).filter_map(|t| t["cwd"].as_str().map(String::from)));
-    let u = Scanner::default().usage(&Sources::from_env(), &name, &cwds, &owners, since);
-    if as_json {
-        let rows: Vec<Value> = u
-            .threads
-            .iter()
-            .map(|m| json!({"thread": m.thread, "runtime": m.runtime, "sessions": m.sessions, "input": m.tokens.input, "cache_write": m.tokens.cache_write, "cache_read": m.tokens.cache_read, "output": m.tokens.output, "total": m.tokens.total(), "models": m.models.keys().collect::<Vec<_>>()}))
-            .collect();
-        let limits: Vec<Value> = u.codex_limits.iter().map(|l| json!({"used_percent": l.used_percent, "window_minutes": l.window_minutes, "resets_at_ms": l.resets_at_ms, "seen_ms": l.seen_ms, "plan": l.plan})).collect();
-        println!("{}", serde_json::to_string_pretty(&json!({"project": name, "threads": rows, "codex_limits": limits}))?);
-        return Ok(());
-    }
-    if u.threads.is_empty() {
-        println!("no sessions of {name}'s threads found{}", if days.is_some() { " in that time" } else { "" });
-    }
-    for m in &u.threads {
-        let t = &m.tokens;
-        let models: Vec<&str> = m.models.keys().map(String::as_str).collect();
-        println!("{:<10} {:>7}  in {:>6}  cache w {:>6} r {:>7}  out {:>6}  {} session(s)  {}", m.thread, short(t.total()), short(t.input), short(t.cache_write), short(t.cache_read), short(t.output), m.sessions, models.join(", "));
-    }
-    if !u.threads.is_empty() {
-        println!("{:<10} {:>7}", "total", short(u.total.total()));
-    }
-    for l in &u.codex_limits {
-        println!("codex: {:.0}% of the {}-minute window used, resets in {} min", l.used_percent, l.window_minutes, ((l.resets_at_ms - now) / 60_000).max(0));
-    }
-    Ok(())
-}
-
 // ---------------- text output ----------------
 
 fn list(v: &Value) -> String {
@@ -599,12 +459,10 @@ fn list(v: &Value) -> String {
 fn fmt_project(p: &Value) -> String {
     let d = &p["defaults"];
     let mut s = format!(
-        "{:<14} {}  [{} {} {} · {}]  {} thread(s)",
+        "{:<14} {}  [{} · {}]  {} thread(s)",
         p["id"].as_str().unwrap_or(""),
         p["cwd"].as_str().unwrap_or(""),
-        d["engine"].as_str().unwrap_or(""),
-        d["model"].as_str().unwrap_or(""),
-        d["effort"].as_str().unwrap_or("-"),
+        d["model"].as_str().filter(|m| !m.is_empty()).unwrap_or("default model"),
         d["permission"].as_str().unwrap_or(""),
         p["threads"].as_u64().unwrap_or(0)
     );
@@ -615,19 +473,16 @@ fn fmt_project(p: &Value) -> String {
 }
 
 fn thread_line(t: &Value) -> String {
-    let waiting = t["waiting"].as_str().map(|w| match t["waiting_for"].as_str() {
-        Some(what) => format!(" ({w}: {what})"),
-        None => format!(" ({w})"),
-    }).unwrap_or_default();
+    let waiting = t["waiting"].as_str().map(|w| format!(" ({w})")).unwrap_or_default();
     format!(
-        "{:<10} {:<9} {:<6} {:<20} {:<9} {}{}",
+        "{:<10} {:<9} {:<20} {:<9} {}{}{}",
         t["id"].as_str().unwrap_or(""),
         format!("{}{waiting}", t["state"].as_str().unwrap_or("")),
-        t["engine"].as_str().unwrap_or(""),
         t["model"].as_str().unwrap_or(""),
         t["permission"].as_str().unwrap_or(""),
         t["title"].as_str().unwrap_or(""),
-        if t["archived"] == true { "  [archived]" } else { "" }
+        if t["archived"] == true { "  [archived]" } else { "" },
+        t["legacy"].as_str().map(|l| format!("  [{l}: cannot be resumed]")).unwrap_or_default()
     ) + &worktree_note(t)
 }
 
@@ -711,6 +566,7 @@ fn fmt_conversation(v: &Value) -> String {
             "user_message" => s.push_str(&format!("\nyou: {}\n", text("text"))),
             "agent_message" => s.push_str(&format!("\n{}\n", text("text"))),
             "thought" => s.push_str(&format!("\n(thinking) {}\n", text("text").lines().next().unwrap_or(""))),
+            "error" => s.push_str(&format!("\n! {}\n", text("text"))),
             "tool_call" => {
                 let out = text("output");
                 let tail = out.lines().next().map(|l| format!("\n    {l}")).unwrap_or_default();
@@ -719,8 +575,14 @@ fn fmt_conversation(v: &Value) -> String {
             _ => {}
         }
     }
-    if let Some(w) = v["writing"].as_str() {
-        s.push_str(&format!("\n… {w}\n"));
+    for q in v["questions"].as_array().into_iter().flatten() {
+        let options: Vec<String> = q["options"].as_array().into_iter().flatten().filter_map(|o| o.as_str()).enumerate().map(|(i, o)| format!("{}) {o}", i + 1)).collect();
+        let how = match q["kind"].as_str() {
+            Some("choice") => options.join("  "),
+            Some("confirm") => "yes / no".to_owned(),
+            _ => "words of your own".to_owned(),
+        };
+        s.push_str(&format!("\n? [{}] {} ({how})\n", q["id"].as_str().unwrap_or(""), q["title"].as_str().unwrap_or("")));
     }
     for c in v["permissions"].as_array().into_iter().flatten() {
         let opts: Vec<&str> = c["options"].as_array().into_iter().flatten().filter_map(|o| o["id"].as_str()).collect();
@@ -820,7 +682,7 @@ mod tests {
         assert_eq!(fmt_changes(&json!({"repo": false})), "not in a git repository");
         let d = fmt_diffs(&json!({"diffs": [{"path": "a.txt", "status": "modified", "lines": ["@@ -1 +1 @@", "-a", "+b"], "truncated": true}, {"path": "p.bin", "status": "added", "lines": [], "binary": true}]}));
         assert_eq!(d, "--- a.txt [modified]\n@@ -1 +1 @@\n-a\n+b\n… cut here\n--- p.bin [added]\nBinary file");
-        let line = thread_line(&json!({"id": "t1", "state": "idle", "engine": "codex", "model": "m", "permission": "full", "title": "T", "worktree": true, "base_branch": "main", "changes": {"files": 2, "add": 5, "del": 1}}));
+        let line = thread_line(&json!({"id": "t1", "state": "idle", "model": "m", "permission": "full", "title": "T", "worktree": true, "base_branch": "main", "changes": {"files": 2, "add": 5, "del": 1}}));
         assert!(line.ends_with("T  [worktree of main]  2 file(s) +5 -1"), "{line}");
     }
     #[test]

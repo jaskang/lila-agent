@@ -28,12 +28,17 @@ chrono.workspace = true
 libc = "0.2"
 regex = "1"
 shlex = "1"
-linkify = "0.10"
-strip-ansi-escapes = "0.2"
 uuid = { version = "1", features = ["v4"] }
-wait-timeout = "0.2"
 walkdir = "2"
 tempfile.workspace = true
 which = "8"
-yaml-rust2 = "0.13.0"
 
+
+[dev-dependencies]
+rusqlite.workspace = true
+base64 = "0.22"
+
+# A stand-in omp and a stand-in lilad around the real `lila host omp` (the test binary is the stand-in omp).
+[[test]]
+name = "host"
+harness = false

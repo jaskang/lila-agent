@@ -7,7 +7,7 @@ use crate::style::{self, card, muted, muted2};
 use gpui::component::button::{Button, ButtonVariants};
 use gpui::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui::component::spinner::Spinner;
-use gpui::component::{Disableable as _, Icon, IconName, InteractiveElementExt, Sizable, StyledExt, h_flex, v_flex};
+use gpui::component::{Icon, IconName, InteractiveElementExt, Sizable, StyledExt, h_flex, v_flex};
 use crate::style::Control as _;
 use gpui::prelude::*;
 use gpui::*;
@@ -69,10 +69,10 @@ pub fn drag_bar(bar: Stateful<Div>, cx: &mut Context<LilaApp>) -> Stateful<Div> 
 }
 
 impl LilaApp {
-    /// The center card's first row. A thread: its title, then in grey the engine, model and effort, and on the right
+    /// The center card's first row. A thread: its title, then in grey the model and effort, and on the right
     /// its actions (`header_actions`). A new session: the workspace it will be in. With the sidebar folded away the row
     /// leaves room for the traffic lights and starts with the button that brings it back. Drags the window.
-    fn header(&mut self, thread: Option<&Value>, terminal: Option<Entity<lila_term::TerminalView>>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn header(&mut self, thread: Option<&Value>, cx: &mut Context<Self>) -> impl IntoElement {
         let quiet = style::quiet(cx);
         let folded = self.sidebar_hidden;
         let bar = drag_bar(h_flex().id("thread-bar"), cx)
@@ -87,8 +87,7 @@ impl LilaApp {
             let avatar = self.new_in.as_deref().map(|id| avatar(id, 20., cx));
             return bar.children(avatar).child(self.project_switch(cx)).child(div().flex_1());
         };
-        let engine = s(t, "engine");
-        let info = format!("{} · {}", crate::engines::engine_name(&engine), crate::engines::spec_label(&engine, &s(t, "model"), &s(t, "effort")));
+        let info = crate::engines::spec_label(&s(t, "model"), &s(t, "effort"));
         bar.border_b_1()
             .border_color(style::divider())
             .child(div().flex_none().max_w(relative(0.45)).truncate().text_size(px(13.)).font_semibold().child(s(t, "title")))
@@ -107,29 +106,22 @@ impl LilaApp {
                     }),
             )
             .child(div().flex_1())
-            .child(h_flex().flex_none().gap_1().children(self.header_actions(t, terminal, cx)))
+            .child(h_flex().flex_none().gap_1().children(self.header_actions(t, cx)))
     }
 
     /// The buttons at the right end of a thread's first row, left to right.
-    fn header_actions(&mut self, t: &Value, terminal: Option<Entity<lila_term::TerminalView>>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn header_actions(&mut self, t: &Value, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let quiet = style::quiet(cx);
         let tool = |id: &'static str, icon: IconName, tip: &'static str| Button::new(id).custom(quiet).xsmall().icon(icon).tooltip(tip);
         let id = s(t, "id");
         // A merged thread is over: its worktree is gone, there is nothing to continue or to show.
         let merged = t["merged_ms"].is_number();
-        let ended = t["state"] == "ended" && !merged;
+        // A thread from before omp was the only engine cannot be continued.
+        let ended = t["state"] == "ended" && !merged && t["legacy"].is_null();
         let mut actions: Vec<AnyElement> = Vec::new();
-        // Claude Code's TUI keeps running under its conversation.
-        if t["caps"]["tui"] == true && !ended {
-            actions.push(self.view_switch(t, cx).into_any_element());
-        }
         // Only an ended session has a button: a message to a live or ended one carries on, and ending is in the sidebar menu.
         if ended {
             actions.push(Button::new("resume-thread").small().small_button().primary().icon(IconName::Play).label("继续").on_click(cx.listener(move |this, _, _, cx| this.act("thread.resume", json!({"thread": id}), cx))).into_any_element());
-        }
-        // Searches the terminal, when it is what is shown.
-        if let Some(view) = terminal {
-            actions.push(tool("terminal-find", IconName::Search, "搜索 (⌘F)").on_click(move |_, window, cx| view.update(cx, |view, cx| view.open_search(window, cx))).into_any_element());
         }
         // The files and changes buttons open the right panel.
         actions.extend(self.panel_buttons(t, cx));
@@ -176,30 +168,17 @@ impl LilaApp {
     pub fn center(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let quiet = style::quiet(cx);
         let thread = self.shown_thread();
-        let address = thread.as_ref().map(|t| s(t, "terminal")).filter(|a| !a.is_empty());
-        let mut terminal_view = None;
         let empty = || v_flex().flex_1().items_center().justify_center().gap_3();
-        // Shown as its conversation (the default), else its terminal.
-        let gui = thread.as_ref().filter(|t| self.shows_gui(t)).cloned();
-        let body: AnyElement = match (&thread, address) {
-            _ if gui.is_some() => self.conversation_view(gui.as_ref().unwrap(), window, cx),
-            (Some(_), Some(addr)) => match (self.core_error.clone(), self.terminal(&addr, window, cx)) {
-                (Some(e), _) => placeholder(e, cx).into_any_element(),
-                (None, Some(view)) => {
-                    terminal_view = Some(view.clone());
-                    div().flex_1().min_h_0().px_1().child(view).into_any_element()
-                }
-                (None, None) => empty().child(Spinner::new().color(muted())).into_any_element(),
-            },
-            (Some(_), None) => placeholder("这个会话已经结束".into(), cx).into_any_element(),
-            (None, _) if !self.snap.daemon => empty().child(Spinner::new().color(muted())).child(div().text_color(muted()).child("正在连接 lilad…")).into_any_element(),
-            (None, _) if self.snap.projects.is_empty() => empty().child(Button::new("add-project-big").primary().icon(IconName::Plus).label("新建工作区").on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))).into_any_element(),
-            (None, _) => match self.new_in.clone() {
+        let body: AnyElement = match &thread {
+            Some(t) => self.conversation_view(t, window, cx),
+            None if !self.snap.daemon => empty().child(Spinner::new().color(muted())).child(div().text_color(muted()).child("正在连接 lilad…")).into_any_element(),
+            None if self.snap.projects.is_empty() => empty().child(Button::new("add-project-big").primary().icon(IconName::Plus).label("新建工作区").on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))).into_any_element(),
+            None => match self.new_in.clone() {
                 Some(p) => self.new_session_view(&p, window, cx),
                 None => empty().child(Spinner::new().color(muted())).into_any_element(),
             },
         };
-        let header = self.header(thread.as_ref(), terminal_view, cx).into_any_element();
+        let header = self.header(thread.as_ref(), cx).into_any_element();
         v_flex().size_full().child(
             card()
                 .flex()
@@ -246,62 +225,91 @@ impl LilaApp {
             .into_any_element()
     }
 
-    /// The row above the box when the engine waits in its terminal (Claude Code's "trust this folder", a login):
-    /// the conversation cannot answer it, so it says where to go. For the trust dialog lilad has recognised (`waiting_for`),
-    /// the row shows the folder and answers it in place.
-    pub(crate) fn terminal_ask(&mut self, t: &Value, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if t["waiting"] != "terminal" {
-            return None;
-        }
-        let id = s(t, "id");
-        let tui = t["caps"]["tui"] == true;
-        let trust = trust_folder(t);
-        let strip = h_flex()
-            .w_full()
-            .px_3()
-            .py(px(8.))
-            .gap_2()
-            .rounded(px(style::R_BLOCK))
-            .border_1()
-            .border_color(style::yellow().opacity(0.35))
-            .bg(style::yellow().opacity(0.06))
-            .child(Icon::new(IconName::SquareTerminal).small().text_color(style::yellow()));
-        let open = |id: String, primary: bool, cx: &mut Context<Self>| {
-            Button::new("open-terminal").small().small_button().when(primary, |b| b.primary()).when(!primary, |b| b.outline()).label("打开终端").on_click(cx.listener(move |this, _, _, cx| this.set_view(&id, true, cx)))
+    /// A question card on the shown thread: what the agent asks, and the ways to answer (the choices, yes and no, or a box for words).
+    pub(crate) fn question_card(&mut self, thread: &str, card: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let id = s(card, "id");
+        let kind = s(card, "kind");
+        let options: Vec<String> = card["options"].as_array().into_iter().flatten().filter_map(|o| o.as_str().map(String::from)).collect();
+        let detail = Some(s(card, "detail")).filter(|d| !d.is_empty());
+        let answer = move |thread: &str, card: &str, extra: Value| {
+            let mut p = json!({"thread": thread, "card": card});
+            p.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
+            p
         };
-        let Some(folder) = trust else {
-            return Some(strip.child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(format!("{} 在终端里等你", crate::engines::engine_name(&s(t, "engine"))))).when(tui, |d| d.child(open(id, true, cx))).into_any_element());
-        };
-        let busy = self.trusting.contains(&id);
-        let thread = id.clone();
-        Some(
-            strip
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_2()
-                        .child(div().flex_none().text_size(px(13.)).child("信任此文件夹"))
-                        // The end of a long path is the folder itself.
-                        .child(div().min_w_0().truncate().text_size(px(12.)).font_family(lila_term::theme::FONT).text_color(muted2()).child(crate::data::tail(&crate::data::tilde(&folder), 48))),
-                )
-                .when(tui, |d| d.child(open(id.clone(), false, cx)))
-                .child(Button::new("trust-folder").small().small_button().primary().loading(busy).disabled(busy).label("信任并继续").on_click(cx.listener(move |this, _, _, cx| {
-                    let thread = thread.clone();
-                    this.trusting.insert(thread.clone());
-                    cx.notify();
-                    let id = thread.clone();
-                    this.call("thread.trust", json!({"thread": id}), cx, move |this, r, cx| {
-                        this.trusting.remove(&thread);
-                        if let Err(e) = r {
-                            this.notice = Some(format!("{e:#}"));
+        let (t0, c0) = (thread.to_owned(), id.clone());
+        let cancel = Button::new(SharedString::from(format!("ask-{id}-cancel"))).small().small_button().rounded_full().custom(style::quiet(cx)).label("不回答").on_click(cx.listener(move |this, _, _, cx| this.act("thread.answer", answer(&t0, &c0, json!({"cancel": true})), cx)));
+        let input = (kind == "text").then(|| {
+            let prefill = s(card, "prefill");
+            self.question_inputs.entry(id.clone()).or_insert_with(|| cx.new(|cx| gpui::component::input::InputState::new(window, cx).placeholder(prefill))).clone()
+        });
+        let controls = match kind.as_str() {
+            "text" => {
+                let input = input.clone().expect("a text question has its box");
+                let (t, c, box_) = (thread.to_owned(), id.clone(), input.clone());
+                h_flex()
+                    .gap(px(6.))
+                    .child(div().flex_1().min_w_0().child(gpui::component::input::Input::new(&input).control()))
+                    .child(Button::new(SharedString::from(format!("ask-{id}-send"))).small().small_button().rounded_full().primary().label("回答").on_click(cx.listener(move |this, _, _, cx| {
+                        let value = box_.read(cx).value().trim().to_owned();
+                        if !value.is_empty() {
+                            this.question_inputs.remove(&c);
+                            this.act("thread.answer", answer(&t, &c, json!({"value": value})), cx);
                         }
-                        this.refresh_now();
-                        cx.notify();
-                    });
-                })))
-                .into_any_element(),
-        )
+                    })))
+                    .child(cancel)
+                    .into_any_element()
+            }
+            "confirm" => {
+                let yes_no = [("是", true), ("否", false)].into_iter().map(|(label, yes)| {
+                    let (t, c) = (thread.to_owned(), id.clone());
+                    Button::new(SharedString::from(format!("ask-{id}-{yes}")))
+                        .small()
+                        .small_button()
+                        .rounded_full()
+                        .when(yes, |b| b.primary())
+                        .when(!yes, |b| b.outline())
+                        .label(label)
+                        .on_click(cx.listener(move |this, _, _, cx| this.act("thread.answer", answer(&t, &c, json!({"yes": yes})), cx)))
+                });
+                h_flex().gap(px(6.)).flex_wrap().children(yes_no).child(cancel).into_any_element()
+            }
+            _ => {
+                let choices = options.into_iter().enumerate().map(|(n, option)| {
+                    let (t, c, o) = (thread.to_owned(), id.clone(), option.clone());
+                    Button::new(SharedString::from(format!("ask-{id}-{n}")))
+                        .small()
+                        .small_button()
+                        .rounded_full()
+                        .when(n == 0, |b| b.primary())
+                        .when(n > 0, |b| b.outline())
+                        .label(crate::engines::clip(&option, 44))
+                        .tooltip(option.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| this.act("thread.answer", answer(&t, &c, json!({"value": o})), cx)))
+                });
+                h_flex().gap(px(6.)).flex_wrap().children(choices).child(cancel).into_any_element()
+            }
+        };
+        v_flex()
+            .px_4()
+            .py(px(12.))
+            .gap(px(9.))
+            .child(h_flex().gap(px(7.)).child(Icon::new(IconName::CircleAlert).small().text_color(style::blue())).child(div().text_size(px(13.)).font_semibold().child("要你回答")))
+            .child(
+                div()
+                    .id(SharedString::from(format!("ask-title-{id}")))
+                    .max_h(px(160.))
+                    .overflow_y_scroll()
+                    .px_3()
+                    .py(px(7.))
+                    .rounded(px(6.))
+                    .bg(style::well())
+                    .text_size(px(13.))
+                    .line_height(relative(1.5))
+                    .child(s(card, "title")),
+            )
+            .children(detail.map(|d| div().text_xs().text_color(muted()).child(d)))
+            .child(controls)
+            .into_any_element()
     }
 
     /// A permission card on the shown thread: what it wants to do, why the person is asked, and the answers.
@@ -309,7 +317,6 @@ impl LilaApp {
         let id = s(card, "id");
         let danger = !card["danger"].is_null();
         let options: Vec<(String, String, String)> = card["options"].as_array().into_iter().flatten().map(|o| (s(o, "id"), s(o, "label"), s(o, "kind"))).collect();
-        let tui = self.shown_thread().is_some_and(|t| t["caps"]["tui"] == true);
         let detail = Some(s(card, "detail")).filter(|d| !d.is_empty() && *d != s(card, "title"));
         let paths: Vec<String> = card["paths"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(String::from)).collect();
         let why = Some(s(card, "why")).filter(|d| !d.is_empty());
@@ -334,7 +341,7 @@ impl LilaApp {
                     .py(px(7.))
                     .rounded(px(6.))
                     .bg(style::well())
-                    .font_family(lila_term::theme::FONT)
+                    .font_family(style::MONO)
                     .text_size(px(12.))
                     .line_height(relative(1.5))
                     .child(s(card, "title")),
@@ -359,43 +366,8 @@ impl LilaApp {
                             .label(crate::engines::clip(&label, 44))
                             .tooltip(label.clone())
                             .on_click(cx.listener(move |this, _, _, cx| this.act("thread.answer", json!({"thread": thread, "card": card, "option": opt}), cx)))
-                    }))
-                    // Claude Code can ask in its own terminal instead.
-                    .when(tui, |d| {
-                        let (thread, card) = (thread.to_owned(), id.clone());
-                        d.child(style::link(SharedString::from(format!("perm-term-{id}")), "在终端里回答", false).text_size(px(13.)).on_click(cx.listener(move |this, _, _, cx| {
-                            this.act("thread.answer", json!({"thread": thread, "card": card, "dismiss": true}), cx)
-                        })))
-                    }),
+                    })),
             )
             .into_any_element()
-    }
-}
-
-/// The folder of the trust dialog a thread waits at, when lilad has recognised it (`waiting_for`); an older lilad, or any other
-/// reason a terminal waits, says nothing, and the row is the plain "waits in its terminal".
-pub fn trust_folder(t: &Value) -> Option<String> {
-    (t["waiting"] == "terminal" && t["waiting_for"] == "trust").then(|| s(t, "trust_folder")).filter(|f| !f.is_empty())
-}
-
-pub fn placeholder(text: String, _cx: &App) -> impl IntoElement {
-    div().flex_1().flex().items_center().justify_center().p_8().text_color(muted()).child(text)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::trust_folder;
-    use serde_json::json;
-
-    #[test]
-    fn only_a_recognised_trust_dialog_gets_the_trust_row() {
-        let waiting = json!({"waiting": "terminal", "waiting_for": "trust", "trust_folder": "/Users/me/shop"});
-        assert_eq!(trust_folder(&waiting).as_deref(), Some("/Users/me/shop"));
-        // A terminal that waits for something else, an older lilad (nothing said), a dialog without its folder, a thread that waits for a card.
-        assert_eq!(trust_folder(&json!({"waiting": "terminal", "waiting_for": null})), None);
-        assert_eq!(trust_folder(&json!({"waiting": "terminal"})), None);
-        assert_eq!(trust_folder(&json!({"waiting": "terminal", "waiting_for": "trust"})), None);
-        assert_eq!(trust_folder(&json!({"waiting": "card", "waiting_for": "trust", "trust_folder": "/x"})), None);
-        assert_eq!(trust_folder(&json!({"waiting": null, "waiting_for": "trust", "trust_folder": "/x"})), None);
     }
 }

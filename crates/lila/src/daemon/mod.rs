@@ -3,30 +3,27 @@
 //! on one thread, so there is no locking.
 //!
 //! The model is projects and their threads (docs/architecture-v4.md). A thread is a
-//! conversation with one agent; the agent runs in an hc terminal of its own, so a lilad restart
-//! does not end it.
+//! conversation with omp; omp runs behind `lila host omp` in an hc terminal of its own, so a lilad
+//! restart does not end it.
 
 mod checkpoints;
 mod conversation;
-mod hooks;
 mod host;
 mod jobs;
 mod permissions;
+mod questions;
 mod requests;
 mod server;
 mod sources;
 mod threads;
-mod trust;
 
 pub use jobs::{Begin, Job, Output};
 pub use server::serve;
 pub use sources::{PollJob, PostJob};
 
 use crate::paths::{Paths, which};
-use crate::sessions;
-use crate::usage::Sources;
 use anyhow::{Context, Result, anyhow, bail};
-use lila_core::{AgentStatus, ProjectConfig, Runtime, Thread, ThreadState, Tier};
+use lila_core::{AgentStatus, ProjectConfig, Thread, ThreadState, Tier};
 use lila_store::Store;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -38,13 +35,7 @@ pub trait Terminals {
     fn list(&mut self, project: &str) -> Result<Vec<Value>>;
     /// Starts a program; returns its terminal address.
     fn run(&mut self, req: Value) -> Result<String>;
-    /// Types text and presses Enter. `only_if`: only when the status word is exactly this.
-    fn send(&mut self, terminal: &str, text: &str, only_if: Option<&str>) -> Result<()>;
     fn kill(&mut self, terminal: &str) -> Result<()>;
-    /// Presses named keys (`esc`, `ctrl+c`, …).
-    fn keys(&mut self, terminal: &str, keys: &[&str]) -> Result<()>;
-    /// The terminal's screen as text.
-    fn read(&mut self, terminal: &str) -> Result<String>;
 }
 
 pub struct HcTerminals(pub hc_client::Hc);
@@ -60,36 +51,16 @@ impl Terminals for HcTerminals {
         r["address"].as_str().map(String::from).ok_or_else(|| anyhow!("terminal.run returned no address: {r}"))
     }
 
-    fn send(&mut self, terminal: &str, text: &str, only_if: Option<&str>) -> Result<()> {
-        let mut p = json!({"terminal": terminal, "text": text});
-        if let Some(s) = only_if {
-            p["if"] = json!(s);
-        }
-        self.0.call("terminal.send", p)?;
-        Ok(())
-    }
-
     fn kill(&mut self, terminal: &str) -> Result<()> {
         self.0.call("terminal.kill", json!({"terminal": terminal}))?;
         Ok(())
     }
-
-    fn keys(&mut self, terminal: &str, keys: &[&str]) -> Result<()> {
-        self.0.call("terminal.keys", json!({"terminal": terminal, "keys": keys}))?;
-        Ok(())
-    }
-
-    fn read(&mut self, terminal: &str) -> Result<String> {
-        let r = self.0.call("terminal.read", json!({"terminal": terminal}))?;
-        r["text"].as_str().map(String::from).ok_or_else(|| anyhow!("terminal.read returned no text"))
-    }
 }
 
-/// How long an engine may run without reporting a status before the thread says it waits for the
-/// person (Claude Code's "trust this folder?" and login dialogs report nothing).
+/// How long a host may run without reporting a status before lilad says so in its log.
 const STARTUP_MS: i64 = 20_000;
 
-/// What lilad knows of a thread's running engine that the database does not hold.
+/// What lilad knows of a thread's running omp that the database does not hold.
 #[derive(Debug, Clone)]
 struct Live {
     status: AgentStatus,
@@ -98,12 +69,12 @@ struct Live {
     /// Has reported a status at least once since it started.
     reported: bool,
     started_ms: i64,
-    /// When the engine last became free to take a message.
+    /// When omp last became free to take a message.
     free_since: i64,
-    /// The model and effort this thread runs on, as the engine reported them (nothing yet: the stored ones),
-    /// with the choices it lists. Starts over with the engine.
+    /// The model and effort this thread runs on, as omp reported them (nothing yet: the stored ones),
+    /// with the choices it lists. Starts over with omp.
     config: lila_agent::Config,
-    /// The slash commands an ACP agent declared for this thread.
+    /// The slash commands omp declared for this thread.
     commands: Vec<lila_agent::SlashCommand>,
 }
 
@@ -128,11 +99,11 @@ pub struct Daemon<T: Terminals> {
     term: T,
     paths: Paths,
     projects: BTreeMap<String, Proj>,
-    /// Running threads' engines, by thread id.
+    /// Running threads' omp, by thread id.
     live: HashMap<String, Live>,
-    /// PATH the engines get (the CLI's PATH when it started the daemon).
+    /// PATH omp gets (the CLI's PATH when it started the daemon).
     path_env: String,
-    /// The `lila` binary, so engines can run it (`lila hook`, `lila host`).
+    /// The `lila` binary, so threads can run `lila host`.
     lila_bin: PathBuf,
     pub log: Vec<String>,
     /// The last delivery error per thread, so a stuck delivery is logged once, not every tick.
@@ -143,28 +114,15 @@ pub struct Daemon<T: Terminals> {
     dirty: BTreeSet<String>,
     /// Projects that were added, changed or removed since the watchers were told.
     dirty_projects: BTreeSet<String>,
-    /// Where the CLIs record their sessions.
-    sources: Sources,
-    /// How far each Claude thread's transcript has been read (`conversation`), by thread.
-    tails: HashMap<String, conversation::Tail>,
-    /// Attached hosts of protocol threads (`host`), by thread: their command channel.
+    /// Attached hosts (`host`), by thread: their command channel.
     hosts: HashMap<String, std::sync::mpsc::Sender<String>>,
     /// Open permission cards (`permissions`): what a thread asks the person.
     asking: Vec<permissions::Asking>,
+    /// Open question cards (`questions`): what an agent asks the person.
+    questions: Vec<questions::Asked>,
+    /// The models omp offers, and when it was asked (`models.list`).
+    models: Option<(i64, Vec<lila_agent::Choice>)>,
     next_card: u64,
-    /// Answers waiting for the Claude Code hook that asked (`hooks`), by request id: the option and a message for the agent, or none (left to the terminal).
-    hook_answers: HashMap<String, Option<(String, Option<String>)>>,
-    next_hook: u64,
-    /// When this lilad started: in the ids of its hook requests, so one from before a restart is never mistaken for one of ours.
-    boot: i64,
-    /// What `PreToolUse` decided about recent tool calls (`hooks`), by thread, for the `PermissionRequest` that may follow.
-    judged: HashMap<String, std::collections::VecDeque<hooks::Judged>>,
-    /// What Claude threads are writing now (`MessageDisplay`), by thread: (message id, text so far).
-    writing: HashMap<String, (String, String)>,
-    /// The Claude threads whose terminal shows the trust dialog (`trust`), by thread: the folder it asks about.
-    trust_seen: HashMap<String, String>,
-    /// magpie's command line, when it is installed (set by `serve`; tests leave it out).
-    pub magpie: Option<PathBuf>,
     /// Work waiting to be run off the loop (`jobs`), taken by the server.
     jobs: Vec<jobs::Job>,
     /// What each thread has changed, counted after its turns end (`jobs`): `None` is a folder outside git.
@@ -213,18 +171,11 @@ impl<T: Terminals> Daemon<T> {
             live_version: 0,
             dirty: BTreeSet::new(),
             dirty_projects: BTreeSet::new(),
-            sources: Sources::from_env(),
-            tails: HashMap::new(),
             hosts: HashMap::new(),
             asking: Vec::new(),
+            questions: Vec::new(),
+            models: None,
             next_card: 0,
-            hook_answers: HashMap::new(),
-            next_hook: 0,
-            boot: now_ms(),
-            judged: HashMap::new(),
-            writing: HashMap::new(),
-            trust_seen: HashMap::new(),
-            magpie: None,
             jobs: Vec::new(),
             summaries: HashMap::new(),
             refreshing: BTreeSet::new(),
@@ -264,8 +215,8 @@ impl<T: Terminals> Daemon<T> {
     /// The push for a thread that changed: its state and how far its conversation goes (`None`: it is gone).
     pub(super) fn thread_event(&self, tid: &str, seq: u64) -> Option<Value> {
         let t = self.store.thread(tid).ok()??;
-        let (state, waiting) = self.state_of(&t, now_ms());
-        Some(json!({"event": "thread", "project": t.project, "thread": tid, "state": state.as_str(), "waiting": waiting, "waiting_for": self.trust_seen.get(tid).filter(|_| waiting == Some("terminal")).map(|_| "trust"), "items_seq": self.store.last_seq(tid).unwrap_or(0), "changes": self.summary_of(tid).map(|c| c.json()), "seq": seq}))
+        let (state, waiting) = self.state_of(&t);
+        Some(json!({"event": "thread", "project": t.project, "thread": tid, "state": state.as_str(), "waiting": waiting, "items_seq": self.store.last_seq(tid).unwrap_or(0), "changes": self.summary_of(tid).map(|c| c.json()), "seq": seq}))
     }
 
     fn mark(&mut self, thread: &str) {
@@ -308,6 +259,11 @@ impl<T: Terminals> Daemon<T> {
     pub fn on_terminal(&mut self, rec: &Value, now: i64) {
         let (Some(tid), Some(addr)) = (rec["labels"]["lila.thread"].as_str(), rec["address"].as_str()) else { return };
         let Ok(Some(t)) = self.store.thread(tid) else { return };
+        if rec["state"] == "live" && t.legacy.is_some() {
+            // A Claude Code or Codex thread from before omp was the only engine: nothing here runs it any more, so its terminal goes.
+            let _ = self.term.kill(addr);
+            return;
+        }
         if rec["state"] == "live" {
             if t.terminal.as_deref() != Some(addr) {
                 // A terminal this thread was not known to run in (lilad was away when it started): take it.
@@ -392,7 +348,7 @@ impl<T: Terminals> Daemon<T> {
         }
     }
 
-    /// The engine of a thread is gone: its terminal ended, was killed, or is no longer there. The
+    /// The omp of a thread is gone: its terminal ended, was killed, or is no longer there. The
     /// thread stays, ended; its conversation is kept and it can be resumed.
     fn thread_gone(&mut self, tid: &str, why: &str, now: i64) {
         let Ok(Some(t)) = self.store.thread(tid) else { return };
@@ -402,11 +358,9 @@ impl<T: Terminals> Daemon<T> {
         let _ = self.store.set_ended(tid, now);
         self.live.remove(tid);
         self.hosts.remove(tid);
-        self.writing.remove(tid);
-        self.tails.remove(tid);
         self.asking.retain(|a| a.thread != tid);
-        self.trust_seen.remove(tid);
-        let _ = self.store.event(tid, "lilad", "ended", &format!("{} ({}): {why}", t.terminal.unwrap_or_default(), t.engine), now);
+        self.questions.retain(|a| a.thread != tid);
+        let _ = self.store.event(tid, "lilad", "ended", &format!("{}: {why}", t.terminal.unwrap_or_default()), now);
         self.say(format!("{}: thread {tid} ended ({why})", t.project));
         self.mark(tid);
     }
@@ -435,98 +389,45 @@ impl<T: Terminals> Daemon<T> {
             self.say(format!("thread {tid} has not reported a status"));
             self.mark(&tid);
         }
-        self.drop_abandoned_cards(now);
         self.pump(now);
     }
 
     // ---------------- what threads look like ----------------
 
-    /// The state a thread shows, and what it waits for (`card`: a permission card; `terminal`: a dialog in its terminal).
-    fn state_of(&self, t: &Thread, now: i64) -> (ThreadState, Option<&'static str>) {
+    /// The state a thread shows, and what it waits for (`card`: a permission card or a question).
+    fn state_of(&self, t: &Thread) -> (ThreadState, Option<&'static str>) {
         let live = self.live.get(&t.id).filter(|_| t.terminal.is_some());
         let status = live.map_or(AgentStatus::Gone, |l| l.status);
-        let card = self.asking.iter().any(|a| a.thread == t.id);
-        let mut state = status.thread_state(card);
-        let mut waiting = match state {
-            ThreadState::Waiting if card => Some("card"),
-            ThreadState::Waiting => Some("terminal"),
-            _ => None,
-        };
-        // No status for a while: a dialog in the terminal (trust the folder, sign in) is likely waiting.
-        if state == ThreadState::Starting && live.is_some_and(|l| !l.reported && now - l.started_ms >= STARTUP_MS) {
-            state = ThreadState::Waiting;
-            waiting = Some("terminal");
-        }
-        // The dialog is on the screen: the thread waits for it already, not only when the engine has been quiet for a while.
-        if state == ThreadState::Starting && self.trust_seen.contains_key(&t.id) {
-            state = ThreadState::Waiting;
-            waiting = Some("terminal");
-        }
-        (state, waiting)
+        let card = self.asking.iter().any(|a| a.thread == t.id) || self.questions.iter().any(|a| a.thread == t.id);
+        let state = status.thread_state(card);
+        (state, (state == ThreadState::Waiting).then_some("card"))
     }
 
-    /// What a runtime offers the window.
-    pub(super) fn caps(engine: Runtime) -> lila_agent::Caps {
-        match engine {
-            Runtime::Claude => lila_agent::Caps { tui: true, gui: true, steer: true },
-            // Through `codex app-server` (`lila host codex`): no TUI to switch to.
-            Runtime::Codex => lila_agent::Caps { tui: false, gui: true, steer: true },
-            // Over ACP (`lila host omp`): words wait for the prompt under way.
-            Runtime::Omp => lila_agent::Caps { tui: false, gui: true, steer: false },
-        }
-    }
-
-    pub(super) fn thread_json(&self, t: &Thread, now: i64) -> Value {
-        let (state, waiting) = self.state_of(t, now);
+    pub(super) fn thread_json(&self, t: &Thread) -> Value {
+        let (state, waiting) = self.state_of(t);
         let live = self.live.get(&t.id).filter(|_| t.terminal.is_some());
-        let cards = self.asking.iter().filter(|a| a.thread == t.id).count();
-        let trust = self.trust_seen.get(&t.id).filter(|_| waiting == Some("terminal"));
+        let cards = self.asking.iter().filter(|a| a.thread == t.id).count() + self.questions.iter().filter(|a| a.thread == t.id).count();
         json!({
-            "id": t.id, "project": t.project, "title": t.title, "engine": t.engine.as_str(),
+            "id": t.id, "project": t.project, "title": t.title, "legacy": t.legacy,
             "model": live.and_then(|l| l.config.model.clone()).unwrap_or_else(|| t.model.clone()),
             "effort": live.and_then(|l| l.config.effort.clone()).or_else(|| t.effort.clone()),
             "permission": t.tier.as_str(), "cwd": t.cwd, "session": t.session,
             "state": state.as_str(), "status": live.map_or("gone", |l| l.status.as_str()), "waiting": waiting, "cards": cards,
-            "waiting_for": trust.map(|_| "trust"), "trust_folder": trust,
             "msg": live.map(|l| l.msg.clone()).filter(|m| !m.is_empty()),
-            "terminal": t.terminal, "caps": Self::caps(t.engine),
+            "terminal": t.terminal,
             "created_ms": t.created_ms, "active_ms": t.active_ms, "started_ms": t.started_ms, "ended_ms": t.ended_ms, "archived": t.archived,
             "worktree": t.worktree, "base_branch": t.base_branch, "base_commit": t.base_commit, "merged_ms": t.merged_ms,
             "merging": self.merging.contains(&t.id), "restoring": self.restoring.contains(&t.id), "changes": self.summary_of(&t.id).map(|c| c.json()),
         })
     }
 
-    /// The engine's program on PATH and the environment its terminal gets (PATH = lila's folder + the
-    /// PATH lilad was started with), including the account it runs on (`accounts`).
-    pub(super) fn engine_env(&self, engine: Runtime) -> Result<(PathBuf, BTreeMap<String, String>)> {
+    /// omp's program on PATH and the environment its terminal gets (PATH = lila's folder + the
+    /// PATH lilad was started with).
+    pub(super) fn omp_env(&self) -> Result<(PathBuf, BTreeMap<String, String>)> {
         let lila_dir = self.lila_bin.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
         let path = format!("{lila_dir}:{}", self.path_env);
-        let mut env: BTreeMap<String, String> = BTreeMap::new();
-        // Claude Code draws inline by default: its input box follows the output and the wheel scrolls
-        // the whole terminal. Full-screen (alternate screen, the wheel to Claude) keeps the input at the bottom.
-        if engine == Runtime::Claude {
-            env.insert("CLAUDE_CODE_NO_FLICKER".into(), "1".into());
-        }
-        let name = lila_core::runtime::cli(engine);
-        let program = which(name, &path).ok_or_else(|| anyhow!("{name:?} is not on PATH; install it and sign in"))?;
-        env.insert("PATH".into(), path);
-        if let Some((var, dir)) = self.account(engine).and_then(|a| a.env()) {
-            env.insert(var.into(), dir);
-        }
-        Ok((program, env))
-    }
-
-    /// A CLI's current subscription account (`~/.config/lila/accounts.toml`).
-    fn account(&self, r: Runtime) -> Option<crate::accounts::Account> {
-        let list = crate::accounts::load(&self.paths.accounts()).ok()?;
-        crate::accounts::current(&list, r).cloned()
-    }
-
-    /// Where the CLIs record sessions now: the current accounts' folders, or the
-    /// defaults (`sources`) for an account in the CLI's own folder.
-    fn live_sources(&self) -> Sources {
-        let pick = |r: Runtime, default: &PathBuf| self.account(r).and_then(|a| a.dir).unwrap_or_else(|| default.clone());
-        Sources { claude: pick(Runtime::Claude, &self.sources.claude), codex: pick(Runtime::Codex, &self.sources.codex) }
+        let program = which(lila_core::runtime::CLI, &path).ok_or_else(|| anyhow!("{:?} is not on PATH; install it and sign in", lila_core::runtime::CLI))?;
+        Ok((program, BTreeMap::from([("PATH".to_owned(), path)])))
     }
 }
 

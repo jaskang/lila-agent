@@ -12,6 +12,9 @@ use crate::{merge, worktree};
 use lila_agent::Attachment;
 use lila_store::{Base, Checkpoint, NewThread};
 
+/// How long the list of models is kept before omp is asked again.
+const MODELS_FOR_MS: i64 = 10 * 60 * 1000;
+
 /// What a request comes to: its answer, or work to run first.
 pub enum Begin {
     Done(Value),
@@ -36,12 +39,14 @@ pub(super) enum Work {
     Merge { thread: String, job: merge::Job },
     /// A merged thread's worktree and branch, or those of a thread that did not start.
     Remove { thread: String, main: PathBuf, path: PathBuf, branch: String },
-    /// A checkpoint of the folder before a turn (`daemon/checkpoints.rs`). `deliver`: the thread's words wait for it and go when it is done.
-    Checkpoint { thread: String, n: i64, cwd: PathBuf, text: String, prev: Option<Prev>, at_ms: i64, deliver: bool },
+    /// A checkpoint of the folder before a turn (`daemon/checkpoints.rs`). The thread's words wait for it and go when it is done.
+    Checkpoint { thread: String, n: i64, cwd: PathBuf, text: String, prev: Option<Prev>, at_ms: i64 },
     /// `thread.restore`: the folder's files go back to `target` (a dry run only says what would be done).
     Restore { thread: String, cwd: PathBuf, target: Box<Checkpoint>, undo_n: i64, prev: Option<Prev>, dry_run: bool },
     /// The checkpoint refs of threads that are gone, in the repository `dir` is in.
     DropRefs { dir: PathBuf, threads: Vec<String> },
+    /// `models.list`: the models omp offers, asked of an omp of its own.
+    Models { program: PathBuf, cwd: PathBuf },
 }
 
 /// Work to run off the loop. `run` blocks; `Daemon::finish` takes what it gives.
@@ -61,6 +66,7 @@ pub enum Output {
     Checkpoint(Option<Taken>),
     Restored(Restored),
     Dropped,
+    Models(Vec<lila_agent::Choice>),
 }
 
 impl Job {
@@ -81,6 +87,7 @@ impl Job {
                 let undo = checkpoint::Spec { thread, n: *undo_n, prev: prev.as_ref(), keep_below: undo_n - checkpoint::KEEP };
                 checkpoint::restore(cwd, env, &goal, (!dry_run).then_some(&undo)).map(Output::Restored).map_err(words)
             }
+            Work::Models { program, cwd } => crate::models::list(program, env, cwd).map(Output::Models).map_err(words),
             Work::DropRefs { dir, threads } => threads.iter().try_for_each(|t| checkpoint::drop_all(dir, env, t).map(|_| ())).map(|_| Output::Dropped).map_err(words),
         }
     }
@@ -112,11 +119,10 @@ impl<T: Terminals> Daemon<T> {
                 let t = self.thread_of(params)?;
                 Ok(Begin::Job(self.job(Work::Diff { cwd: PathBuf::from(&t.cwd), path: s(params, "path").map(String::from) })))
             }
-            "thread.commit" => self.commit_begin(params, now),
-            "thread.merge" => self.merge_begin(params, now),
-            "thread.restore" => self.restore_begin(params, now),
-            // The turn is not let begin before its checkpoint is taken: the hook waits for the job.
-            "hook" if s(params, "event") == Some("UserPromptSubmit") => self.prompt_begin(params, now),
+            "thread.commit" => self.commit_begin(params),
+            "thread.merge" => self.merge_begin(params),
+            "thread.restore" => self.restore_begin(params),
+            "models.list" => self.models_begin(params, now),
             other => Ok(Begin::Done(self.dispatch(other, params, now)?)),
         }
     }
@@ -188,7 +194,7 @@ impl<T: Terminals> Daemon<T> {
                     bail!("{thread} has nothing to commit");
                 }
                 let t = self.store.thread(&thread)?.ok_or_else(|| anyhow!("no thread {thread}"))?;
-                self.check_free(&t, false, now)?;
+                self.check_free(&t, false)?;
                 self.send_to(&t, COMMIT_REQUEST, Vec::new(), now)?;
                 self.store.event(&thread, "human", "commit", "asked the agent to commit", now)?;
                 self.refresh_changes(&thread);
@@ -199,8 +205,8 @@ impl<T: Terminals> Daemon<T> {
                 match result {
                     Ok(Output::Merged(m)) => {
                         let t = self.store.thread(&thread)?.ok_or_else(|| anyhow!("no thread {thread}"))?;
-                        // Its engine ends first: its folder goes.
-                        self.stop_engine(&t, "merged", now);
+                        // omp ends first: its folder goes.
+                        self.stop_thread(&t, "merged", now);
                         self.store.set_merged(&thread, now)?;
                         self.store.set_archived(&thread, true)?;
                         for m in self.store.outbox(&thread)? {
@@ -214,7 +220,7 @@ impl<T: Terminals> Daemon<T> {
                         self.set_summary(&thread, None);
                         self.mark(&thread);
                         let t = self.store.thread(&thread)?.ok_or_else(|| anyhow!("no thread {thread}"))?;
-                        Ok(json!({"merged": true, "thread": self.thread_json(&t, now), "commit": m.sha, "commits": m.commits, "files": m.files, "branch": merge_job.base_branch}))
+                        Ok(json!({"merged": true, "thread": self.thread_json(&t), "commit": m.sha, "commits": m.commits, "files": m.files, "branch": merge_job.base_branch}))
                     }
                     Err(e) => {
                         let _ = self.store.event(&thread, "lilad", "merge_failed", &e, now);
@@ -224,7 +230,7 @@ impl<T: Terminals> Daemon<T> {
                     Ok(_) => unreachable!("a merge job gives a merge"),
                 }
             }
-            Work::Checkpoint { thread, n, cwd, text, at_ms, deliver, .. } => self.checkpoint_done(&thread, n, cwd, text, at_ms, deliver, result, now),
+            Work::Checkpoint { thread, n, cwd, text, at_ms, .. } => self.checkpoint_done(&thread, n, cwd, text, at_ms, result, now),
             Work::Restore { thread, target, undo_n, dry_run, .. } => self.restore_done(&thread, *target, undo_n, dry_run, result, now),
             Work::DropRefs { threads, .. } => {
                 if let Err(e) = result {
@@ -232,6 +238,14 @@ impl<T: Terminals> Daemon<T> {
                 }
                 Ok(Value::Null)
             }
+            Work::Models { .. } => match result {
+                Ok(Output::Models(models)) => {
+                    self.models = Some((now, models));
+                    Ok(self.models_json())
+                }
+                Ok(_) => unreachable!("a models job gives models"),
+                Err(e) => bail!("could not list omp's models: {e}"),
+            },
             Work::Remove { thread, .. } => {
                 if let Err(e) = result {
                     self.say(format!("{thread}: could not remove its worktree: {e}"));
@@ -242,6 +256,23 @@ impl<T: Terminals> Daemon<T> {
                 Ok(Value::Null)
             }
         }
+    }
+
+    /// `models.list {refresh?}`: the models omp offers, `[{id, name}]`. Asked of a short-lived omp, and remembered for a while.
+    fn models_begin(&mut self, params: &Value, now: i64) -> Result<Begin> {
+        if let Some((at, _)) = &self.models
+            && now - at < MODELS_FOR_MS
+            && params["refresh"].as_bool() != Some(true)
+        {
+            return Ok(Begin::Done(self.models_json()));
+        }
+        let (program, _) = self.omp_env()?;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        Ok(Begin::Job(self.job(Work::Models { program, cwd })))
+    }
+
+    pub(super) fn models_json(&self) -> Value {
+        json!({"models": self.models.as_ref().map(|(_, m)| m.clone()).unwrap_or_default()})
     }
 
     fn remove_later(&mut self, thread: &str, main: PathBuf, path: PathBuf, branch: String) {
@@ -258,14 +289,14 @@ impl<T: Terminals> Daemon<T> {
     }
 
     /// Nothing is going on in the thread: its agent is idle (`or_ended`: or gone, which a merge does not mind; a commit needs the agent).
-    pub(super) fn check_free(&self, t: &Thread, or_ended: bool, now: i64) -> Result<()> {
+    pub(super) fn check_free(&self, t: &Thread, or_ended: bool) -> Result<()> {
         if self.merging.contains(&t.id) {
             bail!("{} is being merged", t.id);
         }
         if self.restoring.contains(&t.id) {
             bail!("{} is being restored", t.id);
         }
-        match self.state_of(t, now).0 {
+        match self.state_of(t).0 {
             ThreadState::Idle => Ok(()),
             ThreadState::Ended if or_ended => Ok(()),
             ThreadState::Ended => bail!("{} has ended; resume it first", t.id),
@@ -276,17 +307,17 @@ impl<T: Terminals> Daemon<T> {
 
     /// `thread.commit {thread}`: asks the agent to commit what the folder has changed. The agent writes the message and commits (only that: no push, no history changes);
     /// what it may run is up to the thread's permission tier. The thread must be idle and have changes.
-    fn commit_begin(&mut self, params: &Value, now: i64) -> Result<Begin> {
+    fn commit_begin(&mut self, params: &Value) -> Result<Begin> {
         let t = self.thread_of(params)?;
         if t.merged_ms.is_some() {
             bail!("{} was merged; its worktree is gone", t.id);
         }
-        self.check_free(&t, false, now)?;
+        self.check_free(&t, false)?;
         Ok(Begin::Job(self.job(Work::CommitCheck { thread: t.id.clone(), cwd: PathBuf::from(&t.cwd) })))
     }
 
     /// `thread.merge {thread}`: a worktree thread's work goes into the branch it started from (`merge.rs`).
-    fn merge_begin(&mut self, params: &Value, now: i64) -> Result<Begin> {
+    fn merge_begin(&mut self, params: &Value) -> Result<Begin> {
         let t = self.thread_of(params)?;
         if !t.worktree {
             bail!("{} does not work in a worktree of its own; there is nothing to merge", t.id);
@@ -294,9 +325,9 @@ impl<T: Terminals> Daemon<T> {
         if t.merged_ms.is_some() {
             bail!("{} was merged already", t.id);
         }
-        self.check_free(&t, true, now)?;
+        self.check_free(&t, true)?;
         // Words an agent that is still up has not taken yet go to it first; an ended one will never take them.
-        if self.state_of(&t, now).0 != ThreadState::Ended && self.has_words_waiting(&t.id)? {
+        if self.state_of(&t).0 != ThreadState::Ended && self.has_words_waiting(&t.id)? {
             bail!("{} has a message waiting for its agent; let it be taken first", t.id);
         }
         let main = self.projects.get(&t.project).map(|p| p.cwd.clone()).ok_or_else(|| anyhow!("unknown project {}", t.project))?;

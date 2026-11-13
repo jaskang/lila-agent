@@ -3,13 +3,9 @@
 //! around it: when one is taken, how a checkpoint finds the message of its turn in the conversation, what a
 //! restore needs before it may run and what follows from it.
 //!
-//! Where a turn's checkpoint is taken, so that it is of the folder before the engine can act and never twice:
-//! - Claude Code: in the `UserPromptSubmit` hook. Claude Code waits for the hook, so the turn does not begin before
-//!   the job is done (or its 30 seconds are up), whether the person typed in the window or in Claude's own terminal.
-//!   `deliver` takes none for Claude.
-//! - Codex, omp: in `deliver`, before the words are sent to the host; they wait for the job. A message that joins a turn
-//!   under way (Codex steers) starts no turn and has none. omp cannot take words while it works, so they are not
-//!   delivered until it is free.
+//! A turn's checkpoint is taken in `deliver`, before the words are sent to the host, so that it is of the folder before
+//! omp can act and never twice: the words wait for the job. omp takes words one turn at a time, so they are not
+//! delivered until it is free, and every message begins a turn.
 //!
 //! A checkpoint that cannot be taken is recorded (`checkpoint_failed`) and the turn goes on.
 
@@ -21,16 +17,15 @@ use lila_store::{Checkpoint, CheckpointKind};
 use std::collections::HashSet;
 
 /// How much earlier than the checkpoint a message's own time may be and still be the message of its turn
-/// (the engines stamp it by their own clocks, a little before or after lilad's).
+/// (omp's host stamps it by its own clock, a little before or after lilad's).
 const SLACK_MS: i64 = 3000;
 
 /// The words of a message as compared between what was sent and what the conversation shows of it.
 fn normal(text: &str) -> String {
-    let text = lila_agent::claude::unwrap_paste(lila_agent::without_notes(text.trim()));
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    lila_agent::without_notes(text.trim()).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The same words, allowing for what one side adds or cuts at the end (Claude Code's `@file` mentions).
+/// The same words; a message of files only has none.
 fn same_words(a: &str, b: &str) -> bool {
     a.is_empty() || b.is_empty() || a.starts_with(b) || b.starts_with(a)
 }
@@ -82,7 +77,7 @@ impl<T: Terminals> Daemon<T> {
 
     /// The job that takes a checkpoint of the thread's folder for a turn that begins with `text`; none when the folder is
     /// certainly not in a git repository (nothing is started for that) or the thread was merged.
-    pub(super) fn checkpoint_job(&mut self, t: &Thread, text: String, deliver: bool, now: i64) -> Option<Job> {
+    pub(super) fn checkpoint_job(&mut self, t: &Thread, text: String, now: i64) -> Option<Job> {
         if t.merged_ms.is_some() {
             return None;
         }
@@ -96,27 +91,13 @@ impl<T: Terminals> Daemon<T> {
         }
         let n = self.reserve_checkpoint(&t.id);
         let prev = self.latest_prev(&t.id);
-        Some(self.job(Work::Checkpoint { thread: t.id.clone(), n, cwd, text, prev, at_ms: now, deliver }))
-    }
-
-    /// Claude Code's `UserPromptSubmit` hook: the turn is about to begin. The hook is answered when the checkpoint is taken.
-    pub(super) fn prompt_begin(&mut self, params: &Value, now: i64) -> Result<Begin> {
-        let t = self.thread_of(params)?;
-        // What the hook always did: the message is read into the conversation, whatever was being written is in the transcript.
-        self.hook(params, now)?;
-        let text = params["payload"]["prompt"].as_str().unwrap_or_default().to_owned();
-        Ok(match self.checkpoint_job(&t, text, false, now) {
-            Some(job) => Begin::Job(job),
-            None => Begin::Done(json!({})),
-        })
+        Some(self.job(Work::Checkpoint { thread: t.id.clone(), n, cwd, text, prev, at_ms: now }))
     }
 
     /// A checkpoint job is done: it is recorded (or why not), and the words that waited for it go.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn checkpoint_done(&mut self, tid: &str, n: i64, cwd: PathBuf, text: String, at_ms: i64, deliver: bool, result: std::result::Result<Output, String>, now: i64) -> Result<Value> {
-        if deliver {
-            self.snapshotting.remove(tid);
-        }
+    pub(super) fn checkpoint_done(&mut self, tid: &str, n: i64, cwd: PathBuf, text: String, at_ms: i64, result: std::result::Result<Output, String>, now: i64) -> Result<Value> {
+        self.snapshotting.remove(tid);
         let t = self.store.thread(tid).ok().flatten();
         let live = t.as_ref().is_some_and(|t| t.merged_ms.is_none());
         match result {
@@ -139,9 +120,7 @@ impl<T: Terminals> Daemon<T> {
             }
             Ok(_) => unreachable!("a checkpoint job gives a checkpoint"),
         }
-        if deliver {
-            self.deliver_with(tid, now, true);
-        }
+        self.deliver_with(tid, now, true);
         Ok(json!({}))
     }
 
@@ -159,8 +138,7 @@ impl<T: Terminals> Daemon<T> {
 
     /// Attaches each checkpoint to the message that began its turn, and returns them, the newest first.
     ///
-    /// The conversation's ids are the engines' (Claude's come from the transcript, a while after the checkpoint), so a
-    /// checkpoint has none to begin with. It takes the first message of the person (or Lila) that is not taken yet, from
+    /// The conversation's ids are omp's host's, made when the words are sent, so a checkpoint has none to begin with. It takes the first message of the person (or Lila) that is not taken yet, from
     /// its own time on, and says the same words. That is remembered in the row once found; one whose message never turned
     /// up is given up when a later checkpoint has found its own.
     pub(super) fn resolve_checkpoints(&mut self, tid: &str) -> Result<Vec<Checkpoint>> {
@@ -215,9 +193,9 @@ impl<T: Terminals> Daemon<T> {
     }
 
     /// The checkpoints as the window gets them (`thread.checkpoints`, and `thread.read` carries the same list).
-    pub(super) fn checkpoint_rows(&mut self, t: &Thread, now: i64) -> Result<Vec<Value>> {
+    pub(super) fn checkpoint_rows(&mut self, t: &Thread) -> Result<Vec<Value>> {
         let rows = self.resolve_checkpoints(&t.id)?;
-        let restorable = self.restore_blocker(t, now).is_none();
+        let restorable = self.restore_blocker(t).is_none();
         Ok(rows
             .iter()
             .map(|c| {
@@ -232,34 +210,34 @@ impl<T: Terminals> Daemon<T> {
     /// `thread.checkpoints {thread}`: the thread's checkpoints, the newest first. `item` is the conversation item of the message
     /// the turn began with (none while it is not in the conversation yet, or when it never will be); `can_restore` says whether a
     /// restore is accepted now, and `why_not` what stops it.
-    pub(super) fn thread_checkpoints(&mut self, params: &Value, now: i64) -> Result<Value> {
+    pub(super) fn thread_checkpoints(&mut self, params: &Value) -> Result<Value> {
         let t = self.thread_of(params)?;
-        let rows = self.checkpoint_rows(&t, now)?;
-        let why = self.restore_blocker(&t, now);
+        let rows = self.checkpoint_rows(&t)?;
+        let why = self.restore_blocker(&t);
         Ok(json!({"checkpoints": rows, "can_restore": why.is_none(), "why_not": why}))
     }
 
     // ---------------- going back ----------------
 
     /// What stops the thread's files being put back now, in words.
-    pub(super) fn restore_blocker(&self, t: &Thread, now: i64) -> Option<String> {
+    pub(super) fn restore_blocker(&self, t: &Thread) -> Option<String> {
         if t.merged_ms.is_some() {
             return Some(format!("{} was merged; its folder is gone", t.id));
         }
-        if let Err(e) = self.check_free(t, true, now) {
+        if let Err(e) = self.check_free(t, true) {
             return Some(format!("{e:#}"));
         }
         if self.snapshotting.contains(&t.id) {
             return Some(format!("{} has a message being sent", t.id));
         }
-        let ended = self.state_of(t, now).0 == ThreadState::Ended;
+        let ended = self.state_of(t).0 == ThreadState::Ended;
         if !ended && self.has_words_waiting(&t.id).unwrap_or(true) {
             return Some(format!("{} has a message waiting for its agent; let it be taken first", t.id));
         }
         // The folder may be shared (threads work in place by default): a restore undoes the others' edits in it too.
         let busy = self.store.threads(&t.project, false).unwrap_or_default().into_iter().find(|o| {
             o.id != t.id && o.cwd == t.cwd && {
-                let (state, waiting) = self.state_of(o, now);
+                let (state, waiting) = self.state_of(o);
                 state == ThreadState::Running || (state == ThreadState::Waiting && waiting == Some("card"))
             }
         });
@@ -267,11 +245,11 @@ impl<T: Terminals> Daemon<T> {
     }
 
     /// `thread.restore {thread, checkpoint, dry_run?}`.
-    pub(super) fn restore_begin(&mut self, params: &Value, now: i64) -> Result<Begin> {
+    pub(super) fn restore_begin(&mut self, params: &Value) -> Result<Begin> {
         let t = self.thread_of(params)?;
         let n = params["checkpoint"].as_i64().ok_or_else(|| anyhow!("missing checkpoint"))?;
         let dry_run = params["dry_run"].as_bool().unwrap_or(false);
-        if let Some(why) = self.restore_blocker(&t, now) {
+        if let Some(why) = self.restore_blocker(&t) {
             bail!("{why}");
         }
         let target = self.store.checkpoint(&t.id, n)?.ok_or_else(|| anyhow!("{} has no checkpoint {n}", t.id))?;

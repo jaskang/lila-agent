@@ -1,5 +1,7 @@
 # Lila 架构 v3：多 agent 运行时与原生 GUI（草案）
 
+> **2026-11-13 之后：Claude Code、Codex 驱动已删，omp 也不走 ACP 了，改成 RPC 模式（`omp --mode rpc-ui`，`lila_agent::omp`）。下面写 ACP、`acp.rs`、`omp acp`、Claude 终端加 hooks、Codex app-server 的地方都是历史；现状看 `architecture-v4.md` §2、§6。事件模型（§5）仍然是 `lila_agent::model` 的样子。**
+
 > 2026-11-09 · 用户的决定：**默认用原生 GUI**。Codex 走官方的 `codex app-server`；omp 走 ACP；Claude Code 因为官方对 `-p` 和 SDK 的限制，**内部照旧跑 TUI，由 Lila 代理出一个 GUI**，并且可以在 TUI 和 GUI 之间切换。
 >
 > 一句话结论：**每个成员仍然是一个 hc 终端**，lilad 现有的生命周期、状态和派活机制一律不动。新增两样东西：一套与 agent 无关的**对话事件模型**，以及按运行时实现的**驱动**。Claude 的驱动从 TUI 旁边收集事件。Codex 和 omp 的驱动是 Lila 自己的托管进程 `lila host`，它在 hc 终端里运行，通过官方协议驱动 agent，并像普通程序一样向 hc 报告状态。窗口只认对话事件，所以 GUI 只需要写一份。

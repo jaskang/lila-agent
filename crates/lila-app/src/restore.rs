@@ -256,7 +256,7 @@ impl LilaApp {
             .gap(px(2.))
             .rounded(px(6.))
             .bg(style::well())
-            .font_family(lila_term::theme::FONT)
+            .font_family(crate::style::MONO)
             .text_size(px(12.))
             .children(plan.files().into_iter().map(|(status, path)| {
                 let (letter, color) = mark(status);

@@ -5,11 +5,9 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Paths {
-    /// `accounts.toml` and the CLI folders of accounts Lila added.
-    pub config: PathBuf,
     /// `lila.db`.
     pub data: PathBuf,
-    /// The socket, thread files, host logs.
+    /// The socket and the hosts' logs.
     pub state: PathBuf,
     /// Set when `LILA_HOME` is: the daemon then runs without the shared `lilad` name.
     pub isolated: bool,
@@ -30,24 +28,13 @@ impl Paths {
     pub fn from_env() -> Paths {
         if let Some(h) = std::env::var_os("LILA_HOME").filter(|v| !v.is_empty()) {
             let h = PathBuf::from(h);
-            return Paths { config: h.join("config"), data: h.join("data"), state: h.join("state"), isolated: true };
+            return Paths { data: h.join("data"), state: h.join("state"), isolated: true };
         }
         Paths {
-            config: xdg("XDG_CONFIG_HOME", ".config").join("lila"),
             data: xdg("XDG_DATA_HOME", ".local/share").join("lila"),
             state: xdg("XDG_STATE_HOME", ".local/state").join("lila"),
             isolated: false,
         }
-    }
-
-    /// The subscription accounts (`accounts`).
-    pub fn accounts(&self) -> PathBuf {
-        self.config.join("accounts.toml")
-    }
-
-    /// Where accounts Lila adds keep their CLI config folders.
-    pub fn account_dirs(&self) -> PathBuf {
-        self.config.join("accounts")
     }
 
     pub fn db(&self) -> PathBuf {
@@ -73,18 +60,18 @@ impl Paths {
         self.data.join("worktrees").join(project)
     }
 
+    /// One thread's omp sessions (`omp --session-dir`): what a resumed thread goes on with.
+    pub fn omp_sessions(&self, thread: &str) -> PathBuf {
+        self.data.join("omp").join(thread)
+    }
+
     /// One thread's worktree.
     pub fn worktree(&self, project: &str, thread: &str) -> PathBuf {
         self.worktrees(project).join(thread)
     }
 
-    /// A thread's files: the hooks' settings file Claude Code starts with.
-    pub fn thread_dir(&self, thread: &str) -> PathBuf {
-        self.state.join("threads").join(thread)
-    }
-
     pub fn ensure(&self) -> Result<()> {
-        for d in [&self.config, &self.data, &self.state] {
+        for d in [&self.data, &self.state] {
             std::fs::create_dir_all(d)?;
         }
         Ok(())
@@ -131,7 +118,7 @@ mod tests {
     #[test]
     fn long_state_folders_get_a_short_socket() {
         let long = PathBuf::from("/".to_string() + &"x".repeat(120));
-        let p = Paths { config: long.clone(), data: long.clone(), state: long, isolated: true };
+        let p = Paths { data: long.clone(), state: long, isolated: true };
         let sock = p.socket().unwrap();
         assert!(sock.as_os_str().len() < 100 && sock.to_string_lossy().ends_with(".sock"));
         assert_eq!(sock, p.socket().unwrap(), "stable");
