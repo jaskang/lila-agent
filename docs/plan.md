@@ -6,16 +6,17 @@
 
 ## 下一个任务
 
-### 1. 实测 omp RPC
+### 1. 实测 omp RPC（收尾）
 
-写一个独立脚本，不进正式代码：
+主体已完成，结论是 omp RPC 可用：Claude Code 和 Codex 两条通道都跑通了真实对话、工具调用和一次审批拒绝，记录在 [omp-rpc.md](omp-rpc.md)。
 
-- 以 `--mode rpc-ui` 启动 omp 子进程，发一条消息，打印收到的全部事件。
-- 触发一次需要审批的工具调用，确认审批请求的格式和回传方式。
-- 分别用 Claude 订阅和 ChatGPT 订阅的模型各跑一轮，确认能用、额度扣在订阅上。
-- 确认会话恢复、列出可用模型、中断运行各自用哪条 RPC 命令。
+剩下几项用 `scripts/omp-probe.ts` 补测，可以和第 2 项并行，结果补进 `omp-rpc.md`：
 
-产出：一份 omp RPC 事件和命令的笔记（`docs/omp-rpc.md`），作为适配层的依据。如果订阅登录不可用，停下来重新讨论运行时。
+- 审批选 `Approve` 后的完整流程，以及多个工具同时等待审批的情况。
+- `always-ask-cached` 档的授权选项在 RPC 下的实际格式。
+- `abort`、`switch_session`、`get_messages_page` 的行为。
+- 试用官方 `RpcClient`（npm 包 `@oh-my-pi/pi-coding-agent`），确认在 Bun 下可以直接用。
+- 在 Claude 和 ChatGPT 的用量页面核对额度扣在订阅上（需要用户自己看）。
 
 ## 之后的任务
 
@@ -42,9 +43,11 @@ Bun workspace，三个包：`packages/protocol`、`packages/core`、`apps/deskto
 - 输入框发送消息，可以中断运行。
 - 流式增量按帧合并，只更新正在输出的那条消息；代码高亮放在 Worker 里。
 
-### 6. 审批
+### 6. 提问与审批
 
-审批请求在界面上显示为待处理项（Questionnaire），用户选择后回传。应用未在前台时发系统通知。
+- 会话默认用 `yolo` 档启动 omp，不审批。每个会话可以切到 `write` 或 `always-ask`，切换时重启该会话的 omp 进程。
+- Agent 的提问（`ask`）和非 `yolo` 档下的审批请求，在界面上显示为待处理项（Questionnaire），用户选择后回传。
+- 有待处理项而应用不在前台时，发系统通知。
 
 ### 7. 项目与模型选择
 

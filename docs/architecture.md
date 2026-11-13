@@ -24,7 +24,8 @@ core（Bun 独立进程）←───┘←── 以后的手机端（经 Tail
 - **所有客户端都走 WebSocket。** 窗口直接连 `core`，不经过 Electron 的 IPC。桌面端和以后的手机端用同一套协议。
 - **界面只认 Lila 自己的事件协议。** omp 的 RPC 消息在 `core` 的适配层里翻译成 Lila 事件。以后换运行时或加第二个运行时，只改适配层。
 - **事件日志是唯一事实来源。** 每个事件有会话内递增的序号并落库。客户端连接时带上最后收到的序号，`core` 补发之后的事件。
-- **审批走 `rpc-ui` 模式。** omp 以 `--mode rpc-ui` 启动，审批请求由 `core` 落库并转给界面，用户的选择再回传给 omp。
+- **默认不审批，按会话可调。** Lila 启动 omp 时明确传 `--approval-mode`，默认 `yolo`（全部工具直接执行），每个会话可以切到 `write`（只在执行命令时询问）或 `always-ask`（写和执行都询问）。
+- **审批和提问走 `rpc-ui` 模式。** omp 以 `--mode rpc-ui` 启动，审批请求和 Agent 的提问由 `core` 落库并转给界面，用户的选择再回传给 omp。
 - **关窗口不等于退出。** 窗口隐藏而不销毁，应用留在菜单栏，再次打开没有等待。
 - **界面线程只管渲染。** 重活不放在界面线程：代码高亮放 Worker，流式增量按帧合并，只更新正在输出的那条消息。
 - **界面组件用现成的。** 会话界面用 shadcn/ui 自带的 AI 组件拼装，不自己重写一套。
@@ -44,7 +45,7 @@ core（Bun 独立进程）←───┘←── 以后的手机端（经 Tail
 | 仓库 | Bun workspace：`packages/protocol`、`packages/core`、`apps/desktop` |
 | 桌面壳 | Electron + electron-vite，打包用 electron-builder |
 | `core` 运行时 | Bun；发布时用 `bun build --compile` 编译成单个可执行文件，放进应用包 |
-| Agent 运行时 | omp（`--mode rpc-ui`），作为 `core` 的子进程 |
+| Agent 运行时 | omp（`--mode rpc-ui --approval-mode <档位>`），作为 `core` 的子进程；协议细节见 [omp-rpc.md](omp-rpc.md) |
 | 协议 | Zod 定义事件和命令类型，经 WebSocket 传输 |
 | 存储 | `bun:sqlite` + drizzle-orm `1.0.0-rc.5`（drizzle-kit 同版本，版本号写死） |
 | 界面 | React + Tailwind + shadcn/ui（Base UI 版本） |
@@ -77,6 +78,6 @@ DeepSeek Harness 的官方桌面端（`deepseek-ai/deepseek-harness`）也是 El
 
 ## 待验证
 
-- omp 用 Claude 和 ChatGPT 订阅登录后，在 RPC 模式下能否正常对话、额度如何扣除。见任务单第 1 项。
+- 额度是否扣在订阅上。omp RPC 已实测可用（见 [omp-rpc.md](omp-rpc.md)），但扣费要在 Claude 和 ChatGPT 的用量页面核对。
 - Bun 作为常驻进程的内存是否稳定。第一版记录 `core` 的内存占用，连续跑几天看曲线；有问题就换回 Node 运行，改动集中在 SQLite 和 WebSocket 两处。
 - drizzle-orm v1 的 API 和 0.x 不同，写代码时以 rc.5 的官方文档为准。
