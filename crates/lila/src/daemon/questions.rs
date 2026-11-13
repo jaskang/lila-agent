@@ -23,10 +23,10 @@ pub(super) fn card_json(a: &Asked) -> Value {
     })
 }
 
-impl<T: Terminals> Daemon<T> {
+impl<A: Agents> Daemon<A> {
     /// A question of thread `tid`: a card for the person.
     pub(super) fn open_question(&mut self, tid: &str, question: Question, now: i64) {
-        // Asked again (lilad came back, the host repeated it): the card already open.
+        // Asked again: the card is already open.
         if let Some(a) = self.questions.iter_mut().find(|a| a.thread == tid && a.question.id == question.id) {
             a.question = question;
         } else {
@@ -75,7 +75,7 @@ impl<T: Terminals> Daemon<T> {
                 QuestionKind::Text => Reply::Text { value: value.ok_or_else(|| anyhow!("give value: the answer, or cancel"))?.to_owned() },
             }
         };
-        self.host_command(&t.id, &Command::Reply { question: q.id.clone(), reply: reply.clone() })?;
+        self.agent_command(&t.id, &Command::Reply { question: q.id.clone(), reply: reply.clone() })?;
         let card = self.questions.remove(at);
         let said = match &reply {
             Reply::Choice { value } | Reply::Text { value } => value.clone(),

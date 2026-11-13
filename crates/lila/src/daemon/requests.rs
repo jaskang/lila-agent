@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<T: Terminals> Daemon<T> {
+impl<A: Agents> Daemon<A> {
     /// A request answered now: work that has to be run off the loop (`begin`) is run here, one thing at a time (tests; the server runs it on threads).
     pub fn handle(&mut self, method: &str, params: &Value, now: i64) -> Result<Value> {
         match self.begin(method, params, now)? {

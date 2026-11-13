@@ -41,7 +41,7 @@ pub(super) fn mentioned(text: &str, cwd: &Path) -> Vec<Attachment> {
     out
 }
 
-impl<T: Terminals> Daemon<T> {
+impl<A: Agents> Daemon<A> {
     /// `thread.read {thread, after?}`: the thread's items after a seq (the latest when there are
     /// many), the cards it waits on (`permissions`, `questions`), and what omp offers.
     pub(super) fn thread_read(&mut self, params: &Value) -> Result<Value> {
@@ -90,7 +90,7 @@ impl<T: Terminals> Daemon<T> {
 
     /// Words from the person to `t`: now, or queued until omp takes them.
     pub(super) fn send_to(&mut self, t: &Thread, text: &str, mut files: Vec<Attachment>, now: i64) -> Result<()> {
-        let Some(live) = self.live.get(&t.id).filter(|_| t.terminal.is_some()) else {
+        let Some(live) = self.live.get(&t.id) else {
             bail!("{} has ended; resume it first", t.id);
         };
         if self.merging.contains(&t.id) {
@@ -165,12 +165,12 @@ impl<T: Terminals> Daemon<T> {
         if model.is_none() && effort.is_none() {
             bail!("missing model or effort");
         }
-        if self.live.contains_key(&t.id) && t.terminal.is_some() {
+        if self.live.contains_key(&t.id) {
             if let Some(m) = model {
-                self.host_command(&t.id, &Command::SetModel { model: m.to_owned() })?;
+                self.agent_command(&t.id, &Command::SetModel { model: m.to_owned() })?;
             }
             if let Some(e) = effort {
-                self.host_command(&t.id, &Command::SetEffort { effort: e.to_owned() })?;
+                self.agent_command(&t.id, &Command::SetEffort { effort: e.to_owned() })?;
             }
         }
         self.store.set_model(&t.id, model.unwrap_or(&t.model), effort.or(t.effort.as_deref()))?;
@@ -181,7 +181,7 @@ impl<T: Terminals> Daemon<T> {
     /// The model and effort for the box under the conversation: what it runs on now (else the stored ones), the
     /// stored ones, whether the person can change them here (omp changes only what it lists), and the choices.
     fn config_json(&self, t: &Thread) -> Value {
-        let live = self.live.get(&t.id).filter(|_| t.terminal.is_some());
+        let live = self.live.get(&t.id);
         let cfg = live.map(|l| l.config.clone()).unwrap_or_default();
         // The thread's own omp names the choices once it has; until then, those omp was last asked for.
         let models = if cfg.models.is_empty() { self.models.as_ref().map(|(_, m)| m.clone()).unwrap_or_default() } else { cfg.models.clone() };
@@ -196,14 +196,14 @@ impl<T: Terminals> Daemon<T> {
     /// `thread.interrupt {thread}`: stops what the thread is doing this turn. Only while it works.
     pub(super) fn thread_interrupt(&mut self, params: &Value) -> Result<Value> {
         let t = self.thread_of(params)?;
-        if t.terminal.is_none() {
+        if !self.live.contains_key(&t.id) {
             bail!("{} is not running", t.id);
         }
         let status = self.live.get(&t.id).map_or(AgentStatus::Gone, |l| l.status);
         if status != AgentStatus::Working {
             bail!("{} is not working ({})", t.id, status.as_str());
         }
-        self.host_command(&t.id, &Command::Interrupt)?;
+        self.agent_command(&t.id, &Command::Interrupt)?;
         Ok(json!({"interrupted": true, "thread": t.id}))
     }
 }

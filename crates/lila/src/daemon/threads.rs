@@ -2,11 +2,10 @@
 //! (start, send, stop, resume, archive, tier).
 
 use super::*;
-use lila_core::runtime;
 use super::jobs::{Begin, Plan};
 use lila_store::NewThread;
 
-impl<T: Terminals> Daemon<T> {
+impl<A: Agents> Daemon<A> {
     // ---------------- who is asked about ----------------
 
     /// The registered project a request is about: `project`, else the one whose folder holds `cwd`.
@@ -135,7 +134,7 @@ impl<T: Terminals> Daemon<T> {
         }
         let main = proj.cwd.clone();
         // The program first, so a missing one doesn't leave half a thread behind.
-        self.omp_env()?;
+        self.omp_program()?;
         let text = s(params, "text").unwrap_or_default().trim().to_owned();
         let files = self.attachments_of(params)?;
         let title = s(params, "title").map(String::from).unwrap_or_else(|| title_of(&text));
@@ -167,42 +166,10 @@ impl<T: Terminals> Daemon<T> {
         Ok(self.thread_json(&t))
     }
 
-    /// Starts a thread's omp in a terminal of its own.
-    pub(super) fn start_thread(&mut self, t: &Thread, now: i64) -> Result<String> {
-        let mut launch = runtime::launch(&t.model, &self.paths.omp_sessions(&t.id));
-        let (program, mut env) = self.omp_env()?;
-        // Driven over omp's RPC mode by `lila host omp`, which starts omp.
-        launch.argv[0] = self.lila_bin.to_string_lossy().to_string();
-        launch.argv.splice(3..3, ["--program".to_owned(), program.to_string_lossy().to_string()]);
-        env.insert("LILA_PROJECT".into(), t.project.clone());
-        env.insert("LILA_THREAD".into(), t.id.clone());
-        env.insert("LILA_ROOT".into(), t.cwd.clone());
-        if let Some(h) = std::env::var_os("LILA_HOME") {
-            env.insert("LILA_HOME".into(), h.to_string_lossy().to_string());
-        }
-        let addr = self.term.run(json!({
-            "argv": launch.argv,
-            "cwd": t.cwd,
-            "env": env,
-            "labels": {"lila.project": t.project, "lila.thread": t.id},
-            "name": terminal_name(&t.id),
-            "no_parent": true,
-            "no_notify": true,
-        }))?;
-        self.store.set_running(&t.id, &addr, now)?;
-        self.live.insert(t.id.clone(), Live::new(AgentStatus::Unknown, now));
-        let shown: Vec<String> = launch.argv.iter().map(|a| if a.chars().count() > 80 { format!("{}…", a.chars().take(40).collect::<String>()) } else { a.clone() }).collect();
-        self.store.event(&t.id, "lilad", "started", &format!("in {addr}: {}", shown.join(" ")), now)?;
-        self.say(format!("{}: started thread {} in {addr}", t.project, t.id));
-        self.mark(&t.id);
-        Ok(addr)
-    }
-
-    /// Kills a thread's terminal and marks it ended. Returns whether there was a host running.
+    /// Ends a thread's omp and marks it ended. Returns whether there was one running.
     pub(super) fn stop_thread(&mut self, t: &Thread, why: &str, now: i64) -> bool {
-        let Some(terminal) = t.terminal.clone() else { return false };
-        if let Err(e) = self.term.kill(&terminal) {
-            self.say(format!("{}: kill {} ({terminal}): {e:#}", t.project, t.id));
+        if !self.live.contains_key(&t.id) {
+            return false;
         }
         self.thread_gone(&t.id, why, now);
         true
@@ -226,7 +193,7 @@ impl<T: Terminals> Daemon<T> {
         if let Some(old) = &t.legacy {
             bail!("{} ran on {old}, which Lila no longer runs; its conversation stays, start a new thread to go on", t.id);
         }
-        if t.terminal.is_some() {
+        if self.live.contains_key(&t.id) {
             bail!("{} is running", t.id);
         }
         if t.merged_ms.is_some() {
@@ -246,7 +213,7 @@ impl<T: Terminals> Daemon<T> {
         if t.worktree && !Path::new(&t.cwd).is_dir() {
             bail!("the worktree {} is gone", t.cwd);
         }
-        self.omp_env()?;
+        self.omp_program()?;
         if let Some(m) = s(params, "model") {
             self.store.set_model(&t.id, m, t.effort.as_deref())?;
         }
@@ -255,7 +222,7 @@ impl<T: Terminals> Daemon<T> {
         }
         t = self.thread_of(params)?;
         let dir = self.paths.omp_sessions(&t.id);
-        let detail = if crate::host::has_session(&dir) { format!("goes on with the omp session in {}", dir.display()) } else { format!("no omp session in {}: a new one", dir.display()) };
+        let detail = if has_session(&dir) { format!("goes on with the omp session in {}", dir.display()) } else { format!("no omp session in {}: a new one", dir.display()) };
         self.start_thread(&t, now)?;
         self.store.event(&t.id, "human", "resumed", &detail, now)?;
         let text = s(params, "text").unwrap_or_default().trim().to_owned();
@@ -356,10 +323,10 @@ impl<T: Terminals> Daemon<T> {
             }
             return;
         };
-        let (Some(_), Some(live)) = (t.terminal.as_ref(), self.live.get(tid)) else { return };
+        let Some(live) = self.live.get(tid) else { return };
         let status = live.status;
         // omp takes words one turn at a time: they go when it is free, which is when their turn begins.
-        if self.merging.contains(tid) || self.restoring.contains(tid) || self.snapshotting.contains(tid) || !status.is_free() || !self.hosts.contains_key(tid) {
+        if self.merging.contains(tid) || self.restoring.contains(tid) || self.snapshotting.contains(tid) || !status.is_free() || !self.senders.contains_key(tid) {
             return;
         }
         let msgs = self.store.outbox(tid).unwrap_or_default();

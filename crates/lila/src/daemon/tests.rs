@@ -1,45 +1,66 @@
 use super::*;
-use lila_agent::{AgentEvent, Command, Item, ItemKind, ItemState, PermKind, PermOption, PermissionRequest, Question, QuestionKind, Reply, SlashCommand, ToolKind};
+use lila_agent::{AgentEvent, Command, HostStatus, Item, ItemKind, ItemState, PermKind, PermOption, PermissionRequest, Question, QuestionKind, Reply, SlashCommand, ToolKind};
 use std::os::unix::fs::PermissionsExt;
 
+/// A stand-in for the omp of every thread: what it was started with, what lilad sent it, and whether it was let go.
 #[derive(Default)]
 struct Fake {
-    /// Terminals made by a lilad before this one: their addresses are not made again.
-    made: usize,
-    runs: Vec<Value>,
-    kills: Vec<String>,
-    refuse_runs: bool,
+    runs: Vec<Spawn>,
+    rx: std::cell::RefCell<Vec<std::sync::mpsc::Receiver<Command>>>,
+    got: std::cell::RefCell<Vec<Vec<Command>>>,
+    refuse: bool,
 }
 
-impl Terminals for Fake {
-    fn list(&mut self, _project: &str) -> Result<Vec<Value>> {
-        Ok(Vec::new())
-    }
-
-    fn run(&mut self, req: Value) -> Result<String> {
-        if self.refuse_runs {
-            bail!("no terminal");
+impl Agents for Fake {
+    fn start(&mut self, spawn: Spawn) -> Result<Started> {
+        if self.refuse {
+            bail!("no omp");
         }
-        self.runs.push(req);
-        Ok(format!("t{}", self.made + self.runs.len()))
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runs.push(spawn);
+        self.rx.borrow_mut().push(rx);
+        self.got.borrow_mut().push(Vec::new());
+        Ok(Started { run: self.runs.len() as u64, commands: tx })
     }
 
-    fn kill(&mut self, terminal: &str) -> Result<()> {
-        self.kills.push(terminal.into());
-        Ok(())
-    }
+    fn wait(&mut self) {}
 }
 
-/// A stand-in host: the terminal it runs in, what lilad sends it, and what was read so far.
-type StandIn = (String, std::sync::mpsc::Receiver<String>, Vec<Command>);
+impl Fake {
+    /// Reads what each run was sent so far; for each, whether lilad let go of it (its omp is to end).
+    fn drain(&self) -> Vec<bool> {
+        use std::sync::mpsc::TryRecvError;
+        self.rx
+            .borrow()
+            .iter()
+            .zip(self.got.borrow_mut().iter_mut())
+            .map(|(rx, got)| loop {
+                match rx.try_recv() {
+                    Ok(c) => got.push(c),
+                    Err(TryRecvError::Empty) => break false,
+                    Err(TryRecvError::Disconnected) => break true,
+                }
+            })
+            .collect()
+    }
+
+    /// How many of the omp started were let go.
+    fn ended(&self) -> usize {
+        self.drain().into_iter().filter(|e| *e).count()
+    }
+
+    /// What a thread's omp (every run of it) was sent so far.
+    fn commands(&self, tid: &str) -> Vec<Command> {
+        self.drain();
+        self.runs.iter().zip(self.got.borrow().iter()).filter(|(r, _)| r.thread == tid).flat_map(|(_, got)| got.clone()).collect()
+    }
+}
 
 struct World {
     d: Daemon<Fake>,
     repo: PathBuf,
     _tmp: tempfile::TempDir,
     now: i64,
-    /// Stand-in hosts of the threads (`lila host omp`): the commands lilad sent them.
-    hosts: std::cell::RefCell<BTreeMap<String, StandIn>>,
 }
 
 fn world() -> World {
@@ -61,8 +82,8 @@ fn world_over(prepare: impl FnOnce(&Paths, &Path)) -> World {
     std::fs::create_dir_all(repo.join("src")).unwrap();
     prepare(&paths, &repo);
     let store = Store::open(&paths.db()).unwrap();
-    let d = Daemon::new(store, Fake::default(), paths, bin.to_string_lossy().to_string(), PathBuf::from("/opt/lila/bin/lila"));
-    World { d, repo, _tmp: tmp, now: 1_000_000, hosts: Default::default() }
+    let d = Daemon::new(store, Fake::default(), paths, bin.to_string_lossy().to_string());
+    World { d, repo, _tmp: tmp, now: 1_000_000 }
 }
 
 impl World {
@@ -108,28 +129,9 @@ impl World {
         self.ok("thread.new", p)["id"].as_str().unwrap().to_owned()
     }
 
-    fn terminal(&self, tid: &str) -> String {
-        self.d.store.thread(tid).unwrap().unwrap().terminal.unwrap()
-    }
-
-    /// A thread's host attaches when it first reports (as `lila host` does once running), and again when the thread runs in another terminal.
-    fn attach(&mut self, tid: &str) {
-        let terminal = self.terminal(tid);
-        if self.hosts.borrow().get(tid).is_some_and(|h| h.0 == terminal) {
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        let before = self.hosts.borrow_mut().remove(tid).map(|h| h.2).unwrap_or_default();
-        self.hosts.borrow_mut().insert(tid.to_owned(), (terminal, rx, before));
-        self.d.host_attach(tid, tx, self.now);
-    }
-
-    /// The commands a thread's host got so far.
+    /// The commands a thread's omp got so far.
     fn commands(&self, tid: &str) -> Vec<Command> {
-        let mut hosts = self.hosts.borrow_mut();
-        let Some((_, rx, got)) = hosts.get_mut(tid) else { return Vec::new() };
-        got.extend(rx.try_iter().filter_map(|l| serde_json::from_str(&l).ok()));
-        got.clone()
+        self.d.agents.commands(tid)
     }
 
     fn status(&mut self, tid: &str, word: &str) {
@@ -140,13 +142,26 @@ impl World {
     /// The same, without running the checkpoint jobs it may queue.
     fn status_raw(&mut self, tid: &str, word: &str) {
         self.now += 1000;
-        self.attach(tid);
-        let t = self.terminal(tid);
-        let ev = json!({"jsonrpc":"2.0","method":"event","params":{"seq":1,"type":"status","terminal":t,"data":{"status":{"app":"x","state":word},"reported":true,"records":{}}}});
-        self.d.on_event(&ev, self.now);
+        let status = match word {
+            "idle" => HostStatus::Idle,
+            "working" => HostStatus::Working,
+            "done" => HostStatus::Done,
+            "blocked" => HostStatus::Blocked { why: String::new() },
+            "error" => HostStatus::Error { why: String::new() },
+            other => panic!("no status {other}"),
+        };
+        let run = self.d.live.get(tid).map_or(0, |l| l.run);
+        self.d.agent_fact(tid, run, Fact::Status(status), self.now);
     }
 
-    /// What a thread was given: its host's prompts.
+    /// omp of a thread is gone by itself.
+    fn exited(&mut self, tid: &str, why: &str) {
+        self.now += 1000;
+        let run = self.d.live.get(tid).map_or(0, |l| l.run);
+        self.d.agent_fact(tid, run, Fact::Exited(why.to_owned()), self.now);
+    }
+
+    /// What a thread was given: its omp's prompts.
     fn sends_to(&self, tid: &str) -> Vec<String> {
         self.commands(tid)
             .into_iter()
@@ -187,7 +202,7 @@ impl World {
 
     fn host_event(&mut self, tid: &str, ev: AgentEvent) {
         self.now += 1000;
-        self.d.host_event(tid, ev, self.now);
+        self.d.agent_event(tid, ev, self.now);
     }
 
     /// omp asks for `request`: the option lilad answered with at once, or none when a card is open.
@@ -197,7 +212,7 @@ impl World {
         self.answer_to(tid, &id)
     }
 
-    /// The option the host was told for a request, if it was.
+    /// The option omp was told for a request, if it was.
     fn answer_to(&self, tid: &str, id: &str) -> Option<String> {
         self.commands(tid).into_iter().rev().find_map(|c| match c {
             Command::Answer { permission, option } if permission == id => Some(option),
@@ -217,19 +232,17 @@ impl World {
         }
     }
 
-    /// lilad is stopped and started again: a new one over the same database, which presumes the threads alive until herdr-core's snapshot says.
+    /// lilad is stopped and started again: a new one over the same database, in which the threads that were running are ended (their omp ended with it).
     fn restart(&mut self) {
         let paths = self.d.paths.clone();
         let store = Store::open(&paths.db()).unwrap();
-        let term = Fake { made: self.d.term.made + self.d.term.runs.len(), ..Fake::default() };
-        self.d = Daemon::new(store, term, paths, self.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
-        self.hosts.borrow_mut().clear();
+        self.d = Daemon::new(store, Fake::default(), paths, self.d.path_env.clone());
         self.now += 5000;
     }
 }
 
 fn argv(w: &World, run: usize) -> Vec<String> {
-    w.d.term.runs[run]["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_owned()).collect()
+    w.d.agents.runs[run].args.clone()
 }
 
 fn ask(id: &str, name: &str, command: &str) -> PermissionRequest {
@@ -304,8 +317,8 @@ fn removing_a_project_stops_its_threads_and_forgets_them() {
     let b = w.new_thread(json!({}));
     w.ok("thread.stop", json!({"thread": b}));
     let r = w.ok("project.remove", json!({"project": "shop"}));
-    assert_eq!(r["stopped"], json!([a]), "only the running one had a terminal to stop");
-    assert_eq!(w.d.term.kills.len(), 2, "the thread stopped before and the one running now");
+    assert_eq!(r["stopped"], json!([a]), "only the running one had an omp to stop");
+    assert_eq!(w.d.agents.ended(), 2, "the thread stopped before and the one running now");
     assert!(w.d.store.thread(&a).unwrap().is_none() && w.d.store.projects().unwrap().is_empty());
     assert!(w.repo.join(".lila/project.toml").is_file(), "the folder is not touched");
     assert!(w.call("thread.list", json!({"project": "shop"})).is_err());
@@ -314,25 +327,23 @@ fn removing_a_project_stops_its_threads_and_forgets_them() {
 // ---------------- a thread's life ----------------
 
 #[test]
-fn a_thread_runs_omp_through_its_host_and_its_first_message_waits_for_the_host() {
+fn a_thread_runs_omp_and_its_first_message_waits_until_omp_is_free() {
     let mut w = world();
     w.project();
     let tid = w.new_thread(json!({"model": "deepseek/deepseek-v4", "text": "hello", "permission": "confirm"}));
-    let run = &w.d.term.runs[0];
-    assert_eq!(run["labels"], json!({"lila.project": "shop", "lila.thread": tid}));
-    assert_eq!(run["name"], format!("lila-{tid}"));
-    assert_eq!(run["cwd"], w.repo.to_string_lossy().as_ref());
-    assert_eq!((run["env"]["LILA_THREAD"].as_str(), run["env"]["LILA_PROJECT"].as_str()), (Some(tid.as_str()), Some("shop")));
+    let run = &w.d.agents.runs[0];
+    assert_eq!(run.thread, tid);
+    assert_eq!(run.cwd, w.repo);
+    assert!(run.program.ends_with("bin/omp"), "{:?}", run.program);
     let args = argv(&w, 0);
-    assert_eq!(args[0], "/opt/lila/bin/lila");
-    assert_eq!(args[1..4], ["host", "omp", "--program"]);
-    assert!(args[4].ends_with("/bin/omp"), "{args:?}");
-    assert_eq!(args[5..], ["--model", "deepseek/deepseek-v4", "--session-dir", w.d.paths.omp_sessions(&tid).to_str().unwrap()], "the thread's own folder of omp sessions");
-    assert_eq!(w.d.store.thread(&tid).unwrap().unwrap().session, None, "omp's session id comes from its host");
-    // Starting: nothing goes before the host is attached; then the first message does, once omp is free.
+    assert_eq!(args[..4], ["--mode", "rpc-ui", "--approval-mode", "always-ask"]);
+    assert_eq!(args[4..], ["--model", "deepseek/deepseek-v4", "--session-dir", w.d.paths.omp_sessions(&tid).to_str().unwrap()], "the thread's own folder of omp sessions");
+    assert!(w.d.paths.omp_sessions(&tid).is_dir());
+    assert_eq!(w.d.store.thread(&tid).unwrap().unwrap().session, None, "omp's session id comes from omp");
+    // Starting: nothing goes before omp is free; then the first message does.
     assert_eq!(w.state(&tid), "starting");
     assert!(w.sends_to(&tid).is_empty());
-    assert_eq!(w.d.store.outbox(&tid).unwrap().len(), 1, "kept until the host takes it");
+    assert_eq!(w.d.store.outbox(&tid).unwrap().len(), 1, "kept until omp takes it");
     w.status(&tid, "idle");
     assert_eq!(w.sends_to(&tid), ["hello"]);
     assert!(w.d.store.outbox(&tid).unwrap().is_empty());
@@ -399,17 +410,16 @@ fn an_ended_thread_is_resumed_on_its_omp_session() {
     w.status(&tid, "idle");
     w.host_event(&tid, AgentEvent::Session { id: "s9".into() });
     assert!(w.call("thread.resume", json!({"thread": tid})).is_err(), "it is running");
-    // omp ends by itself (hc says its terminal finished).
-    let t = w.terminal(&tid);
-    w.now += 1000;
-    w.d.on_event(&json!({"method": "event", "params": {"type": "finished", "terminal": t, "data": {"reason": "exited"}}}), w.now);
+    // omp ends by itself.
+    w.exited(&tid, "omp stopped (code 0)");
     assert_eq!(w.state(&tid), "ended");
     let shown = w.ok("thread.show", json!({"thread": tid}));
-    assert_eq!((shown["terminal"].is_null(), shown["ended_ms"].is_i64()), (true, true));
+    assert!(shown["ended_ms"].is_i64());
+    assert!(w.events(&tid).contains(&"ended omp stopped (code 0)".to_owned()), "{:?}", w.events(&tid));
     assert!(w.call("thread.send", json!({"thread": tid, "text": "hello?"})).unwrap_err().to_string().contains("resume"));
     assert!(w.call("thread.stop", json!({"thread": tid})).is_err(), "nothing runs");
 
-    // Resumed on its session, with a message and another tier and model: in the same folder of omp sessions, which the host goes on with.
+    // Resumed on its session, with a message and another tier and model: in the same folder of omp sessions, which omp goes on with.
     let dir = w.d.paths.omp_sessions(&tid);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("2026-11-13_s9.jsonl"), "{}\n").unwrap();
@@ -422,9 +432,11 @@ fn an_ended_thread_is_resumed_on_its_omp_session() {
     assert!(resumed(&w, &tid).starts_with("goes on with the omp session in"), "{}", resumed(&w, &tid));
     w.status(&tid, "idle");
     assert_eq!(w.sends_to(&tid).last().map(String::as_str), Some("go on"));
-    // Stopped by the person: ended too, and the terminal is killed.
+    assert!(argv(&w, 1).contains(&"--continue".to_owned()), "it goes on with its session");
+    // Stopped by the person: ended too, and omp is let go.
+    assert_eq!(w.d.agents.ended(), 1, "the first run ended by itself");
     w.ok("thread.stop", json!({"thread": tid}));
-    assert_eq!(w.d.term.kills.last(), Some(&"t2".to_string()));
+    assert_eq!(w.d.agents.ended(), 2);
     assert_eq!(w.state(&tid), "ended");
 
     // One that ended before omp made a session starts a new one, in a folder of its own.
@@ -432,7 +444,7 @@ fn an_ended_thread_is_resumed_on_its_omp_session() {
     w.ok("thread.stop", json!({"thread": early}));
     w.ok("thread.resume", json!({"thread": early}));
     assert!(resumed(&w, &early).starts_with("no omp session in"), "{}", resumed(&w, &early));
-    assert_ne!(argv(&w, 3), argv(&w, 1)[..4].to_vec());
+    assert!(!argv(&w, 3).contains(&"--continue".to_owned()), "a new omp session");
     assert!(argv(&w, 3).contains(&w.d.paths.omp_sessions(&early).to_string_lossy().to_string()));
 }
 
@@ -459,25 +471,23 @@ fn threads_list_by_activity_and_archived_ones_leave_the_list() {
 }
 
 #[test]
-fn lilad_finds_its_threads_again_after_a_restart() {
+fn threads_that_were_running_when_lilad_stopped_are_ended_when_it_is_back() {
     let mut w = world();
     w.project();
-    let alive = w.new_thread(json!({}));
-    let lost = w.new_thread(json!({}));
-    w.status(&alive, "idle");
-    // A new lilad over the same database: they are presumed alive until herdr-core's snapshot says.
-    let paths = w.d.paths.clone();
-    let store = Store::open(&paths.db()).unwrap();
-    let mut d = Daemon::new(store, Fake::default(), paths, w.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
-    let t_alive = w.d.store.thread(&alive).unwrap().unwrap().terminal.unwrap();
-    let state = |d: &Daemon<Fake>, id: &str| d.thread_json(&d.store.thread(id).unwrap().unwrap())["state"].as_str().unwrap().to_owned();
-    assert_eq!(state(&d, &alive), "starting", "alive, nothing known yet");
-    d.reconcile(std::slice::from_ref(&t_alive), 5_000_000, 5_000_000);
-    assert_eq!(state(&d, &alive), "starting");
-    assert_eq!(state(&d, &lost), "ended", "its terminal is not in the snapshot");
-    // Its status comes with the snapshot's record, labeled with the thread.
-    d.on_terminal(&json!({"state": "live", "address": t_alive, "labels": {"lila.project": "shop", "lila.thread": alive}, "reported": true, "status": {"state": "working"}}), 5_000_001);
-    assert_eq!(state(&d, &alive), "running");
+    let a = w.new_thread(json!({}));
+    let b = w.new_thread(json!({}));
+    w.status(&a, "idle");
+    w.ok("thread.stop", json!({"thread": b}));
+    // A new lilad over the same database: their omp ended with the old one.
+    w.restart();
+    for t in [&a, &b] {
+        assert_eq!(w.state(t), "ended", "{t}");
+    }
+    assert!(w.events(&a).contains(&"ended lilad was not running".to_owned()), "{:?}", w.events(&a));
+    assert!(w.d.store.live_threads().unwrap().is_empty());
+    // Resumed, one goes on.
+    w.ok("thread.resume", json!({"thread": a}));
+    assert_eq!(w.state(&a), "starting");
 }
 
 #[test]
@@ -539,7 +549,7 @@ fn unknown_requests_and_threads_are_errors() {
     assert!(w.call("hook", json!({"thread": "t00000000", "event": "Stop"})).is_err(), "Claude Code's hooks are gone");
     assert!(w.call("thread.show", json!({"thread": "t00000000"})).is_err());
     assert!(w.call("thread.new", json!({"project": "shop", "permission": "yolo"})).is_err());
-    assert!(w.d.term.runs.is_empty(), "nothing was started");
+    assert!(w.d.agents.runs.is_empty(), "nothing was started");
     let status = w.ok("status", json!({}));
     assert_eq!(status["projects"], 1);
 }
@@ -579,12 +589,11 @@ fn threads_of_claude_code_and_codex_in_an_existing_database_are_kept_ended_and_c
     let by_id = |id: &str| list.as_array().unwrap().iter().find(|t| t["id"] == id).unwrap().clone();
     // Both are ended, whatever they were doing, and say which engine they ran on; omp's is as it was.
     for id in ["t00000001", "t00000002"] {
-        assert_eq!((by_id(id)["state"].as_str(), by_id(id)["legacy"].as_str(), by_id(id)["terminal"].is_null()), (Some("ended"), Some(if id == "t00000001" { "claude" } else { "codex" }), true), "{id}");
+        assert_eq!((by_id(id)["state"].as_str(), by_id(id)["legacy"].as_str()), (Some("ended"), Some(if id == "t00000001" { "claude" } else { "codex" })), "{id}");
     }
     assert_eq!((by_id("t00000003")["state"].as_str(), by_id("t00000003")["legacy"].is_null()), (Some("ended"), true));
-    // Nothing is running here, and the Claude Code terminal still alive in herdr-core is closed when it shows up.
-    w.d.on_terminal(&json!({"state": "live", "address": "old-1", "labels": {"lila.project": "shop", "lila.thread": "t00000001"}, "reported": true, "status": {"state": "idle"}}), w.now);
-    assert_eq!(w.d.term.kills, ["old-1"]);
+    // Nothing is running here.
+    assert!(w.d.agents.runs.is_empty());
     assert_eq!(w.state("t00000001"), "ended");
     // Their conversations can be read, but they take no words and cannot be resumed; omp's can.
     w.ok("thread.read", json!({"thread": "t00000001"}));
@@ -592,7 +601,7 @@ fn threads_of_claude_code_and_codex_in_an_existing_database_are_kept_ended_and_c
     assert!(err.contains("claude") && err.contains("no longer"), "{err}");
     assert!(w.call("thread.resume", json!({"thread": "t00000002"})).is_err());
     assert!(w.call("thread.send", json!({"thread": "t00000002", "text": "x"})).is_err());
-    assert!(w.d.term.runs.is_empty());
+    assert!(w.d.agents.runs.is_empty());
     w.ok("thread.resume", json!({"thread": "t00000003"}));
     // It had an ACP session id and no folder of omp sessions: it starts a new omp session, its conversation kept.
     assert_eq!(w.d.store.thread("t00000003").unwrap().unwrap().session.as_deref(), Some("s-1"));
@@ -856,8 +865,9 @@ fn rules_survive_a_restart_and_a_resume_go_when_the_tier_is_read_only_and_can_be
     w.ok("thread.answer", json!({"thread": tid, "card": card["id"], "option": "always"}));
     assert_eq!(w.verdict(&tid, "touch b"), "allow");
 
-    // lilad restarted: the rule is there and answers.
+    // lilad restarted (the thread's omp ended with it, and it is resumed): the rule is there and answers.
     w.restart();
+    w.ok("thread.resume", json!({"thread": tid}));
     w.status(&tid, "idle");
     assert_eq!(rule_keys(&mut w, &tid), ["touch"]);
     assert_eq!(w.verdict(&tid, "touch c"), "allow");
@@ -953,20 +963,17 @@ fn edits_inside_the_folder_can_be_allowed_always_and_nothing_outside_and_no_mcp_
 // ---------------- conversation ----------------
 
 #[test]
-fn a_message_waits_for_a_host_that_has_not_attached_and_a_host_that_went_away_is_waited_for() {
+fn words_wait_in_the_outbox_while_omp_cannot_take_them() {
     let mut w = world();
     w.project();
     let tid = w.new_thread(json!({"text": "first"}));
     w.status(&tid, "idle");
     assert_eq!(w.sends_to(&tid), ["first"]);
-    // The host went away (it reattaches when lilad is back): words wait in the outbox, and are not lost.
-    w.d.host_gone(&tid);
+    // omp's input is gone: words wait in the outbox, and are not lost.
+    w.d.senders.remove(&tid);
     w.ok("thread.send", json!({"thread": tid, "text": "second"}));
     assert_eq!(w.d.store.outbox(&tid).unwrap().len(), 1);
-    w.hosts.borrow_mut().remove(&tid);
-    w.attach(&tid);
-    assert_eq!(w.sends_to(&tid), ["second"]);
-    assert!(w.d.store.outbox(&tid).unwrap().is_empty());
+    assert_eq!(w.sends_to(&tid), ["first"]);
 }
 
 // ---------------- worktrees, changes, commit, merge (P2) ----------------
@@ -1029,8 +1036,7 @@ mod p2 {
         assert_eq!((j["worktree"].clone(), j["base_branch"].clone(), j["base_commit"].clone(), j["merged_ms"].clone()), (json!(true), json!("main"), json!(head), Value::Null));
         assert_eq!(j["cwd"], wt.to_string_lossy().as_ref());
         // omp starts there.
-        assert_eq!(w.d.term.runs[0]["cwd"], wt.to_string_lossy().as_ref());
-        assert_eq!(w.d.term.runs[0]["env"]["LILA_ROOT"], wt.to_string_lossy().as_ref());
+        assert_eq!(w.d.agents.runs[0].cwd, wt);
         assert_eq!(sh(&wt, &["symbolic-ref", "--short", "HEAD"]), format!("lila/{tid}"));
         assert_eq!(sh(&wt, &["rev-parse", "HEAD"]), head);
         assert_eq!(sh(&w.repo, &["symbolic-ref", "--short", "HEAD"]), "main", "the project folder stays where it was");
@@ -1068,7 +1074,7 @@ mod p2 {
         assert!(err.contains("detached HEAD"), "{err}");
         sh(&w.repo, &["checkout", "-q", "main"]);
         // The engine cannot start: the worktree and its branch are not left behind.
-        w.d.term.refuse_runs = true;
+        w.d.agents.refuse = true;
         let err = format!("{:#}", w.call("thread.new", json!({"project": "shop", "worktree": true})).unwrap_err());
         assert!(err.contains("start omp"), "{err}");
         w.settle();
@@ -1242,7 +1248,7 @@ mod p2 {
         let t = &r["thread"];
         assert_eq!((t["archived"].clone(), t["state"].clone(), t["merging"].clone(), t["changes"].clone()), (json!(true), json!("ended"), json!(false), Value::Null));
         assert!(t["merged_ms"].is_number());
-        assert_eq!(w.d.term.kills.len(), 1);
+        assert_eq!(w.d.agents.ended(), 1);
         w.settle();
         assert!(!wt.exists());
         assert!(sh(&w.repo, &["branch", "--list", "lila/*"]).is_empty());
@@ -1262,10 +1268,10 @@ mod p2 {
         let tid = in_worktree(&mut w);
         commit(&worktree_of(&w, &tid), "b.txt", "b\n", "Add b");
         w.ok("thread.stop", json!({"thread": tid}));
-        let kills = w.d.term.kills.len();
+        let ended = w.d.agents.ended();
         let r = w.ok("thread.merge", json!({"thread": tid}));
         assert_eq!(r["merged"], true);
-        assert_eq!(w.d.term.kills.len(), kills, "no engine to end");
+        assert_eq!(w.d.agents.ended(), ended, "no engine to end");
         assert_eq!(sh(&w.repo, &["log", "--format=%s"]), "Add b\nfirst");
     }
 
@@ -1366,7 +1372,7 @@ mod p2 {
         assert_eq!((j["archived"].clone(), j["worktree"].clone(), j["merged_ms"].clone()), (json!(false), json!(true), Value::Null));
         // And it goes on: resumed in the same worktree.
         w.ok("thread.resume", json!({"thread": tid}));
-        assert_eq!(w.d.term.runs.last().unwrap()["cwd"], wt.to_string_lossy().as_ref());
+        assert_eq!(w.d.agents.runs.last().unwrap().cwd, wt);
         // Its folder deleted by hand: said so.
         w.ok("thread.stop", json!({"thread": tid}));
         sh(&w.repo, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
@@ -1380,7 +1386,7 @@ mod p2 {
         write(&worktree_of(&w, &tid), "x.txt", "x\n");
         // A new lilad on the same data.
         let store = Store::open(&w.d.paths.db()).unwrap();
-        let mut d = Daemon::new(store, Fake::default(), w.d.paths.clone(), w.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
+        let mut d = Daemon::new(store, Fake::default(), w.d.paths.clone(), w.d.path_env.clone());
         let jobs = d.take_jobs();
         assert_eq!(jobs.len(), 1);
         for job in jobs {
@@ -1597,7 +1603,7 @@ mod a1 {
         assert_eq!(files(&w), broken, "as broken as it was, ignored files and all");
         // It all survives lilad starting again.
         let store = Store::open(&w.d.paths.db()).unwrap();
-        let mut d = Daemon::new(store, Fake::default(), w.d.paths.clone(), w.d.path_env.clone(), PathBuf::from("/opt/lila/bin/lila"));
+        let mut d = Daemon::new(store, Fake::default(), w.d.paths.clone(), w.d.path_env.clone());
         let read = d.handle("thread.read", &json!({"thread": tid}), w.now + 1000).unwrap();
         assert!(read["items"].as_array().unwrap().iter().filter(|i| i["from"] == "restored").count() == 2 && read["checkpoints"].as_array().unwrap().len() >= 4);
     }
@@ -1644,7 +1650,7 @@ mod a1 {
         refused(&mut w, &tid, &format!("{other} is working in the same folder"));
         w.status(&other, "idle");
         // Words not taken yet.
-        w.d.hosts.remove(&tid);
+        w.d.senders.remove(&tid);
         w.ok("thread.send", json!({"thread": tid, "text": "queued"}));
         refused(&mut w, &tid, "message waiting");
         // No checkpoint of that number; and not while it is being restored (what the loop sees in between).

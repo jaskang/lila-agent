@@ -106,7 +106,7 @@ impl Job {
 /// What a thread is asked when the person asks it to commit. In the conversation it shows as Lila's quiet line.
 const COMMIT_REQUEST: &str = "<lila note about=\"commit\">\n提交当前所有改动：先看 git status 和 git diff，按这个仓库已有提交信息的风格写一条提交信息，提交全部改动（包括新文件）。只提交，不要推送，不要改历史。\n</lila>";
 
-impl<T: Terminals> Daemon<T> {
+impl<A: Agents> Daemon<A> {
     /// What a request needs: its answer now, or a job to run first. Jobs are for what runs git on a folder that may be big.
     pub fn begin(&mut self, method: &str, params: &Value, now: i64) -> Result<Begin> {
         match method {
@@ -266,7 +266,7 @@ impl<T: Terminals> Daemon<T> {
         {
             return Ok(Begin::Done(self.models_json()));
         }
-        let (program, _) = self.omp_env()?;
+        let program = self.omp_program()?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
         Ok(Begin::Job(self.job(Work::Models { program, cwd })))
     }

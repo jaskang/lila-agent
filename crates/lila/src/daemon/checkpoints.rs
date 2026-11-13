@@ -54,7 +54,7 @@ fn restore_note(n: i64, title: &str, d: &Diff, head_moved: bool) -> String {
     )
 }
 
-impl<T: Terminals> Daemon<T> {
+impl<A: Agents> Daemon<A> {
     // ---------------- taking them ----------------
 
     /// Someone is waiting for the thread's words (not just a note that waits for them).
@@ -138,7 +138,7 @@ impl<T: Terminals> Daemon<T> {
 
     /// Attaches each checkpoint to the message that began its turn, and returns them, the newest first.
     ///
-    /// The conversation's ids are omp's host's, made when the words are sent, so a checkpoint has none to begin with. It takes the first message of the person (or Lila) that is not taken yet, from
+    /// The conversation's ids are made by the omp connection, when the words are sent, so a checkpoint has none to begin with. It takes the first message of the person (or Lila) that is not taken yet, from
     /// its own time on, and says the same words. That is remembered in the row once found; one whose message never turned
     /// up is given up when a later checkpoint has found its own.
     pub(super) fn resolve_checkpoints(&mut self, tid: &str) -> Result<Vec<Checkpoint>> {

@@ -13,7 +13,8 @@ use std::path::Path;
 /// 6: the `checkpoints` table, and `outbox.hold` (a note that goes out only with a message).
 /// 7: the `thread_rules` table (what a person allowed "always" for a thread).
 /// 8: omp is the only engine: `threads.engine` is gone; a thread that ran on another (Claude Code, Codex) keeps its name in `legacy`, ended.
-const VERSION: i64 = 8;
+/// 9: `threads.terminal` is gone: a thread runs when it has been started and not ended (`started_ms`, `ended_ms`).
+const VERSION: i64 = 9;
 
 /// Columns added to a table after it first existed: an older database gets them by `ALTER TABLE`.
 const ADDED_COLUMNS: [(&str, &str, &str); 6] = [
@@ -41,7 +42,6 @@ CREATE TABLE IF NOT EXISTS threads (
     tier TEXT NOT NULL,
     cwd TEXT NOT NULL,
     session TEXT,
-    terminal TEXT,
     created_ms INTEGER NOT NULL,
     active_ms INTEGER NOT NULL,
     started_ms INTEGER,
@@ -232,10 +232,15 @@ fn migrate(db: &Connection) -> Result<()> {
         db.execute_batch(
             "BEGIN;
              UPDATE threads SET legacy = engine WHERE engine <> 'omp' AND legacy IS NULL;
-             UPDATE threads SET terminal = NULL, ended_ms = COALESCE(ended_ms, active_ms) WHERE legacy IS NOT NULL AND terminal IS NOT NULL;
+             UPDATE threads SET ended_ms = COALESCE(ended_ms, active_ms) WHERE legacy IS NOT NULL AND terminal IS NOT NULL;
              ALTER TABLE threads DROP COLUMN engine;
              COMMIT;",
         )?;
+    }
+    // Threads used to name the terminal they ran in; now a thread runs when it has been started and not ended.
+    let have: Vec<String> = db.prepare("SELECT name FROM pragma_table_info('threads')")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    if have.iter().any(|c| c == "terminal") {
+        db.execute_batch("ALTER TABLE threads DROP COLUMN terminal")?;
     }
     db.pragma_update(None, "user_version", VERSION)?;
     Ok(())
@@ -260,20 +265,19 @@ fn thread_from(r: &Row) -> rusqlite::Result<Thread> {
         tier: Tier::parse(&tier).unwrap_or_default(),
         cwd: r.get(7)?,
         session: r.get(8)?,
-        terminal: r.get(9)?,
-        created_ms: r.get(10)?,
-        active_ms: r.get(11)?,
-        started_ms: r.get(12)?,
-        ended_ms: r.get(13)?,
-        archived: r.get::<_, i64>(14)? != 0,
-        worktree: r.get::<_, i64>(15)? != 0,
-        base_branch: r.get(16)?,
-        base_commit: r.get(17)?,
-        merged_ms: r.get(18)?,
+        created_ms: r.get(9)?,
+        active_ms: r.get(10)?,
+        started_ms: r.get(11)?,
+        ended_ms: r.get(12)?,
+        archived: r.get::<_, i64>(13)? != 0,
+        worktree: r.get::<_, i64>(14)? != 0,
+        base_branch: r.get(15)?,
+        base_commit: r.get(16)?,
+        merged_ms: r.get(17)?,
     })
 }
 
-const THREAD_COLS: &str = "id, project, title, legacy, model, effort, tier, cwd, session, terminal, created_ms, active_ms, started_ms, ended_ms, archived, worktree, base_branch, base_commit, merged_ms";
+const THREAD_COLS: &str = "id, project, title, legacy, model, effort, tier, cwd, session, created_ms, active_ms, started_ms, ended_ms, archived, worktree, base_branch, base_commit, merged_ms";
 
 impl Store {
     /// Opens (making it if needed) the database. A v3 one is moved to `<name>.v3.bak` first: its
@@ -386,22 +390,22 @@ impl Store {
         Ok(st.query_map(params![project, archived], thread_from)?.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Every thread that was started and not ended: what lilad finds its terminals for after a restart.
+    /// Every thread that was started and not ended: after a restart of lilad these are the ones whose omp died with it.
     pub fn live_threads(&self) -> Result<Vec<Thread>> {
-        let sql = format!("SELECT {THREAD_COLS} FROM threads WHERE terminal IS NOT NULL ORDER BY created_ms");
+        let sql = format!("SELECT {THREAD_COLS} FROM threads WHERE started_ms IS NOT NULL AND ended_ms IS NULL ORDER BY created_ms");
         let mut st = self.db.prepare(&sql)?;
         Ok(st.query_map([], thread_from)?.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// omp runs in `terminal` now (started at `now`); a new run clears `ended_ms`.
-    pub fn set_running(&self, id: &str, terminal: &str, now: i64) -> Result<()> {
-        self.db.execute("UPDATE threads SET terminal = ?2, started_ms = ?3, ended_ms = NULL WHERE id = ?1", params![id, terminal, now])?;
+    /// omp runs now (started at `now`); a new run clears `ended_ms`.
+    pub fn set_running(&self, id: &str, now: i64) -> Result<()> {
+        self.db.execute("UPDATE threads SET started_ms = ?2, ended_ms = NULL WHERE id = ?1", params![id, now])?;
         Ok(())
     }
 
     /// Its omp process is gone.
     pub fn set_ended(&self, id: &str, now: i64) -> Result<()> {
-        self.db.execute("UPDATE threads SET terminal = NULL, ended_ms = ?2 WHERE id = ?1", params![id, now])?;
+        self.db.execute("UPDATE threads SET ended_ms = ?2 WHERE id = ?1", params![id, now])?;
         Ok(())
     }
 
@@ -660,17 +664,18 @@ mod tests {
     fn a_thread_lives_from_start_to_end_and_back() {
         let s = store();
         let t = s.create_thread(new("t00000001"), 10).unwrap();
-        assert_eq!((t.legacy.clone(), t.tier, t.terminal.clone(), t.session.clone()), (None, Tier::Full, None, None));
-        s.set_running(&t.id, "t5", 20).unwrap();
+        assert_eq!((t.legacy.clone(), t.tier, t.started_ms, t.session.clone()), (None, Tier::Full, None, None));
+        assert!(s.live_threads().unwrap().is_empty(), "never started");
+        s.set_running(&t.id, 20).unwrap();
         s.set_session(&t.id, "sess-1").unwrap();
         let t = s.thread("t00000001").unwrap().unwrap();
-        assert_eq!((t.terminal.as_deref(), t.session.as_deref(), t.started_ms, t.ended_ms), (Some("t5"), Some("sess-1"), Some(20), None));
+        assert_eq!((t.session.as_deref(), t.started_ms, t.ended_ms), (Some("sess-1"), Some(20), None));
         assert_eq!(s.live_threads().unwrap().len(), 1);
         s.set_ended(&t.id, 30).unwrap();
         assert!(s.live_threads().unwrap().is_empty());
         let t = s.thread("t00000001").unwrap().unwrap();
-        assert_eq!((t.terminal, t.ended_ms, t.session.as_deref()), (None, Some(30), Some("sess-1")), "the session stays: it resumes");
-        s.set_running(&t.id, "t6", 40).unwrap();
+        assert_eq!((t.ended_ms, t.session.as_deref()), (Some(30), Some("sess-1")), "the session stays: it resumes");
+        s.set_running(&t.id, 40).unwrap();
         assert_eq!(s.thread("t00000001").unwrap().unwrap().ended_ms, None, "a new run is not ended");
     }
 
@@ -743,7 +748,7 @@ mod tests {
                  INSERT INTO projects VALUES ('shop', '/repo/shop', 1);
                  INSERT INTO threads (id, project, title, engine, model, tier, cwd, terminal, created_ms, active_ms) VALUES ('t00000001', 'shop', 'old', 'claude', 'm', 'full', '/repo/shop', 'term-1', 1, 7);
                  INSERT INTO threads (id, project, title, engine, model, tier, cwd, terminal, created_ms, active_ms) VALUES ('t00000003', 'shop', 'codex', 'codex', 'm', 'full', '/repo/shop', NULL, 1, 1);
-                 INSERT INTO threads (id, project, title, engine, model, tier, cwd, terminal, created_ms, active_ms) VALUES ('t00000004', 'shop', 'mine', 'omp', 'm', 'full', '/repo/shop', 'term-4', 1, 1);
+                 INSERT INTO threads (id, project, title, engine, model, tier, cwd, terminal, created_ms, active_ms, started_ms) VALUES ('t00000004', 'shop', 'mine', 'omp', 'm', 'full', '/repo/shop', 'term-4', 1, 1, 2);
                  PRAGMA user_version = 4;",
             )
             .unwrap();
@@ -752,10 +757,12 @@ mod tests {
         let t = s.thread("t00000001").unwrap().unwrap();
         assert_eq!((t.title.as_str(), t.worktree, t.base_branch, t.merged_ms), ("old", false, None, None), "the old thread is as it was");
         // Claude Code's and Codex's threads are ended for good (their terminals are not theirs to keep); omp's go on.
-        assert_eq!((t.legacy.as_deref(), t.terminal, t.ended_ms), (Some("claude"), None, Some(7)));
+        assert_eq!((t.legacy.as_deref(), t.ended_ms), (Some("claude"), Some(7)));
         assert_eq!(s.thread("t00000003").unwrap().unwrap().legacy.as_deref(), Some("codex"));
         let omp = s.thread("t00000004").unwrap().unwrap();
-        assert_eq!((omp.legacy, omp.terminal.as_deref(), omp.ended_ms), (None, Some("term-4"), None));
+        assert_eq!((omp.legacy, omp.ended_ms), (None, None));
+        assert_eq!(s.live_threads().unwrap().iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["t00000004"], "it was running when lilad stopped");
+        assert!(!s.db.prepare("SELECT name FROM pragma_table_info('threads')").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().flatten().any(|c| c == "terminal"));
         s.create_thread(NewThread { worktree: Some(Base { branch: "main".into(), commit: "c".into() }), ..new("t00000002") }, 2).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();

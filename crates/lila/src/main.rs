@@ -43,30 +43,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
-    /// Runs a thread's omp over its RPC mode (lilad starts it in the thread's terminal).
-    #[command(hide = true)]
-    Host {
-        #[command(subcommand)]
-        cmd: HostCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum HostCmd {
-    /// omp over its RPC mode (`omp --mode rpc-ui`), in the current folder.
-    Omp {
-        /// The omp program.
-        #[arg(long)]
-        program: std::path::PathBuf,
-        #[arg(long)]
-        model: Option<String>,
-        /// The folder of the thread's omp sessions: omp goes on with the last one in it.
-        #[arg(long)]
-        session_dir: std::path::PathBuf,
-        /// More options for omp.
-        #[arg(last = true)]
-        extra: Vec<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -227,11 +203,11 @@ enum ThreadCmd {
 enum DaemonCmd {
     /// Run in the foreground (what `lila up` starts inside herdr-core).
     Run,
-    /// Stop the running daemon. Threads keep running.
+    /// Stop the running daemon. The omp of its running threads ends with it.
     Stop,
     /// Whether it is running, and whether it speaks this `lila`'s protocol.
     Status,
-    /// Stop it, wait until its socket is gone, start it again from this `lila`. Threads keep running.
+    /// Stop it, wait until its socket is gone, start it again from this `lila`. The omp of its running threads ends with it.
     Restart,
 }
 
@@ -303,18 +279,11 @@ fn run() -> Result<()> {
             if rows.is_empty() { "no models".into() } else { rows.join("\n") }
         }),
         Cmd::Thread { cmd } => thread(cmd, &call, &out)?,
-        Cmd::Daemon { cmd: DaemonCmd::Run } => lila::daemon::serve(paths.clone(), client::hc_bin())?,
-        Cmd::Host { cmd: HostCmd::Omp { program, model, session_dir, extra } } => {
-            let cwd = cwd()?;
-            std::fs::create_dir_all(&session_dir)?;
-            let args = lila::host::omp_args(model.as_deref(), &session_dir, &extra);
-            let run = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
-            lila::host::run(&paths, lila::host::Agent { program, args, cwd: cwd.clone() }, lila_agent::omp::Omp::new(lila_agent::omp::Options { cwd, run }))?
-        }
+        Cmd::Daemon { cmd: DaemonCmd::Run } => lila::daemon::serve(paths.clone())?,
         Cmd::Daemon { cmd: DaemonCmd::Stop } => {
             if client::daemon_state(&paths)? {
                 call("stop", json!({}))?;
-                println!("lilad stopped; threads keep running");
+                println!("lilad stopped; the omp of its running threads ended with it");
             } else {
                 println!("lilad is not running; nothing to stop");
             }
@@ -335,7 +304,7 @@ fn run() -> Result<()> {
         }
         Cmd::Daemon { cmd: DaemonCmd::Restart } => {
             client::restart_daemon(&paths)?;
-            println!("lilad restarted; threads keep running");
+            println!("lilad restarted; the omp of its threads ended with the old one");
         }
     }
     Ok(())
@@ -349,7 +318,7 @@ fn daemon_status_text(state: &client::DaemonVersion, socket: &str) -> String {
     match state {
         Current(i) => format!("lilad is running ({})", who(i)),
         Different(i) => format!(
-            "lilad is running ({}), but this lila speaks protocol {ours}: it is an older or newer lilad.\nRestart it with `lila daemon restart`, or `lila daemon stop` (any lila command starts it again). Threads keep running.\nIf it differs again, the `lila` on disk is the old one: `cargo install --path crates/lila`.",
+            "lilad is running ({}), but this lila speaks protocol {ours}: it is an older or newer lilad.\nRestart it with `lila daemon restart`, or `lila daemon stop` (any lila command starts it again). The omp of its running threads ends with it.\nIf it differs again, the `lila` on disk is the old one: `cargo install --path crates/lila`.",
             who(i)
         ),
         NotRunning => "lilad is not running".into(),

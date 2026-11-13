@@ -64,7 +64,7 @@ impl ThreadState {
     }
 }
 
-/// A thread's terminal status as its program reports it (OSC 7501), plus what Lila knows.
+/// A thread's omp status as its connection reports it, plus what Lila knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
     /// Not started, or started but has reported nothing yet.
@@ -76,7 +76,7 @@ pub enum AgentStatus {
     /// Finished a turn while nobody looked; as free as idle.
     Done,
     Error,
-    /// Its terminal ended or was lost.
+    /// Its omp ended.
     Gone,
 }
 
@@ -145,8 +145,6 @@ pub struct Thread {
     pub merged_ms: Option<i64>,
     /// The engine's own id for the conversation, once known: what resumes it.
     pub session: Option<String>,
-    /// The hc terminal it runs in now; none once it ended.
-    pub terminal: Option<String>,
     pub created_ms: i64,
     /// The latest message or reply.
     pub active_ms: i64,
@@ -155,7 +153,7 @@ pub struct Thread {
     pub archived: bool,
 }
 
-/// A thread's id: `t` and eight hex digits (terminal names, labels, file names).
+/// A thread's id: `t` and eight hex digits (file names).
 pub fn new_thread_id(random: u32) -> String {
     format!("t{random:08x}")
 }

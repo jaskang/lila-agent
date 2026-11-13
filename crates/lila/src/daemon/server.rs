@@ -1,4 +1,4 @@
-//! The server: the socket, herdr-core's events and the hosts, all feeding one `Daemon`.
+//! The server: the socket and the omp of each thread, all feeding one `Daemon`.
 
 use super::*;
 
@@ -6,16 +6,9 @@ use super::*;
 
 pub(super) enum Input {
     Request(String, Value, std::sync::mpsc::Sender<Value>),
-    Hc(Value),
-    /// A fresh `events.subscribe` snapshot and when it was taken.
-    Snapshot(Value, i64),
     Tick,
-    /// A thread's host attached: the thread, its command channel.
-    HostAttach(String, std::sync::mpsc::Sender<String>),
-    /// An event from a thread's host.
-    HostEvent(String, lila_agent::AgentEvent),
-    /// A thread's host detached.
-    HostGone(String),
+    /// A fact from a thread's omp: the thread, which run of it, the fact.
+    Agent(String, u64, Fact),
     /// A job off the loop is done: the job, what it gave, and who is waiting for the answer (none: lilad asked for it).
     JobDone(Job, std::result::Result<Output, String>, Option<std::sync::mpsc::Sender<Value>>),
     Stop,
@@ -41,7 +34,7 @@ fn with_id(mut reply: Value, id: &Option<Value>) -> Value {
 }
 
 /// One socket connection: one JSON request per line, one reply line per request, in order.
-/// `subscribe` turns it into a stream of `{"event":"changed"}` lines, `host.attach` into a host's channel.
+/// `subscribe` turns it into a stream of `{"event":"changed"}` lines.
 fn connection(conn: std::os::unix::net::UnixStream, tx: std::sync::mpsc::Sender<Input>, watchers: Watchers) {
     use std::io::{BufRead, BufReader, Write};
     use std::sync::mpsc;
@@ -67,30 +60,6 @@ fn connection(conn: std::os::unix::net::UnixStream, tx: std::sync::mpsc::Sender<
                 }
                 return;
             }
-            // A thread's host: events in, commands out, until it goes.
-            Ok((req, id)) if req["method"] == "host.attach" => {
-                let tid = req["params"]["thread"].as_str().unwrap_or_default().to_owned();
-                let (ctx, crx) = mpsc::channel::<String>();
-                if writeln!(writer, "{}", with_id(json!({"result": {"attached": true}}), &id)).is_err() || tx.send(Input::HostAttach(tid.clone(), ctx)).is_err() {
-                    return;
-                }
-                std::thread::spawn(move || {
-                    for cmd in crx {
-                        if writeln!(writer, "{cmd}").is_err() {
-                            return;
-                        }
-                    }
-                });
-                for line in lines.by_ref().map_while(Result::ok) {
-                    if let Ok(ev) = serde_json::from_str::<lila_agent::AgentEvent>(&line)
-                        && tx.send(Input::HostEvent(tid.clone(), ev)).is_err()
-                    {
-                        return;
-                    }
-                }
-                let _ = tx.send(Input::HostGone(tid));
-                return;
-            }
             Ok((req, id)) => {
                 let (rtx, rrx) = mpsc::channel();
                 let method = req["method"].as_str().unwrap_or_default().to_owned();
@@ -108,7 +77,7 @@ fn connection(conn: std::os::unix::net::UnixStream, tx: std::sync::mpsc::Sender<
 }
 
 /// Runs until `lila daemon stop` or the socket is removed.
-pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
+pub fn serve(paths: Paths) -> Result<()> {
     use std::os::unix::net::UnixListener;
     use std::sync::{Arc, mpsc};
 
@@ -121,13 +90,15 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
 
     let store = Store::open(&paths.db())?;
-    let hc = hc_client::Hc::connect(&hc_bin)?;
     let path_env = std::env::var("PATH").unwrap_or_default();
-    let lila_bin = std::env::current_exe()?;
-    let mut daemon = Daemon::new(store, HcTerminals(hc), paths.clone(), path_env.clone(), lila_bin);
+    let (tx, rx) = mpsc::channel::<Input>();
+    let tx_agent = tx.clone();
+    let agents = OmpAgents::new(paths.state.join("omp"), move |thread, run, fact| {
+        let _ = tx_agent.send(Input::Agent(thread.to_owned(), run, fact));
+    });
+    let mut daemon = Daemon::new(store, agents, paths.clone(), path_env);
     eprintln!("[lilad] listening on {} (pid {})", sock.display(), std::process::id());
 
-    let (tx, rx) = mpsc::channel::<Input>();
     // Watchers (lila-app) that asked to hear when anything changes.
     let watchers: Watchers = Arc::default();
 
@@ -141,28 +112,6 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
             let tx = tx_sock.clone();
             let watchers = watchers_sock.clone();
             std::thread::spawn(move || connection(conn, tx, watchers));
-        }
-    });
-
-    // herdr-core events, resubscribing when the core restarts.
-    let tx_ev = tx.clone();
-    std::thread::spawn(move || {
-        loop {
-            match hc_client::Events::subscribe(&hc_bin, json!({})) {
-                Ok(mut ev) => {
-                    if tx_ev.send(Input::Snapshot(ev.snapshot.clone(), now_ms())).is_err() {
-                        return;
-                    }
-                    while let Ok(line) = ev.next_line() {
-                        if tx_ev.send(Input::Hc(line)).is_err() {
-                            return;
-                        }
-                    }
-                    eprintln!("[lilad] lost herdr-core events; resubscribing");
-                }
-                Err(e) => eprintln!("[lilad] cannot subscribe to herdr-core events: {e:#}"),
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
 
@@ -231,19 +180,8 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
                 (Err(e), None) => daemon.say(format!("job: {e:#}")),
                 (Ok(_), None) => {}
             },
-            Input::Snapshot(snap, taken_ms) => {
-                for rec in snap["terminals"].as_array().cloned().unwrap_or_default() {
-                    daemon.on_terminal(&rec, now);
-                }
-                // Members whose terminal is not in the snapshot are gone.
-                let known: Vec<String> = snap["terminals"].as_array().into_iter().flatten().filter(|t| t["state"] == "live").filter_map(|t| t["address"].as_str().map(String::from)).collect();
-                daemon.reconcile(&known, taken_ms, now);
-            }
-            Input::Hc(line) => daemon.on_event(&line, now),
             Input::Tick => daemon.tick(now),
-            Input::HostAttach(tid, ctx) => daemon.host_attach(&tid, ctx, now),
-            Input::HostEvent(tid, ev) => daemon.host_event(&tid, ev, now),
-            Input::HostGone(tid) => daemon.host_gone(&tid),
+            Input::Agent(thread, run, fact) => daemon.agent_fact(&thread, run, fact, now),
             Input::Stop => break,
         }
         for job in daemon.take_jobs() {
@@ -264,6 +202,7 @@ pub fn serve(paths: Paths, hc_bin: String) -> Result<()> {
             }
         }
     }
+    daemon.shutdown(now_ms());
     let _ = std::fs::remove_file(&sock);
     eprintln!("[lilad] stopped");
     Ok(())
@@ -332,12 +271,5 @@ mod tests {
         let mut event = String::new();
         reader.read_line(&mut event).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&event).unwrap(), json!({"event": "changed", "seq": 1}));
-    }
-
-    #[test]
-    fn host_attach_echoes_the_id() {
-        let (mut conn, _w) = socket();
-        let mut reader = BufReader::new(conn.try_clone().unwrap());
-        assert_eq!(ask(&mut conn, &mut reader, r#"{"id":3,"method":"host.attach","params":{"thread":"t1"}}"#), json!({"id": 3, "result": {"attached": true}}));
     }
 }

@@ -1,27 +1,30 @@
 //! lilad: the only writer of Lila's state. Requests come from the CLI and the window over a
-//! Unix socket, terminal facts from herdr-core's event stream; both are handled one at a time
+//! Unix socket, facts from the omp of each thread over channels; all are handled one at a time
 //! on one thread, so there is no locking.
 //!
-//! The model is projects and their threads. A thread is a
-//! conversation with omp; omp runs behind `lila host omp` in an hc terminal of its own, so a lilad
-//! restart does not end it.
+//! The model is projects and their threads. A thread is a conversation with omp; omp is a child
+//! process of lilad (`runner`), so it ends with lilad.
 
+mod agents;
 mod checkpoints;
 mod conversation;
-mod host;
 mod jobs;
 mod permissions;
 mod questions;
 mod requests;
+mod runner;
 mod server;
 mod sources;
 mod threads;
 
+pub use agents::{Agents, Fact, Spawn, Started, has_session, omp_args};
 pub use jobs::{Begin, Job, Output};
+pub use runner::OmpAgents;
 pub use server::serve;
 pub use sources::{PollJob, PostJob};
 
 use crate::paths::{Paths, which};
+use std::sync::mpsc::Sender;
 use anyhow::{Context, Result, anyhow, bail};
 use lila_core::{AgentStatus, ProjectConfig, Thread, ThreadState, Tier};
 use lila_store::Store;
@@ -29,46 +32,14 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-/// What the daemon needs from herdr-core. A fake stands in for it in tests.
-pub trait Terminals {
-    /// Live terminals carrying this project's label.
-    fn list(&mut self, project: &str) -> Result<Vec<Value>>;
-    /// Starts a program; returns its terminal address.
-    fn run(&mut self, req: Value) -> Result<String>;
-    fn kill(&mut self, terminal: &str) -> Result<()>;
-}
-
-pub struct HcTerminals(pub hc_client::Hc);
-
-impl Terminals for HcTerminals {
-    fn list(&mut self, project: &str) -> Result<Vec<Value>> {
-        let r = self.0.call("terminal.list", json!({"labels": {"lila.project": project}}))?;
-        r["terminals"].as_array().cloned().ok_or_else(|| anyhow!("terminal.list returned no terminals"))
-    }
-
-    fn run(&mut self, req: Value) -> Result<String> {
-        let r = self.0.call("terminal.run", req)?;
-        r["address"].as_str().map(String::from).ok_or_else(|| anyhow!("terminal.run returned no address: {r}"))
-    }
-
-    fn kill(&mut self, terminal: &str) -> Result<()> {
-        self.0.call("terminal.kill", json!({"terminal": terminal}))?;
-        Ok(())
-    }
-}
-
-/// How long a host may run without reporting a status before lilad says so in its log.
-const STARTUP_MS: i64 = 20_000;
-
 /// What lilad knows of a thread's running omp that the database does not hold.
 #[derive(Debug, Clone)]
 struct Live {
     status: AgentStatus,
     kind: Option<String>,
     msg: String,
-    /// Has reported a status at least once since it started.
-    reported: bool,
-    started_ms: i64,
+    /// Which run of the thread's omp this is: the facts of another are let go.
+    run: u64,
     /// When omp last became free to take a message.
     free_since: i64,
     /// The model and effort this thread runs on, as omp reported them (nothing yet: the stored ones),
@@ -79,8 +50,8 @@ struct Live {
 }
 
 impl Live {
-    fn new(status: AgentStatus, started_ms: i64) -> Live {
-        Live { status, kind: None, msg: String::new(), reported: false, started_ms, free_since: started_ms, config: Default::default(), commands: Vec::new() }
+    fn new(status: AgentStatus, started_ms: i64, run: u64) -> Live {
+        Live { status, kind: None, msg: String::new(), run, free_since: started_ms, config: Default::default(), commands: Vec::new() }
     }
 }
 
@@ -94,28 +65,26 @@ struct Proj {
     repo: bool,
 }
 
-pub struct Daemon<T: Terminals> {
+pub struct Daemon<A: Agents> {
     pub store: Store,
-    term: T,
+    agents: A,
     paths: Paths,
     projects: BTreeMap<String, Proj>,
     /// Running threads' omp, by thread id.
     live: HashMap<String, Live>,
-    /// PATH omp gets (the CLI's PATH when it started the daemon).
+    /// The PATH omp is looked for on (lilad's own when it started).
     path_env: String,
-    /// The `lila` binary, so threads can run `lila host`.
-    lila_bin: PathBuf,
     pub log: Vec<String>,
     /// The last delivery error per thread, so a stuck delivery is logged once, not every tick.
     failed_sends: BTreeMap<String, String>,
-    /// Goes up when what threads are doing changes (status, words, terminals): not in the database.
+    /// Goes up when what threads are doing changes (status, words): not in the database.
     live_version: u64,
     /// Threads something changed in since the watchers were told (`take_dirty`).
     dirty: BTreeSet<String>,
     /// Projects that were added, changed or removed since the watchers were told.
     dirty_projects: BTreeSet<String>,
-    /// Attached hosts (`host`), by thread: their command channel.
-    hosts: HashMap<String, std::sync::mpsc::Sender<String>>,
+    /// Where the commands of each running omp go, by thread. Letting go of one ends that omp.
+    senders: HashMap<String, Sender<lila_agent::Command>>,
     /// Open permission cards (`permissions`): what a thread asks the person.
     asking: Vec<permissions::Asking>,
     /// Open question cards (`questions`): what an agent asks the person.
@@ -152,26 +121,21 @@ fn req<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
     s(p, key).ok_or_else(|| anyhow!("missing {key}"))
 }
 
-fn terminal_name(thread: &str) -> String {
-    format!("lila-{thread}")
-}
-
-impl<T: Terminals> Daemon<T> {
-    pub fn new(store: Store, term: T, paths: Paths, path_env: String, lila_bin: PathBuf) -> Daemon<T> {
+impl<A: Agents> Daemon<A> {
+    pub fn new(store: Store, agents: A, paths: Paths, path_env: String) -> Daemon<A> {
         let mut d = Daemon {
             store,
-            term,
+            agents,
             paths,
             projects: BTreeMap::new(),
             live: HashMap::new(),
             path_env,
-            lila_bin,
             log: Vec::new(),
             failed_sends: BTreeMap::new(),
             live_version: 0,
             dirty: BTreeSet::new(),
             dirty_projects: BTreeSet::new(),
-            hosts: HashMap::new(),
+            senders: HashMap::new(),
             asking: Vec::new(),
             questions: Vec::new(),
             models: None,
@@ -188,10 +152,11 @@ impl<T: Terminals> Daemon<T> {
         for p in d.store.projects().unwrap_or_default() {
             d.load_project(&p.id, Path::new(&p.cwd));
         }
-        // Threads that had a terminal when lilad last stopped: presumed alive until herdr-core's snapshot says otherwise.
+        // Threads that were running when lilad last stopped: their omp ended with it.
         let now = now_ms();
         for t in d.store.live_threads().unwrap_or_default() {
-            d.live.insert(t.id, Live::new(AgentStatus::Unknown, now));
+            let _ = d.store.set_ended(&t.id, now);
+            let _ = d.store.event(&t.id, "lilad", "ended", "lilad was not running", now);
         }
         // What every thread has changed, counted in the background.
         for p in d.projects.keys().cloned().collect::<Vec<_>>() {
@@ -249,82 +214,12 @@ impl<T: Terminals> Daemon<T> {
         self.live_version += 1;
     }
 
-    // ---------------- herdr-core facts ----------------
-
-    fn find_thread(&self, terminal: &str) -> Option<String> {
-        self.store.live_threads().ok()?.into_iter().find(|t| t.terminal.as_deref() == Some(terminal)).map(|t| t.id)
-    }
-
-    /// A whole terminal record (snapshot, `created`, `restarted`).
-    pub fn on_terminal(&mut self, rec: &Value, now: i64) {
-        let (Some(tid), Some(addr)) = (rec["labels"]["lila.thread"].as_str(), rec["address"].as_str()) else { return };
-        let Ok(Some(t)) = self.store.thread(tid) else { return };
-        if rec["state"] == "live" && t.legacy.is_some() {
-            // A Claude Code or Codex thread from before omp was the only engine: nothing here runs it any more, so its terminal goes.
-            let _ = self.term.kill(addr);
-            return;
-        }
-        if rec["state"] == "live" {
-            if t.terminal.as_deref() != Some(addr) {
-                // A terminal this thread was not known to run in (lilad was away when it started): take it.
-                if self.store.set_running(tid, addr, t.started_ms.unwrap_or(now)).is_err() {
-                    return;
-                }
-                self.mark(tid);
-            }
-            let live = self.live.entry(tid.to_owned()).or_insert_with(|| Live::new(AgentStatus::Unknown, now));
-            live.reported |= rec["reported"].as_bool().unwrap_or(false);
-            if live.status == AgentStatus::Gone {
-                live.status = AgentStatus::Unknown;
-            }
-            let status = rec.get("status").cloned().unwrap_or(Value::Null);
-            self.set_status(tid, &status, now);
-        } else if t.terminal.as_deref() == Some(addr) {
-            self.thread_gone(tid, rec["reason"].as_str().unwrap_or("finished"), now);
-        }
-    }
-
-    /// A line from `events.subscribe`.
-    pub fn on_event(&mut self, line: &Value, now: i64) {
-        let p = &line["params"];
-        match line["method"].as_str() {
-            Some("missed") => {
-                for rec in p["terminals"].as_array().cloned().unwrap_or_default() {
-                    self.on_terminal(&rec, now);
-                }
-            }
-            Some("event") => {
-                let Some(terminal) = p["terminal"].as_str() else { return };
-                match p["type"].as_str() {
-                    Some("created" | "restarted") => self.on_terminal(&p["data"], now),
-                    Some("status") => {
-                        if let Some(tid) = self.find_thread(terminal) {
-                            if p["data"]["reported"].as_bool() == Some(true)
-                                && let Some(l) = self.live.get_mut(&tid)
-                            {
-                                l.reported = true;
-                            }
-                            self.set_status(&tid, &p["data"]["status"], now);
-                        }
-                    }
-                    Some("finished" | "removed" | "lost") => {
-                        if let Some(tid) = self.find_thread(terminal) {
-                            let why = p["data"]["reason"].as_str().unwrap_or("ended").to_owned();
-                            self.thread_gone(&tid, &why, now);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn set_status(&mut self, tid: &str, status: &Value, now: i64) {
+    fn set_status(&mut self, tid: &str, status: &lila_agent::HostStatus, now: i64) {
         let Some(live) = self.live.get_mut(tid) else { return };
         let old = live.status;
-        let new = if status.is_null() { AgentStatus::Unknown } else { AgentStatus::from_word(status["state"].as_str()) };
-        let (kind, msg) = (status["kind"].as_str().map(String::from), status["msg"].as_str().unwrap_or_default().to_owned());
+        let (word, kind, msg) = status.parts();
+        let (kind, msg) = (kind.map(String::from), msg.unwrap_or_default());
+        let new = AgentStatus::from_word(Some(word));
         let changed = old != new || live.kind != kind || live.msg != msg;
         live.status = new;
         live.kind = kind;
@@ -334,9 +229,6 @@ impl<T: Terminals> Daemon<T> {
         }
         // A turn ended: what it changed is counted again.
         let turn_ended = new.is_free() && matches!(old, AgentStatus::Working | AgentStatus::Blocked);
-        if new != AgentStatus::Unknown {
-            live.reported = true;
-        }
         if changed {
             self.mark(tid);
         }
@@ -348,47 +240,25 @@ impl<T: Terminals> Daemon<T> {
         }
     }
 
-    /// The omp of a thread is gone: its terminal ended, was killed, or is no longer there. The
-    /// thread stays, ended; its conversation is kept and it can be resumed.
+    /// The omp of a thread is gone: it exited, was stopped, or lilad is stopping. The thread stays, ended;
+    /// its conversation is kept and it can be resumed. Its omp ends if it is still there (`senders`).
     fn thread_gone(&mut self, tid: &str, why: &str, now: i64) {
         let Ok(Some(t)) = self.store.thread(tid) else { return };
-        if t.terminal.is_none() && !self.live.contains_key(tid) {
+        if !self.live.contains_key(tid) {
             return;
         }
         let _ = self.store.set_ended(tid, now);
         self.live.remove(tid);
-        self.hosts.remove(tid);
+        self.senders.remove(tid);
         self.asking.retain(|a| a.thread != tid);
         self.questions.retain(|a| a.thread != tid);
-        let _ = self.store.event(tid, "lilad", "ended", &format!("{}: {why}", t.terminal.unwrap_or_default()), now);
+        let _ = self.store.event(tid, "lilad", "ended", why, now);
         self.say(format!("{}: thread {tid} ended ({why})", t.project));
         self.mark(tid);
     }
 
-    /// After a fresh snapshot: threads pointing at terminals that no longer exist ended while we were away.
-    /// Threads started after the snapshot was taken are not in it and are left alone.
-    pub fn reconcile(&mut self, live_terminals: &[String], taken_ms: i64, now: i64) {
-        let gone: Vec<String> = self
-            .store
-            .live_threads()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|t| t.started_ms.is_none_or(|s| s < taken_ms - 2000))
-            .filter(|t| t.terminal.as_ref().is_some_and(|a| !live_terminals.contains(a)))
-            .map(|t| t.id)
-            .collect();
-        for tid in gone {
-            self.thread_gone(&tid, "its terminal no longer exists", now);
-        }
-    }
-
-    /// Every few seconds: startup timeouts, then the pump.
+    /// Every few seconds: words waiting for a thread that takes them.
     pub fn tick(&mut self, now: i64) {
-        let slow: Vec<String> = self.live.iter().filter(|(_, l)| !l.reported && l.status == AgentStatus::Unknown && now - l.started_ms >= STARTUP_MS && now - l.started_ms < STARTUP_MS + 6000).map(|(t, _)| t.clone()).collect();
-        for tid in slow {
-            self.say(format!("thread {tid} has not reported a status"));
-            self.mark(&tid);
-        }
         self.pump(now);
     }
 
@@ -396,7 +266,7 @@ impl<T: Terminals> Daemon<T> {
 
     /// The state a thread shows, and what it waits for (`card`: a permission card or a question).
     fn state_of(&self, t: &Thread) -> (ThreadState, Option<&'static str>) {
-        let live = self.live.get(&t.id).filter(|_| t.terminal.is_some());
+        let live = self.live.get(&t.id);
         let status = live.map_or(AgentStatus::Gone, |l| l.status);
         let card = self.asking.iter().any(|a| a.thread == t.id) || self.questions.iter().any(|a| a.thread == t.id);
         let state = status.thread_state(card);
@@ -405,7 +275,7 @@ impl<T: Terminals> Daemon<T> {
 
     pub(super) fn thread_json(&self, t: &Thread) -> Value {
         let (state, waiting) = self.state_of(t);
-        let live = self.live.get(&t.id).filter(|_| t.terminal.is_some());
+        let live = self.live.get(&t.id);
         let cards = self.asking.iter().filter(|a| a.thread == t.id).count() + self.questions.iter().filter(|a| a.thread == t.id).count();
         json!({
             "id": t.id, "project": t.project, "title": t.title, "legacy": t.legacy,
@@ -414,20 +284,15 @@ impl<T: Terminals> Daemon<T> {
             "permission": t.tier.as_str(), "cwd": t.cwd, "session": t.session,
             "state": state.as_str(), "status": live.map_or("gone", |l| l.status.as_str()), "waiting": waiting, "cards": cards,
             "msg": live.map(|l| l.msg.clone()).filter(|m| !m.is_empty()),
-            "terminal": t.terminal,
             "created_ms": t.created_ms, "active_ms": t.active_ms, "started_ms": t.started_ms, "ended_ms": t.ended_ms, "archived": t.archived,
             "worktree": t.worktree, "base_branch": t.base_branch, "base_commit": t.base_commit, "merged_ms": t.merged_ms,
             "merging": self.merging.contains(&t.id), "restoring": self.restoring.contains(&t.id), "changes": self.summary_of(&t.id).map(|c| c.json()),
         })
     }
 
-    /// omp's program on PATH and the environment its terminal gets (PATH = lila's folder + the
-    /// PATH lilad was started with).
-    pub(super) fn omp_env(&self) -> Result<(PathBuf, BTreeMap<String, String>)> {
-        let lila_dir = self.lila_bin.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-        let path = format!("{lila_dir}:{}", self.path_env);
-        let program = which(lila_core::runtime::CLI, &path).ok_or_else(|| anyhow!("{:?} is not on PATH; install it and sign in", lila_core::runtime::CLI))?;
-        Ok((program, BTreeMap::from([("PATH".to_owned(), path)])))
+    /// omp's program, on the PATH lilad was started with.
+    pub(super) fn omp_program(&self) -> Result<PathBuf> {
+        which(lila_core::runtime::CLI, &self.path_env).ok_or_else(|| anyhow!("{:?} is not on PATH; install it and sign in", lila_core::runtime::CLI))
     }
 }
 

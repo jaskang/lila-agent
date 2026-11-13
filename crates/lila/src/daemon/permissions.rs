@@ -39,7 +39,7 @@ pub(super) fn card_json(a: &Asking) -> Value {
     })
 }
 
-impl<T: Terminals> Daemon<T> {
+impl<A: Agents> Daemon<A> {
     /// Answers `request` of thread `tid` by its tier, or opens a card for the person.
     pub(super) fn ask_permission(&mut self, tid: &str, request: PermissionRequest, now: i64) -> Result<Decided> {
         let t = self.store.thread(tid)?.ok_or_else(|| anyhow!("no thread {tid}"))?;
@@ -139,7 +139,7 @@ impl<T: Terminals> Daemon<T> {
     pub(super) fn open_card(&mut self, tid: &str, request: PermissionRequest, why: String, danger: Option<Danger>, now: i64) -> Result<Decided> {
         let t = self.store.thread(tid)?.ok_or_else(|| anyhow!("no thread {tid}"))?;
         let request = self.with_always(&t, request, danger);
-        // Asked again (lilad came back, the host repeated it): the card already open.
+        // Asked again: the card is already open.
         if let Some(a) = self.asking.iter_mut().find(|a| a.thread == tid && a.request.id == request.id) {
             a.request = request;
         } else {
@@ -153,7 +153,7 @@ impl<T: Terminals> Daemon<T> {
     }
 
     /// The person's answer to a permission card: `thread.answer {thread, card | permission, option | allow}`.
-    /// The host gets it as a command. The option `always` adds the rules the card said (`with_always`) to the thread
+    /// omp gets it as a command. The option `always` adds the rules the card said (`with_always`) to the thread
     /// and answers with omp's plain allow; the thread's other cards that those rules answer too are answered with it.
     pub(super) fn thread_answer(&mut self, params: &Value, now: i64) -> Result<Value> {
         let t = self.thread_of(params)?;
@@ -191,9 +191,9 @@ impl<T: Terminals> Daemon<T> {
         Ok(json!({"thread": t.id, "card": card.id, "answered": true}))
     }
 
-    /// Hands the person's answer to the host and closes the card.
+    /// Hands the person's answer to omp and closes the card.
     fn deliver_answer(&mut self, t: &Thread, card: &Asking, picked: String, note: Option<&str>, now: i64) -> Result<()> {
-        self.host_command(&t.id, &Command::Answer { permission: card.request.id.clone(), option: picked.clone() })?;
+        self.agent_command(&t.id, &Command::Answer { permission: card.request.id.clone(), option: picked.clone() })?;
         self.asking.retain(|a| a.id != card.id);
         let detail = format!("{} · {picked}{}", card.request.title.lines().next().unwrap_or_default(), note.map(|n| format!(" ({n})")).unwrap_or_default());
         self.store.event(&t.id, "human", "answered", &detail, now)?;

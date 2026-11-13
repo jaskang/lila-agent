@@ -38,7 +38,7 @@ which = "8"
 rusqlite.workspace = true
 base64 = "0.22"
 
-# A stand-in omp and a stand-in lilad around the real `lila host omp` (the test binary is the stand-in omp).
+# A stand-in omp around the real `OmpAgents` (the test binary is the stand-in omp).
 [[test]]
-name = "host"
+name = "omp"
 harness = false

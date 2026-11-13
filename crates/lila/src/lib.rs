@@ -8,7 +8,8 @@
 /// `thread.new`, `thread.resume` and `project.set` take no `engine` or `effort`; `thread.trust`, `thread.run`, `hook` and `hook.answer` are gone; `thread.read` has no `writing`.
 /// 5 (omp RPC): `thread.read` lists the thread's `questions` (cards beside `permissions`: an agent asking the person), `thread.answer` answers them with
 /// `value`, `yes` or `cancel`, `models.list`; a conversation can hold `error` items; the tools' `name` is omp's own (`bash`, `edit`).
-pub const PROTOCOL: u32 = 5;
+/// 6 (one process): no `host.attach`; a thread has no `terminal`.
+pub const PROTOCOL: u32 = 6;
 
 pub mod check;
 pub mod changes;
@@ -16,7 +17,6 @@ pub mod checkpoint;
 pub mod client;
 pub mod daemon;
 pub mod github;
-pub mod host;
 pub mod merge;
 pub mod models;
 pub mod paths;

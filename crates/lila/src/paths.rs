@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 pub struct Paths {
     /// `lila.db`.
     pub data: PathBuf,
-    /// The socket and the hosts' logs.
+    /// The socket and omp's logs.
     pub state: PathBuf,
     /// Set when `LILA_HOME` is: the daemon then runs without the shared `lilad` name.
     pub isolated: bool,

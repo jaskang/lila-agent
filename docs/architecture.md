@@ -35,7 +35,7 @@ Lila 是建在 oh-my-pi（omp）上的个人 agent 桌面应用：一个原生�
 - **socket 只给命令行用。** `lila thread send …` 这类命令连到正在运行的程序。程序没在运行时，命令行报错并提示先启动。
 - **每个会话一个 omp 子进程**，第一次用到时启动，由核心里的一个线程读写。
 
-**现状**：还是两个程序（窗口 `lila-app` 和后台的 lilad），omp 的宿主进程和 lilad 都跑在 herdr-core 的终端里，窗口经 socket 调 lilad。合并是 `plan.md` 的 P1。
+**现状**：还是两个程序（窗口 `lila-app` 和后台的 lilad），lilad 跑在 herdr-core 的终端里，窗口经 socket 调 lilad。每个会话的 omp 已经是 lilad 的子进程，由 lilad 里的一个线程读写（`crates/lila/src/daemon/runner.rs`），没有宿主进程了；lilad 退出时 omp 一起结束。合并成一个程序是 `plan.md` 的 P1.2 起。
 
 ## 3. 谁做什么
 

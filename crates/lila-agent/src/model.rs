@@ -1,7 +1,5 @@
 //! The conversation model omp is translated into (architecture v3 §5).
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 /// Who a message came from.
@@ -393,7 +391,7 @@ pub enum Command {
     SetEffort { effort: String },
 }
 
-/// What a host reports to hc (OSC 7501), and so lilad's dispatch sees.
+/// What omp is doing, as the connection reports it to lilad.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStatus {
     Idle,
@@ -405,8 +403,9 @@ pub enum HostStatus {
 }
 
 impl HostStatus {
-    /// The OSC 7501 record: `ESC ]7501;state=…:app=…[:kind=…][:msg=<base64>] ESC \`.
-    pub fn osc(&self, app: &str) -> String {
+    /// The state word (`idle`, `working`, `done`, `blocked`, `error`), what it is blocked on (`kind`), and the
+    /// message (one line, cut).
+    pub fn parts(&self) -> (&'static str, Option<&'static str>, Option<String>) {
         let (state, kind, msg) = match self {
             HostStatus::Idle => ("idle", None, None),
             HostStatus::Working => ("working", None, None),
@@ -414,15 +413,8 @@ impl HostStatus {
             HostStatus::Blocked { why } => ("blocked", Some("permission"), Some(why.as_str())),
             HostStatus::Error { why } => ("error", None, Some(why.as_str())),
         };
-        let mut body = format!("state={state}");
-        if let Some(k) = kind {
-            body.push_str(&format!(":kind={k}"));
-        }
-        body.push_str(&format!(":app={app}"));
-        if let Some(m) = msg.map(|m| m.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|m| !m.is_empty()) {
-            body.push_str(&format!(":msg={}", STANDARD.encode(clip(&m, 2000))));
-        }
-        format!("\x1b]7501;{body}\x1b\\")
+        let msg = msg.map(|m| m.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|m| !m.is_empty()).map(|m| clip(&m, 2000));
+        (state, kind, msg)
     }
 }
 
@@ -494,9 +486,9 @@ mod tests {
     }
 
     #[test]
-    fn host_status_is_an_osc_7501_record() {
-        assert_eq!(HostStatus::Idle.osc("lila-omp"), "\x1b]7501;state=idle:app=lila-omp\x1b\\");
-        assert_eq!(HostStatus::Blocked { why: "waiting on Q7".into() }.osc("x"), "\x1b]7501;state=blocked:kind=permission:app=x:msg=d2FpdGluZyBvbiBRNw==\x1b\\");
+    fn host_status_has_a_word_a_kind_and_a_one_line_message() {
+        assert_eq!(HostStatus::Idle.parts(), ("idle", None, None));
+        assert_eq!(HostStatus::Blocked { why: "waiting\non  Q7".into() }.parts(), ("blocked", Some("permission"), Some("waiting on Q7".into())));
         let ev: AgentEvent = serde_json::from_str(r#"{"event":"session","id":"t1"}"#).unwrap();
         assert_eq!(ev, AgentEvent::Session { id: "t1".into() });
         assert_eq!(serde_json::to_string(&Command::Prompt { text: "hi".into(), attachments: Vec::new() }).unwrap(), r#"{"command":"prompt","text":"hi"}"#);

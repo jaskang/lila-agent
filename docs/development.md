@@ -34,5 +34,5 @@ cargo clippy --workspace --all-targets
 要省额度，并且不碰平时用的数据：
 
 - 放在单独的 `LILA_HOME`（一个临时目录）里跑。
-- 能用假 omp 测的不用真的：`crates/lila/tests/host.rs` 里有一个按脚本回帧的假 omp。
+- 能用假 omp 测的不用真的：`crates/lila/tests/omp.rs` 里有一个按脚本回帧的假 omp（通过 `OmpAgents` 启动），`crates/lila/src/daemon/tests.rs` 里服务核心的测试用 `Fake` 代替 omp。
 - 跑完把自己起的进程都结束掉：`lila thread stop <id>`，再 `lila daemon stop`。

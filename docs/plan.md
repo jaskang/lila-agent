@@ -14,10 +14,11 @@
 |---|---|
 | 精简成只用 omp | 删掉 Claude Code、Codex 两个引擎和终端、hook、账号用量等，约 2.8 万行 |
 | omp 接入换成 RPC | 流式对话、工具卡片、权限卡片、提问卡片、会话续聊、模型菜单 |
+| P1.1 omp 由服务核心直接启动 | 去掉 `lila host`、OSC 7501、`host.attach` 和 `Terminals`；库里去掉 `threads.terminal` 列 |
 
 验证到的程度：测试和 clippy 全过；真 omp 加 magpie 跑过普通回复、出权限卡片并允许执行、停止后续聊。**没有验证**：窗口接真后台用鼠标点、agent 真的提一个问题、改文件和 MCP 工具的权限卡片。
 
-**下一个任务：P1.1。**
+**下一个任务：P1.2。**
 
 ## 每个任务都要守的
 
@@ -33,17 +34,20 @@
 
 把后台的 lilad 并进窗口程序，去掉 herdr-core。**完成标志**：只装一个程序、只依赖 `omp`，就能开会话干活；关掉窗口后会话还在跑，重新打开能看到结果。
 
-现在的样子：窗口 `lila-app` 经 socket 调 lilad（`crates/lila/src/daemon/`）；lilad 自己和每个会话的宿主进程（`lila host omp`，`crates/lila/src/host.rs`）都跑在 herdr-core 的终端里（`crates/hc-client`，以及 lilad 里的 `Terminals`、`HcTerminals`）；宿主把状态用 OSC 7501 报给 lilad，经 socket 的 `host.attach` 交换 `AgentEvent` 和 `Command`。
+现在的样子：窗口 `lila-app` 经 socket 调 lilad（`crates/lila/src/daemon/`）；lilad 自己跑在 herdr-core 的终端里（`crates/hc-client`，`client::start_daemon`）；每个会话的 omp 是 lilad 的子进程（P1.1 做完）。
 
-### P1.1 omp 由服务核心直接启动
+### P1.1 omp 由服务核心直接启动 ✅
 
-- 去掉 `lila host omp` 这个中间进程：服务核心为每个会话起一个线程，线程里启动 omp 子进程，读写它的标准输入输出，用 `lila_agent::omp::Omp` 翻译（它是纯的，`host.rs` 里约 150 行的 IO 循环搬过来）。
-- 状态不再走 OSC 7501，事件和命令不再走 `host.attach`，都改成进程内的通道。
-- 删掉 `Terminals`、`HcTerminals`、hc 事件处理（`on_terminal`、`on_event`、`reconcile`）、`lila host` 子命令。
-- 保留的语义：omp 进程退出，会话变为已结束，对话里出现带退出码和最后几行输出的错误；结束会话时先关 omp 的标准输入，3 秒后还在就杀掉。
-- 测试：`crates/lila/tests/host.rs` 里的假 omp 改成给服务核心的测试用。
+lilad 里每个会话一个线程（`daemon/runner.rs` 的 `OmpAgents`）启动 omp 子进程、读写它的标准输入输出，用 `lila_agent::omp::Omp` 翻译；事件、状态、退出都作为 `Fact` 经通道回到 lilad 的主循环（`Input::Agent`）。服务核心通过 `Agents` trait 用它，测试用假的 `Fake`。
 
-验收：隔离的 `LILA_HOME` 里用真 omp 走「新会话 → 回复 → 权限卡片 → 允许 → 停止 → 继续」；`pgrep` 确认停止后没有残留的 omp。这一步做完 lilad 还是独立进程，但已经不需要 hc 来管会话。
+- 删掉：`lila host omp`、`crates/lila/src/host.rs`、OSC 7501（`HostStatus::osc`）、`host.attach`、`Terminals`、`HcTerminals`、`on_terminal`/`on_event`/`reconcile`、启动 20 秒没报状态的日志。
+- 库升到版本 9：去掉 `threads.terminal` 列；一个会话「在跑」就是 `started_ms` 有值、`ended_ms` 没有。lilad 重启时这样的会话（它们的 omp 随旧 lilad 结束了）被标成已结束，事件里记「lilad was not running」。
+- omp 退出：会话变为已结束，对话里出现带退出码和最后几行输出的错误（omp 的 stderr 写在 `state/omp/<会话 id>.log`）。放手一个会话（停止、归档、`lila daemon stop`）：关 omp 的标准输入，3 秒后还在就杀掉；`lila daemon stop` 等所有 omp 走完才退出。
+- 事件带「第几次启动」，已经被放手的旧 omp 的迟到事件会被丢掉（停止后马上继续时不会串）。
+- socket 协议升到 6：没有 `host.attach`，会话 JSON 没有 `terminal`。
+- 测试：`tests/omp.rs`（假 omp 通过真的 `OmpAgents`：启动参数、`--continue`、分块帧、提问回复、崩溃信息、放手后离开）、`runner.rs` 里用 shell 脚本测退出信息、放手、杀掉；`daemon/tests.rs` 的假终端换成假 omp。
+
+验收（实测，隔离的 `LILA_HOME`，真 omp 加 magpie，3 次模型请求）：新会话 → 回复 → 写文件出权限卡片 → 允许 → 文件写好 → 停止（`pgrep -x omp` 为 0）→ 继续（带 `--continue`，agent 记得上一轮写过 `hello.txt`）；`lila daemon stop` 后没有残留的 omp；`kill -9` lilad 后 3 秒内 omp 也走了（标准输入关了它自己退出）。**没验证**：窗口接这个 lilad 点鼠标（窗口没改，协议只是少了 `terminal` 字段）。
 
 ### P1.2 服务核心成为库
 

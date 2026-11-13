@@ -6,7 +6,7 @@
 
 ## 安装
 
-需要 Rust（版本见 `rust-toolchain.toml`）、[herdr-core](https://github.com/herdrdev/herdr-core) 的 `hc`（lilad 和每个会话的 omp 都跑在它的终端里），以及 `omp`（已经登录、配好模型）。
+需要 Rust（版本见 `rust-toolchain.toml`）、[herdr-core](https://github.com/herdrdev/herdr-core) 的 `hc`（lilad 跑在它的终端里；并进窗口后不再需要，见 `docs/plan.md` P1.3），以及 `omp`（已经登录、配好模型）。
 
 ```sh
 cargo install --path crates/lila
