@@ -180,9 +180,7 @@ omp 需要用户决定时，发 `extension_ui_request`，`core` 回 `extension_u
 
 默认模型是 `magpie` 的 `claude/claude-sonnet-5-5`，思考级别 `high`。
 
-## 可以直接用的现成东西
-
-- **官方 TypeScript 客户端。** npm 包 `@oh-my-pi/pi-coding-agent`（18.20.0）导出 `RpcClient`，已实现起进程、请求对应、版本 2 协商、分片拼接、历史分页、`promptAndWait()`、`waitForSettled()` 和扩展界面请求。适配层优先用它，不自己写协议解析。它默认用 `bun` 启动，和 `core` 的运行时一致。（文档，未试用）
+- **官方 TypeScript 客户端。** npm 包 `@oh-my-pi/pi-coding-agent` `18.20.0` 的 `RpcClient` 源码声明支持 Bun `>=1.4.4`，但默认启动 `--mode rpc`，没有公开的 `extension_ui_request` 订阅和 `extension_ui_response` 回复接口；相关 UI listener 和写帧方法是私有实现。Lila 仍需掌控 `rpc-ui` 传输适配，最多复用官方的帧处理逻辑。（源码已核对，Bun 下完整集成启动尚未验证）
 - **协议的 JSON Schema。** omp 仓库里有 `rpc-wire.schema.json` 和生成的 TypeScript 类型，可以用来校验。
 - **宿主工具。** `set_host_tools` 让 `core` 向 omp 注册自己实现的工具，omp 调用时发 `host_tool_call`，`core` 回 `host_tool_result`。以后做个人助理的日历、待办等工具走这条路，不用写 omp 扩展。（文档）
 

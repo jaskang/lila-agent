@@ -23,10 +23,17 @@ async function ensureCore(): Promise<void> {
   const coreCommand = app.isPackaged ? join(coreDir, "lilad") : (process.env.LILA_BUN_BIN ?? "bun");
   const coreArgs = app.isPackaged ? [] : ["run", "src/main.ts"];
 
+  const projectPath =
+    process.env.LILA_PROJECT_PATH ?? (app.isPackaged ? app.getPath("documents") : join(app.getAppPath(), "../.."));
+
   const child = spawn(coreCommand, coreArgs, {
     cwd: coreDir,
     detached: true,
-    env: { ...process.env, LILA_CORE_PORT: String(DEFAULT_CORE_PORT) },
+    env: {
+      ...process.env,
+      LILA_CORE_PORT: String(DEFAULT_CORE_PORT),
+      LILA_PROJECT_PATH: projectPath,
+    },
     stdio: "ignore",
   });
   child.unref();
