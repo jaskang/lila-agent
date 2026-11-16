@@ -42,7 +42,7 @@ core（Bun 独立进程）←───┘←── 以后的手机端（经 Tail
 
 | 部分 | 选择 |
 |---|---|
-| 仓库 | Bun workspace：`packages/protocol`、`packages/core`、`apps/desktop` |
+| 仓库 | Bun workspace：`packages/protocol`、`packages/core`、`packages/app-desktop` |
 | 桌面壳 | Electron + electron-vite，打包用 electron-builder |
 | `core` 运行时 | Bun；发布时用 `bun build --compile` 编译成单个可执行文件，放进应用包 |
 | Agent 运行时 | omp（`--mode rpc-ui --approval-mode <档位>`），作为 `core` 的子进程；协议细节见 [omp-rpc.md](omp-rpc.md) |

@@ -20,9 +20,9 @@
 
 ## 之后的任务
 
-### 2. 搭仓库骨架
+### 2. 搭仓库骨架（已完成）
 
-Bun workspace，三个包：`packages/protocol`、`packages/core`、`apps/desktop`。`core` 用 Bun 能启动并监听本机 WebSocket，Electron 窗口能打开并连上它，shadcn/ui（Base UI）初始化完成，lint、类型检查、测试命令可用。
+Bun workspace，三个包：`packages/protocol`、`packages/core`、`packages/app-desktop`。`core` 用 Bun 能启动并监听本机 WebSocket，Electron 窗口能打开并连上它，shadcn/ui（Base UI）初始化完成，lint、类型检查、测试命令可用。
 
 ### 3. 事件协议
 

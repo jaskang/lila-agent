@@ -1,0 +1,14 @@
+{
+  "name": "@lila/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "start": "bun src/main.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@lila/protocol": "workspace:*"
+  }
+}
