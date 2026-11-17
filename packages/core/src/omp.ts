@@ -11,11 +11,26 @@ type OmpProcess = Bun.Subprocess<"pipe", "pipe", "pipe">;
 export interface OmpSessionOptions {
   cwd: string;
   approvalMode: ApprovalMode;
+  /** `provider::modelId`, as listed by `models.list`. */
   modelId?: string;
   sessionFile?: string;
   onFrame: (frame: OmpFrame) => void;
   onExit: (code: number) => void;
 }
+
+/** What core needs from an omp process; tests replace it with recorded frames. */
+export interface OmpRuntime {
+  start(): Promise<void>;
+  prompt(id: string, message: string): Promise<void>;
+  abort(id: string): Promise<void>;
+  respond(id: string, response: Record<string, unknown>): Promise<void>;
+  request(type: string, payload?: Record<string, unknown>): Promise<OmpFrame>;
+  stop(): Promise<void>;
+}
+
+export type CreateOmp = (options: OmpSessionOptions) => OmpRuntime;
+
+export const createOmpSession: CreateOmp = (options) => new OmpSession(options);
 
 type PendingChunks = {
   chunkId: string;
@@ -123,7 +138,7 @@ function modelParts(modelId: string): { provider: string; modelId: string } {
   return { provider: modelId.slice(0, separator), modelId: modelId.slice(separator + 2) };
 }
 
-export class OmpSession {
+export class OmpSession implements OmpRuntime {
   readonly #options: OmpSessionOptions;
   #process?: OmpProcess;
   #readPromise?: Promise<void>;
@@ -192,12 +207,13 @@ export class OmpSession {
     }
   }
 
+  /** Resolves once omp accepted the prompt; the run itself ends with `prompt_result`. */
   async prompt(id: string, message: string): Promise<void> {
-    await this.#send({ id, type: "prompt", message });
+    await this.#request({ id, type: "prompt", message });
   }
 
   async abort(id: string): Promise<void> {
-    await this.#send({ id, type: "abort" });
+    await this.#request({ id, type: "abort" });
   }
 
   async respond(id: string, response: Record<string, unknown>): Promise<void> {

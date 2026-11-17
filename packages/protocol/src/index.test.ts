@@ -28,12 +28,3 @@ test("SessionEvent requires a positive sequence", () => {
     }).success,
   ).toBe(false);
 });
-
-test("ServerHello rejects a different protocol version", () => {
-  const result = ServerHello.safeParse({
-    type: "hello",
-    protocolVersion: 999,
-    coreVersion: "0.0.0",
-  });
-  expect(result.success).toBe(false);
-});

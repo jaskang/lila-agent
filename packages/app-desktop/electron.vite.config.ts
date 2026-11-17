@@ -5,6 +5,12 @@ import { defineConfig } from "electron-vite";
 
 export default defineConfig({
   main: {},
+  // Sandboxed preload scripts must be CommonJS.
+  preload: {
+    build: {
+      rolldownOptions: { output: { format: "cjs", entryFileNames: "[name].cjs" } },
+    },
+  },
   renderer: {
     resolve: {
       alias: {
@@ -12,5 +18,6 @@ export default defineConfig({
       },
     },
     plugins: [react(), tailwindcss()],
+    worker: { format: "es" },
   },
 });

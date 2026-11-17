@@ -68,12 +68,12 @@ Lila 默认用 `yolo`，每个会话可以切换档位。切换档位要重启�
 |---|---|---|
 | 发消息 | `prompt`（`message`，可选 `images`） | 已实测 |
 | 运行中追加消息 | `steer`、`follow_up` | 未测 |
-| 中断 | `abort` | 未测 |
+| 中断 | `abort` | 已实测：响应成功，之后 `prompt_result.status` 为 `aborted` |
 | 读当前状态 | `get_state` | 已实测 |
 | 列出模型 | `get_available_models` | 已实测 |
-| 切换模型 | `set_model`（`provider: "magpie"`、`modelId`） | 已实测 |
+| 切换模型 | `set_model`（`provider: "magpie"`、`modelId`） | 已实测；`modelId` 必须是 `get_available_models` 返回的完整 `id`（如 `codex/gpt-6.1-sol`），只写 `claude-sonnet-5-5` 会报 `Model not found` |
 | 新会话 | `new_session` | 未测 |
-| 恢复旧会话 | `switch_session`（`sessionPath`） | 未测 |
+| 恢复旧会话 | 启动参数 `--resume <sessionFile>` | 已实测：`rpc-ui` 模式下可用，`get_state` 返回同一个 `sessionFile`，模型记得之前的对话 |
 | 读历史消息 | `get_messages_page`（`cursor`、`limit`） | 未测 |
 | 只收增量 | `set_event_filter`（`messageUpdates: "delta"`） | 未测 |
 | 列出斜杠命令 | `get_available_commands` | 已实测 |
@@ -118,7 +118,7 @@ Lila 默认用 `yolo`，每个会话可以切换档位。切换档位要重启�
 - **`message_update` 默认只带增量**，字段是 `messageId` 和 `assistantMessageEvent`。增量分三类，各有 `_start`、`_delta`、`_end`：`thinking`（思考）、`text`（正文）、`toolcall`（工具参数）。
 - **`message_end` 带完整消息**，助手消息里有 `usage`（输入、输出、缓存读写的 token 数和名义费用）、`model`、`provider`、`duration`、`ttft`、`stopReason`。
 - **工具调用用 `toolCallId` 串起来。** `tool_execution_start` 带 `toolName`、`args` 和一句 `intent`（模型自己写的意图说明，可以直接显示）。
-- **编辑文件时有 `tool_stream_update`**，带 `files: [{ path, diff, op }]`，可以在工具执行过程中就显示 diff。
+- **编辑文件时有 `tool_stream_update`**，带 `update.files: [{ path, diff, op, firstChangedLine }]`，在 `tool_execution_start` 之前就开始发，`update.streaming` 为 `false` 时是最终 diff。diff 每行形如 `-2|旧内容`、`+2|新内容`、` 3|上下文`。`tool_execution_end.result.details.diff` 里也有最终 diff。（已实测）
 - `agent_end.messages` 在内容过大时不完整，适配层要自己保留流式收到的消息。
 - 这一轮的日志约 137 KB，其中大部分是 `message_end` 里的完整消息。
 
@@ -157,10 +157,11 @@ omp 需要用户决定时，发 `extension_ui_request`，`core` 回 `extension_u
 ```
 
 - **回复选项的原文**：`{ "type": "extension_ui_response", "id": "...", "value": "Approve" }`。
-- **请求里没有 `toolCallId`。** 适配层要把它和紧挨着的上一条 `tool_execution_start` 对应起来；工具名和参数从那条事件里取，不要解析 `title`。
+- **请求里没有 `toolCallId`。** 适配层要把它和紧挨着的上一条 `tool_execution_start` 对应起来；工具名和参数从那条事件里取，不要解析 `title`。`title` 第一行是 `Allow tool: <工具名>`，之后是命令或文件路径，可以直接显示。
 - **拒绝或取消后**，工具以 `isError: true` 结束，结果文本是 `Tool call denied by user: bash`，模型会收到并继续回答。回 `{ cancelled: true }` 的效果和选 `Deny` 一样。
-- 「Approve bash for this session」由 omp 自己记住，同一进程内该工具不再询问。
-- 选择 `Approve` 后工具正常执行这一路还没跑过，同时有多个工具等待审批时的顺序也没测。
+- 「Approve bash for this session」由 omp 自己记住，同一进程内该工具不再询问；进程被回收或重启后要重新授权。
+- 选择 `Approve` 后工具正常执行，已实测（`write`、`edit`、`bash`）。同时有多个工具等待审批时的顺序还没测。
+- **开了 `set_ask_dialog` 后，Agent 的 `ask` 工具在本机仍然拆成一连串 `select`**，每个问题一条，选项末尾多一个 `Other (type your own)`。所以界面上 Agent 的提问和工具审批都走 `select`，`ask` 格式暂时没出现过。（已实测）
 
 ## 本机的模型
 
@@ -186,8 +187,6 @@ omp 需要用户决定时，发 `extension_ui_request`，`core` 回 `extension_u
 
 ## 还要实测的
 
-1. 审批选 `Approve` 后的完整流程，以及多个工具同时等待审批的情况。
+1. 同时有多个工具等待审批时的顺序。
 2. `always-ask-cached` 档的授权选项在 RPC 下的实际格式。
-3. `abort`、`switch_session`、`get_messages_page` 的实际行为。
-4. 试用官方 `RpcClient`，确认它在 Bun 下可以直接用。
-5. 在 Claude 和 ChatGPT 的用量页面核对额度确实扣在订阅上。
+3. 在 Claude 和 ChatGPT 的用量页面核对额度确实扣在订阅上。

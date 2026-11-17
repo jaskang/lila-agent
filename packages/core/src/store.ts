@@ -1,272 +1,214 @@
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { ApprovalMode, SessionEvent, type SessionEventType } from "@lila/protocol";
+import { basename, dirname } from "node:path";
+import type {
+  ApprovalMode,
+  Project,
+  SessionEvent,
+  SessionEventBody,
+  SessionStatus,
+} from "@lila/protocol";
 import { Database } from "bun:sqlite";
+
+const SCHEMA_VERSION = 1;
 
 export interface SessionRecord {
   id: string;
   projectId: string;
-  modelId?: string;
-  sessionFile?: string;
-  approvalMode: ApprovalMode;
-  status: "idle" | "running" | "waiting" | "finished" | "failed" | "aborted" | "interrupted";
-}
-
-export interface CreateSessionInput {
-  id: string;
-  projectId: string;
+  title: string;
   modelId?: string;
   approvalMode: ApprovalMode;
+  status: SessionStatus;
+  ompSessionFile?: string;
+  updatedAt: string;
 }
 
-export interface ProjectRecord {
+type SessionRow = {
   id: string;
-  path: string;
+  project_id: string;
+  title: string;
+  model_id: string | null;
+  approval_mode: ApprovalMode;
+  status: SessionStatus;
+  omp_session_file: string | null;
+  updated_at: string;
+};
+
+function toSession(row: SessionRow): SessionRecord {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    title: row.title,
+    ...(row.model_id ? { modelId: row.model_id } : {}),
+    approvalMode: row.approval_mode,
+    status: row.status,
+    ...(row.omp_session_file ? { ompSessionFile: row.omp_session_file } : {}),
+    updatedAt: row.updated_at,
+  };
 }
 
-export class SessionStore {
+const SESSION_COLUMNS = "id, project_id, title, model_id, approval_mode, status, omp_session_file, updated_at";
+
+/** SQLite persistence for projects, sessions and the per-session event log. */
+export class Store {
   readonly #db: Database;
+  readonly #nextSeq = new Map<string, number>();
 
   constructor(path = ":memory:") {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-    this.#db = new Database(path);
-    this.#db.exec(`
-      PRAGMA journal_mode = WAL;
-      CREATE TABLE IF NOT EXISTS projects (
+    this.#db = new Database(path, { strict: true });
+    this.#db.run("PRAGMA journal_mode = WAL");
+    this.#db.run("PRAGMA synchronous = NORMAL");
+    const { user_version } = this.#db.query("PRAGMA user_version").get() as { user_version: number };
+    if (user_version === 0) this.#createSchema();
+    else if (user_version !== SCHEMA_VERSION) throw new Error(`Unsupported database schema version ${user_version}`);
+  }
+
+  #createSchema(): void {
+    // The prototype schema had no version; keep its tables under a legacy_ prefix instead of dropping them.
+    const legacy = this.#db
+      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'legacy_%' AND name NOT LIKE 'sqlite_%'")
+      .all() as Array<{ name: string }>;
+    for (const { name } of legacy) this.#db.run(`ALTER TABLE "${name}" RENAME TO "legacy_${name}"`);
+    this.#db.run(`
+      CREATE TABLE projects (
         id TEXT PRIMARY KEY,
-        path TEXT NOT NULL,
+        path TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS sessions (
+      CREATE TABLE sessions (
         id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        title TEXT NOT NULL,
         model_id TEXT,
-        session_file TEXT,
         approval_mode TEXT NOT NULL,
         status TEXT NOT NULL,
+        omp_session_file TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS events (
+      CREATE TABLE events (
         session_id TEXT NOT NULL,
         seq INTEGER NOT NULL,
+        run_id TEXT,
         event_type TEXT NOT NULL,
         payload_json TEXT NOT NULL,
-        request_id TEXT,
-        run_id TEXT,
-        pending_id TEXT,
         created_at TEXT NOT NULL,
         PRIMARY KEY (session_id, seq)
-      );
-      CREATE TABLE IF NOT EXISTS pending_items (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        run_id TEXT,
-        status TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        resolved_at TEXT
-      );
-      CREATE TABLE IF NOT EXISTS command_requests (
-        session_id TEXT NOT NULL,
-        request_id TEXT NOT NULL,
-        command_type TEXT NOT NULL,
-        response_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY (session_id, request_id)
-      );
+      ) WITHOUT ROWID;
+      PRAGMA user_version = ${SCHEMA_VERSION};
     `);
-    try {
-      this.#db.exec("ALTER TABLE sessions ADD COLUMN session_file TEXT");
-    } catch {
-      // Existing databases already have the column.
-    }
   }
 
   close(): void {
     this.#db.close();
   }
 
-  addProject(id: string, path: string): ProjectRecord {
-    this.ensureProject(id, path);
-    return { id, path };
+  listProjects(): Project[] {
+    return this.#db.query("SELECT id, path, name FROM projects ORDER BY created_at ASC").all() as Project[];
   }
 
-  listProjects(): ProjectRecord[] {
-    return this.#db.prepare("SELECT id, path FROM projects ORDER BY created_at ASC").all() as ProjectRecord[];
+  getProject(id: string): Project | undefined {
+    return (this.#db.query("SELECT id, path, name FROM projects WHERE id = ?").get(id) as Project | null) ?? undefined;
   }
 
-  getProject(id: string): ProjectRecord | undefined {
-    const row = this.#db.prepare("SELECT id, path FROM projects WHERE id = ?").get(id) as ProjectRecord | null;
-    return row ?? undefined;
-  }
-
-  listSessions(projectId?: string): SessionRecord[] {
-    const rows = projectId
-      ? this.#db
-          .prepare(
-            "SELECT id, project_id, model_id, session_file, approval_mode, status FROM sessions WHERE project_id = ? ORDER BY created_at ASC",
-          )
-          .all(projectId)
-      : this.#db
-          .prepare("SELECT id, project_id, model_id, session_file, approval_mode, status FROM sessions ORDER BY created_at ASC")
-          .all();
-    return (rows as Array<{
-      id: string;
-      project_id: string;
-      model_id: string | null;
-      session_file: string | null;
-      approval_mode: string;
-      status: SessionRecord["status"];
-    }>).flatMap((row) => {
-      const approvalMode = ApprovalMode.safeParse(row.approval_mode);
-      if (!approvalMode.success) return [];
-      return [
-        {
-          id: row.id,
-          projectId: row.project_id,
-          ...(row.model_id ? { modelId: row.model_id } : {}),
-          ...(row.session_file ? { sessionFile: row.session_file } : {}),
-          approvalMode: approvalMode.data,
-          status: row.status,
-        },
-      ];
-    });
-  }
-
-  configureSession(id: string, input: { modelId?: string | null; approvalMode?: ApprovalMode }): SessionRecord | undefined {
-    const current = this.getSession(id);
-    if (!current) return undefined;
+  /** Adds a project for `path`, or returns the existing one. */
+  addProject(path: string): Project {
+    const existing = this.#db.query("SELECT id, path, name FROM projects WHERE path = ?").get(path) as Project | null;
+    if (existing) return existing;
+    const project = { id: crypto.randomUUID(), path, name: basename(path) || path };
     this.#db
-      .prepare("UPDATE sessions SET model_id = ?, approval_mode = ?, updated_at = ? WHERE id = ?")
-      .run(input.modelId === undefined ? current.modelId ?? null : input.modelId, input.approvalMode ?? current.approvalMode, new Date().toISOString(), id);
-    return this.getSession(id);
+      .query("INSERT INTO projects (id, path, name, created_at) VALUES (?, ?, ?, ?)")
+      .run(project.id, project.path, project.name, new Date().toISOString());
+    return project;
   }
 
-  ensureProject(id: string, path: string): void {
-    this.#db
-      .prepare("INSERT OR IGNORE INTO projects (id, path, created_at) VALUES (?, ?, ?)")
-      .run(id, path, new Date().toISOString());
-  }
-
-  createSession(input: CreateSessionInput): SessionRecord {
-    const now = new Date().toISOString();
-    this.#db
-      .prepare(
-        "INSERT INTO sessions (id, project_id, model_id, session_file, approval_mode, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      )
-      .run(input.id, input.projectId, input.modelId ?? null, null, input.approvalMode, "idle", now, now);
-    return {
-      id: input.id,
-      projectId: input.projectId,
-      ...(input.modelId ? { modelId: input.modelId } : {}),
-      approvalMode: input.approvalMode,
-      status: "idle",
-    };
+  listSessions(): SessionRecord[] {
+    return (this.#db.query(`SELECT ${SESSION_COLUMNS} FROM sessions ORDER BY updated_at DESC`).all() as SessionRow[]).map(
+      toSession,
+    );
   }
 
   getSession(id: string): SessionRecord | undefined {
-    const row = this.#db
-      .prepare(
-        "SELECT id, project_id, model_id, session_file, approval_mode, status FROM sessions WHERE id = ?",
+    const row = this.#db.query(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE id = ?`).get(id) as SessionRow | null;
+    return row ? toSession(row) : undefined;
+  }
+
+  createSession(input: { projectId: string; modelId?: string; approvalMode: ApprovalMode }): SessionRecord {
+    const now = new Date().toISOString();
+    const id = crypto.randomUUID();
+    this.#db
+      .query(
+        "INSERT INTO sessions (id, project_id, title, model_id, approval_mode, status, created_at, updated_at) VALUES (?, ?, '', ?, ?, 'idle', ?, ?)",
       )
-      .get(id) as
-      | {
-          id: string;
-          project_id: string;
-          model_id: string | null;
-          session_file: string | null;
-          approval_mode: string;
-          status: SessionRecord["status"];
-        }
-      | null;
-    if (!row) return undefined;
-    const approvalMode = ApprovalMode.safeParse(row.approval_mode);
-    if (!approvalMode.success) throw new Error(`Invalid approval mode in session ${id}`);
-    return {
-      id: row.id,
-      projectId: row.project_id,
-      ...(row.model_id ? { modelId: row.model_id } : {}),
-      ...(row.session_file ? { sessionFile: row.session_file } : {}),
-      approvalMode: approvalMode.data,
-      status: row.status,
-    };
+      .run(id, input.projectId, input.modelId ?? null, input.approvalMode, now, now);
+    return this.getSession(id)!;
   }
 
-  setSessionStatus(id: string, status: SessionRecord["status"]): void {
+  updateSession(
+    id: string,
+    patch: Partial<Pick<SessionRecord, "title" | "approvalMode" | "status" | "ompSessionFile">> & {
+      modelId?: string | null;
+    },
+  ): SessionRecord {
+    const current = this.getSession(id);
+    if (!current) throw new Error(`Session ${id} does not exist`);
+    const modelId = patch.modelId === undefined ? current.modelId ?? null : patch.modelId;
     this.#db
-      .prepare("UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?")
-      .run(status, new Date().toISOString(), id);
-  }
-
-  setSessionFile(id: string, sessionFile: string): void {
-    this.#db
-      .prepare("UPDATE sessions SET session_file = ?, updated_at = ? WHERE id = ?")
-      .run(sessionFile, new Date().toISOString(), id);
-  }
-
-  appendEvent(input: {
-    sessionId: string;
-    eventType: SessionEventType;
-    payload: Record<string, unknown>;
-    requestId?: string;
-    runId?: string;
-    pendingId?: string;
-  }): SessionEvent {
-    const next = this.#db
-      .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE session_id = ?")
-      .get(input.sessionId) as { seq: number };
-    const event = SessionEvent.parse({
-      type: "event",
-      sessionId: input.sessionId,
-      seq: next.seq,
-      eventType: input.eventType,
-      payload: input.payload,
-      ...(input.requestId ? { requestId: input.requestId } : {}),
-      ...(input.runId ? { runId: input.runId } : {}),
-      ...(input.pendingId ? { pendingId: input.pendingId } : {}),
-    });
-    this.#db
-      .prepare(
-        "INSERT INTO events (session_id, seq, event_type, payload_json, request_id, run_id, pending_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      .query(
+        "UPDATE sessions SET title = ?, model_id = ?, approval_mode = ?, status = ?, omp_session_file = ?, updated_at = ? WHERE id = ?",
       )
       .run(
-        event.sessionId,
-        event.seq,
-        event.eventType,
-        JSON.stringify(event.payload),
-        event.requestId ?? null,
-        event.runId ?? null,
-        event.pendingId ?? null,
+        patch.title ?? current.title,
+        modelId,
+        patch.approvalMode ?? current.approvalMode,
+        patch.status ?? current.status,
+        patch.ompSessionFile ?? current.ompSessionFile ?? null,
         new Date().toISOString(),
+        id,
       );
-    return event;
+    return this.getSession(id)!;
   }
 
-  listEventsAfter(sessionId: string, seq: number): SessionEvent[] {
+  appendEvent(sessionId: string, body: SessionEventBody, runId?: string): SessionEvent {
+    let seq = this.#nextSeq.get(sessionId);
+    if (seq === undefined) {
+      const row = this.#db.query("SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE session_id = ?").get(sessionId) as {
+        seq: number;
+      };
+      seq = row.seq + 1;
+    }
+    this.#db
+      .query("INSERT INTO events (session_id, seq, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(sessionId, seq, runId ?? null, body.eventType, JSON.stringify(body.payload), new Date().toISOString());
+    this.#nextSeq.set(sessionId, seq + 1);
+    return { type: "event", sessionId, seq, ...(runId ? { runId } : {}), ...body } as SessionEvent;
+  }
+
+  listEventsAfter(sessionId: string, afterSeq: number): SessionEvent[] {
     const rows = this.#db
-      .prepare(
-        "SELECT seq, event_type, payload_json, request_id, run_id, pending_id FROM events WHERE session_id = ? AND seq > ? ORDER BY seq ASC",
-      )
-      .all(sessionId, seq) as Array<{
-      seq: number;
-      event_type: SessionEventType;
-      payload_json: string;
-      request_id: string | null;
-      run_id: string | null;
-      pending_id: string | null;
-    }>;
-    return rows.map((row) =>
-      SessionEvent.parse({
-        type: "event",
-        sessionId,
-        seq: row.seq,
-        eventType: row.event_type,
-        payload: JSON.parse(row.payload_json),
-        ...(row.request_id ? { requestId: row.request_id } : {}),
-        ...(row.run_id ? { runId: row.run_id } : {}),
-        ...(row.pending_id ? { pendingId: row.pending_id } : {}),
-      }),
+      .query("SELECT seq, run_id, event_type, payload_json FROM events WHERE session_id = ? AND seq > ? ORDER BY seq ASC")
+      .all(sessionId, afterSeq) as Array<{ seq: number; run_id: string | null; event_type: string; payload_json: string }>;
+    return rows.map(
+      (row) =>
+        ({
+          type: "event",
+          sessionId,
+          seq: row.seq,
+          ...(row.run_id ? { runId: row.run_id } : {}),
+          eventType: row.event_type,
+          payload: JSON.parse(row.payload_json),
+        }) as SessionEvent,
     );
+  }
+
+  /** Last run of the session that has no terminal event. */
+  unfinishedRunId(sessionId: string): string | undefined {
+    const row = this.#db
+      .query(
+        "SELECT run_id, event_type FROM events WHERE session_id = ? AND event_type IN ('run.started', 'run.finished', 'run.aborted', 'run.failed', 'run.interrupted') ORDER BY seq DESC LIMIT 1",
+      )
+      .get(sessionId) as { run_id: string | null; event_type: string } | null;
+    return row?.event_type === "run.started" ? row.run_id ?? undefined : undefined;
   }
 }

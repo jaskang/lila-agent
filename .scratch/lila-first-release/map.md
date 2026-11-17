@@ -17,14 +17,15 @@
 - [omp RPC 客户端与运行生命周期的最小事实集](issues/02-omp-rpc-boundary-and-lifecycle.md)：官方 RpcClient 可在 Bun 使用，但不能直接承载 rpc-ui 审批/提问，core 需要保留 RPC UI 适配层。
 - [第一版会话协议与事件闭环](issues/01-protocol-and-event-contract.md)：采用会话级单调 `seq`，事件先落日志再推送；命令用 `requestId` 幂等，运行和待处理项分别用 `runId`、`pendingId` 关联。
 - [可运行的端到端骨架](issues/08-running-vertical-slice.md)：protocol、core、SQLite、omp RPC 和桌面工作台已打通，真实任务已收到流式回复并完成。
-
-
-
+- [会话、事件和待处理项的持久化与恢复](issues/03-session-persistence-and-recovery.md)：只有定稿事实落库，增量只推送；打开运行中的会话时附带未完成输出快照；`core` 重启时未完成运行标记为 `run.interrupted`；待处理项只在内存。
+- [桌面会话界面](issues/04-desktop-conversation-surface.md)：侧边栏按项目列会话，会话界面用 shadcn AI 组件拼装，工具调用折叠显示意图和目标，diff 默认展开，待处理项固定在输入框上方。
+- [提问、审批与 approval mode](issues/05-approval-and-question-flow.md)：只有需要回复的界面请求成为待处理项，审批关联上一条 `tool_execution_start`，一次只处理最早的一个，选项原文回传，`cancel` 关闭对应项。
+- [项目、模型与会话入口](issues/06-project-model-session-entry.md)：项目用系统目录选择器添加；模型列表和默认模型来自 omp；模型和审批方式按会话保存，修改后下次发消息用 `--resume` 重启 omp。
 
 ## Not yet specified
 
-- 第一轮运行暴露的审批并发顺序、缓存授权交互和 crash 恢复语义仍需专项决策。
-- SQLite 事务、命令幂等和长会话性能优化的具体方案仍需在后续票据中确定。
+- 多个工具同时等待审批时 omp 的实际顺序。
+- 长会话的分页加载和几百条消息时的打开速度，需要在验收（07）里实测。
 
 ## Out of scope
 
