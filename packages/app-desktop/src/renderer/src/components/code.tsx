@@ -1,6 +1,5 @@
 import * as React from "react";
 import { FileDiff as FileDiffIcon } from "lucide-react";
-import type { FileDiff } from "@lila/protocol";
 import {
   CodeBlock,
   CodeBlockActions,
@@ -14,6 +13,8 @@ import { useHighlighted } from "@/lib/highlight";
 
 const EXTENSION_LANGUAGE: Record<string, string> = {
   ts: "typescript",
+  mts: "typescript",
+  cts: "typescript",
   tsx: "tsx",
   js: "javascript",
   jsx: "jsx",
@@ -42,7 +43,7 @@ export function Code({
   maxHeight = "20rem",
 }: {
   code: string;
-  language?: string;
+  language?: string | undefined;
   title?: React.ReactNode;
   streaming?: boolean;
   maxHeight?: string;
@@ -72,41 +73,81 @@ export function Code({
   );
 }
 
-type DiffLine = { variant: "added" | "removed" | "default"; text: string };
+type DiffLine = { variant: "added" | "removed" | "default" | "highlighted"; text: string };
+type DiffFile = { path: string; lines: DiffLine[]; added: number; removed: number };
 
-/** Pi 的显示 diff 可能是带行号的 `+N|text`、`-N|text`、` N|text`，其他格式按统一 diff 处理。 */
-export function parseDiff(diff: string): DiffLine[] {
-  return diff.split("\n").map((row) => {
-    const match = /^([+\- ])\s*(\d+)?\|(.*)$/.exec(row);
-    const marker = match ? match[1] : row[0];
-    const text = match ? (match[3] ?? "") : row.slice(1);
-    return { variant: marker === "+" ? "added" : marker === "-" ? "removed" : "default", text };
-  });
+function stripPrefix(path: string): string {
+  return path.replace(/^[ab]\//, "").split("\t")[0] ?? path;
 }
 
-export function DiffView({ file }: { file: FileDiff }) {
-  const lines = React.useMemo(() => parseDiff(file.diff), [file.diff]);
-  const added = lines.filter((line) => line.variant === "added").length;
-  const removed = lines.filter((line) => line.variant === "removed").length;
+/** Splits a unified patch into files; hunk headers become highlighted separator lines. */
+export function parsePatch(patch: string, fallbackPath: string): DiffFile[] {
+  const files: DiffFile[] = [];
+  let file: DiffFile | undefined;
+  const open = (path: string): DiffFile => {
+    const next = { path, lines: [], added: 0, removed: 0 };
+    files.push(next);
+    return next;
+  };
+  for (const row of patch.split("\n")) {
+    if (row.startsWith("diff --git ") || row.startsWith("index ") || row.startsWith("Index: ") || row.startsWith("===")) continue;
+    if (row.startsWith("--- ")) continue;
+    if (row.startsWith("+++ ")) {
+      const path = stripPrefix(row.slice(4).trim());
+      file = open(path === "/dev/null" ? fallbackPath : path);
+      continue;
+    }
+    file ??= open(fallbackPath);
+    if (row.startsWith("@@")) {
+      const context = row.replace(/^@@[^@]*@@\s?/, "");
+      file.lines.push({ variant: "highlighted", text: context ? `⋯ ${context}` : "⋯" });
+    } else if (row.startsWith("+")) {
+      file.added += 1;
+      file.lines.push({ variant: "added", text: row.slice(1) });
+    } else if (row.startsWith("-")) {
+      file.removed += 1;
+      file.lines.push({ variant: "removed", text: row.slice(1) });
+    } else if (row.startsWith("\\")) {
+      continue;
+    } else {
+      file.lines.push({ variant: "default", text: row.slice(1) });
+    }
+  }
+  for (const item of files) {
+    while (item.lines.at(-1)?.variant === "default" && !item.lines.at(-1)?.text) item.lines.pop();
+  }
+  return files.filter((item) => item.lines.length);
+}
+
+export function DiffView({ patch, path }: { patch: string; path: string }) {
+  const files = React.useMemo(() => parsePatch(patch, path), [patch, path]);
   return (
-    <CodeBlock size="sm" className="not-typeset">
-      <CodeBlockHeader>
-        <CodeBlockTitle>
-          <FileDiffIcon />
-          {file.path}
-        </CodeBlockTitle>
-        <span className="ms-auto shrink-0 font-mono text-xs tabular-nums">
-          <span className="text-emerald-600 dark:text-emerald-400">+{added}</span>{" "}
-          <span className="text-destructive">−{removed}</span>
-        </span>
-      </CodeBlockHeader>
-      <CodeBlockContent style={{ maxHeight: "24rem" }}>
-        {lines.map((line, index) => (
-          <CodeBlockLine key={index} variant={line.variant}>
-            {line.text}
-          </CodeBlockLine>
-        ))}
-      </CodeBlockContent>
-    </CodeBlock>
+    <>
+      {files.map((file, fileIndex) => (
+        <CodeBlock key={`${file.path}-${fileIndex}`} size="sm" className="not-typeset">
+          <CodeBlockHeader>
+            <CodeBlockTitle>
+              <FileDiffIcon />
+              {file.path}
+            </CodeBlockTitle>
+            <span className="ms-auto shrink-0 font-mono text-xs tabular-nums">
+              <span className="text-emerald-600 dark:text-emerald-400">+{file.added}</span>{" "}
+              <span className="text-destructive">−{file.removed}</span>
+            </span>
+          </CodeBlockHeader>
+          <CodeBlockContent style={{ maxHeight: "24rem" }}>
+            {file.lines.map((line, index) => (
+              <CodeBlockLine
+                key={index}
+                variant={line.variant}
+                className={line.variant === "highlighted" ? "text-muted-foreground" : undefined}
+              >
+                {line.text}
+              </CodeBlockLine>
+            ))}
+          </CodeBlockContent>
+        </CodeBlock>
+      ))}
+    </>
   );
 }

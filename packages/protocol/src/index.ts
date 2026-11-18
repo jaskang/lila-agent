@@ -1,164 +1,167 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 2;
+/**
+ * Lila's wire protocol between core and its clients (desktop now, mobile later).
+ *
+ * Commands from clients are validated with Zod at the core boundary. Messages from core are plain
+ * TypeScript types: core is trusted once the socket is authenticated, and streaming frames are too
+ * frequent to validate one by one.
+ *
+ * The transcript is not stored by Lila. Pi's session file is the only record; core projects its
+ * entries into `TranscriptItem`s when a client opens a session, then pushes `item` / `delta` frames.
+ * A client that reconnects simply opens the session again.
+ */
 
+export const PROTOCOL_VERSION = 3;
 export const DEFAULT_CORE_PORT = 7457;
 
 const Id = z.string().min(1);
 
-export const ApprovalMode = z.enum(["yolo", "write", "always-ask"]);
+/** auto: never ask. ask-exec: ask before commands, MCP, subagents and scripts; file edits run. ask-all: ask before every tool that is not read-only. */
+export const ApprovalMode = z.enum(["auto", "ask-exec", "ask-all"]);
 export type ApprovalMode = z.infer<typeof ApprovalMode>;
 
-export const SessionStatus = z.enum(["idle", "running", "waiting", "finished", "failed", "aborted", "interrupted"]);
-export type SessionStatus = z.infer<typeof SessionStatus>;
+export const ThinkingLevel = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+export type ThinkingLevel = z.infer<typeof ThinkingLevel>;
 
-export const Project = z.object({ id: Id, path: z.string().min(1), name: z.string().min(1) });
-export type Project = z.infer<typeof Project>;
+export const ImageInput = z.object({ mimeType: z.string().regex(/^image\//), data: z.string().min(1).max(14_000_000) });
+export type ImageInput = z.infer<typeof ImageInput>;
 
-export const Model = z.object({ id: Id, label: z.string().min(1) });
-export type Model = z.infer<typeof Model>;
+export type Project = { id: string; path: string; name: string };
 
-export const AttachmentMeta = z.object({ name: z.string().min(1), mimeType: z.string().min(1) });
-export type AttachmentMeta = z.infer<typeof AttachmentMeta>;
-export const Attachment = AttachmentMeta.extend({ data: z.string().min(1).max(7_000_000) });
-export type Attachment = z.infer<typeof Attachment>;
+export type ModelInfo = {
+  /** `provider/modelId`, as Pi writes it. */
+  id: string;
+  provider: string;
+  label: string;
+  reasoning: boolean;
+  images: boolean;
+  contextWindow?: number;
+};
 
-export const SessionSummary = z.object({
-  id: Id,
-  projectId: Id,
-  title: z.string(),
-  modelId: Id.optional(),
-  approvalMode: ApprovalMode,
-  status: SessionStatus,
-  updatedAt: z.string(),
-  pendingCount: z.number().int().nonnegative(),
-});
-export type SessionSummary = z.infer<typeof SessionSummary>;
+export type SessionStatus = "idle" | "running" | "waiting" | "error";
 
-export const FileDiff = z.object({ path: z.string(), diff: z.string(), op: z.string().optional() });
-export type FileDiff = z.infer<typeof FileDiff>;
+export type SessionSummary = {
+  id: string;
+  projectId: string;
+  title: string;
+  updatedAt: string;
+  status: SessionStatus;
+  pendingCount: number;
+  /** Set for a sub-agent's own session: the session that spawned it. */
+  parentId?: string;
+};
 
-export const PendingKind = z.enum(["approval", "confirm", "select", "input", "ask"]);
-export type PendingKind = z.infer<typeof PendingKind>;
+// ---------------------------------------------------------------------------
+// Transcript projection
 
-export const PendingQuestion = z.object({
-  id: Id,
-  question: z.string(),
-  options: z.array(z.string()),
-  multiple: z.boolean(),
-});
-export type PendingQuestion = z.infer<typeof PendingQuestion>;
+export type ToolStatus = "running" | "done" | "error";
 
-/** The user's answer to a pending item. Option values are the upstream option text, unchanged. */
+export type TranscriptItem =
+  | { kind: "user"; id: string; text: string; images: ImageInput[]; canRewind: boolean }
+  | { kind: "assistant"; id: string; text: string; thinking: string; model?: string; streaming: boolean; error?: string }
+  | {
+      kind: "tool";
+      /** The tool call id. */
+      id: string;
+      name: string;
+      args: Record<string, unknown>;
+      status: ToolStatus;
+      /** Text output, clipped by core. Replaced (not appended) on every update. */
+      output: string;
+      /** Unified patch for edit/write tools. */
+      diff?: string;
+      /** Tool-specific details for rich rendering (for example the subagent `Agent` tool), dropped when large. */
+      details?: Record<string, unknown>;
+      durationMs?: number;
+    }
+  /** Context an extension injected, for example a background subagent's report. Markdown. */
+  | { kind: "custom"; id: string; customType: string; text: string }
+  | { kind: "notice"; id: string; tone: "info" | "warning" | "error"; text: string };
+
+export type ItemKind = TranscriptItem["kind"];
+
+// ---------------------------------------------------------------------------
+// Requests that wait for the user (tool approvals, extension dialogs, ask_user)
+
+export type PendingQuestion = { id: string; question: string; options: string[]; multiple: boolean };
+
+export type PendingRequest = {
+  id: string;
+  kind: "approval" | "select" | "confirm" | "input" | "editor" | "ask";
+  title: string;
+  message?: string;
+  /** select: the option texts. approval: always allow / always / deny, rendered by the client. */
+  options: string[];
+  placeholder?: string;
+  prefill?: string;
+  /** approval: the tool call that waits. */
+  toolCallId?: string;
+  toolName?: string;
+  /** ask: one or more questions. */
+  questions?: PendingQuestion[];
+};
+
 export const PendingAnswer = z.discriminatedUnion("type", [
   z.object({ type: z.literal("cancel") }),
+  /** approval: "allow" | "always" | "deny". select: the option text. */
   z.object({ type: z.literal("option"), value: z.string() }),
   z.object({ type: z.literal("confirm"), confirmed: z.boolean() }),
   z.object({ type: z.literal("text"), value: z.string() }),
   z.object({
     type: z.literal("ask"),
-    answers: z.array(
-      z.object({ id: Id, selectedOptions: z.array(z.string()), customInput: z.string().optional() }),
-    ),
+    answers: z.array(z.object({ id: Id, selected: z.array(z.string()), custom: z.string().optional() })),
   }),
 ]);
 export type PendingAnswer = z.infer<typeof PendingAnswer>;
 
 // ---------------------------------------------------------------------------
-// Persisted session events. Only finished facts are stored; streaming deltas
-// travel as transient StreamMessage frames and are never replayed.
+// Live session state
 
-function event<T extends string, P extends z.ZodRawShape>(eventType: T, payload: P) {
-  return z.object({
-    type: z.literal("event"),
-    sessionId: Id,
-    seq: z.number().int().positive(),
-    runId: Id.optional(),
-    eventType: z.literal(eventType),
-    payload: z.object(payload),
-  });
-}
+export type SessionState = {
+  status: SessionStatus;
+  modelId?: string;
+  thinkingLevel: ThinkingLevel;
+  /** Levels the current model accepts; ["off"] for a model without reasoning. */
+  thinkingLevels: ThinkingLevel[];
+  approvalMode: ApprovalMode;
+  /** Messages typed while the agent ran, waiting to be delivered. */
+  queue: { steering: string[]; followUp: string[] };
+  context?: { tokens: number | null; window: number; percent: number | null };
+  /** Total cost of the session in USD. */
+  cost: number;
+  compacting: boolean;
+  retry?: { attempt: number; max: number; message: string };
+  pending: PendingRequest[];
+  /** Status lines set by extensions (`ctx.ui.setStatus`). */
+  statusLines: Record<string, string>;
+};
 
-export const SessionEvent = z.discriminatedUnion("eventType", [
-  event("session.created", { projectId: Id, modelId: Id.optional(), approvalMode: ApprovalMode }),
-  event("session.updated", { modelId: Id.optional(), approvalMode: ApprovalMode }),
-  event("message.user", { text: z.string(), attachments: z.array(AttachmentMeta).optional() }),
-  event("run.started", {}),
-  event("assistant.message", { messageId: Id, text: z.string(), thinking: z.string(), model: z.string().optional() }),
-  event("tool.started", {
-    toolCallId: Id,
-    toolName: z.string(),
-    intent: z.string().optional(),
-    args: z.record(z.string(), z.unknown()),
-  }),
-  event("tool.finished", { toolCallId: Id, isError: z.boolean(), output: z.string(), diffs: z.array(FileDiff) }),
-  event("pending.created", {
-    pendingId: Id,
-    kind: PendingKind,
-    title: z.string(),
-    message: z.string().optional(),
-    options: z.array(z.string()),
-    questions: z.array(PendingQuestion),
-    toolCallId: Id.optional(),
-    placeholder: z.string().optional(),
-    defaultValue: z.string().optional(),
-  }),
-  event("pending.resolved", {
-    pendingId: Id,
-    status: z.enum(["answered", "cancelled", "interrupted"]),
-    answer: z.string().optional(),
-  }),
-  event("run.finished", {}),
-  event("run.aborted", {}),
-  event("run.failed", { error: z.string() }),
-  event("run.interrupted", { reason: z.string() }),
-]);
-export type SessionEvent = z.infer<typeof SessionEvent>;
-export type SessionEventType = SessionEvent["eventType"];
-export type SessionEventBody = {
-  [K in SessionEvent as K["eventType"]]: { eventType: K["eventType"]; payload: K["payload"] };
-}[SessionEventType];
+export type SlashCommand = { name: string; description: string; source: "builtin" | "extension" | "prompt" | "skill" };
 
-// ---------------------------------------------------------------------------
-// Transient stream frames: sent only to clients watching the session.
-
-const streamBase = { type: z.literal("stream"), sessionId: Id, runId: Id };
-
-export const StreamMessage = z.discriminatedUnion("kind", [
-  z.object({
-    ...streamBase,
-    kind: z.literal("assistant.delta"),
-    messageId: Id,
-    channel: z.enum(["text", "thinking"]),
-    delta: z.string(),
-  }),
-  /** Latest output and diffs of a running tool; each frame replaces the previous one. */
-  z.object({
-    ...streamBase,
-    kind: z.literal("tool.progress"),
-    toolCallId: Id,
-    toolName: z.string(),
-    output: z.string().optional(),
-    diffs: z.array(FileDiff).optional(),
-  }),
-]);
-export type StreamMessage = z.infer<typeof StreamMessage>;
-
-/** Unfinished output of the active run, sent when a client opens a running session. */
-export type LiveSnapshot = {
-  runId: string;
-  messages: Array<{ messageId: string; text: string; thinking: string }>;
-  tools: Array<{ toolCallId: string; toolName: string; output: string; diffs: FileDiff[] }>;
+export type SessionResources = {
+  cwd: string;
+  agentDir: string;
+  /** Pi's MCP configuration files: the user one, then the project one. */
+  mcpConfigPaths: string[];
+  skills: Array<{ name: string; description: string; path: string; scope: string }>;
+  prompts: Array<{ name: string; description: string; path: string }>;
+  extensions: Array<{ path: string; tools: string[]; commands: string[] }>;
+  tools: Array<{ name: string; description: string; source: string; active: boolean }>;
+  contextFiles: string[];
+  diagnostics: string[];
 };
 
 // ---------------------------------------------------------------------------
-// Client commands and their results.
+// Client commands and their results
 
 const RequestId = Id;
+const SessionRef = { requestId: RequestId, sessionId: Id };
 
 export const ClientCommand = z.discriminatedUnion("type", [
   z.object({ type: z.literal("projects.list"), requestId: RequestId }),
   z.object({ type: z.literal("projects.add"), requestId: RequestId, path: z.string().min(1) }),
+  z.object({ type: z.literal("projects.remove"), requestId: RequestId, projectId: Id }),
   z.object({ type: z.literal("models.list"), requestId: RequestId }),
   z.object({ type: z.literal("sessions.list"), requestId: RequestId }),
   z.object({
@@ -166,82 +169,87 @@ export const ClientCommand = z.discriminatedUnion("type", [
     requestId: RequestId,
     projectId: Id,
     modelId: Id.optional(),
+    thinkingLevel: ThinkingLevel.optional(),
     approvalMode: ApprovalMode.optional(),
   }),
+  /** Returns the newest items and makes this socket watch the session; replaces any previous watch. */
+  z.object({ type: z.literal("session.open"), ...SessionRef, limit: z.number().int().positive().max(1000).optional() }),
+  z.object({ type: z.literal("session.earlier"), ...SessionRef, beforeId: Id, limit: z.number().int().positive().max(1000) }),
+  z.object({
+    type: z.literal("session.prompt"),
+    ...SessionRef,
+    text: z.string(),
+    images: z.array(ImageInput).max(10).optional(),
+    /** While the agent runs: steer joins after the current tool round, followUp waits for the run to end. */
+    mode: z.enum(["steer", "followUp"]).optional(),
+  }),
+  z.object({ type: z.literal("session.abort"), ...SessionRef }),
   z.object({
     type: z.literal("session.configure"),
-    requestId: RequestId,
-    sessionId: Id,
-    modelId: Id.nullable().optional(),
+    ...SessionRef,
+    modelId: Id.optional(),
+    thinkingLevel: ThinkingLevel.optional(),
     approvalMode: ApprovalMode.optional(),
   }),
-  z.object({ type: z.literal("session.rename"), requestId: RequestId, sessionId: Id, title: z.string().trim().min(1).max(120) }),
-  z.object({ type: z.literal("session.delete"), requestId: RequestId, sessionId: Id }),
-  z.object({ type: z.literal("message.send"), requestId: RequestId, sessionId: Id, text: z.string().trim().min(1), attachments: z.array(Attachment).max(10).optional() }),
-  z.object({ type: z.literal("run.abort"), requestId: RequestId, sessionId: Id }),
-  z.object({
-    type: z.literal("pending.respond"),
-    requestId: RequestId,
-    sessionId: Id,
-    pendingId: Id,
-    answer: PendingAnswer,
-  }),
-  /** Replays events after `afterSeq` and makes this socket watch the session; replaces any previous watch. */
-  z.object({
-    type: z.literal("events.resume"),
-    requestId: RequestId,
-    sessionId: Id,
-    afterSeq: z.number().int().nonnegative(),
-  }),
-  z.object({
-    type: z.literal("events.before"),
-    requestId: RequestId,
-    sessionId: Id,
-    beforeSeq: z.number().int().positive(),
-    limit: z.number().int().positive().max(500),
-  }),
+  z.object({ type: z.literal("session.rename"), ...SessionRef, title: z.string().trim().min(1).max(120) }),
+  z.object({ type: z.literal("session.delete"), ...SessionRef }),
+  z.object({ type: z.literal("session.compact"), ...SessionRef }),
+  /** Moves the session back to before a user message and returns its text for editing. */
+  z.object({ type: z.literal("session.rewind"), ...SessionRef, itemId: Id }),
+  z.object({ type: z.literal("session.respond"), ...SessionRef, pendingId: Id, answer: PendingAnswer }),
+  /** Slash commands: the session's when it is given, else the project's (for a session not created yet). */
+  z.object({ type: z.literal("commands.list"), requestId: RequestId, projectId: Id, sessionId: Id.optional() }),
+  z.object({ type: z.literal("session.resources"), ...SessionRef }),
+  /** Reloads skills, prompts, extensions and MCP servers, for example after editing mcp.json. */
+  z.object({ type: z.literal("session.reload"), ...SessionRef }),
+  z.object({ type: z.literal("files.search"), requestId: RequestId, projectId: Id, query: z.string(), limit: z.number().int().positive().max(200) }),
 ]);
 export type ClientCommand = z.infer<typeof ClientCommand>;
 export type CommandType = ClientCommand["type"];
 
+type Empty = Record<string, never>;
+
 export interface CommandResults {
   "projects.list": { projects: Project[] };
   "projects.add": { project: Project };
-  "models.list": { models: Model[]; defaultModelId?: string };
+  "projects.remove": Empty;
+  "models.list": { models: ModelInfo[]; defaultModelId?: string };
   "sessions.list": { sessions: SessionSummary[] };
   "session.create": { session: SessionSummary };
-  "session.configure": { session: SessionSummary };
+  "session.open": { items: TranscriptItem[]; hasEarlier: boolean; state: SessionState };
+  "session.earlier": { items: TranscriptItem[]; hasEarlier: boolean };
+  "session.prompt": Empty;
+  "session.abort": Empty;
+  "session.configure": { state: SessionState };
   "session.rename": { session: SessionSummary };
-  "session.delete": Record<string, never>;
-  "message.send": { runId: string };
-  "run.abort": Record<string, never>;
-  "pending.respond": Record<string, never>;
-  "events.resume": { events: SessionEvent[]; live?: LiveSnapshot; hasEarlier: boolean };
-  "events.before": { events: SessionEvent[]; hasEarlier: boolean };
+  "session.delete": Empty;
+  "session.compact": Empty;
+  "session.rewind": { text: string };
+  "session.respond": Empty;
+  "commands.list": { commands: SlashCommand[] };
+  "session.resources": { resources: SessionResources };
+  "session.reload": Empty;
+  "files.search": { files: string[] };
 }
 
 // ---------------------------------------------------------------------------
-// Server messages.
+// Messages from core
 
-export const ServerHello = z.object({
-  type: z.literal("hello"),
-  protocolVersion: z.number().int(),
-  coreVersion: z.string(),
-});
-export type ServerHello = z.infer<typeof ServerHello>;
+export type ServerMessage =
+  | { type: "hello"; protocolVersion: number; coreVersion: string }
+  | { type: "response"; requestId: string; ok: true; data: unknown }
+  | { type: "response"; requestId: string; ok: false; error: string }
+  /** Broadcast to every client when a session's list entry changes. */
+  | { type: "session"; session: SessionSummary }
+  | { type: "session.removed"; sessionId: string }
+  /** To watchers: insert or replace one transcript item. */
+  | { type: "item"; sessionId: string; item: TranscriptItem }
+  /** To watchers: append streamed text to an assistant item. */
+  | { type: "delta"; sessionId: string; itemId: string; channel: "text" | "thinking"; delta: string }
+  | { type: "state"; sessionId: string; state: SessionState }
+  /** To watchers: the transcript changed shape (rewind, compaction); open the session again. */
+  | { type: "reset"; sessionId: string }
+  | { type: "notify"; sessionId?: string; level: "info" | "warning" | "error"; message: string }
+  | { type: "error"; code: string; message: string };
 
-export const CoreResponse = z.discriminatedUnion("ok", [
-  z.object({ type: z.literal("response"), requestId: RequestId, command: z.string(), ok: z.literal(true), data: z.unknown() }),
-  z.object({ type: z.literal("response"), requestId: RequestId, command: z.string(), ok: z.literal(false), error: z.string() }),
-]);
-export type CoreResponse = z.infer<typeof CoreResponse>;
-
-/** Broadcast to every client whenever a session's list entry changes. */
-export const SessionChanged = z.object({ type: z.literal("session"), session: SessionSummary });
-export type SessionChanged = z.infer<typeof SessionChanged>;
-
-export const CoreError = z.object({ type: z.literal("error"), code: z.string().min(1), message: z.string().min(1) });
-export type CoreError = z.infer<typeof CoreError>;
-
-export const ProtocolMessage = z.union([ServerHello, SessionEvent, StreamMessage, CoreResponse, SessionChanged, CoreError]);
-export type ProtocolMessage = z.infer<typeof ProtocolMessage>;
+export type ServerMessageType = ServerMessage["type"];

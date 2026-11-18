@@ -1,6 +1,7 @@
 import * as React from "react";
 import { RotateCw, WifiOff } from "lucide-react";
 import { AppSidebar } from "@/components/app-sidebar";
+import { CommandPalette } from "@/components/command-palette";
 import { Conversation } from "@/components/conversation";
 import { NewSession } from "@/components/new-session";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -46,16 +47,18 @@ function ConnectionBanner() {
 
 export function App() {
   const selectedId = useLila((state) => state.selectedId);
-  const [newSessionProject, setNewSessionProject] = React.useState<string>();
 
   React.useEffect(() => {
     client.start();
-    if (Notification.permission === "default") void Notification.requestPermission();
+    if (typeof Notification !== "undefined" && Notification.permission === "default") void Notification.requestPermission();
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "n" && event.metaKey) {
+      if (!event.metaKey || event.shiftKey || event.altKey) return;
+      if (event.key === "n") {
         event.preventDefault();
-        setNewSessionProject(undefined);
-        actions.select(undefined);
+        actions.startNew();
+      } else if (event.key === "k") {
+        event.preventDefault();
+        actions.setPaletteOpen(!useLila.getState().paletteOpen);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -68,17 +71,13 @@ export function App() {
   return (
     <TooltipProvider>
       <SidebarProvider className="h-svh min-h-0">
-        <AppSidebar
-          onNewSession={(projectId) => {
-            setNewSessionProject(projectId);
-            actions.select(undefined);
-          }}
-        />
+        <AppSidebar />
         <SidebarInset className="relative min-h-0 overflow-hidden">
           <ConnectionBanner />
-          {selectedId ? <Conversation key={selectedId} sessionId={selectedId} /> : <NewSession {...(newSessionProject ? { projectId: newSessionProject } : {})} />}
+          {selectedId ? <Conversation key={selectedId} sessionId={selectedId} /> : <NewSession />}
         </SidebarInset>
       </SidebarProvider>
+      <CommandPalette />
       <Toaster position="bottom-right" richColors closeButton />
     </TooltipProvider>
   );

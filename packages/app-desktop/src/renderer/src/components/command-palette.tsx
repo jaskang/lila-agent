@@ -1,0 +1,69 @@
+import * as React from "react";
+import { CircleAlert, FolderPlus, MessageCircleQuestion, MessageSquare, SquarePen } from "lucide-react";
+import { CommandDialog, Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from "@/components/ui/command";
+import { Spinner } from "@/components/ui/spinner";
+import { actions, useLila } from "@/lib/store";
+
+export function CommandPalette() {
+  const open = useLila((state) => state.paletteOpen);
+  const sessions = useLila((state) => state.sessions);
+  const projects = useLila((state) => state.projects);
+  const projectName = React.useMemo(() => new Map(projects.map((project) => [project.id, project.name])), [projects]);
+  const sorted = React.useMemo(() => Object.values(sessions).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)), [sessions]);
+
+  const run = (action: () => void) => {
+    actions.setPaletteOpen(false);
+    action();
+  };
+
+  return (
+    <CommandDialog open={open} onOpenChange={actions.setPaletteOpen} title="命令面板" description="切换会话或执行命令">
+      <Command>
+        <CommandInput placeholder="搜索会话、项目或命令…" />
+        <CommandList>
+          <CommandEmpty>没有匹配的结果</CommandEmpty>
+          <CommandGroup heading="命令">
+            <CommandItem value="new-session 新会话" onSelect={() => run(() => actions.startNew())}>
+              <SquarePen />
+              新会话
+              <CommandShortcut>⌘N</CommandShortcut>
+            </CommandItem>
+            {projects.map((project) => (
+              <CommandItem key={project.id} value={`new-in ${project.id} 在 ${project.name} 中新建会话`} onSelect={() => run(() => actions.startNew(project.id))}>
+                <SquarePen />
+                在 {project.name} 中新建会话
+              </CommandItem>
+            ))}
+            <CommandItem value="add-project 添加项目" onSelect={() => run(() => void actions.addProject())}>
+              <FolderPlus />
+              添加项目…
+            </CommandItem>
+          </CommandGroup>
+          {sorted.length ? (
+            <CommandGroup heading="会话">
+              {sorted.map((session) => (
+                <CommandItem
+                  key={session.id}
+                  value={`session ${session.id} ${session.title || "新会话"} ${projectName.get(session.projectId) ?? ""}`}
+                  onSelect={() => run(() => actions.select(session.id))}
+                >
+                  {session.status === "running" ? (
+                    <Spinner />
+                  ) : session.status === "waiting" ? (
+                    <MessageCircleQuestion className="text-amber-600 dark:text-amber-400" />
+                  ) : session.status === "error" ? (
+                    <CircleAlert className="text-destructive" />
+                  ) : (
+                    <MessageSquare />
+                  )}
+                  <span className="min-w-0 truncate">{session.title || "新会话"}</span>
+                  <CommandShortcut className="tracking-normal">{projectName.get(session.projectId)}</CommandShortcut>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          ) : null}
+        </CommandList>
+      </Command>
+    </CommandDialog>
+  );
+}

@@ -1,15 +1,15 @@
 import * as React from "react";
-import { ArrowUp, Ban, Brain, Check, ChevronUp, CircleAlert, Info, Paperclip, RotateCw, Square, TriangleAlert, X } from "lucide-react";
-import type { ApprovalMode, Attachment } from "@lila/protocol";
-import { Markdown } from "@/components/markdown";
-import { optionLabel, PendingPanel } from "@/components/pending-panel";
-import { ToolCall } from "@/components/tool-call";
-import { Bubble, BubbleContent } from "@/components/ui/bubble";
+import { Blocks, ChevronUp, RotateCw } from "lucide-react";
+import type { SessionState } from "@lila/protocol";
+import { Composer } from "@/components/composer";
+import { PendingPanel } from "@/components/pending-panel";
+import { ResourcesSheet } from "@/components/resources-sheet";
+import { ApprovalSelect, ContextUsage, ModelPicker, ThinkingSelect } from "@/components/session-controls";
+import { TranscriptEntry } from "@/components/transcript-item";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
-import { Kbd } from "@/components/ui/kbd";
 import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
-import { Message, MessageContent } from "@/components/ui/message";
 import {
   MessageScroller,
   MessageScrollerButton,
@@ -18,282 +18,122 @@ import {
   MessageScrollerProvider,
   MessageScrollerViewport,
 } from "@/components/ui/message-scroller";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
-import { Textarea } from "@/components/ui/textarea";
-import {
-  Trace,
-  TraceCollapsible,
-  TraceCollapsibleContent,
-  TraceCollapsibleTrigger,
-  TraceIcon,
-  TraceLine,
-  TraceTitle,
-} from "@/components/ui/trace";
-import { actions, APPROVAL_LABEL, emptyView, useLila, type TranscriptItem } from "@/lib/store";
+import { actions, emptyView, useLila } from "@/lib/store";
 
-const NOTICE_ICON = { info: Info, warning: TriangleAlert, error: CircleAlert } as const;
-
-const Item = React.memo(function Item({ item }: { item: TranscriptItem }) {
-  switch (item.kind) {
-    case "user":
-      return (
-        <Message align="end">
-          <MessageContent>
-            <Bubble align="end" variant="muted">
-              <BubbleContent className="text-sm whitespace-pre-wrap">{item.text}</BubbleContent>
-            </Bubble>
-            {item.attachments?.length ? (
-              <div className="mt-2 flex flex-wrap justify-end gap-1">
-                {item.attachments.map((attachment) => (
-                  <span key={`${attachment.name}-${attachment.mimeType}`} className="rounded-md border bg-muted px-2 py-1 text-xs text-muted-foreground">
-                    {attachment.name}
-                  </span>
-                ))}
-              </div>
-            ) : null}
-          </MessageContent>
-        </Message>
-      );
-    case "assistant":
-      return (
-        <Message>
-          <MessageContent>
-            {item.thinking ? (
-              <Trace>
-                <TraceCollapsible>
-                  <TraceCollapsibleTrigger>
-                    <TraceLine {...(item.streaming && !item.text ? { status: "running" as const } : {})}>
-                      <TraceIcon>
-                        <Brain />
-                      </TraceIcon>
-                      <TraceTitle>{item.streaming && !item.text ? "思考中" : "思考过程"}</TraceTitle>
-                    </TraceLine>
-                  </TraceCollapsibleTrigger>
-                  <TraceCollapsibleContent>
-                    <Markdown text={item.thinking} streaming={item.streaming} />
-                  </TraceCollapsibleContent>
-                </TraceCollapsible>
-              </Trace>
-            ) : null}
-            {item.text ? <Markdown text={item.text} streaming={item.streaming} /> : null}
-          </MessageContent>
-        </Message>
-      );
-    case "tool":
-      return <ToolCall tool={item} />;
-    case "decision":
-      return (
-        <Marker>
-          <MarkerIcon>{item.status === "answered" ? <Check /> : <Ban />}</MarkerIcon>
-          <MarkerContent>
-            {item.title.replace(/^Allow tool:\s*/, "运行 ")}
-            {" · "}
-            {item.status === "answered" ? (item.answer ? optionLabel(item.answer) : "已回答") : item.status === "cancelled" ? "已取消" : "已失效"}
-          </MarkerContent>
-        </Marker>
-      );
-    case "notice": {
-      const Icon = NOTICE_ICON[item.tone];
-      return (
-        <Marker
-          className={
-            item.tone === "error" ? "text-destructive" : item.tone === "warning" ? "text-amber-700 dark:text-amber-400" : undefined
-          }
-        >
-          <MarkerIcon>
-            <Icon />
-          </MarkerIcon>
-          <MarkerContent className="whitespace-pre-wrap">{item.text}</MarkerContent>
-        </Marker>
-      );
-    }
-  }
-});
-
-function Composer({ sessionId, running }: { sessionId: string; running: boolean }) {
-  const [text, setText] = React.useState("");
-  const [attachments, setAttachments] = React.useState<Attachment[]>([]);
-  const [sending, setSending] = React.useState(false);
-  const connected = useLila((state) => state.connection === "connected");
-  const ref = React.useRef<HTMLTextAreaElement>(null);
-  React.useEffect(() => ref.current?.focus(), [sessionId]);
-  const canSend = connected && !running && !sending && text.trim().length > 0;
-
-  async function submit(): Promise<void> {
-    if (!canSend) return;
-    setSending(true);
-    const ok = await actions.send(sessionId, text.trim(), attachments);
-    setSending(false);
-    if (ok) {
-      setText("");
-      setAttachments([]);
-    }
-  }
-
-  async function addAttachments(): Promise<void> {
-    const picked = await window.lila.pickFiles();
-    if (picked.length) setAttachments((current) => [...current, ...picked].slice(0, 10));
-  }
-
+function SessionToolbar({ sessionId, onResources }: { sessionId: string; onResources: () => void }) {
+  const session = useLila((store) => store.sessions[sessionId]);
+  const project = useLila((store) => store.projects.find((item) => item.id === session?.projectId));
   return (
-    <form
-      className="rounded-2xl border bg-background shadow-xs transition-colors focus-within:border-ring"
-      onSubmit={(event) => {
-        event.preventDefault();
-        void submit();
-      }}
-    >
-      <Textarea
-        ref={ref}
-        value={text}
-        onChange={(event) => setText(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-            event.preventDefault();
-            void submit();
-          }
-          if (event.key === "Escape" && running) void actions.abort(sessionId);
-        }}
-        placeholder={running ? "任务进行中… 按 Esc 停止" : "描述你要完成的编程任务"}
-        className="max-h-60 min-h-14 resize-none border-0 bg-transparent px-4 pt-3 shadow-none focus-visible:ring-0 dark:bg-transparent"
-      />
-      {attachments.length ? (
-        <div className="flex flex-wrap gap-2 px-3 pb-2">
-          {attachments.map((attachment, index) => (
-            <span key={`${attachment.name}-${index}`} className="inline-flex max-w-full items-center gap-1 rounded-md border bg-muted px-2 py-1 text-xs">
-              <span className="max-w-52 truncate">{attachment.name}</span>
-              <button type="button" aria-label={`移除附件 ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((_, at) => at !== index))}>
-                <X className="size-3" />
-              </button>
-            </span>
-          ))}
-        </div>
-      ) : null}
-      <div className="flex items-center justify-between gap-2 px-3 pb-2">
-        <span className="text-xs text-muted-foreground">
-          <Kbd>↵</Kbd> 发送 · <Kbd>⇧↵</Kbd> 换行
-        </span>
-        {running ? (
-          <Button type="button" size="sm" variant="outline" onClick={() => void actions.abort(sessionId)}>
-            <Square className="fill-current" />
-            停止
-          </Button>
-        ) : (
-          <div className="flex items-center gap-1">
-            <Button type="button" size="icon-sm" variant="ghost" disabled={!connected || sending} aria-label="添加附件" title="添加附件" onClick={() => void addAttachments()}>
-              <Paperclip />
-            </Button>
-            <Button type="submit" size="icon-sm" disabled={!canSend} aria-label="发送">
-              {sending ? <Spinner /> : <ArrowUp />}
-            </Button>
-          </div>
-        )}
-      </div>
-    </form>
-  );
-}
-
-function SessionToolbar({ sessionId }: { sessionId: string }) {
-  const session = useLila((state) => state.sessions[sessionId]);
-  const project = useLila((state) => state.projects.find((item) => item.id === session?.projectId));
-  const models = useLila((state) => state.models);
-  const defaultModelId = useLila((state) => state.defaultModelId);
-  if (!session) return null;
-  const busy = session.status === "running" || session.status === "waiting";
-  const modelValue = session.modelId ?? defaultModelId ?? "";
-  return (
-    <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4 [-webkit-app-region:drag]">
+    <header className="flex h-12 shrink-0 items-center gap-2 px-4 [-webkit-app-region:drag]">
       <div className="flex min-w-0 flex-1 items-baseline gap-2">
-        <h1 className="truncate text-sm font-medium">{session.title || "新会话"}</h1>
+        <h1 className="truncate text-sm font-medium">{session?.title || "新会话"}</h1>
         <span className="truncate text-xs text-muted-foreground" title={project?.path}>
           {project?.name}
         </span>
       </div>
-      <div className="flex items-center gap-2 [-webkit-app-region:no-drag]">
-        <Select
-          value={modelValue}
-          disabled={busy || !models.length}
-          onValueChange={(value) => {
-            if (typeof value === "string" && value !== modelValue) void actions.configure(sessionId, { modelId: value });
-          }}
-          items={models.map((model) => ({ value: model.id, label: model.label }))}
-        >
-          <SelectTrigger size="sm" className="max-w-56" aria-label="模型">
-            <SelectValue placeholder="默认模型" />
-          </SelectTrigger>
-          <SelectContent alignItemWithTrigger={false} align="end">
-            {models.map((model) => (
-              <SelectItem key={model.id} value={model.id}>
-                {model.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select
-          value={session.approvalMode}
-          disabled={busy}
-          onValueChange={(value) => {
-            if (value && value !== session.approvalMode) void actions.configure(sessionId, { approvalMode: value as ApprovalMode });
-          }}
-          items={Object.entries(APPROVAL_LABEL).map(([value, label]) => ({ value, label }))}
-        >
-          <SelectTrigger size="sm" aria-label="审批方式">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent alignItemWithTrigger={false} align="end">
-            {Object.entries(APPROVAL_LABEL).map(([value, label]) => (
-              <SelectItem key={value} value={value}>
-                {label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+      <Button variant="ghost" size="sm" className="font-normal text-muted-foreground [-webkit-app-region:no-drag]" onClick={onResources}>
+        <Blocks />
+        能力
+      </Button>
     </header>
   );
 }
 
-function RunStatus({ status }: { status: string | undefined }) {
-  if (status !== "running" && status !== "waiting") return null;
+function RunStatus({ state }: { state: SessionState }) {
+  if (state.status !== "running" && !state.compacting) return null;
+  const text = state.retry
+    ? `重试中（${state.retry.attempt}/${state.retry.max}）：${state.retry.message}`
+    : state.compacting
+      ? "正在压缩上下文…"
+      : "正在工作…";
   return (
     <Marker>
       <MarkerIcon>
         <Spinner />
       </MarkerIcon>
-      <MarkerContent className="shimmer">{status === "waiting" ? "等你处理上面的请求" : "正在工作…"}</MarkerContent>
+      <MarkerContent className={state.retry ? "text-amber-700 dark:text-amber-400" : "shimmer"}>{text}</MarkerContent>
     </Marker>
   );
 }
 
+function StatusLines({ lines }: { lines: Record<string, string> }) {
+  const entries = Object.entries(lines).filter(([, text]) => text);
+  if (!entries.length) return null;
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-0.5 px-1 text-xs text-muted-foreground">
+      {entries.map(([key, text]) => (
+        <span key={key} className="truncate" title={`${key}: ${text}`}>
+          {text}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function QueueChips({ queue }: { queue: SessionState["queue"] }) {
+  if (!queue.steering.length && !queue.followUp.length) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5 px-1">
+      {queue.steering.map((text, index) => (
+        <Badge key={`s-${index}`} variant="secondary" className="max-w-full" title={text}>
+          <span className="text-muted-foreground">插话</span>
+          <span className="truncate">{text}</span>
+        </Badge>
+      ))}
+      {queue.followUp.map((text, index) => (
+        <Badge key={`f-${index}`} variant="outline" className="max-w-full" title={text}>
+          <span className="text-muted-foreground">排队</span>
+          <span className="truncate">{text}</span>
+        </Badge>
+      ))}
+    </div>
+  );
+}
+
+function SessionControls({ sessionId, state }: { sessionId: string; state: SessionState }) {
+  const models = useLila((store) => store.models);
+  return (
+    <>
+      <ModelPicker models={models} value={state.modelId} onChange={(modelId) => void actions.configure(sessionId, { modelId })} />
+      <ThinkingSelect levels={state.thinkingLevels} value={state.thinkingLevel} onChange={(thinkingLevel) => void actions.configure(sessionId, { thinkingLevel })} />
+      <ApprovalSelect value={state.approvalMode} onChange={(approvalMode) => void actions.configure(sessionId, { approvalMode })} />
+    </>
+  );
+}
+
 export function Conversation({ sessionId }: { sessionId: string }) {
-  const view = useLila((state) => state.views[sessionId]) ?? emptyView();
-  const status = useLila((state) => state.sessions[sessionId]?.status);
-  const running = Boolean(view.runId) || status === "running" || status === "waiting";
+  const view = useLila((store) => store.views[sessionId]) ?? emptyView();
+  const projectId = useLila((store) => store.sessions[sessionId]?.projectId);
+  const [resourcesOpen, setResourcesOpen] = React.useState(false);
+  const state = view.state;
+  const running = state ? state.status === "running" || state.status === "waiting" || state.compacting : false;
+  const loaded = state !== undefined;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <SessionToolbar sessionId={sessionId} />
+      <SessionToolbar sessionId={sessionId} onResources={() => setResourcesOpen(true)} />
       <MessageScrollerProvider key={sessionId} autoScroll defaultScrollPosition="last-anchor" scrollPreviousItemPeek={48}>
         <MessageScroller className="min-h-0 flex-1">
           <MessageScrollerViewport>
             <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-4 px-6 pt-6 pb-10">
-              {view.loading ? (
+              {view.loading && !loaded ? (
                 <MessageScrollerItem messageId="loading">
                   <Empty className="py-24">
                     <EmptyHeader>
-                      <EmptyTitle>正在恢复会话</EmptyTitle>
+                      <EmptyTitle>正在打开会话</EmptyTitle>
                       <EmptyDescription>正在读取消息和任务状态。</EmptyDescription>
                     </EmptyHeader>
                     <Spinner />
                   </Empty>
                 </MessageScrollerItem>
               ) : null}
-              {!view.loading && view.loadError ? (
+              {!view.loading && view.error ? (
                 <MessageScrollerItem messageId="load-error">
                   <Empty className="py-24">
                     <EmptyHeader>
-                      <EmptyTitle>会话恢复失败</EmptyTitle>
-                      <EmptyDescription className="max-w-md break-words">{view.loadError}</EmptyDescription>
+                      <EmptyTitle>会话打开失败</EmptyTitle>
+                      <EmptyDescription className="max-w-md break-words">{view.error}</EmptyDescription>
                     </EmptyHeader>
                     <Button variant="outline" onClick={() => actions.retrySession(sessionId)}>
                       <RotateCw />
@@ -302,7 +142,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                   </Empty>
                 </MessageScrollerItem>
               ) : null}
-              {view.loaded && !view.loading && !view.loadError && view.items.length === 0 ? (
+              {loaded && !view.error && view.items.length === 0 ? (
                 <MessageScrollerItem messageId="empty">
                   <Empty className="py-24">
                     <EmptyHeader>
@@ -312,7 +152,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                   </Empty>
                 </MessageScrollerItem>
               ) : null}
-              {view.loaded && view.hasEarlier ? (
+              {view.hasEarlier ? (
                 <MessageScrollerItem messageId="load-earlier">
                   <div className="flex justify-center py-1">
                     <Button variant="ghost" size="sm" disabled={view.loadingEarlier} onClick={() => void actions.loadEarlier(sessionId)}>
@@ -324,12 +164,12 @@ export function Conversation({ sessionId }: { sessionId: string }) {
               ) : null}
               {view.items.map((item) => (
                 <MessageScrollerItem key={item.id} messageId={item.id} scrollAnchor={item.kind === "user"}>
-                  <Item item={item} />
+                  <TranscriptEntry item={item} sessionId={sessionId} running={running} />
                 </MessageScrollerItem>
               ))}
-              {running && !view.pending.length ? (
+              {state && !state.pending.length ? (
                 <MessageScrollerItem messageId="status">
-                  <RunStatus status={status} />
+                  <RunStatus state={state} />
                 </MessageScrollerItem>
               ) : null}
             </MessageScrollerContent>
@@ -337,10 +177,24 @@ export function Conversation({ sessionId }: { sessionId: string }) {
           <MessageScrollerButton />
         </MessageScroller>
       </MessageScrollerProvider>
-      <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-3 px-6 pb-5">
-        <PendingPanel sessionId={sessionId} pending={view.pending} />
-        <Composer sessionId={sessionId} running={running} />
+      <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-2 px-6 pb-5">
+        {state ? <PendingPanel sessionId={sessionId} pending={state.pending} /> : null}
+        {state ? <QueueChips queue={state.queue} /> : null}
+        <Composer
+          draftKey={sessionId}
+          sessionId={sessionId}
+          projectId={projectId}
+          running={running}
+          disabled={!loaded}
+          placeholder={running ? "补充说明会在当前工具结束后送达… 按 Esc 停止" : "继续对话，/ 使用命令和技能，@ 引用文件"}
+          onSubmit={(text, images, mode) => actions.prompt(sessionId, text, images, mode)}
+          onAbort={() => void actions.abort(sessionId)}
+          footer={state ? <SessionControls sessionId={sessionId} state={state} /> : null}
+          trailing={state ? <ContextUsage sessionId={sessionId} state={state} /> : null}
+        />
+        {state ? <StatusLines lines={state.statusLines} /> : null}
       </div>
+      <ResourcesSheet sessionId={sessionId} open={resourcesOpen} onOpenChange={setResourcesOpen} />
     </div>
   );
 }

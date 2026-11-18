@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, openSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { DEFAULT_CORE_PORT, PROTOCOL_VERSION } from "@lila/protocol";
 
@@ -42,15 +42,14 @@ async function ensureCore(): Promise<void> {
     await waitFor(async () => !(await health()), 5_000);
   }
 
+  // Core is plain TypeScript run by this app's own Node (Node strips the types), so it ships as files.
   const coreDir = app.isPackaged ? join(process.resourcesPath, "core") : join(app.getAppPath(), "../core");
-  const command = app.isPackaged ? join(coreDir, "lilad") : (process.env.LILA_BUN_BIN ?? "bun");
-  const args = app.isPackaged ? [] : ["run", "src/main.ts"];
   mkdirSync(dataDir, { recursive: true });
   const log = openSync(join(dataDir, "core.log"), "a");
-  const child = spawn(command, args, {
+  const child = spawn(process.execPath, [join(coreDir, "src", "main.ts")], {
     cwd: coreDir,
     detached: true,
-    env: { ...process.env, LILA_CORE_PORT: String(port), LILA_DATA_DIR: dataDir },
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", LILA_CORE_PORT: String(port), LILA_DATA_DIR: dataDir },
     stdio: ["ignore", log, log],
   });
   child.unref();
@@ -106,27 +105,6 @@ function createWindow(): void {
   else void win.loadFile(join(import.meta.dirname, "../renderer/index.html"));
 }
 
-function mimeType(path: string): string {
-  const extension = path.toLowerCase().split(".").pop();
-  return {
-    png: "image/png",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    gif: "image/gif",
-    webp: "image/webp",
-    svg: "image/svg+xml",
-    txt: "text/plain",
-    md: "text/markdown",
-    json: "application/json",
-    ts: "text/plain",
-    tsx: "text/plain",
-    js: "text/plain",
-    jsx: "text/plain",
-    css: "text/plain",
-    html: "text/html",
-  }[extension ?? ""] ?? "application/octet-stream";
-}
-
 ipcMain.handle("lila:connection", async () => {
   ensuring ??= ensureCore().finally(() => {
     ensuring = undefined;
@@ -142,20 +120,17 @@ ipcMain.handle("lila:pick-directory", async () => {
   return result.canceled ? undefined : result.filePaths[0];
 });
 
-ipcMain.handle("lila:pick-files", async () => {
-  const options: Electron.OpenDialogOptions = {
-    title: "添加附件",
-    properties: ["openFile", "multiSelections"],
-    filters: [{ name: "图片和文本", extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg", "txt", "md", "json", "ts", "tsx", "js", "jsx", "css", "html"] }],
-  };
-  const result = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
-  if (result.canceled) return [];
-  return result.filePaths.flatMap((path) => {
-    const bytes = readFileSync(path);
-    if (bytes.byteLength > 5 * 1024 * 1024) return [];
-    return [{ name: path.split(/[\\/]/).pop() ?? path, mimeType: mimeType(path), data: bytes.toString("base64") }];
-  });
+ipcMain.handle("lila:open-path", async (_event, path: string) => {
+  // Pi reads MCP servers from mcp.json; give the user an empty one to fill in.
+  if (path.endsWith("mcp.json") && !existsSync(path)) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, '{"mcpServers":{}}\n');
+  }
+  const error = await shell.openPath(path);
+  if (error) throw new Error(error);
 });
+
+ipcMain.on("lila:reveal-path", (_event, path: string) => shell.showItemInFolder(path));
 
 ipcMain.on("lila:focus", () => showWindow());
 

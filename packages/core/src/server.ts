@@ -1,124 +1,183 @@
-import { existsSync, statSync } from "node:fs";
-import { resolve } from "node:path";
-import { ClientCommand, PROTOCOL_VERSION, type CommandResults, type CommandType, type CoreResponse, type ProtocolMessage } from "@lila/protocol";
-import type { Server, ServerWebSocket } from "bun";
+import { createServer, type IncomingMessage } from "node:http";
+import type { AddressInfo } from "node:net";
+import { ClientCommand, type CommandResults, type CommandType, PROTOCOL_VERSION, type ServerMessage } from "@lila/protocol";
+import { type WebSocket, WebSocketServer } from "ws";
 import pkg from "../package.json" with { type: "json" };
-import { DurableCore } from "./durable.ts";
+import { errorMessage, UserError } from "./errors.ts";
+import { SessionHost } from "./host.ts";
+import type { Clients } from "./live-session.ts";
 
 export interface CoreOptions {
   port: number;
   hostname?: string;
-  databasePath: string;
+  dataDir: string;
   token: string;
 }
 
-type SocketData = { watching?: string };
-type Socket = ServerWebSocket<SocketData>;
-
-export class UserError extends Error {}
-
-function encode(message: ProtocolMessage): string { return JSON.stringify(message); }
-function directoryError(path: string): string | undefined {
-  if (!existsSync(path)) return "目录不存在";
-  if (!statSync(path).isDirectory()) return "这不是一个目录";
-  return undefined;
+export interface Core {
+  url: string;
+  port: number;
+  /** Disposes every live session, then closes the sockets and the listener. */
+  stop(): Promise<void>;
 }
 
-export async function startCore(options: CoreOptions): Promise<Server<SocketData>> {
-  const clients = new Set<Socket>();
-  let server!: Server<SocketData>;
-  let core: DurableCore;
-  const toWatchers = (sessionId: string, message: string) => {
-    for (const client of clients) if (client.data.watching === sessionId) client.send(message);
-  };
-  const broadcastSession = async (sessionId: string) => {
-    try {
-      const session = await core.getSession(sessionId);
-      const message = encode({ type: "session", session });
-      for (const client of clients) client.send(message);
-    } catch {
-      // A deleted session is no longer present in the sidebar.
-    }
-  };
+const ALLOWED_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 
-  core = await DurableCore.open(options.databasePath, {
-    emit: toWatchers,
-    stream: (sessionId, runId, message) => toWatchers(sessionId, encode({ ...message, type: "stream", sessionId, runId })),
-    update: (sessionId) => void broadcastSession(sessionId),
-  });
+function originAllowed(origin: string | undefined): boolean {
+  return !origin || origin === "null" || origin === "file://" || ALLOWED_ORIGIN.test(origin);
+}
 
-  const hello = encode({ type: "hello", protocolVersion: PROTOCOL_VERSION, coreVersion: pkg.version });
-  async function execute(ws: Socket, command: ClientCommand): Promise<CommandResults[CommandType]> {
+export async function startCore(options: CoreOptions): Promise<Core> {
+  const watching = new Map<WebSocket, string>();
+  const send = (ws: WebSocket, message: ServerMessage) => {
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
+  };
+  const clients: Clients = {
+    toWatchers(sessionId, message) {
+      const data = JSON.stringify(message);
+      for (const [ws, watched] of watching) if (watched === sessionId && ws.readyState === ws.OPEN) ws.send(data);
+    },
+    broadcast(message) {
+      const data = JSON.stringify(message);
+      for (const ws of wss.clients) if (ws.readyState === ws.OPEN) ws.send(data);
+    },
+    isWatched: (sessionId) => [...watching.values()].includes(sessionId),
+  };
+  const host = new SessionHost(options.dataDir, clients);
+  const expectedProtocol = `lila.${options.token}`;
+
+  async function execute(ws: WebSocket, command: ClientCommand): Promise<CommandResults[CommandType]> {
     switch (command.type) {
-      case "projects.list": return { projects: await core.listProjects() };
-      case "projects.add": {
-        const path = resolve(command.path);
-        const error = directoryError(path);
-        if (error) throw new UserError(`${error}：${path}`);
-        return { project: await core.addProject({ id: crypto.randomUUID(), path, name: path.split("/").filter(Boolean).at(-1) ?? path }) };
+      case "projects.list":
+        return { projects: [...host.store.projects] };
+      case "projects.add":
+        return { project: host.addProject(command.path) };
+      case "projects.remove":
+        await host.removeProject(command.projectId);
+        return {};
+      case "models.list":
+        return await host.listModels();
+      case "sessions.list":
+        return { sessions: await host.listSessions() };
+      case "session.create":
+        return { session: await host.createSession(command) };
+      case "files.search":
+        return { files: await host.searchFiles(command.projectId, command.query, command.limit) };
+      case "session.delete":
+        await host.deleteSession(command.sessionId);
+        return {};
+      case "commands.list":
+        return { commands: await host.commands(command.projectId, command.sessionId) };
+      default:
+        break;
+    }
+    const live = await host.live(command.sessionId);
+    switch (command.type) {
+      case "session.open": {
+        watching.set(ws, command.sessionId);
+        return live.open(command.limit);
       }
-      case "models.list": {
-        const models = core.models;
-        return { models: [...models], ...(models[0] ? { defaultModelId: models[0].id } : {}) };
-      }
-      case "sessions.list": return { sessions: await core.listSessions() };
-      case "session.create": {
-        const session = await core.createSession(command.projectId, command.modelId, command.approvalMode ?? "yolo");
-        broadcastSession(session.id);
-        return { session };
-      }
-      case "session.configure": return { session: await core.configure(command.sessionId, { ...(command.modelId !== undefined ? { modelId: command.modelId } : {}), ...(command.approvalMode ? { approvalMode: command.approvalMode } : {}) }) };
-      case "session.rename": return { session: await core.rename(command.sessionId, command.title) };
-      case "session.delete": await core.delete(command.sessionId); return {};
-      case "message.send": return { runId: await core.send(command.sessionId, command.text, command.attachments ?? []) };
-      case "run.abort": await core.abort(command.sessionId); return {};
-      case "pending.respond": await core.respond(command.sessionId, command.pendingId, command.answer); return {};
-      case "events.resume": {
-        ws.data.watching = command.sessionId;
-        return await core.resumeEvents(command.sessionId, command.afterSeq);
-      }
-      case "events.before": return await core.eventsBefore(command.sessionId, command.beforeSeq, command.limit);
+      case "session.earlier":
+        return live.earlier(command.beforeId, command.limit);
+      case "session.prompt":
+        await live.prompt(command);
+        return {};
+      case "session.abort":
+        await live.abort();
+        return {};
+      case "session.configure":
+        return { state: await live.configure(command) };
+      case "session.rename":
+        return { session: live.rename(command.title) };
+      case "session.compact":
+        live.compact();
+        return {};
+      case "session.rewind":
+        return { text: await live.rewind(command.itemId) };
+      case "session.respond":
+        live.respond(command.pendingId, command.answer);
+        return {};
+      case "session.resources":
+        return { resources: live.resources() };
+      case "session.reload":
+        await live.reload();
+        return {};
     }
   }
 
-  async function handle(ws: Socket, raw: string): Promise<void> {
+  async function handle(ws: WebSocket, raw: string): Promise<void> {
     let value: unknown;
-    try { value = JSON.parse(raw); } catch { ws.send(encode({ type: "error", code: "invalid_json", message: "命令不是合法的 JSON" })); return; }
-    const parsed = ClientCommand.safeParse(value);
-    if (!parsed.success) { ws.send(encode({ type: "error", code: "invalid_command", message: parsed.error.message })); return; }
-    const command = parsed.data;
-    let response: CoreResponse;
     try {
-      response = { type: "response", requestId: command.requestId, command: command.type, ok: true, data: await execute(ws, command) };
+      value = JSON.parse(raw);
+    } catch {
+      send(ws, { type: "error", code: "invalid_json", message: "命令不是合法的 JSON" });
+      return;
+    }
+    const parsed = ClientCommand.safeParse(value);
+    if (!parsed.success) {
+      const requestId = (value as { requestId?: unknown } | null)?.requestId;
+      if (typeof requestId === "string") send(ws, { type: "response", requestId, ok: false, error: `命令格式不对：${parsed.error.message}` });
+      else send(ws, { type: "error", code: "invalid_command", message: parsed.error.message });
+      return;
+    }
+    const command = parsed.data;
+    try {
+      send(ws, { type: "response", requestId: command.requestId, ok: true, data: await execute(ws, command) });
     } catch (error) {
       if (!(error instanceof UserError)) console.error(`[core] ${command.type} failed`, error);
-      response = { type: "response", requestId: command.requestId, command: command.type, ok: false, error: error instanceof Error ? error.message : String(error) };
+      send(ws, { type: "response", requestId: command.requestId, ok: false, error: errorMessage(error) });
     }
-    ws.send(encode(response));
   }
 
-  server = Bun.serve<SocketData>({
-    hostname: options.hostname ?? "127.0.0.1",
-    port: options.port,
-    fetch(req, srv) {
-      const { pathname } = new URL(req.url);
-      if (pathname === "/health") return Response.json({ ok: true, coreVersion: pkg.version, protocolVersion: PROTOCOL_VERSION, pid: process.pid });
-      if (pathname !== "/ws") return new Response("Not found", { status: 404 });
-      const origin = req.headers.get("origin");
-      if (origin && origin !== "null" && origin !== "file://" && !/^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) return new Response("Forbidden origin", { status: 403 });
-      const expected = `lila.${options.token}`;
-      const protocols = (req.headers.get("sec-websocket-protocol") ?? "").split(",").map((item) => item.trim());
-      if (!protocols.includes(expected)) return new Response("Unauthorized", { status: 401 });
-      if (srv.upgrade(req, { data: {}, headers: { "Sec-WebSocket-Protocol": expected } })) return undefined;
-      return new Response("Expected a WebSocket upgrade", { status: 426 });
-    },
-    websocket: {
-      open(ws) { clients.add(ws); ws.send(hello); },
-      message(ws, message) { void handle(ws, String(message)); },
-      close(ws) { clients.delete(ws); },
-    },
+  const server = createServer((req, res) => {
+    const { pathname } = new URL(req.url ?? "/", "http://localhost");
+    if (pathname === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, coreVersion: pkg.version, protocolVersion: PROTOCOL_VERSION, pid: process.pid }));
+      return;
+    }
+    res.writeHead(pathname === "/ws" ? 426 : 404).end();
   });
-  const stop = server.stop.bind(server);
-  server.stop = async (closeActiveConnections?: boolean) => { await stop(closeActiveConnections); await core.close(); };
-  return server;
+
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: 64 * 1024 * 1024,
+    handleProtocols: (protocols) => (protocols.has(expectedProtocol) ? expectedProtocol : false),
+  });
+
+  server.on("upgrade", (req: IncomingMessage, socket, head) => {
+    const reject = (status: number, text: string) => {
+      socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    };
+    if (new URL(req.url ?? "/", "http://localhost").pathname !== "/ws") return reject(404, "Not Found");
+    if (!originAllowed(req.headers.origin)) return reject(403, "Forbidden");
+    const protocols = (req.headers["sec-websocket-protocol"] ?? "").split(",").map((item) => item.trim());
+    if (!protocols.includes(expectedProtocol)) return reject(401, "Unauthorized");
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.on("message", (data) => void handle(ws, data.toString()));
+      ws.on("close", () => watching.delete(ws));
+      send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, coreVersion: pkg.version });
+    });
+  });
+
+  const hostname = options.hostname ?? "127.0.0.1";
+  const { promise: listening, resolve, reject } = Promise.withResolvers<void>();
+  server.once("error", reject);
+  server.listen(options.port, hostname, () => resolve());
+  await listening;
+  const port = (server.address() as AddressInfo).port;
+
+  return {
+    url: `http://${hostname}:${port}`,
+    port,
+    async stop() {
+      await host.dispose();
+      for (const ws of wss.clients) ws.terminate();
+      wss.close();
+      const { promise, resolve: closed } = Promise.withResolvers<void>();
+      server.close(() => closed());
+      server.closeAllConnections();
+      await promise;
+    },
+  };
 }

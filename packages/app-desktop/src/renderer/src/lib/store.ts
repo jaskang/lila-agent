@@ -2,88 +2,87 @@ import { create } from "zustand";
 import { toast } from "sonner";
 import type {
   ApprovalMode,
-  Attachment,
-  AttachmentMeta,
-  FileDiff,
-  LiveSnapshot,
-  Model,
+  ImageInput,
+  ModelInfo,
   PendingAnswer,
-  PendingKind,
-  PendingQuestion,
   Project,
-  SessionEvent,
+  SessionState,
   SessionSummary,
-  StreamMessage,
+  SlashCommand,
+  ThinkingLevel,
+  TranscriptItem,
 } from "@lila/protocol";
-import { CoreClient, type ConnectionState } from "./client.ts";
-
-export type TranscriptItem =
-  | { kind: "user"; id: string; text: string; attachments?: AttachmentMeta[] }
-  | { kind: "assistant"; id: string; text: string; thinking: string; streaming: boolean }
-  | {
-      kind: "tool";
-      id: string;
-      toolName: string;
-      intent?: string;
-      args: Record<string, unknown>;
-      status: "running" | "done" | "error";
-      output: string;
-      diffs: FileDiff[];
-    }
-  | { kind: "notice"; id: string; tone: "info" | "warning" | "error"; text: string }
-  | { kind: "decision"; id: string; title: string; status: "answered" | "cancelled" | "interrupted"; answer?: string };
-
-export type OpenPending = {
-  pendingId: string;
-  kind: PendingKind;
-  title: string;
-  message?: string;
-  options: string[];
-  questions: PendingQuestion[];
-  toolCallId?: string;
-  placeholder?: string;
-  defaultValue?: string;
-};
+import { CoreClient, type ConnectionState, type PushMessage } from "./client.ts";
 
 export type SessionView = {
-  lastSeq: number;
-  firstSeq: number;
   items: TranscriptItem[];
   /** Item id → index in `items`. */
   index: Record<string, number>;
-  pending: OpenPending[];
-  runId?: string;
-  loaded: boolean;
-  loading: boolean;
-  loadError?: string;
   hasEarlier: boolean;
   loadingEarlier: boolean;
+  state?: SessionState;
+  loading: boolean;
+  error?: string;
 };
+
+/** Settings for a session that does not exist yet; remembered between new sessions. */
+export type NewSessionOptions = { projectId?: string; modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode: ApprovalMode };
 
 type State = {
   connection: ConnectionState;
   connectionDetail?: string;
   projects: Project[];
-  models: Model[];
+  models: ModelInfo[];
   defaultModelId?: string;
   modelsError?: string;
   sessions: Record<string, SessionSummary>;
   views: Record<string, SessionView>;
   selectedId?: string;
+  newSession: NewSessionOptions;
+  /** Composer text per session; `new` is the new-session composer. */
+  drafts: Record<string, string>;
+  paletteOpen: boolean;
 };
 
-const emptyView = (): SessionView => ({
-  lastSeq: 0,
-  firstSeq: 0,
-  items: [],
-  index: {},
-  pending: [],
-  loaded: false,
-  loading: false,
-  hasEarlier: false,
-  loadingEarlier: false,
-});
+export const NEW_DRAFT = "new";
 const SELECTED_KEY = "lila.selectedSession";
+const NEW_SESSION_KEY = "lila.newSession";
+const OPEN_LIMIT = 200;
+const EARLIER_LIMIT = 200;
+
+export const APPROVAL_LABEL: Record<ApprovalMode, string> = {
+  auto: "自动执行",
+  "ask-exec": "执行命令前询问",
+  "ask-all": "修改和执行都询问",
+};
+
+export const APPROVAL_HINT: Record<ApprovalMode, string> = {
+  auto: "所有工具直接执行，适合你信任的项目。",
+  "ask-exec": "改文件不问，运行命令、MCP 和子 Agent 前先问你。",
+  "ask-all": "改文件和运行命令前都先问你。",
+};
+
+export const THINKING_LABEL: Record<ThinkingLevel, string> = {
+  off: "不思考",
+  minimal: "最少思考",
+  low: "少量思考",
+  medium: "适中思考",
+  high: "深入思考",
+  xhigh: "很深入",
+  max: "最深入",
+};
+
+export const emptyView = (): SessionView => ({ items: [], index: {}, hasEarlier: false, loadingEarlier: false, loading: false });
+
+function readNewSession(): NewSessionOptions {
+  try {
+    const saved = JSON.parse(localStorage.getItem(NEW_SESSION_KEY) ?? "null") as Partial<NewSessionOptions> | null;
+    if (saved && typeof saved === "object") return { ...saved, approvalMode: saved.approvalMode ?? "auto" };
+  } catch {
+    // A broken entry falls back to the defaults.
+  }
+  return { approvalMode: "auto" };
+}
 
 export const useLila = create<State>(() => ({
   connection: "connecting",
@@ -92,436 +91,381 @@ export const useLila = create<State>(() => ({
   sessions: {},
   views: {},
   selectedId: localStorage.getItem(SELECTED_KEY) ?? undefined,
+  newSession: readNewSession(),
+  drafts: {},
+  paletteOpen: false,
 }));
-
-// ---------------------------------------------------------------------------
-// Reducer: pure updates of one session view.
-
-function upsert(view: SessionView, item: TranscriptItem): SessionView {
-  const at = view.index[item.id];
-  if (at === undefined) {
-    return { ...view, items: [...view.items, item], index: { ...view.index, [item.id]: view.items.length } };
-  }
-  const items = view.items.slice();
-  items[at] = item;
-  return { ...view, items };
-}
-
-function patch<K extends TranscriptItem["kind"]>(
-  view: SessionView,
-  id: string,
-  kind: K,
-  update: (item: Extract<TranscriptItem, { kind: K }>) => Extract<TranscriptItem, { kind: K }>,
-): SessionView {
-  const at = view.index[id];
-  const item = at === undefined ? undefined : view.items[at];
-  if (!item || item.kind !== kind) return view;
-  return upsert(view, update(item as Extract<TranscriptItem, { kind: K }>));
-}
-
-function rebuildIndex(items: TranscriptItem[]): Record<string, number> {
-  return Object.fromEntries(items.map((item, index) => [item.id, index]));
-}
-
-function prependEvents(view: SessionView, events: SessionEvent[], models: Model[], hasEarlier: boolean): SessionView {
-  let historical = emptyView();
-  for (const event of events) historical = applyEvent(historical, event, models);
-  const existing = new Set(view.items.map((item) => item.id));
-  const items = [...historical.items.filter((item) => !existing.has(item.id)), ...view.items];
-  return {
-    ...view,
-    firstSeq: events[0]?.seq ?? view.firstSeq,
-    hasEarlier,
-    items,
-    index: rebuildIndex(items),
-  };
-}
-
-export function applyEvent(view: SessionView, event: SessionEvent, models: Model[]): SessionView {
-  if (event.seq <= view.lastSeq) return view;
-  let next: SessionView = { ...view, lastSeq: event.seq };
-  const id = `e${event.seq}`;
-  switch (event.eventType) {
-    case "session.created":
-      return next;
-    case "session.updated": {
-      const label = models.find((model) => model.id === event.payload.modelId)?.label ?? "默认模型";
-      return upsert(next, { kind: "notice", id, tone: "info", text: `已切换到 ${label} · ${APPROVAL_LABEL[event.payload.approvalMode]}` });
-    }
-    case "message.user":
-      return upsert(next, { kind: "user", id, text: event.payload.text, ...(event.payload.attachments ? { attachments: event.payload.attachments } : {}) });
-    case "run.started":
-      return { ...next, runId: event.runId };
-    case "assistant.message": {
-      const { messageId, text, thinking } = event.payload;
-      return upsert(next, { kind: "assistant", id: messageId, text, thinking, streaming: false });
-    }
-    case "tool.started": {
-      const { toolCallId, toolName, intent, args } = event.payload;
-      const existing = next.items[next.index[toolCallId] ?? -1];
-      return upsert(next, {
-        kind: "tool",
-        id: toolCallId,
-        toolName,
-        ...(intent ? { intent } : {}),
-        args,
-        status: "running",
-        output: existing?.kind === "tool" ? existing.output : "",
-        diffs: existing?.kind === "tool" ? existing.diffs : [],
-      });
-    }
-    case "tool.finished":
-      return patch(next, event.payload.toolCallId, "tool", (tool) => ({
-        ...tool,
-        status: event.payload.isError ? "error" : "done",
-        output: event.payload.output,
-        diffs: event.payload.diffs.length ? event.payload.diffs : tool.diffs,
-      }));
-    case "pending.created":
-      return { ...next, pending: [...next.pending, event.payload] };
-    case "pending.resolved": {
-      const open = next.pending.find((item) => item.pendingId === event.payload.pendingId);
-      next = { ...next, pending: next.pending.filter((item) => item.pendingId !== event.payload.pendingId) };
-      if (!open) return next;
-      return upsert(next, {
-        kind: "decision",
-        id,
-        title: open.title,
-        status: event.payload.status,
-        ...(event.payload.answer ? { answer: event.payload.answer } : {}),
-      });
-    }
-    case "run.finished":
-      return endRun(next);
-    case "run.aborted":
-      return upsert(endRun(next), { kind: "notice", id, tone: "warning", text: "已停止" });
-    case "run.failed":
-      return upsert(endRun(next), { kind: "notice", id, tone: "error", text: event.payload.error });
-    case "run.interrupted":
-      return upsert(endRun(next), { kind: "notice", id, tone: "warning", text: event.payload.reason });
-  }
-}
-
-function endRun(view: SessionView): SessionView {
-  const items = view.items.map((item) => {
-    if (item.kind === "assistant" && item.streaming) return { ...item, streaming: false };
-    if (item.kind === "tool" && item.status === "running") return { ...item, status: "error" as const };
-    return item;
-  });
-  const { runId: _, ...rest } = view;
-  return { ...rest, items, pending: [] };
-}
-
-export function applyStream(view: SessionView, message: StreamMessage): SessionView {
-  if (message.runId !== view.runId) return view;
-  if (message.kind === "assistant.delta") {
-    const at = view.index[message.messageId];
-    const current = at === undefined ? undefined : view.items[at];
-    if (current && (current.kind !== "assistant" || !current.streaming)) return view;
-    const base = current ?? { kind: "assistant" as const, id: message.messageId, text: "", thinking: "", streaming: true };
-    return upsert(view, { ...base, [message.channel]: base[message.channel] + message.delta });
-  }
-  const at = view.index[message.toolCallId];
-  const current = at === undefined ? undefined : view.items[at];
-  if (current && (current.kind !== "tool" || current.status !== "running")) return view;
-  const base =
-    current ??
-    ({ kind: "tool", id: message.toolCallId, toolName: message.toolName, args: {}, status: "running", output: "", diffs: [] } as const);
-  return upsert(view, {
-    ...base,
-    ...(message.output !== undefined ? { output: message.output } : {}),
-    ...(message.diffs ? { diffs: message.diffs } : {}),
-  });
-}
-
-function applyLive(view: SessionView, live: LiveSnapshot): SessionView {
-  let next: SessionView = { ...view, runId: live.runId };
-  for (const message of live.messages) {
-    next = upsert(next, { kind: "assistant", id: message.messageId, text: message.text, thinking: message.thinking, streaming: true });
-  }
-  for (const tool of live.tools) {
-    next = applyStream(next, { type: "stream", sessionId: "", runId: live.runId, kind: "tool.progress", ...tool });
-  }
-  return next;
-}
-
-// ---------------------------------------------------------------------------
-// Actions.
-
-export const APPROVAL_LABEL: Record<ApprovalMode, string> = {
-  yolo: "自动执行",
-  write: "执行命令前询问",
-  "always-ask": "修改和执行都询问",
-};
 
 const set = useLila.setState;
 const get = useLila.getState;
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function report(error: unknown): void {
+  toast.error(message(error));
+}
+
+function indexOf(items: TranscriptItem[]): Record<string, number> {
+  const index: Record<string, number> = {};
+  items.forEach((item, at) => {
+    index[item.id] = at;
+  });
+  return index;
+}
 
 function setView(sessionId: string, update: (view: SessionView) => SessionView): void {
   set((state) => ({ views: { ...state.views, [sessionId]: update(state.views[sessionId] ?? emptyView()) } }));
 }
 
-function report(error: unknown): void {
-  toast.error(error instanceof Error ? error.message : String(error));
+// ---------------------------------------------------------------------------
+// Live frames, merged per animation frame so a fast model cannot flood React with renders.
+
+type SessionFrame = Extract<PushMessage, { type: "item" | "delta" | "state" }>;
+
+function applyFrame(view: SessionView, frame: SessionFrame, items: TranscriptItem[], index: Record<string, number>): SessionView {
+  if (frame.type === "state") return { ...view, state: frame.state };
+  if (frame.type === "item") {
+    const at = index[frame.item.id];
+    if (at === undefined) {
+      index[frame.item.id] = items.length;
+      items.push(frame.item);
+    } else {
+      items[at] = frame.item;
+    }
+    return view;
+  }
+  const at = index[frame.itemId];
+  const current = at === undefined ? undefined : items[at];
+  if (current && current.kind !== "assistant") return view;
+  const base = current ?? { kind: "assistant" as const, id: frame.itemId, text: "", thinking: "", streaming: true };
+  const next = { ...base, [frame.channel]: base[frame.channel] + frame.delta };
+  if (at === undefined) {
+    index[frame.itemId] = items.length;
+    items.push(next);
+  } else {
+    items[at] = next;
+  }
+  return view;
 }
 
-/** Streams are merged per animation frame so a fast model cannot flood React with renders. */
-let streamBuffer: StreamMessage[] = [];
-let frame: number | undefined;
-function flushStream(): void {
-  if (frame !== undefined) cancelAnimationFrame(frame);
-  frame = undefined;
-  if (!streamBuffer.length) return;
-  const buffered = streamBuffer;
-  streamBuffer = [];
+let buffer: SessionFrame[] = [];
+let frameHandle: number | undefined;
+
+function flush(): void {
+  if (frameHandle !== undefined) cancelAnimationFrame(frameHandle);
+  frameHandle = undefined;
+  if (!buffer.length) return;
+  const frames = buffer;
+  buffer = [];
   set((state) => {
     const views = { ...state.views };
-    for (const message of buffered) {
-      const view = views[message.sessionId];
-      if (view) views[message.sessionId] = applyStream(view, message);
+    const touched = new Map<string, { items: TranscriptItem[]; index: Record<string, number> }>();
+    for (const frame of frames) {
+      let view = views[frame.sessionId];
+      if (!view) continue;
+      let work = touched.get(frame.sessionId);
+      if (!work) {
+        work = { items: view.items.slice(), index: { ...view.index } };
+        touched.set(frame.sessionId, work);
+      }
+      view = applyFrame(view, frame, work.items, work.index);
+      views[frame.sessionId] = view;
+    }
+    for (const [sessionId, work] of touched) {
+      const view = views[sessionId];
+      if (view) views[sessionId] = { ...view, items: work.items, index: work.index };
     }
     return { views };
   });
 }
 
-/** Live frames that arrive while a resume request is in flight wait for its replay. */
-const resuming = new Map<string, Array<SessionEvent | StreamMessage>>();
+/** The session this socket watches, and opens in flight (frames before the snapshot are already in it). */
+let watching: string | undefined;
+const opening = new Map<string, number>();
+let openCounter = 0;
+
+async function openSession(sessionId: string): Promise<void> {
+  const token = ++openCounter;
+  opening.set(sessionId, token);
+  watching = sessionId;
+  flush();
+  setView(sessionId, (view) => ({ ...view, loading: true, error: undefined }));
+  try {
+    const { items, hasEarlier, state } = await client.call({ type: "session.open", sessionId, limit: OPEN_LIMIT });
+    if (opening.get(sessionId) !== token) return;
+    // Frames queued before the snapshot are already part of it.
+    buffer = buffer.filter((frame) => frame.sessionId !== sessionId);
+    setView(sessionId, () => ({ items, index: indexOf(items), hasEarlier, loadingEarlier: false, state, loading: false }));
+  } catch (error) {
+    if (opening.get(sessionId) !== token) return;
+    setView(sessionId, (view) => ({ ...view, loading: false, error: message(error) }));
+  } finally {
+    if (opening.get(sessionId) === token) opening.delete(sessionId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// System notifications while the window is in the background.
 
 function notify(title: string, body: string): void {
-  if (document.hasFocus()) return;
-  const notification = new Notification(title, { body, silent: false });
+  if (document.hasFocus() || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  const notification = new Notification(title, { body });
   notification.onclick = () => window.lila.focus();
 }
 
-function handleEvent(event: SessionEvent): void {
-  const queue = resuming.get(event.sessionId);
-  if (queue) {
-    queue.push(event);
-    return;
-  }
-  flushStream();
-  const view = get().views[event.sessionId];
-  if (!view) return;
-  if (event.seq > view.lastSeq + 1) {
-    void resume(event.sessionId);
-    return;
-  }
-  setView(event.sessionId, (current) => applyEvent(current, event, get().models));
-  const title = get().sessions[event.sessionId]?.title || "Lila";
-  if (event.eventType === "pending.created") notify(`需要你处理 · ${title}`, event.payload.title);
-  if (event.eventType === "run.finished") notify("任务完成", title);
-  if (event.eventType === "run.failed") notify("任务失败", event.payload.error);
+function notifyTransition(previous: SessionSummary | undefined, next: SessionSummary): void {
+  if (!previous) return;
+  const title = next.title || "新会话";
+  if (next.pendingCount > previous.pendingCount) notify("需要你处理", title);
+  else if (previous.status === "running" && next.status === "idle") notify("任务完成", title);
+  else if (previous.status !== "error" && next.status === "error") notify("任务出错", title);
 }
 
-function handleStream(message: StreamMessage): void {
-  const queue = resuming.get(message.sessionId);
-  if (queue) {
-    queue.push(message);
-    return;
-  }
-  streamBuffer.push(message);
-  frame ??= requestAnimationFrame(flushStream);
-}
-
-async function resume(sessionId: string): Promise<void> {
-  if (resuming.has(sessionId)) return;
-  resuming.set(sessionId, []);
-  setView(sessionId, (current) => ({ ...current, loading: true, loadError: undefined }));
-  try {
-    const afterSeq = get().views[sessionId]?.lastSeq ?? 0;
-    const { events, live, hasEarlier } = await client.call({ type: "events.resume", sessionId, afterSeq });
-    const models = get().models;
-    setView(sessionId, (current) => {
-      let next = afterSeq === 0 ? emptyView() : current;
-      for (const event of events) next = applyEvent(next, event, models);
-      if (live) next = applyLive(next, live);
-      return {
-        ...next,
-        firstSeq: afterSeq === 0 ? (events[0]?.seq ?? 0) : current.firstSeq,
-        hasEarlier: afterSeq === 0 ? hasEarlier : current.hasEarlier,
-        loaded: true,
-        loading: false,
-        loadError: undefined,
-      };
-    });
-  } catch (error) {
-    report(error);
-    setView(sessionId, (current) => ({
-      ...current,
-      loading: false,
-      loadError: error instanceof Error ? error.message : String(error),
-    }));
-  } finally {
-    const queued = resuming.get(sessionId) ?? [];
-    resuming.delete(sessionId);
-    for (const item of queued) {
-      if (item.type === "event") handleEvent(item);
-      else handleStream(item);
+function handlePush(frame: PushMessage): void {
+  switch (frame.type) {
+    case "item":
+    case "delta":
+    case "state":
+      if (frame.sessionId !== watching) return;
+      buffer.push(frame);
+      frameHandle ??= requestAnimationFrame(flush);
+      return;
+    case "reset":
+      if (frame.sessionId === watching) void openSession(frame.sessionId);
+      return;
+    case "session": {
+      const previous = get().sessions[frame.session.id];
+      set((state) => ({ sessions: { ...state.sessions, [frame.session.id]: frame.session } }));
+      notifyTransition(previous, frame.session);
+      return;
     }
+    case "session.removed":
+      forget(frame.sessionId);
+      return;
+    case "notify": {
+      const show = frame.level === "error" ? toast.error : frame.level === "warning" ? toast.warning : toast.info;
+      const title = frame.sessionId ? get().sessions[frame.sessionId]?.title : undefined;
+      show(frame.message, title ? { description: title } : undefined);
+    }
+  }
+}
+
+function forget(sessionId: string): void {
+  const wasSelected = get().selectedId === sessionId;
+  set((state) => {
+    const sessions = { ...state.sessions };
+    delete sessions[sessionId];
+    const views = { ...state.views };
+    delete views[sessionId];
+    return { sessions, views, ...(wasSelected ? { selectedId: undefined } : {}) };
+  });
+  if (wasSelected) {
+    localStorage.removeItem(SELECTED_KEY);
+    watching = undefined;
   }
 }
 
 async function loadModels(): Promise<void> {
   try {
     const { models, defaultModelId } = await client.call({ type: "models.list" });
-    set({ models, ...(defaultModelId ? { defaultModelId } : {}), modelsError: undefined });
+    set({ models, defaultModelId, modelsError: undefined });
   } catch (error) {
-    set({ modelsError: error instanceof Error ? error.message : String(error) });
+    set({ modelsError: message(error) });
+  }
+}
+
+async function onReady(): Promise<void> {
+  void loadModels();
+  try {
+    const [{ projects }, { sessions }] = await Promise.all([
+      client.call({ type: "projects.list" }),
+      client.call({ type: "sessions.list" }),
+    ]);
+    const byId = Object.fromEntries(sessions.map((session) => [session.id, session]));
+    const selectedId = get().selectedId;
+    const missing = selectedId !== undefined && !byId[selectedId];
+    set({ projects, sessions: byId, ...(missing ? { selectedId: undefined } : {}) });
+    if (missing) localStorage.removeItem(SELECTED_KEY);
+    const current = get().selectedId;
+    if (current) await openSession(current);
+  } catch (error) {
+    report(error);
   }
 }
 
 export const client = new CoreClient({
   onState: (connection, connectionDetail) => set({ connection, connectionDetail }),
-  onReady: () => {
-    void (async () => {
-      try {
-        const [{ projects }, { sessions }] = await Promise.all([
-          client.call({ type: "projects.list" }),
-          client.call({ type: "sessions.list" }),
-        ]);
-        const byId = Object.fromEntries(sessions.map((session) => [session.id, session]));
-        const selectedId = get().selectedId;
-        set({ projects, sessions: byId, ...(selectedId && !byId[selectedId] ? { selectedId: undefined } : {}) });
-        const current = get().selectedId;
-        if (current) await resume(current);
-      } catch (error) {
-        report(error);
-      }
-    })();
-    if (!get().models.length) void loadModels();
-  },
-  onEvent: handleEvent,
-  onStream: handleStream,
-  onSession: ({ session }) => set((state) => ({ sessions: { ...state.sessions, [session.id]: session } })),
+  onReady: () => void onReady(),
+  onPush: handlePush,
 });
+
+// ---------------------------------------------------------------------------
+// Actions.
+
+async function attempt<T>(run: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await run();
+  } catch (error) {
+    report(error);
+    return undefined;
+  }
+}
 
 export const actions = {
   select(sessionId: string | undefined): void {
     set({ selectedId: sessionId });
     if (sessionId) localStorage.setItem(SELECTED_KEY, sessionId);
     else localStorage.removeItem(SELECTED_KEY);
-    if (sessionId && get().connection === "connected") void resume(sessionId);
+    if (sessionId && get().connection === "connected") void openSession(sessionId);
+  },
+
+  /** Shows the new-session composer, optionally for one project. */
+  startNew(projectId?: string): void {
+    if (projectId) actions.setNewSession({ projectId });
+    actions.select(undefined);
+  },
+
+  setNewSession(patch: Partial<NewSessionOptions>): void {
+    const next = { ...get().newSession, ...patch };
+    set({ newSession: next });
+    localStorage.setItem(NEW_SESSION_KEY, JSON.stringify(next));
+  },
+
+  setDraft(key: string, text: string): void {
+    set((state) => ({ drafts: { ...state.drafts, [key]: text } }));
+  },
+
+  setPaletteOpen(open: boolean): void {
+    set({ paletteOpen: open });
+  },
+
+  retryModels: loadModels,
+
+  retrySession(sessionId: string): void {
+    void openSession(sessionId);
   },
 
   async addProject(): Promise<Project | undefined> {
     const path = await window.lila.pickDirectory();
     if (!path) return undefined;
-    try {
-      const { project } = await client.call({ type: "projects.add", path });
-      set((state) => ({
-        projects: state.projects.some((item) => item.id === project.id) ? state.projects : [...state.projects, project],
-      }));
-      return project;
-    } catch (error) {
-      report(error);
-      return undefined;
-    }
+    const result = await attempt(() => client.call({ type: "projects.add", path }));
+    if (!result) return undefined;
+    const { project } = result;
+    set((state) => ({
+      projects: state.projects.some((item) => item.id === project.id) ? state.projects : [...state.projects, project],
+    }));
+    return project;
   },
 
-  async createSession(projectId: string, modelId: string | undefined, approvalMode: ApprovalMode): Promise<void> {
-    try {
-      const { session } = await client.call({
+  /** Creates a session from the new-session composer and sends its first message. */
+  async createAndPrompt(text: string, images: ImageInput[]): Promise<boolean> {
+    const { projectId, modelId, thinkingLevel, approvalMode } = get().newSession;
+    if (!projectId) return false;
+    const created = await attempt(() =>
+      client.call({
         type: "session.create",
         projectId,
         approvalMode,
         ...(modelId ? { modelId } : {}),
-      });
-      set((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
-      actions.select(session.id);
-    } catch (error) {
-      report(error);
-    }
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+      }),
+    );
+    if (!created) return false;
+    const { session } = created;
+    set((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
+    actions.select(session.id);
+    return actions.prompt(session.id, text, images);
   },
 
-  async configure(sessionId: string, patch: { modelId?: string | null; approvalMode?: ApprovalMode }): Promise<void> {
+  async prompt(sessionId: string, text: string, images: ImageInput[] = [], mode?: "steer" | "followUp"): Promise<boolean> {
+    const trimmed = text.trim();
+    if (trimmed === "/compact") return Boolean(await actions.compact(sessionId));
+    if (trimmed === "/reload") return Boolean(await actions.reload(sessionId));
+    const result = await attempt(() =>
+      client.call({ type: "session.prompt", sessionId, text, ...(images.length ? { images } : {}), ...(mode ? { mode } : {}) }),
+    );
+    return result !== undefined;
+  },
+
+  async abort(sessionId: string): Promise<void> {
+    await attempt(() => client.call({ type: "session.abort", sessionId }));
+  },
+
+  async configure(sessionId: string, patch: { modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode?: ApprovalMode }): Promise<void> {
+    const result = await attempt(() => client.call({ type: "session.configure", sessionId, ...patch }));
+    if (result) setView(sessionId, (view) => ({ ...view, state: result.state }));
+  },
+
+  async rename(sessionId: string, title: string): Promise<boolean> {
+    const result = await attempt(() => client.call({ type: "session.rename", sessionId, title }));
+    if (!result) return false;
+    set((state) => ({ sessions: { ...state.sessions, [result.session.id]: result.session } }));
+    return true;
+  },
+
+  async remove(sessionId: string): Promise<boolean> {
+    const result = await attempt(() => client.call({ type: "session.delete", sessionId }));
+    if (!result) return false;
+    forget(sessionId);
+    return true;
+  },
+
+  async compact(sessionId: string): Promise<boolean> {
+    return (await attempt(() => client.call({ type: "session.compact", sessionId }))) !== undefined;
+  },
+
+  async reload(sessionId: string): Promise<boolean> {
+    const done = (await attempt(() => client.call({ type: "session.reload", sessionId }))) !== undefined;
+    if (done) toast.success("已重新加载技能、扩展和 MCP");
+    return done;
+  },
+
+  /** Moves the session back to before a user message; its text goes back into the composer. */
+  async rewind(sessionId: string, itemId: string): Promise<void> {
+    const result = await attempt(() => client.call({ type: "session.rewind", sessionId, itemId }));
+    if (result) actions.setDraft(sessionId, result.text);
+  },
+
+  async respond(sessionId: string, pendingId: string, answer: PendingAnswer): Promise<void> {
+    await attempt(() => client.call({ type: "session.respond", sessionId, pendingId, answer }));
+  },
+
+  async commands(projectId: string, sessionId?: string): Promise<SlashCommand[]> {
     try {
-      const { session } = await client.call({ type: "session.configure", sessionId, ...patch });
-      set((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
-    } catch (error) {
-      report(error);
+      return (await client.call({ type: "commands.list", projectId, ...(sessionId ? { sessionId } : {}) })).commands;
+    } catch {
+      return [];
     }
   },
 
-  async renameSession(sessionId: string, title: string): Promise<boolean> {
+  async resources(sessionId: string) {
+    return (await client.call({ type: "session.resources", sessionId })).resources;
+  },
+
+  async searchFiles(projectId: string, query: string): Promise<string[]> {
     try {
-      const { session } = await client.call({ type: "session.rename", sessionId, title });
-      set((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
-      return true;
-    } catch (error) {
-      report(error);
-      return false;
+      return (await client.call({ type: "files.search", projectId, query, limit: 50 })).files;
+    } catch {
+      return [];
     }
-  },
-
-  async deleteSession(sessionId: string): Promise<boolean> {
-    try {
-      const wasSelected = get().selectedId === sessionId;
-      await client.call({ type: "session.delete", sessionId });
-      set((state) => {
-        const sessions = { ...state.sessions };
-        delete sessions[sessionId];
-        const views = { ...state.views };
-        delete views[sessionId];
-        return { sessions, views, ...(wasSelected ? { selectedId: undefined } : {}) };
-      });
-      if (wasSelected) localStorage.removeItem(SELECTED_KEY);
-      return true;
-    } catch (error) {
-      report(error);
-      return false;
-    }
-  },
-
-  retrySession(sessionId: string): void {
-    void resume(sessionId);
   },
 
   async loadEarlier(sessionId: string): Promise<void> {
     const view = get().views[sessionId];
-    if (!view || !view.hasEarlier || view.loadingEarlier || view.firstSeq <= 1) return;
+    const first = view?.items[0];
+    if (!view || !first || !view.hasEarlier || view.loadingEarlier) return;
     setView(sessionId, (current) => ({ ...current, loadingEarlier: true }));
     try {
-      const { events, hasEarlier } = await client.call({
-        type: "events.before",
-        sessionId,
-        beforeSeq: view.firstSeq,
-        limit: 200,
+      const { items, hasEarlier } = await client.call({ type: "session.earlier", sessionId, beforeId: first.id, limit: EARLIER_LIMIT });
+      setView(sessionId, (current) => {
+        const merged = [...items.filter((item) => current.index[item.id] === undefined), ...current.items];
+        return { ...current, items: merged, index: indexOf(merged), hasEarlier, loadingEarlier: false };
       });
-      const models = get().models;
-      setView(sessionId, (current) => ({ ...prependEvents(current, events, models, hasEarlier), loadingEarlier: false }));
     } catch (error) {
       report(error);
       setView(sessionId, (current) => ({ ...current, loadingEarlier: false }));
     }
   },
-
-  async send(sessionId: string, text: string, attachments: Attachment[] = []): Promise<boolean> {
-    try {
-      await client.call({ type: "message.send", sessionId, text, ...(attachments.length ? { attachments } : {}) });
-      return true;
-    } catch (error) {
-      report(error);
-      return false;
-    }
-  },
-
-  async abort(sessionId: string): Promise<void> {
-    try {
-      await client.call({ type: "run.abort", sessionId });
-    } catch (error) {
-      report(error);
-    }
-  },
-
-  async respond(sessionId: string, pendingId: string, answer: PendingAnswer): Promise<void> {
-    try {
-      await client.call({ type: "pending.respond", sessionId, pendingId, answer });
-    } catch (error) {
-      report(error);
-    }
-  },
-
-  retryModels: loadModels,
 };
-
-export { emptyView };

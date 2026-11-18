@@ -1,7 +1,10 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "types": ["bun"]
+    "lib": ["ES2024"],
+    "types": ["node"]
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Tests run under bun:test; the shipped code targets Node and must not see Bun's globals.
+  "exclude": ["src/**/*.test.ts"]
 }

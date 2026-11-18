@@ -1,48 +1,41 @@
-# 第一版任务单
+# 任务单
 
-目标：在 Mac mini 上用 Lila 完成一次真实的编程任务。架构见 [architecture.md](architecture.md)。
+架构见 [architecture.md](architecture.md)，内核选择见 [ADR 0001](adr/0001-pi-sdk-kernel.md)。
 
-按顺序做，每项做完能单独验证。
-
-## 当前状态：pi-durable 接入完成，真实模型冒烟进行中
-
-Lila 的 core 已切换到 `pi-durable`。当前使用 `@earendil-works/pi-durable`、`pi-coding-agent` 和官方 durable tools，模型、会话、任务恢复和 SQLite 持久化由 Harness 直接管理。已完成真实模型调用和 Core WebSocket 冒烟。
-
-本地运行：`bun run dev`（同时启动 `core` 和 Electron）。数据在 `~/Library/Application Support/Lila`，`core` 日志在同目录的 `core.log`。
+本地运行：`bun install` 后 `bun run dev`（同时启动 core 和 Electron）。core 日志在 `~/Library/Application Support/Lila/core.log`。模型、认证、MCP、技能都读 `~/.pi/agent`，先用 `pi` 命令行配好（`/login`、`pi mcp add`、`pi install`）。
 
 ## 下一个任务
 
-### 1. 用它干一件真事，并验收响应速度
+### 1. 用它干真事并验收
 
-用 Lila 给 Lila 自己做一个小改动，记录不顺手的地方，决定下一步。
+用 Lila 给 Lila 自己做几个改动，覆盖：子 Agent（`Agent` 工具前台和后台）、一个 stdio MCP 服务器、一个技能（`/skill:…`）、`ask-exec` 审批、运行中插话（Enter）和追加（⌥Enter）、编辑重发、手动压缩。记录不顺手的地方。
 
-同时按架构文档的三条标准实测：
+响应速度按架构文档三条标准实测；长会话用一个几百条消息的 Pi 会话文件打开试。
 
-- 窗口从 Dock 重新打开，感觉不到延迟。
-- 流式输出时，滚动和输入不掉帧。
-- 几百条消息的长会话，打开不卡。
+### 2. 发布打包
 
-达不到就先查应用代码；确认是 Electron 本身的限制，再讨论换壳。
+- electron-builder 把 `packages/core`（含 `node_modules`）放进 `resources/core`，主进程已经按 `ELECTRON_RUN_AS_NODE=1 <app> resources/core/src/main.ts` 启动它，不需要编译。
+- 签名与公证。
+- 视使用情况决定是否把 core 改成 launchd 用户级常驻服务。
 
-### 2. durable 完整任务验收
+### 3. 个人助理方向
 
-验证真实工具执行、审批文档恢复、MCP 和 sub-agent 接入，再记录运行速度和资源占用。
+- 定时任务界面：pi-subagents 的 `schedule` 已经能定时跑子 Agent，缺的是列表和取消的界面。
+- 一个不绑定代码仓库的“助理”项目（专用目录 + 个人技能）。
+- 手机端：同一套 WebSocket 协议，经 Tailscale。
 
-### 3. 发布打包
+### 4. 体验待补
 
-- 把 `core` 用 `bun build --compile` 编译成单个可执行文件，用 electron-builder 放进应用包（主进程已经按 `resources/core/lilad` 找它）。
-- 视使用情况决定是否把 `core` 改成 launchd 用户级常驻服务，让它被系统杀掉后也能自己起来。
-
-### 4. 体验补齐
-
-- 输入框支持图片和文本文件附件，单个文件最多 5 MiB，最多发送 10 个附件。
-- 会话列表支持重命名、删除、按项目折叠。
-- 长会话首次只加载最近 200 条事件，可从顶部继续加载更早的事件。
+- 会话树导航（Pi 的 `/tree`）和从任意消息分叉成新会话。
+- 项目的 git 改动面板（当前工作区 diff）。
+- 子 Agent 运行中的实时进度（pi-subagents 的事件总线 `subagents:*`）。
 
 ## 已完成
 
-- **仓库骨架。** Bun workspace，三个包：`packages/protocol`、`packages/core`、`packages/app-desktop`。
-- **事件协议 v2。** 每种事件的载荷有明确类型；只有定稿的事实落库，流式增量只推送不落库；命令和响应用 `requestId` 配对。
-- **core。** `pi-durable` Harness 管理会话、任务串行化、工具执行、恢复和 SQLite；WebSocket 用 token 鉴权并拒绝网页来源；测试覆盖 token 和 durable 会话持久化。
-- **桌面界面。** 侧边栏按项目列会话和状态；会话界面用 Message Scroller、Message、Bubble、Trace、Code Block、Marker、Questionnaire、Typeset 拼装；工具调用显示意图、命令、输出和 diff；审批卡片支持数字键选择；断线自动重连并按序号续上；应用不在前台时有待处理项或任务结束会发系统通知；代码高亮在 Worker 里做，流式增量按帧合并。
-- **常驻与恢复。** 关窗口只隐藏；应用启动时复用已在运行的 `core`，协议版本不一致时替换它；应用退出后 `core` 继续跑。
+- **内核换成 pi-coding-agent SDK。** 会话是 Pi 的 JSONL 文件，与 `pi` 命令行共用配置；MCP、codemode、tool_search、技能、提示模板、AGENTS.md、用户扩展和 Pi 包都生效；子 Agent 用 pi-subagents。
+- **core 改在 Node 上运行**（Electron 自带 Node 24），WebSocket 用 `ws`，token 鉴权、拒绝网页来源。
+- **协议 v3**：打开会话拿快照，之后推 `item`/`delta`/`state`；不再有自存事件库和序号。
+- **审批与提问**：Lila 内置 Pi 扩展（`tool_call` 钩子 + `ask_user` 工具），任何扩展的对话框都会变成待处理卡片。
+- **子 Agent 会话**：pi-subagents 给每个子 Agent 写自己的 Pi 会话（带 `parentSession`），侧栏把它们折叠在发起的会话下面，点开就是子 Agent 的完整过程。
+- **界面**：新会话直接是输入框；斜杠命令与 @文件补全；粘贴/拖入图片和文本；运行中插话/追加与队列显示；模型、思考深度、审批方式切换；上下文用量、花费与手动压缩；编辑重发；子 Agent / MCP / codemode 的工具卡片；“能力”面板（技能、工具、MCP、扩展、上下文，可打开 mcp.json 并重新加载）；⌘K 命令面板；会话重命名/删除（移入回收目录）；系统通知。
+- **常驻与恢复**：关窗口只隐藏；应用启动复用已运行的 core，协议版本不一致时替换；应用退出后 core 继续跑完任务。

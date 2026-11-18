@@ -1,30 +1,18 @@
 import { expect, test } from "bun:test";
-import { ClientCommand, PROTOCOL_VERSION, ServerHello, SessionEvent } from "./index.ts";
+import { ClientCommand } from "./index.ts";
 
-test("ServerHello accepts a well-formed hello", () => {
-  const hello = { type: "hello", protocolVersion: PROTOCOL_VERSION, coreVersion: "0.0.0" } as const;
-  expect(ServerHello.parse(hello)).toEqual(hello);
+test("a prompt sent while the agent runs carries its delivery mode", () => {
+  const command = ClientCommand.parse({ type: "session.prompt", requestId: "r", sessionId: "s", text: "also run the tests", mode: "steer" });
+  expect(command).toMatchObject({ type: "session.prompt", mode: "steer" });
 });
 
-test("ClientCommand parses a session creation command", () => {
-  expect(
-    ClientCommand.parse({
-      type: "session.create",
-      requestId: "request-1",
-      projectId: "workspace",
-      approvalMode: "yolo",
-    }),
-  ).toMatchObject({ type: "session.create", projectId: "workspace" });
-});
-
-test("SessionEvent requires a positive sequence", () => {
-  expect(
-    SessionEvent.safeParse({
-      type: "event",
-      sessionId: "session-1",
-      seq: 0,
-      eventType: "session.created",
-      payload: {},
-    }).success,
-  ).toBe(false);
+test("attachments must be images", () => {
+  const result = ClientCommand.safeParse({
+    type: "session.prompt",
+    requestId: "r",
+    sessionId: "s",
+    text: "look",
+    images: [{ mimeType: "application/pdf", data: "AAAA" }],
+  });
+  expect(result.success).toBe(false);
 });
