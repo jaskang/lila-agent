@@ -18,6 +18,11 @@ export type Project = z.infer<typeof Project>;
 export const Model = z.object({ id: Id, label: z.string().min(1) });
 export type Model = z.infer<typeof Model>;
 
+export const AttachmentMeta = z.object({ name: z.string().min(1), mimeType: z.string().min(1) });
+export type AttachmentMeta = z.infer<typeof AttachmentMeta>;
+export const Attachment = AttachmentMeta.extend({ data: z.string().min(1).max(7_000_000) });
+export type Attachment = z.infer<typeof Attachment>;
+
 export const SessionSummary = z.object({
   id: Id,
   projectId: Id,
@@ -77,7 +82,7 @@ function event<T extends string, P extends z.ZodRawShape>(eventType: T, payload:
 export const SessionEvent = z.discriminatedUnion("eventType", [
   event("session.created", { projectId: Id, modelId: Id.optional(), approvalMode: ApprovalMode }),
   event("session.updated", { modelId: Id.optional(), approvalMode: ApprovalMode }),
-  event("message.user", { text: z.string() }),
+  event("message.user", { text: z.string(), attachments: z.array(AttachmentMeta).optional() }),
   event("run.started", {}),
   event("assistant.message", { messageId: Id, text: z.string(), thinking: z.string(), model: z.string().optional() }),
   event("tool.started", {
@@ -170,7 +175,9 @@ export const ClientCommand = z.discriminatedUnion("type", [
     modelId: Id.nullable().optional(),
     approvalMode: ApprovalMode.optional(),
   }),
-  z.object({ type: z.literal("message.send"), requestId: RequestId, sessionId: Id, text: z.string().trim().min(1) }),
+  z.object({ type: z.literal("session.rename"), requestId: RequestId, sessionId: Id, title: z.string().trim().min(1).max(120) }),
+  z.object({ type: z.literal("session.delete"), requestId: RequestId, sessionId: Id }),
+  z.object({ type: z.literal("message.send"), requestId: RequestId, sessionId: Id, text: z.string().trim().min(1), attachments: z.array(Attachment).max(10).optional() }),
   z.object({ type: z.literal("run.abort"), requestId: RequestId, sessionId: Id }),
   z.object({
     type: z.literal("pending.respond"),
@@ -186,6 +193,13 @@ export const ClientCommand = z.discriminatedUnion("type", [
     sessionId: Id,
     afterSeq: z.number().int().nonnegative(),
   }),
+  z.object({
+    type: z.literal("events.before"),
+    requestId: RequestId,
+    sessionId: Id,
+    beforeSeq: z.number().int().positive(),
+    limit: z.number().int().positive().max(500),
+  }),
 ]);
 export type ClientCommand = z.infer<typeof ClientCommand>;
 export type CommandType = ClientCommand["type"];
@@ -197,10 +211,13 @@ export interface CommandResults {
   "sessions.list": { sessions: SessionSummary[] };
   "session.create": { session: SessionSummary };
   "session.configure": { session: SessionSummary };
+  "session.rename": { session: SessionSummary };
+  "session.delete": Record<string, never>;
   "message.send": { runId: string };
   "run.abort": Record<string, never>;
   "pending.respond": Record<string, never>;
-  "events.resume": { events: SessionEvent[]; live?: LiveSnapshot };
+  "events.resume": { events: SessionEvent[]; live?: LiveSnapshot; hasEarlier: boolean };
+  "events.before": { events: SessionEvent[]; hasEarlier: boolean };
 }
 
 // ---------------------------------------------------------------------------

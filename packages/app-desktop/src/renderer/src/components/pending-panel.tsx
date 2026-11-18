@@ -19,7 +19,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { actions, type OpenPending } from "@/lib/store";
 
-/** omp's approval options are English; show them in Chinese but send the original text back. */
+/** Pi 的审批选项是英文，界面显示中文但回传原始文本。 */
 export function optionLabel(option: string): string {
   if (option === "Approve") return "允许";
   if (option === "Deny") return "拒绝";
@@ -197,7 +197,7 @@ function PendingCard({ sessionId, item }: { sessionId: string; item: OpenPending
   );
 }
 
-/** Only the oldest pending item is actionable; omp asks one thing at a time. */
+/** 只允许处理最早的待处理项，Pi 一次等待一个界面回答。 */
 export function PendingPanel({ sessionId, pending }: { sessionId: string; pending: OpenPending[] }) {
   const [current] = pending;
   if (!current) return null;

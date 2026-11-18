@@ -1,6 +1,6 @@
 import * as React from "react";
-import { ArrowUp, Ban, Brain, Check, CircleAlert, Info, Square, TriangleAlert } from "lucide-react";
-import type { ApprovalMode } from "@lila/protocol";
+import { ArrowUp, Ban, Brain, Check, ChevronUp, CircleAlert, Info, Paperclip, RotateCw, Square, TriangleAlert, X } from "lucide-react";
+import type { ApprovalMode, Attachment } from "@lila/protocol";
 import { Markdown } from "@/components/markdown";
 import { optionLabel, PendingPanel } from "@/components/pending-panel";
 import { ToolCall } from "@/components/tool-call";
@@ -43,6 +43,15 @@ const Item = React.memo(function Item({ item }: { item: TranscriptItem }) {
             <Bubble align="end" variant="muted">
               <BubbleContent className="text-sm whitespace-pre-wrap">{item.text}</BubbleContent>
             </Bubble>
+            {item.attachments?.length ? (
+              <div className="mt-2 flex flex-wrap justify-end gap-1">
+                {item.attachments.map((attachment) => (
+                  <span key={`${attachment.name}-${attachment.mimeType}`} className="rounded-md border bg-muted px-2 py-1 text-xs text-muted-foreground">
+                    {attachment.name}
+                  </span>
+                ))}
+              </div>
+            ) : null}
           </MessageContent>
         </Message>
       );
@@ -104,6 +113,7 @@ const Item = React.memo(function Item({ item }: { item: TranscriptItem }) {
 
 function Composer({ sessionId, running }: { sessionId: string; running: boolean }) {
   const [text, setText] = React.useState("");
+  const [attachments, setAttachments] = React.useState<Attachment[]>([]);
   const [sending, setSending] = React.useState(false);
   const connected = useLila((state) => state.connection === "connected");
   const ref = React.useRef<HTMLTextAreaElement>(null);
@@ -113,9 +123,17 @@ function Composer({ sessionId, running }: { sessionId: string; running: boolean 
   async function submit(): Promise<void> {
     if (!canSend) return;
     setSending(true);
-    const ok = await actions.send(sessionId, text.trim());
+    const ok = await actions.send(sessionId, text.trim(), attachments);
     setSending(false);
-    if (ok) setText("");
+    if (ok) {
+      setText("");
+      setAttachments([]);
+    }
+  }
+
+  async function addAttachments(): Promise<void> {
+    const picked = await window.lila.pickFiles();
+    if (picked.length) setAttachments((current) => [...current, ...picked].slice(0, 10));
   }
 
   return (
@@ -140,6 +158,18 @@ function Composer({ sessionId, running }: { sessionId: string; running: boolean 
         placeholder={running ? "任务进行中… 按 Esc 停止" : "描述你要完成的编程任务"}
         className="max-h-60 min-h-14 resize-none border-0 bg-transparent px-4 pt-3 shadow-none focus-visible:ring-0 dark:bg-transparent"
       />
+      {attachments.length ? (
+        <div className="flex flex-wrap gap-2 px-3 pb-2">
+          {attachments.map((attachment, index) => (
+            <span key={`${attachment.name}-${index}`} className="inline-flex max-w-full items-center gap-1 rounded-md border bg-muted px-2 py-1 text-xs">
+              <span className="max-w-52 truncate">{attachment.name}</span>
+              <button type="button" aria-label={`移除附件 ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((_, at) => at !== index))}>
+                <X className="size-3" />
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
       <div className="flex items-center justify-between gap-2 px-3 pb-2">
         <span className="text-xs text-muted-foreground">
           <Kbd>↵</Kbd> 发送 · <Kbd>⇧↵</Kbd> 换行
@@ -150,9 +180,14 @@ function Composer({ sessionId, running }: { sessionId: string; running: boolean 
             停止
           </Button>
         ) : (
-          <Button type="submit" size="icon-sm" disabled={!canSend} aria-label="发送">
-            {sending ? <Spinner /> : <ArrowUp />}
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button type="button" size="icon-sm" variant="ghost" disabled={!connected || sending} aria-label="添加附件" title="添加附件" onClick={() => void addAttachments()}>
+              <Paperclip />
+            </Button>
+            <Button type="submit" size="icon-sm" disabled={!canSend} aria-label="发送">
+              {sending ? <Spinner /> : <ArrowUp />}
+            </Button>
+          </div>
         )}
       </div>
     </form>
@@ -242,7 +277,32 @@ export function Conversation({ sessionId }: { sessionId: string }) {
         <MessageScroller className="min-h-0 flex-1">
           <MessageScrollerViewport>
             <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-4 px-6 pt-6 pb-10">
-              {view.loaded && view.items.length === 0 ? (
+              {view.loading ? (
+                <MessageScrollerItem messageId="loading">
+                  <Empty className="py-24">
+                    <EmptyHeader>
+                      <EmptyTitle>正在恢复会话</EmptyTitle>
+                      <EmptyDescription>正在读取消息和任务状态。</EmptyDescription>
+                    </EmptyHeader>
+                    <Spinner />
+                  </Empty>
+                </MessageScrollerItem>
+              ) : null}
+              {!view.loading && view.loadError ? (
+                <MessageScrollerItem messageId="load-error">
+                  <Empty className="py-24">
+                    <EmptyHeader>
+                      <EmptyTitle>会话恢复失败</EmptyTitle>
+                      <EmptyDescription className="max-w-md break-words">{view.loadError}</EmptyDescription>
+                    </EmptyHeader>
+                    <Button variant="outline" onClick={() => actions.retrySession(sessionId)}>
+                      <RotateCw />
+                      重试
+                    </Button>
+                  </Empty>
+                </MessageScrollerItem>
+              ) : null}
+              {view.loaded && !view.loading && !view.loadError && view.items.length === 0 ? (
                 <MessageScrollerItem messageId="empty">
                   <Empty className="py-24">
                     <EmptyHeader>
@@ -250,6 +310,16 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                       <EmptyDescription>Agent 会在项目目录里读代码、改文件、跑命令，过程都会显示在这里。</EmptyDescription>
                     </EmptyHeader>
                   </Empty>
+                </MessageScrollerItem>
+              ) : null}
+              {view.loaded && view.hasEarlier ? (
+                <MessageScrollerItem messageId="load-earlier">
+                  <div className="flex justify-center py-1">
+                    <Button variant="ghost" size="sm" disabled={view.loadingEarlier} onClick={() => void actions.loadEarlier(sessionId)}>
+                      {view.loadingEarlier ? <Spinner /> : <ChevronUp />}
+                      {view.loadingEarlier ? "正在加载更早消息…" : "加载更早消息"}
+                    </Button>
+                  </div>
                 </MessageScrollerItem>
               ) : null}
               {view.items.map((item) => (

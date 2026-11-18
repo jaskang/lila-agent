@@ -74,7 +74,7 @@ export function Code({
 
 type DiffLine = { variant: "added" | "removed" | "default"; text: string };
 
-/** omp diffs are `+N|text`, `-N|text`, ` N|text` rows; other formats fall back to unified-diff markers. */
+/** Pi 的显示 diff 可能是带行号的 `+N|text`、`-N|text`、` N|text`，其他格式按统一 diff 处理。 */
 export function parseDiff(diff: string): DiffLine[] {
   return diff.split("\n").map((row) => {
     const match = /^([+\- ])\s*(\d+)?\|(.*)$/.exec(row);

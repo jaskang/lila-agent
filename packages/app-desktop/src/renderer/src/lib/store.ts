@@ -2,6 +2,8 @@ import { create } from "zustand";
 import { toast } from "sonner";
 import type {
   ApprovalMode,
+  Attachment,
+  AttachmentMeta,
   FileDiff,
   LiveSnapshot,
   Model,
@@ -16,7 +18,7 @@ import type {
 import { CoreClient, type ConnectionState } from "./client.ts";
 
 export type TranscriptItem =
-  | { kind: "user"; id: string; text: string }
+  | { kind: "user"; id: string; text: string; attachments?: AttachmentMeta[] }
   | { kind: "assistant"; id: string; text: string; thinking: string; streaming: boolean }
   | {
       kind: "tool";
@@ -45,12 +47,17 @@ export type OpenPending = {
 
 export type SessionView = {
   lastSeq: number;
+  firstSeq: number;
   items: TranscriptItem[];
   /** Item id → index in `items`. */
   index: Record<string, number>;
   pending: OpenPending[];
   runId?: string;
   loaded: boolean;
+  loading: boolean;
+  loadError?: string;
+  hasEarlier: boolean;
+  loadingEarlier: boolean;
 };
 
 type State = {
@@ -65,7 +72,17 @@ type State = {
   selectedId?: string;
 };
 
-const emptyView = (): SessionView => ({ lastSeq: 0, items: [], index: {}, pending: [], loaded: false });
+const emptyView = (): SessionView => ({
+  lastSeq: 0,
+  firstSeq: 0,
+  items: [],
+  index: {},
+  pending: [],
+  loaded: false,
+  loading: false,
+  hasEarlier: false,
+  loadingEarlier: false,
+});
 const SELECTED_KEY = "lila.selectedSession";
 
 export const useLila = create<State>(() => ({
@@ -102,6 +119,24 @@ function patch<K extends TranscriptItem["kind"]>(
   return upsert(view, update(item as Extract<TranscriptItem, { kind: K }>));
 }
 
+function rebuildIndex(items: TranscriptItem[]): Record<string, number> {
+  return Object.fromEntries(items.map((item, index) => [item.id, index]));
+}
+
+function prependEvents(view: SessionView, events: SessionEvent[], models: Model[], hasEarlier: boolean): SessionView {
+  let historical = emptyView();
+  for (const event of events) historical = applyEvent(historical, event, models);
+  const existing = new Set(view.items.map((item) => item.id));
+  const items = [...historical.items.filter((item) => !existing.has(item.id)), ...view.items];
+  return {
+    ...view,
+    firstSeq: events[0]?.seq ?? view.firstSeq,
+    hasEarlier,
+    items,
+    index: rebuildIndex(items),
+  };
+}
+
 export function applyEvent(view: SessionView, event: SessionEvent, models: Model[]): SessionView {
   if (event.seq <= view.lastSeq) return view;
   let next: SessionView = { ...view, lastSeq: event.seq };
@@ -114,7 +149,7 @@ export function applyEvent(view: SessionView, event: SessionEvent, models: Model
       return upsert(next, { kind: "notice", id, tone: "info", text: `已切换到 ${label} · ${APPROVAL_LABEL[event.payload.approvalMode]}` });
     }
     case "message.user":
-      return upsert(next, { kind: "user", id, text: event.payload.text });
+      return upsert(next, { kind: "user", id, text: event.payload.text, ...(event.payload.attachments ? { attachments: event.payload.attachments } : {}) });
     case "run.started":
       return { ...next, runId: event.runId };
     case "assistant.message": {
@@ -291,18 +326,31 @@ function handleStream(message: StreamMessage): void {
 async function resume(sessionId: string): Promise<void> {
   if (resuming.has(sessionId)) return;
   resuming.set(sessionId, []);
+  setView(sessionId, (current) => ({ ...current, loading: true, loadError: undefined }));
   try {
     const afterSeq = get().views[sessionId]?.lastSeq ?? 0;
-    const { events, live } = await client.call({ type: "events.resume", sessionId, afterSeq });
+    const { events, live, hasEarlier } = await client.call({ type: "events.resume", sessionId, afterSeq });
     const models = get().models;
     setView(sessionId, (current) => {
       let next = afterSeq === 0 ? emptyView() : current;
       for (const event of events) next = applyEvent(next, event, models);
       if (live) next = applyLive(next, live);
-      return { ...next, loaded: true };
+      return {
+        ...next,
+        firstSeq: afterSeq === 0 ? (events[0]?.seq ?? 0) : current.firstSeq,
+        hasEarlier: afterSeq === 0 ? hasEarlier : current.hasEarlier,
+        loaded: true,
+        loading: false,
+        loadError: undefined,
+      };
     });
   } catch (error) {
     report(error);
+    setView(sessionId, (current) => ({
+      ...current,
+      loading: false,
+      loadError: error instanceof Error ? error.message : String(error),
+    }));
   } finally {
     const queued = resuming.get(sessionId) ?? [];
     resuming.delete(sessionId);
@@ -394,9 +442,62 @@ export const actions = {
     }
   },
 
-  async send(sessionId: string, text: string): Promise<boolean> {
+  async renameSession(sessionId: string, title: string): Promise<boolean> {
     try {
-      await client.call({ type: "message.send", sessionId, text });
+      const { session } = await client.call({ type: "session.rename", sessionId, title });
+      set((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
+      return true;
+    } catch (error) {
+      report(error);
+      return false;
+    }
+  },
+
+  async deleteSession(sessionId: string): Promise<boolean> {
+    try {
+      const wasSelected = get().selectedId === sessionId;
+      await client.call({ type: "session.delete", sessionId });
+      set((state) => {
+        const sessions = { ...state.sessions };
+        delete sessions[sessionId];
+        const views = { ...state.views };
+        delete views[sessionId];
+        return { sessions, views, ...(wasSelected ? { selectedId: undefined } : {}) };
+      });
+      if (wasSelected) localStorage.removeItem(SELECTED_KEY);
+      return true;
+    } catch (error) {
+      report(error);
+      return false;
+    }
+  },
+
+  retrySession(sessionId: string): void {
+    void resume(sessionId);
+  },
+
+  async loadEarlier(sessionId: string): Promise<void> {
+    const view = get().views[sessionId];
+    if (!view || !view.hasEarlier || view.loadingEarlier || view.firstSeq <= 1) return;
+    setView(sessionId, (current) => ({ ...current, loadingEarlier: true }));
+    try {
+      const { events, hasEarlier } = await client.call({
+        type: "events.before",
+        sessionId,
+        beforeSeq: view.firstSeq,
+        limit: 200,
+      });
+      const models = get().models;
+      setView(sessionId, (current) => ({ ...prependEvents(current, events, models, hasEarlier), loadingEarlier: false }));
+    } catch (error) {
+      report(error);
+      setView(sessionId, (current) => ({ ...current, loadingEarlier: false }));
+    }
+  },
+
+  async send(sessionId: string, text: string, attachments: Attachment[] = []): Promise<boolean> {
+    try {
+      await client.call({ type: "message.send", sessionId, text, ...(attachments.length ? { attachments } : {}) });
       return true;
     } catch (error) {
       report(error);

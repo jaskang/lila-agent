@@ -106,6 +106,27 @@ function createWindow(): void {
   else void win.loadFile(join(import.meta.dirname, "../renderer/index.html"));
 }
 
+function mimeType(path: string): string {
+  const extension = path.toLowerCase().split(".").pop();
+  return {
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    svg: "image/svg+xml",
+    txt: "text/plain",
+    md: "text/markdown",
+    json: "application/json",
+    ts: "text/plain",
+    tsx: "text/plain",
+    js: "text/plain",
+    jsx: "text/plain",
+    css: "text/plain",
+    html: "text/html",
+  }[extension ?? ""] ?? "application/octet-stream";
+}
+
 ipcMain.handle("lila:connection", async () => {
   ensuring ??= ensureCore().finally(() => {
     ensuring = undefined;
@@ -119,6 +140,21 @@ ipcMain.handle("lila:pick-directory", async () => {
   const options: Electron.OpenDialogOptions = { title: "选择项目目录", properties: ["openDirectory", "createDirectory"] };
   const result = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
   return result.canceled ? undefined : result.filePaths[0];
+});
+
+ipcMain.handle("lila:pick-files", async () => {
+  const options: Electron.OpenDialogOptions = {
+    title: "添加附件",
+    properties: ["openFile", "multiSelections"],
+    filters: [{ name: "图片和文本", extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg", "txt", "md", "json", "ts", "tsx", "js", "jsx", "css", "html"] }],
+  };
+  const result = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
+  if (result.canceled) return [];
+  return result.filePaths.flatMap((path) => {
+    const bytes = readFileSync(path);
+    if (bytes.byteLength > 5 * 1024 * 1024) return [];
+    return [{ name: path.split(/[\\/]/).pop() ?? path, mimeType: mimeType(path), data: bytes.toString("base64") }];
+  });
 });
 
 ipcMain.on("lila:focus", () => showWindow());

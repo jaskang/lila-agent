@@ -22,7 +22,7 @@ function loadToken(): string {
   return token;
 }
 
-const server = startCore({ port, databasePath, token: loadToken() });
+const server = await startCore({ port, databasePath, token: loadToken() });
 console.log(`[core] listening on ${server.url} (data ${dataDir})`);
 
 // Watch resident memory so a slow leak in a long-lived Bun process shows up in the log.
