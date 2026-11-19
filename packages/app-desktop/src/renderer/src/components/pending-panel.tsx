@@ -23,11 +23,13 @@ import { actions } from "@/lib/store";
 type Answer = (answer: PendingAnswer) => void;
 type Choice = { label: string; answer: PendingAnswer; variant: "default" | "secondary" | "outline" };
 
-const APPROVAL_CHOICES: Choice[] = [
-  { label: "允许", answer: { type: "option", value: "allow" }, variant: "default" },
-  { label: "本会话始终允许", answer: { type: "option", value: "always" }, variant: "secondary" },
-  { label: "拒绝", answer: { type: "option", value: "deny" }, variant: "outline" },
-];
+function approvalChoices(toolName?: string): Choice[] {
+  return [
+    { label: "允许", answer: { type: "option", value: "allow" }, variant: "default" },
+    { label: toolName ? `本会话始终允许 ${toolName}` : "本会话始终允许", answer: { type: "option", value: "always" }, variant: "secondary" },
+    { label: "拒绝", answer: { type: "option", value: "deny" }, variant: "outline" },
+  ];
+}
 
 const CONFIRM_CHOICES: Choice[] = [
   { label: "确认", answer: { type: "confirm", confirmed: true }, variant: "default" },
@@ -68,10 +70,8 @@ function Shell({
   );
 }
 
-/** Buttons answered with number keys while focus is not in a text field. */
+/** Buttons answered with number keys while focus is not in a text field. Does not steal focus from the composer. */
 function Choices({ choices, onAnswer, onCancel }: { choices: Choice[]; onAnswer: Answer; onCancel?: () => void }) {
-  const first = React.useRef<HTMLButtonElement>(null);
-  React.useEffect(() => first.current?.focus(), []);
   React.useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -88,7 +88,7 @@ function Choices({ choices, onAnswer, onCancel }: { choices: Choice[]; onAnswer:
   return (
     <div className="flex flex-wrap gap-2">
       {choices.map((choice, index) => (
-        <Button key={choice.label} ref={index === 0 ? first : undefined} size="sm" variant={choice.variant} onClick={() => onAnswer(choice.answer)}>
+        <Button key={choice.label} size="sm" variant={choice.variant} onClick={() => onAnswer(choice.answer)}>
           {choice.label}
           {index < 9 ? <Kbd className="ms-1">{index + 1}</Kbd> : null}
         </Button>
@@ -200,13 +200,14 @@ function PendingCard({ sessionId, item, extra }: { sessionId: string; item: Pend
     () => item.options.map((option, index) => ({ label: option, answer: { type: "option", value: option }, variant: index === 0 ? "default" : "secondary" })),
     [item.options],
   );
+  const approvalOptions = React.useMemo(() => approvalChoices(item.toolName), [item.toolName]);
   const approval = item.kind === "approval";
   const icon = approval ? <ShieldAlert className="size-4" /> : <MessageCircleQuestion className="size-4" />;
   const title = item.title || (approval ? `Agent 想要运行 ${item.toolName ?? "工具"}` : "Agent 有个问题");
   return (
     <div className={busy ? "pointer-events-none opacity-60" : undefined}>
       <Shell icon={icon} title={title} message={item.message} extra={extra}>
-        {item.kind === "approval" ? <Choices choices={APPROVAL_CHOICES} onAnswer={onAnswer} /> : null}
+        {item.kind === "approval" ? <Choices choices={approvalOptions} onAnswer={onAnswer} /> : null}
         {item.kind === "select" ? <Choices choices={selectChoices} onAnswer={onAnswer} onCancel={cancel} /> : null}
         {item.kind === "confirm" ? <Choices choices={CONFIRM_CHOICES} onAnswer={onAnswer} /> : null}
         {item.kind === "input" || item.kind === "editor" ? <TextAnswer item={item} multiline={item.kind === "editor"} onAnswer={onAnswer} /> : null}

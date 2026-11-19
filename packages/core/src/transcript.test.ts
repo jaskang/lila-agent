@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { earlier, projectBranch, snapshot } from "./transcript.ts";
+import { earlier, parseUserItemId, projectBranch, snapshot } from "./transcript.ts";
 
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const base = (id: string, parentId: string | null) => ({ id, parentId, timestamp: new Date(1_000).toISOString() });
@@ -71,4 +71,16 @@ test("marks a tool call without a result as unfinished unless the agent still ru
   const cut = branch.slice(0, 3);
   expect(projectBranch(cut).at(-1)).toMatchObject({ id: "call-1", status: "error" });
   expect(projectBranch(cut, { running: true }).at(-1)).toMatchObject({ id: "call-1", status: "running" });
+});
+
+test("disambiguates items that share the same millisecond timestamp", () => {
+  const sameTs = [
+    { ...base("u1", null), type: "message", message: { role: "user", content: "First", timestamp: 100 } },
+    { ...base("u2", "u1"), type: "message", message: { role: "user", content: "Second", timestamp: 100 } },
+  ] as unknown as SessionEntry[];
+  const items = projectBranch(sameTs);
+  expect(items.map((item) => item.id)).toEqual(["u:100", "u:100#2"]);
+  expect(parseUserItemId("u:100")).toEqual({ timestamp: 100, occurrence: 1 });
+  expect(parseUserItemId("u:100#2")).toEqual({ timestamp: 100, occurrence: 2 });
+  expect(parseUserItemId("a:100")).toBeUndefined();
 });

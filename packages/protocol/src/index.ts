@@ -239,6 +239,8 @@ export type ServerMessage =
   | { type: "hello"; protocolVersion: number; coreVersion: string }
   | { type: "response"; requestId: string; ok: true; data: unknown }
   | { type: "response"; requestId: string; ok: false; error: string }
+  /** Broadcast to every client when the project list changes. */
+  | { type: "projects"; projects: Project[] }
   /** Broadcast to every client when a session's list entry changes. */
   | { type: "session"; session: SessionSummary }
   | { type: "session.removed"; sessionId: string }

@@ -76,8 +76,8 @@ export function App() {
           <ConnectionBanner />
           {selectedId ? <Conversation key={selectedId} sessionId={selectedId} /> : <NewSession />}
         </SidebarInset>
+        <CommandPalette />
       </SidebarProvider>
-      <CommandPalette />
       <Toaster position="bottom-right" richColors closeButton />
     </TooltipProvider>
   );

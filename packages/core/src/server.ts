@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import { ClientCommand, type CommandResults, type CommandType, PROTOCOL_VERSION, type ServerMessage } from "@lila/protocol";
@@ -27,6 +28,11 @@ function originAllowed(origin: string | undefined): boolean {
   return !origin || origin === "null" || origin === "file://" || ALLOWED_ORIGIN.test(origin);
 }
 
+function protocolMatches(candidate: string, expected: Buffer): boolean {
+  const actual = Buffer.from(candidate);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
 export async function startCore(options: CoreOptions): Promise<Core> {
   const watching = new Map<WebSocket, string>();
   const send = (ws: WebSocket, message: ServerMessage) => {
@@ -45,6 +51,7 @@ export async function startCore(options: CoreOptions): Promise<Core> {
   };
   const host = new SessionHost(options.dataDir, clients);
   const expectedProtocol = `lila.${options.token}`;
+  const expectedProtocolBytes = Buffer.from(expectedProtocol);
 
   async function execute(ws: WebSocket, command: ClientCommand): Promise<CommandResults[CommandType]> {
     switch (command.type) {
@@ -133,7 +140,7 @@ export async function startCore(options: CoreOptions): Promise<Core> {
     const { pathname } = new URL(req.url ?? "/", "http://localhost");
     if (pathname === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, coreVersion: pkg.version, protocolVersion: PROTOCOL_VERSION, pid: process.pid }));
+      res.end(JSON.stringify({ ok: true, app: "lila-core", coreVersion: pkg.version, protocolVersion: PROTOCOL_VERSION, pid: process.pid }));
       return;
     }
     res.writeHead(pathname === "/ws" ? 426 : 404).end();
@@ -142,7 +149,10 @@ export async function startCore(options: CoreOptions): Promise<Core> {
   const wss = new WebSocketServer({
     noServer: true,
     maxPayload: 64 * 1024 * 1024,
-    handleProtocols: (protocols) => (protocols.has(expectedProtocol) ? expectedProtocol : false),
+    handleProtocols: (protocols) => {
+      for (const candidate of protocols) if (protocolMatches(candidate, expectedProtocolBytes)) return expectedProtocol;
+      return false;
+    },
   });
 
   server.on("upgrade", (req: IncomingMessage, socket, head) => {
@@ -152,7 +162,7 @@ export async function startCore(options: CoreOptions): Promise<Core> {
     if (new URL(req.url ?? "/", "http://localhost").pathname !== "/ws") return reject(404, "Not Found");
     if (!originAllowed(req.headers.origin)) return reject(403, "Forbidden");
     const protocols = (req.headers["sec-websocket-protocol"] ?? "").split(",").map((item) => item.trim());
-    if (!protocols.includes(expectedProtocol)) return reject(401, "Unauthorized");
+    if (!protocols.some((candidate) => protocolMatches(candidate, expectedProtocolBytes))) return reject(401, "Unauthorized");
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.on("message", (data) => void handle(ws, data.toString()));
       ws.on("close", () => watching.delete(ws));

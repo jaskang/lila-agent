@@ -29,6 +29,7 @@ import {
   contentText,
   displayUserText,
   earlier,
+  parseUserItemId,
   projectBranch,
   snapshot,
   type ToolItem,
@@ -96,6 +97,7 @@ export class LiveSession implements LilaBridge {
   lastActivity = Date.now();
   readonly #store: Store;
   readonly #clients: Clients;
+  readonly #onReload?: () => void;
   #session!: AgentSession;
   #services!: AgentSessionServices;
   #unsubscribe?: () => void;
@@ -111,12 +113,13 @@ export class LiveSession implements LilaBridge {
   #notices = 0;
   #lastSummary = "";
 
-  constructor(options: { id: string; projectId: string; parentId?: string | undefined; store: Store; clients: Clients }) {
+  constructor(options: { id: string; projectId: string; parentId?: string | undefined; store: Store; clients: Clients; onReload?: () => void }) {
     this.id = options.id;
     this.projectId = options.projectId;
     this.parentId = options.parentId;
     this.#store = options.store;
     this.#clients = options.clients;
+    this.#onReload = options.onReload;
   }
 
   get session(): AgentSession {
@@ -153,6 +156,7 @@ export class LiveSession implements LilaBridge {
         waitForIdle: () => this.#session.waitForIdle(),
         reload: async () => {
           await this.#session.reload();
+          this.#onReload?.();
           this.#pushState();
         },
         // One Lila session is one Pi session; extensions cannot replace it from under the client.
@@ -301,10 +305,14 @@ export class LiveSession implements LilaBridge {
   async rewind(itemId: string): Promise<string> {
     const session = this.#session;
     if (session.isStreaming || session.isCompacting) throw new UserError("请先停止当前回复再回退");
-    const timestamp = itemId.startsWith("u:") ? Number(itemId.slice(2)) : Number.NaN;
-    const entry = session.sessionManager
-      .getBranch()
-      .find((candidate) => candidate.type === "message" && candidate.message.role === "user" && candidate.message.timestamp === timestamp);
+    const parsed = parseUserItemId(itemId);
+    let seen = 0;
+    const entry = parsed
+      ? session.sessionManager.getBranch().find((candidate) => {
+          if (candidate.type !== "message" || candidate.message.role !== "user" || candidate.message.timestamp !== parsed.timestamp) return false;
+          return ++seen === parsed.occurrence;
+        })
+      : undefined;
     if (!entry || entry.type !== "message") throw new UserError("找不到这条消息，可能已经不在当前分支上");
     const result = await session.navigateTree(entry.id);
     if (result.cancelled) throw new UserError("回退被扩展取消了");
@@ -356,6 +364,7 @@ export class LiveSession implements LilaBridge {
   async reload(): Promise<void> {
     if (this.#session.isStreaming || this.#session.isCompacting) throw new UserError("请等当前回复结束后再重新加载");
     await this.#session.reload();
+    this.#onReload?.();
     this.#pushState();
   }
 

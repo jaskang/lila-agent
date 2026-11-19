@@ -29,12 +29,70 @@ const streamingComponents = components(true);
 const settledComponents = components(false);
 const plugins = [remarkGfm];
 
+/**
+ * Splits streaming markdown into settled top-level blocks and the growing tail.
+ * Only splits on blank lines outside fenced code blocks so code fences stay intact.
+ */
+function splitStreamingBlocks(text: string): { settled: string[]; active: string } {
+  const lines = text.split("\n");
+  const settled: string[] = [];
+  let current: string[] = [];
+  let fenceChar = "";
+  let fenceLen = 0;
+
+  for (const line of lines) {
+    const fence = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      const marker = fence[1]!;
+      const rest = fence[2]!;
+      if (!fenceChar) {
+        fenceChar = marker[0]!;
+        fenceLen = marker.length;
+      } else if (marker[0] === fenceChar && marker.length >= fenceLen && rest.trim() === "") {
+        fenceChar = "";
+        fenceLen = 0;
+      }
+      current.push(line);
+      continue;
+    }
+
+    if (!fenceChar && line.trim() === "") {
+      if (current.length > 0) {
+        settled.push(current.join("\n"));
+        current = [];
+      }
+      continue;
+    }
+
+    current.push(line);
+  }
+
+  return { settled, active: current.join("\n") };
+}
+
+const MarkdownBlock = React.memo(function MarkdownBlock({ text, streaming }: { text: string; streaming: boolean }) {
+  return (
+    <ReactMarkdown remarkPlugins={plugins} components={streaming ? streamingComponents : settledComponents}>
+      {text}
+    </ReactMarkdown>
+  );
+});
+
 export const Markdown = React.memo(function Markdown({ text, streaming = false }: { text: string; streaming?: boolean }) {
+  if (!streaming) {
+    return (
+      <div className="typeset typeset-chat">
+        <MarkdownBlock text={text} streaming={false} />
+      </div>
+    );
+  }
+  const { settled, active } = splitStreamingBlocks(text);
   return (
     <div className="typeset typeset-chat">
-      <ReactMarkdown remarkPlugins={plugins} components={streaming ? streamingComponents : settledComponents}>
-        {text}
-      </ReactMarkdown>
+      {settled.map((block, index) => (
+        <MarkdownBlock key={index} text={block} streaming={false} />
+      ))}
+      {active ? <MarkdownBlock text={active} streaming /> : null}
     </div>
   );
 });

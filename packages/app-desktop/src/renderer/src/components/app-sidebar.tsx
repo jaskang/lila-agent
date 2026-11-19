@@ -1,6 +1,21 @@
 import * as React from "react";
-import { Bot, ChevronDown, ChevronRight, CircleAlert, FolderPlus, MessageCircleQuestion, MoreHorizontal, Pencil, Plus, Search, SquarePen, Trash2 } from "lucide-react";
-import type { SessionSummary } from "@lila/protocol";
+import {
+  Bot,
+  ChevronDown,
+  ChevronRight,
+  CircleAlert,
+  FolderOpen,
+  FolderPlus,
+  MessageCircleQuestion,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  Search,
+  SquarePen,
+  Trash2,
+  X,
+} from "lucide-react";
+import type { Project, SessionSummary } from "@lila/protocol";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -36,9 +51,27 @@ import { Spinner } from "@/components/ui/spinner";
 import { actions, useLila } from "@/lib/store";
 
 const RELATIVE = new Intl.RelativeTimeFormat("zh-CN", { numeric: "auto" });
+const COLLAPSED_KEY = "lila.collapsedProjects";
 
-function ago(iso: string): string {
-  const minutes = Math.round((Date.parse(iso) - Date.now()) / 60_000);
+function readCollapsed(): Record<string, boolean> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "null") as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, boolean>;
+  } catch {
+    // Ignore invalid stored state.
+  }
+  return {};
+}
+
+function projectStatus(sessions: SessionSummary[]): SessionSummary["status"] {
+  if (sessions.some((session) => session.status === "waiting")) return "waiting";
+  if (sessions.some((session) => session.status === "running")) return "running";
+  if (sessions.some((session) => session.status === "error")) return "error";
+  return "idle";
+}
+
+function ago(iso: string, now: number): string {
+  const minutes = Math.round((Date.parse(iso) - now) / 60_000);
   if (Math.abs(minutes) < 1) return "刚刚";
   if (Math.abs(minutes) < 60) return RELATIVE.format(minutes, "minute");
   const hours = Math.round(minutes / 60);
@@ -55,17 +88,25 @@ function StatusIcon({ status }: { status: SessionSummary["status"] }) {
 
 /** Sessions a sub-agent ran, folded under the session that spawned them, as Pi's `/resume` shows them. */
 function SubSessions({ sessions, selectedId }: { sessions: SessionSummary[]; selectedId: string | undefined }) {
-  const [open, setOpen] = React.useState(false);
-  const expanded = open || sessions.some((session) => session.id === selectedId || session.status !== "idle");
+  const hasAttention = sessions.some((session) => session.id === selectedId || session.status !== "idle");
+  const [open, setOpen] = React.useState(hasAttention);
+  const prevAttention = React.useRef(hasAttention);
+  React.useEffect(() => {
+    // Auto-expand when a sub-agent becomes active or selected, while still allowing manual collapse afterwards.
+    if (hasAttention && !prevAttention.current) setOpen(true);
+    prevAttention.current = hasAttention;
+  }, [hasAttention]);
+  const summaryStatus = projectStatus(sessions);
   return (
     <SidebarMenuSub>
       <SidebarMenuSubItem>
-        <SidebarMenuSubButton size="sm" render={<button type="button" aria-expanded={expanded} onClick={() => setOpen(!expanded)} />}>
-          {expanded ? <ChevronDown /> : <ChevronRight />}
+        <SidebarMenuSubButton size="sm" render={<button type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)} />}>
+          {open ? <ChevronDown /> : <ChevronRight />}
           <span className="text-muted-foreground">{sessions.length} 个子 Agent</span>
+          {!open ? <StatusIcon status={summaryStatus} /> : null}
         </SidebarMenuSubButton>
       </SidebarMenuSubItem>
-      {expanded
+      {open
         ? sessions.map((session) => (
             <SidebarMenuSubItem key={session.id}>
               <SidebarMenuSubButton
@@ -84,7 +125,19 @@ function SubSessions({ sessions, selectedId }: { sessions: SessionSummary[]; sel
   );
 }
 
-function SessionRow({ session, active, subSessions, selectedId }: { session: SessionSummary; active: boolean; subSessions?: SessionSummary[] | undefined; selectedId: string | undefined }) {
+function SessionRow({
+  session,
+  active,
+  subSessions,
+  selectedId,
+  now,
+}: {
+  session: SessionSummary;
+  active: boolean;
+  subSessions?: SessionSummary[] | undefined;
+  selectedId: string | undefined;
+  now: number;
+}) {
   const [editing, setEditing] = React.useState(false);
   const [confirming, setConfirming] = React.useState(false);
   const [title, setTitle] = React.useState(session.title);
@@ -131,7 +184,7 @@ function SessionRow({ session, active, subSessions, selectedId }: { session: Ses
       <SidebarMenuButton isActive={active} onClick={() => actions.select(session.id)} className="h-auto py-1.5 pr-8">
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="truncate">{session.title || "新会话"}</span>
-          <span className="text-xs text-muted-foreground">{ago(session.updatedAt)}</span>
+          <span className="text-xs text-muted-foreground">{ago(session.updatedAt, now)}</span>
         </div>
         <StatusIcon status={session.status} />
       </SidebarMenuButton>
@@ -176,28 +229,135 @@ function SessionRow({ session, active, subSessions, selectedId }: { session: Ses
   );
 }
 
+function ProjectGroup({
+  project,
+  list,
+  allSessions,
+  childrenByParent,
+  selectedId,
+  isCollapsed,
+  now,
+  onToggle,
+}: {
+  project: Project;
+  list: SessionSummary[];
+  allSessions: SessionSummary[];
+  childrenByParent: Record<string, SessionSummary[]>;
+  selectedId: string | undefined;
+  isCollapsed: boolean;
+  now: number;
+  onToggle: () => void;
+}) {
+  const [removing, setRemoving] = React.useState(false);
+  const status = projectStatus(allSessions);
+  const busy = status === "running" || status === "waiting";
+  return (
+    <SidebarGroup className="group/project">
+      <SidebarGroupLabel
+        title={project.path}
+        render={<button type="button" aria-expanded={!isCollapsed} onClick={onToggle} />}
+        className="cursor-pointer gap-1 pr-12 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+      >
+        {isCollapsed ? <ChevronRight /> : <ChevronDown />}
+        <span className="truncate">{project.name}</span>
+        {isCollapsed && status !== "idle" ? <StatusIcon status={status} /> : null}
+      </SidebarGroupLabel>
+      <DropdownMenu>
+        <DropdownMenuTrigger render={<SidebarGroupAction className="right-8 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100 data-popup-open:opacity-100" title="项目操作" aria-label={`${project.name} 的操作`} />}>
+          <MoreHorizontal />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" side="right" className="w-40" finalFocus={false}>
+          <DropdownMenuItem onClick={() => window.lila.revealPath(project.path)}>
+            <FolderOpen />
+            在访达中显示
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem variant="destructive" disabled={busy} onClick={() => setRemoving(true)}>
+            <Trash2 />
+            移除项目
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <SidebarGroupAction title={`在 ${project.name} 中新建会话`} onClick={() => actions.startNew(project.id)}>
+        <Plus />
+        <span className="sr-only">新建会话</span>
+      </SidebarGroupAction>
+      <AlertDialog open={removing} onOpenChange={setRemoving}>
+        <AlertDialogContent size="sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>移除项目？</AlertDialogTitle>
+            <AlertDialogDescription>只会将“{project.name}”从 Lila 列表移除，不会删除本地目录或历史会话文件。</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                setRemoving(false);
+                void actions.removeProject(project.id);
+              }}
+            >
+              移除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      {isCollapsed ? null : (
+        <SidebarGroupContent>
+          <SidebarMenu>
+            {list.map((session) => (
+              <SessionRow
+                key={session.id}
+                session={session}
+                active={session.id === selectedId}
+                subSessions={childrenByParent[session.id]}
+                selectedId={selectedId}
+                now={now}
+              />
+            ))}
+            {!list.length ? <p className="px-2 py-1 text-xs text-muted-foreground">还没有会话</p> : null}
+          </SidebarMenu>
+        </SidebarGroupContent>
+      )}
+    </SidebarGroup>
+  );
+}
+
 export function AppSidebar() {
   const projects = useLila((state) => state.projects);
   const sessions = useLila((state) => state.sessions);
   const selectedId = useLila((state) => state.selectedId);
-  const [collapsed, setCollapsed] = React.useState<Record<string, boolean>>({});
+  const [collapsed, setCollapsed] = React.useState<Record<string, boolean>>(readCollapsed);
   const [query, setQuery] = React.useState("");
+  const [now, setNow] = React.useState(() => Date.now());
   const filter = query.trim().toLowerCase();
+
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const byProject = React.useMemo(() => {
     const groups: Record<string, SessionSummary[]> = {};
+    const allByProject: Record<string, SessionSummary[]> = {};
     const children: Record<string, SessionSummary[]> = {};
     for (const session of Object.values(sessions)) {
+      (allByProject[session.projectId] ??= []).push(session);
       if (filter && !(session.title || "新会话").toLowerCase().includes(filter)) continue;
       // While filtering, matching sub-agent sessions show on their own.
       if (!filter && session.parentId && sessions[session.parentId]) (children[session.parentId] ??= []).push(session);
       else (groups[session.projectId] ??= []).push(session);
     }
     for (const list of [...Object.values(groups), ...Object.values(children)]) list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    return { groups, children };
+    return { groups, allByProject, children };
   }, [sessions, filter]);
 
-  const toggle = (projectId: string) => setCollapsed((current) => ({ ...current, [projectId]: !current[projectId] }));
+  const toggle = (projectId: string) =>
+    setCollapsed((current) => {
+      const next = { ...current, [projectId]: !current[projectId] };
+      localStorage.setItem(COLLAPSED_KEY, JSON.stringify(next));
+      return next;
+    });
 
   return (
     <Sidebar variant="inset">
@@ -221,43 +381,48 @@ export function AppSidebar() {
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
-          <SidebarInput value={query} placeholder="筛选会话…" aria-label="筛选会话" onChange={(event) => setQuery(event.target.value)} />
+          <div className="relative">
+            <SidebarInput
+              value={query}
+              placeholder="筛选会话…"
+              aria-label="筛选会话"
+              className={query ? "pr-7" : undefined}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && query) {
+                  event.preventDefault();
+                  setQuery("");
+                }
+              }}
+            />
+            {query ? (
+              <button
+                type="button"
+                aria-label="清空筛选"
+                onClick={() => setQuery("")}
+                className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-sm p-0.5 text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
+              >
+                <X className="size-3.5" />
+              </button>
+            ) : null}
+          </div>
         </SidebarGroup>
         {projects.map((project) => {
           const list = byProject.groups[project.id] ?? [];
           if (filter && !list.length) return null;
           const isCollapsed = Boolean(collapsed[project.id]) && !filter;
           return (
-            <SidebarGroup key={project.id}>
-              <SidebarGroupLabel
-                title={project.path}
-                render={<button type="button" aria-expanded={!isCollapsed} onClick={() => toggle(project.id)} />}
-                className="cursor-pointer gap-1 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-              >
-                {isCollapsed ? <ChevronRight /> : <ChevronDown />}
-                <span className="truncate">{project.name}</span>
-              </SidebarGroupLabel>
-              <SidebarGroupAction title={`在 ${project.name} 中新建会话`} onClick={() => actions.startNew(project.id)}>
-                <Plus />
-                <span className="sr-only">新建会话</span>
-              </SidebarGroupAction>
-              {isCollapsed ? null : (
-                <SidebarGroupContent>
-                  <SidebarMenu>
-                    {list.map((session) => (
-                      <SessionRow
-                        key={session.id}
-                        session={session}
-                        active={session.id === selectedId}
-                        subSessions={byProject.children[session.id]}
-                        selectedId={selectedId}
-                      />
-                    ))}
-                    {!list.length ? <p className="px-2 py-1 text-xs text-muted-foreground">还没有会话</p> : null}
-                  </SidebarMenu>
-                </SidebarGroupContent>
-              )}
-            </SidebarGroup>
+            <ProjectGroup
+              key={project.id}
+              project={project}
+              list={list}
+              allSessions={byProject.allByProject[project.id] ?? []}
+              childrenByParent={byProject.children}
+              selectedId={selectedId}
+              isCollapsed={isCollapsed}
+              now={now}
+              onToggle={() => toggle(project.id)}
+            />
           );
         })}
         {filter && !Object.keys(byProject.groups).length ? <p className="px-4 py-2 text-xs text-muted-foreground">没有匹配的会话</p> : null}

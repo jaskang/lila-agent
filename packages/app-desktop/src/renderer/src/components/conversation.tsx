@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Blocks, ChevronUp, RotateCw } from "lucide-react";
+import { ArrowLeft, Blocks, ChevronUp, RotateCw } from "lucide-react";
 import type { SessionState } from "@lila/protocol";
 import { Composer } from "@/components/composer";
 import { PendingPanel } from "@/components/pending-panel";
@@ -9,6 +9,7 @@ import { TranscriptEntry } from "@/components/transcript-item";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
+import { Input } from "@/components/ui/input";
 import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import {
   MessageScroller,
@@ -18,16 +19,74 @@ import {
   MessageScrollerProvider,
   MessageScrollerViewport,
 } from "@/components/ui/message-scroller";
+import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
+import { cn } from "cn";
 import { actions, emptyView, useLila } from "@/lib/store";
 
 function SessionToolbar({ sessionId, onResources }: { sessionId: string; onResources: () => void }) {
   const session = useLila((store) => store.sessions[sessionId]);
+  const parentSession = useLila((store) => (session?.parentId ? store.sessions[session.parentId] : undefined));
   const project = useLila((store) => store.projects.find((item) => item.id === session?.projectId));
+  const { open, isMobile } = useSidebar();
+  const [editing, setEditing] = React.useState(false);
+  const [title, setTitle] = React.useState(session?.title ?? "");
+  const inputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    if (!editing) return;
+    setTitle(session?.title ?? "");
+    requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    });
+  }, [editing, session?.title]);
+
+  async function saveTitle(): Promise<void> {
+    const next = title.trim();
+    if (!next || next === session?.title || (await actions.rename(sessionId, next))) setEditing(false);
+  }
+
   return (
-    <header className="flex h-12 shrink-0 items-center gap-2 px-4 [-webkit-app-region:drag]">
+    <header className={cn("flex h-12 shrink-0 items-center gap-2 px-4 [-webkit-app-region:drag]", !open && !isMobile && "pl-20")}>
+      <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" />
+      {parentSession ? (
+        <Button
+          variant="ghost"
+          size="xs"
+          className="shrink-0 text-muted-foreground [-webkit-app-region:no-drag]"
+          title={`返回父会话：${parentSession.title || "新会话"}`}
+          onClick={() => actions.select(parentSession.id)}
+        >
+          <ArrowLeft />
+          父会话
+        </Button>
+      ) : null}
       <div className="flex min-w-0 flex-1 items-baseline gap-2">
-        <h1 className="truncate text-sm font-medium">{session?.title || "新会话"}</h1>
+        {editing ? (
+          <Input
+            ref={inputRef}
+            value={title}
+            maxLength={120}
+            aria-label="会话名称"
+            className="h-7 max-w-sm bg-background text-sm [-webkit-app-region:no-drag]"
+            onChange={(event) => setTitle(event.target.value)}
+            onBlur={() => void saveTitle()}
+            onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing) return;
+              if (event.key === "Enter") void saveTitle();
+              if (event.key === "Escape") setEditing(false);
+            }}
+          />
+        ) : (
+          <h1
+            className="cursor-text truncate text-sm font-medium [-webkit-app-region:no-drag]"
+            title="双击重命名"
+            onDoubleClick={() => setEditing(true)}
+          >
+            {session?.title || "新会话"}
+          </h1>
+        )}
         <span className="truncate text-xs text-muted-foreground" title={project?.path}>
           {project?.name}
         </span>
@@ -105,14 +164,14 @@ function SessionControls({ sessionId, state }: { sessionId: string; state: Sessi
 export function Conversation({ sessionId }: { sessionId: string }) {
   const view = useLila((store) => store.views[sessionId]) ?? emptyView();
   const projectId = useLila((store) => store.sessions[sessionId]?.projectId);
-  const [resourcesOpen, setResourcesOpen] = React.useState(false);
+  const resourcesOpen = useLila((store) => store.resourcesOpen);
   const state = view.state;
   const running = state ? state.status === "running" || state.status === "waiting" || state.compacting : false;
   const loaded = state !== undefined;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <SessionToolbar sessionId={sessionId} onResources={() => setResourcesOpen(true)} />
+      <SessionToolbar sessionId={sessionId} onResources={() => actions.setResourcesOpen(true)} />
       <MessageScrollerProvider key={sessionId} autoScroll defaultScrollPosition="last-anchor" scrollPreviousItemPeek={48}>
         <MessageScroller className="min-h-0 flex-1">
           <MessageScrollerViewport>
@@ -164,7 +223,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
               ) : null}
               {view.items.map((item) => (
                 <MessageScrollerItem key={item.id} messageId={item.id} scrollAnchor={item.kind === "user"}>
-                  <TranscriptEntry item={item} sessionId={sessionId} running={running} />
+                  <TranscriptEntry item={item} sessionId={sessionId} running={item.kind === "user" ? running : false} />
                 </MessageScrollerItem>
               ))}
               {state && !state.pending.length ? (
@@ -186,7 +245,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
           projectId={projectId}
           running={running}
           disabled={!loaded}
-          placeholder={running ? "补充说明会在当前工具结束后送达… 按 Esc 停止" : "继续对话，/ 使用命令和技能，@ 引用文件"}
+          placeholder={running ? "补充说明会在当前工具结束后送达… 双击 Esc 停止" : "继续对话，/ 使用命令和技能，@ 引用文件"}
           onSubmit={(text, images, mode) => actions.prompt(sessionId, text, images, mode)}
           onAbort={() => void actions.abort(sessionId)}
           footer={state ? <SessionControls sessionId={sessionId} state={state} /> : null}
@@ -194,7 +253,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
         />
         {state ? <StatusLines lines={state.statusLines} /> : null}
       </div>
-      <ResourcesSheet sessionId={sessionId} open={resourcesOpen} onOpenChange={setResourcesOpen} />
+      <ResourcesSheet sessionId={sessionId} open={resourcesOpen} onOpenChange={actions.setResourcesOpen} />
     </div>
   );
 }

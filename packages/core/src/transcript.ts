@@ -114,10 +114,27 @@ export type ProjectOptions = {
   running?: boolean;
 };
 
+/** Parses `u:<timestamp>` or `u:<timestamp>#<occurrence>` produced by `projectBranch`. */
+export function parseUserItemId(itemId: string): { timestamp: number; occurrence: number } | undefined {
+  const match = /^u:(\d+)(?:#(\d+))?$/.exec(itemId);
+  if (!match) return undefined;
+  const timestamp = Number(match[1]);
+  const occurrence = match[2] ? Number(match[2]) : 1;
+  if (!Number.isFinite(timestamp) || !Number.isInteger(occurrence) || occurrence < 1) return undefined;
+  return { timestamp, occurrence };
+}
+
+function uniqueId(counts: Map<string, number>, base: string): string {
+  const seen = (counts.get(base) ?? 0) + 1;
+  counts.set(base, seen);
+  return seen === 1 ? base : `${base}#${seen}`;
+}
+
 /** Projects the entries of one branch (root to leaf) into transcript items. */
 export function projectBranch(entries: readonly SessionEntry[], options: ProjectOptions = {}): TranscriptItem[] {
   const items: TranscriptItem[] = [];
   const toolIndex = new Map<string, number>();
+  const idCounts = new Map<string, number>();
   let lastAssistantTools: string[] = [];
   let sawMessage = false;
 
@@ -131,14 +148,16 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
       case "message": {
         const message = entry.message;
         switch (message.role) {
-          case "user":
+          case "user": {
             sawMessage = true;
-            items.push(userItem(message));
+            const item = userItem(message);
+            items.push({ ...item, id: uniqueId(idCounts, item.id) });
             break;
+          }
           case "assistant": {
             sawMessage = true;
             const item = assistantItem(message, false);
-            if (hasAssistantContent(item)) items.push(item);
+            if (hasAssistantContent(item)) items.push({ ...item, id: uniqueId(idCounts, item.id) });
             const tools = toolCallItems(message);
             for (const tool of tools) addTool(tool);
             lastAssistantTools = tools.map((tool) => tool.id);
@@ -157,7 +176,7 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
             sawMessage = true;
             items.push({
               kind: "tool",
-              id: `b:${message.timestamp}`,
+              id: uniqueId(idCounts, `b:${message.timestamp}`),
               name: "bash",
               args: { command: message.command },
               status: message.exitCode === 0 && !message.cancelled ? "done" : "error",
@@ -165,7 +184,7 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
             });
             break;
           case "custom":
-            if (message.display) items.push(customItem(message, `c:${message.timestamp}`));
+            if (message.display) items.push(customItem(message, uniqueId(idCounts, `c:${message.timestamp}`)));
             break;
           default:
             break;
@@ -173,7 +192,7 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
         break;
       }
       case "custom_message":
-        if (entry.display) items.push(customItem(entry, `c:${Date.parse(entry.timestamp)}`));
+        if (entry.display) items.push(customItem(entry, uniqueId(idCounts, `c:${Date.parse(entry.timestamp)}`)));
         break;
       case "compaction":
         items.push({ kind: "notice", id: `n:${entry.id}`, tone: "info", text: `已压缩上下文（压缩前 ${entry.tokensBefore} tokens）` });

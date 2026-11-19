@@ -12,8 +12,29 @@ export class Store {
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     this.#path = join(dataDir, "state.json");
-    const loaded = existsSync(this.#path) ? (JSON.parse(readFileSync(this.#path, "utf8")) as Partial<State>) : {};
-    this.#state = { projects: loaded.projects ?? [], approvalModes: loaded.approvalModes ?? {} };
+    const loaded = this.#load();
+    this.#state = {
+      projects: Array.isArray(loaded.projects) ? loaded.projects : [],
+      approvalModes: loaded.approvalModes && typeof loaded.approvalModes === "object" ? loaded.approvalModes : {},
+    };
+  }
+
+  #load(): Partial<State> {
+    if (!existsSync(this.#path)) return {};
+    try {
+      const parsed = JSON.parse(readFileSync(this.#path, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Partial<State>;
+      throw new Error("state.json root is not an object");
+    } catch (error) {
+      const backup = `${this.#path}.corrupt.${Date.now()}`;
+      try {
+        renameSync(this.#path, backup);
+        console.warn(`[core] corrupted state.json backed up to ${backup}`, error);
+      } catch (backupError) {
+        console.warn(`[core] failed to back up corrupted state.json`, backupError);
+      }
+      return {};
+    }
   }
 
   get projects(): readonly Project[] {

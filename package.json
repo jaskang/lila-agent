@@ -6,12 +6,14 @@
   ],
   "type": "module",
   "scripts": {
-    "dev": "bun run --filter @lila/core --filter @lila/desktop dev",
+    "build:protocol": "bun run --filter @lila/protocol build",
+    "build": "bun run build:protocol && bun run --filter @lila/desktop build",
+    "dev": "bun run build:protocol && bun run --filter @lila/core --filter @lila/desktop dev",
     "lint": "oxlint",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
-    "typecheck": "bun run --filter '*' typecheck",
-    "test": "bun test"
+    "typecheck": "bun run build:protocol && bun run --filter '*' typecheck",
+    "test": "bun run build:protocol && bun test"
   },
   "devDependencies": {
     "@types/bun": "^1.4.4",

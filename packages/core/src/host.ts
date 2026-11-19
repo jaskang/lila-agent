@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
@@ -65,6 +65,26 @@ function createServices(cwd: string, live?: LiveSession): Promise<AgentSessionSe
 }
 
 type IndexedSession = { id: string; projectId: string; path: string; summary: SessionSummary };
+type CachedServices = { promise: Promise<AgentSessionServices>; lastActivity: number };
+
+async function settleServices(promise: Promise<AgentSessionServices>): Promise<void> {
+  try {
+    const services = await promise;
+    await services.modelRuntime.settleCredentialWrites();
+  } catch {
+    // Creation already failed or credentials could not be flushed during teardown.
+  }
+}
+
+function moveToTrash(source: string, destination: string): void {
+  try {
+    renameSync(source, destination);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+    copyFileSync(source, destination);
+    unlinkSync(source);
+  }
+}
 
 /** Projects, the index of their Pi sessions, and the live AgentSessions of opened ones. */
 export class SessionHost {
@@ -76,7 +96,7 @@ export class SessionHost {
   #index = new Map<string, IndexedSession>();
   #modelServices: Promise<AgentSessionServices> | undefined;
   /** Services of projects without a live session, for the slash menu of a session not created yet. */
-  readonly #projectServices = new Map<string, Promise<AgentSessionServices>>();
+  readonly #projectServices = new Map<string, CachedServices>();
   readonly #sweeper: NodeJS.Timeout;
 
   constructor(dataDir: string, clients: Clients) {
@@ -98,12 +118,19 @@ export class SessionHost {
     if (existing) return existing;
     const project: Project = { id: randomUUID(), path: resolved, name: basename(resolved) || resolved };
     this.store.addProject(project);
+    this.#clients.broadcast({ type: "projects", projects: [...this.store.projects] });
     return project;
   }
 
   async removeProject(projectId: string): Promise<void> {
     for (const live of Array.from(this.#live.values())) if (live.projectId === projectId) await this.#dispose(live);
+    const cached = this.#projectServices.get(projectId);
+    if (cached) {
+      this.#projectServices.delete(projectId);
+      await settleServices(cached.promise);
+    }
     this.store.removeProject(projectId);
+    this.#clients.broadcast({ type: "projects", projects: [...this.store.projects] });
   }
 
   #project(projectId: string): Project {
@@ -116,16 +143,36 @@ export class SessionHost {
   // Models
 
   /** One services instance for the user's agentDir, so models registered by user extensions are listed too. */
-  #models(): Promise<AgentSessionServices> {
+  #models(): { promise: Promise<AgentSessionServices>; cached: boolean } {
+    const cached = this.#modelServices !== undefined;
     this.#modelServices ??= createAgentSessionServices({ cwd: homedir(), agentDir: getAgentDir() }).catch((error: unknown) => {
       this.#modelServices = undefined;
       throw error;
     });
-    return this.#modelServices;
+    return { promise: this.#modelServices, cached };
+  }
+
+  #invalidateCaches(projectId?: string): void {
+    const models = this.#modelServices;
+    this.#modelServices = undefined;
+    if (models) void settleServices(models);
+    if (projectId) {
+      const cached = this.#projectServices.get(projectId);
+      if (cached) {
+        this.#projectServices.delete(projectId);
+        void settleServices(cached.promise);
+      }
+    }
   }
 
   async listModels(): Promise<{ models: ModelInfo[]; defaultModelId?: string }> {
-    const services = await this.#models();
+    const { promise, cached } = this.#models();
+    const services = await promise;
+    if (cached) {
+      // Pick up credentials or default model changes made via the `pi` CLI without restarting core.
+      await services.settingsManager.reload();
+      await services.modelRuntime.refresh({ allowNetwork: false });
+    }
     const models = services.modelRuntime.getAvailableSnapshot().map(
       (model): ModelInfo => ({
         id: `${model.provider}/${model.id}`,
@@ -185,13 +232,20 @@ export class SessionHost {
   async commands(projectId: string, sessionId?: string) {
     if (sessionId) return (await this.live(sessionId)).commands();
     const project = this.#project(projectId);
-    let services = this.#projectServices.get(project.id);
-    if (!services) {
-      services = createServices(project.path);
-      services.catch(() => this.#projectServices.delete(project.id));
-      this.#projectServices.set(project.id, services);
+    const existingLive = Array.from(this.#live.values()).find((live) => live.projectId === project.id);
+    if (existingLive) return existingLive.commands();
+    let entry = this.#projectServices.get(project.id);
+    if (!entry) {
+      const promise = createServices(project.path);
+      promise.catch(() => {
+        if (this.#projectServices.get(project.id)?.promise === promise) this.#projectServices.delete(project.id);
+      });
+      entry = { promise, lastActivity: Date.now() };
+      this.#projectServices.set(project.id, entry);
+    } else {
+      entry.lastActivity = Date.now();
     }
-    const loader = (await services).resourceLoader;
+    const loader = (await entry.promise).resourceLoader;
     const extensionCommands = loader.getExtensions().extensions.flatMap((extension) => Array.from(extension.commands.values()));
     return slashCommands(extensionCommands, loader.getPrompts().prompts, loader.getSkills().skills);
   }
@@ -252,6 +306,7 @@ export class SessionHost {
       parentId: options.parentId,
       store: this.store,
       clients: this.#clients,
+      onReload: () => this.#invalidateCaches(project.id),
     });
     const services = await createServices(project.path, live);
     let model;
@@ -282,7 +337,7 @@ export class SessionHost {
     if (path && existsSync(path)) {
       const trash = join(this.#dataDir, "trash");
       mkdirSync(trash, { recursive: true });
-      renameSync(path, join(trash, basename(path)));
+      moveToTrash(path, join(trash, basename(path)));
     }
     this.#index.delete(sessionId);
     this.store.forgetSession(sessionId);
@@ -306,11 +361,24 @@ export class SessionHost {
       if (live.busy || this.#clients.isWatched(live.id) || now - live.lastActivity < IDLE_DISPOSE_MS) continue;
       await this.#dispose(live).catch((error: unknown) => console.error(`[core] disposing ${live.id} failed`, error));
     }
+    for (const [projectId, entry] of Array.from(this.#projectServices.entries())) {
+      if (now - entry.lastActivity < IDLE_DISPOSE_MS) continue;
+      this.#projectServices.delete(projectId);
+      await settleServices(entry.promise);
+    }
   }
 
   async dispose(): Promise<void> {
     clearInterval(this.#sweeper);
-    await Promise.all(Array.from(this.#live.values()).map((live) => this.#dispose(live, false)));
+    const modelServices = this.#modelServices;
+    this.#modelServices = undefined;
+    const projectServices = Array.from(this.#projectServices.values(), (entry) => entry.promise);
+    this.#projectServices.clear();
+    await Promise.all([
+      ...Array.from(this.#live.values()).map((live) => this.#dispose(live, false)),
+      ...projectServices.map(settleServices),
+      ...(modelServices ? [settleServices(modelServices)] : []),
+    ]);
   }
 
   // -------------------------------------------------------------------------

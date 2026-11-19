@@ -9,15 +9,16 @@ import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "cn";
-import { actions, useLila } from "@/lib/store";
+import { actions, type DraftImage, useLila } from "@/lib/store";
 
 const MAX_IMAGES = 10;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TEXT_BYTES = 200 * 1024;
+const ABORT_ARM_MS = 1_500;
+const EMPTY_IMAGES: DraftImage[] = [];
 const TEXT_EXTENSIONS =
   /\.(txt|md|markdown|json|jsonc|ya?ml|toml|ini|env|csv|tsv|log|xml|html?|css|scss|less|[cm]?[jt]sx?|py|rb|go|rs|java|kt|swift|c|cc|cpp|h|hpp|cs|php|sh|bash|zsh|fish|sql|graphql|proto|vue|svelte|lua|dart|ex|exs|r|diff|patch)$/i;
 
-type PendingImage = ImageInput & { id: string; name: string };
 type Suggest = { kind: "slash" | "file"; start: number; query: string };
 type Option = { value: string; label: string; description?: string; group: string; insert: string };
 
@@ -98,21 +99,31 @@ export function Composer({
   onAbort?: () => void;
 }) {
   const text = useLila((state) => state.drafts[draftKey] ?? "");
+  const images = useLila((state) => state.draftImages[draftKey] ?? EMPTY_IMAGES);
   const connected = useLila((state) => state.connection === "connected");
-  const [images, setImages] = React.useState<PendingImage[]>([]);
   const [sending, setSending] = React.useState(false);
   const [dragging, setDragging] = React.useState(false);
+  const [abortArmed, setAbortArmed] = React.useState(false);
   const [suggest, setSuggest] = React.useState<Suggest | null>(null);
   const [highlight, setHighlight] = React.useState(0);
   const [commands, setCommands] = React.useState<SlashCommand[] | null>(null);
   const [files, setFiles] = React.useState<{ query: string; files: string[] } | null>(null);
   const ref = React.useRef<HTMLTextAreaElement>(null);
   const fileInput = React.useRef<HTMLInputElement>(null);
+  const abortTimer = React.useRef<number | undefined>(undefined);
 
   React.useEffect(() => {
     ref.current?.focus();
     setCommands(null);
   }, [draftKey, sessionId, projectId]);
+
+  React.useEffect(() => {
+    if (!running) {
+      window.clearTimeout(abortTimer.current);
+      setAbortArmed(false);
+    }
+    return () => window.clearTimeout(abortTimer.current);
+  }, [running]);
 
   // Slash commands are fetched when the menu first opens for this session or project.
   React.useEffect(() => {
@@ -163,7 +174,8 @@ export function Composer({
   React.useEffect(() => setHighlight(0), [options]);
 
   const menuOpen = suggest !== null;
-  const canSend = connected && !disabled && !sending && (text.trim().length > 0 || images.length > 0);
+  const hasText = text.trim().length > 0;
+  const canSend = connected && !disabled && !sending && (running ? hasText : hasText || images.length > 0);
 
   function syncSuggest(value: string, caret: number): void {
     setSuggest(findSuggest(value, caret, Boolean(projectId), Boolean(projectId)));
@@ -185,7 +197,7 @@ export function Composer({
 
   async function addFiles(list: FileList | File[]): Promise<void> {
     const incoming = Array.from(list);
-    const added: PendingImage[] = [];
+    const added: DraftImage[] = [];
     const blocks: string[] = [];
     for (const file of incoming) {
       try {
@@ -215,7 +227,7 @@ export function Composer({
       }
     }
     if (added.length) {
-      setImages((current) => {
+      actions.setDraftImages(draftKey, (current) => {
         const room = MAX_IMAGES - current.length;
         if (added.length > room) toast.warning(`最多添加 ${MAX_IMAGES} 张图片`);
         return [...current, ...added.slice(0, Math.max(room, 0))];
@@ -230,13 +242,12 @@ export function Composer({
 
   async function submit(mode?: "steer" | "followUp"): Promise<void> {
     if (!canSend) return;
-    if (running && !text.trim()) return;
     setSending(true);
     const ok = await onSubmit(text.trim(), images.map(({ mimeType, data }) => ({ mimeType, data })), running ? (mode ?? "steer") : undefined);
     setSending(false);
     if (ok) {
       actions.setDraft(draftKey, "");
-      setImages([]);
+      actions.setDraftImages(draftKey, []);
       setSuggest(null);
     }
   }
@@ -271,7 +282,15 @@ export function Composer({
     }
     if (event.key === "Escape" && running && onAbort) {
       event.preventDefault();
-      onAbort();
+      if (abortArmed) {
+        window.clearTimeout(abortTimer.current);
+        setAbortArmed(false);
+        onAbort();
+      } else {
+        setAbortArmed(true);
+        window.clearTimeout(abortTimer.current);
+        abortTimer.current = window.setTimeout(() => setAbortArmed(false), ABORT_ARM_MS);
+      }
     }
   }
 
@@ -349,7 +368,7 @@ export function Composer({
                 <AttachmentAction
                   variant="secondary"
                   aria-label={`移除 ${image.name}`}
-                  onClick={() => setImages((current) => current.filter((item) => item.id !== image.id))}
+                  onClick={() => actions.setDraftImages(draftKey, (current) => current.filter((item) => item.id !== image.id))}
                 >
                   <X />
                 </AttachmentAction>
@@ -403,30 +422,52 @@ export function Composer({
           }}
         />
         <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">{footer}</div>
-        {running ? (
+        {abortArmed ? (
+          <span className="shrink-0 px-1 text-xs text-amber-600 dark:text-amber-400">
+            再按一次 <Kbd>Esc</Kbd> 停止
+          </span>
+        ) : running ? (
           <span className="hidden shrink-0 px-1 text-xs text-muted-foreground xl:inline">
             <Kbd>↵</Kbd> 插话 · <Kbd>⌥↵</Kbd> 排队
           </span>
         ) : null}
         {trailing}
-        {running && onAbort && !text.trim() && !images.length ? (
-          // While the agent works and nothing is typed, the send button is the stop button.
-          <Button type="button" size="icon-sm" className="rounded-full" aria-label="停止" title="停止（Esc）" onClick={onAbort}>
+        {running && onAbort ? (
+          <Button
+            type="button"
+            size="icon-sm"
+            variant={hasText ? "secondary" : "default"}
+            className="rounded-full"
+            aria-label="停止"
+            title="停止（双击 Esc）"
+            onClick={() => {
+              window.clearTimeout(abortTimer.current);
+              setAbortArmed(false);
+              onAbort();
+            }}
+          >
             <Square className="size-3 fill-current" />
           </Button>
-        ) : (
+        ) : null}
+        {!running || hasText || images.length > 0 ? (
           <Button
             type="button"
             size="icon-sm"
             className="rounded-full"
             disabled={!canSend}
             aria-label={running ? "插话" : "发送"}
-            title={running ? "插话：当前工具结束后送达（↵），⌥↵ 排到这一轮之后" : "发送（↵），⇧↵ 换行"}
+            title={
+              running
+                ? hasText
+                  ? "插话：当前工具结束后送达（↵），⌥↵ 排到这一轮之后"
+                  : "运行中插话请先输入文字"
+                : "发送（↵），⇧↵ 换行"
+            }
             onClick={() => void submit("steer")}
           >
             {sending ? <Spinner /> : <ArrowUp />}
           </Button>
-        )}
+        ) : null}
       </div>
     </div>
   );

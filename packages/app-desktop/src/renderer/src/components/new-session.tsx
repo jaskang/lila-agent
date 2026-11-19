@@ -5,6 +5,8 @@ import { ApprovalSelect, ModelPicker, ThinkingSelect } from "@/components/sessio
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
+import { cn } from "cn";
 import { actions, NEW_DRAFT, useLila } from "@/lib/store";
 
 /** Before a session exists core cannot tell the exact levels; these are the ones every reasoning model accepts. */
@@ -18,31 +20,41 @@ export function NewSession() {
   const modelsError = useLila((state) => state.modelsError);
   const connected = useLila((state) => state.connection === "connected");
   const options = useLila((state) => state.newSession);
+  const { open, isMobile } = useSidebar();
 
   const projectId = projects.some((project) => project.id === options.projectId) ? options.projectId : projects.at(-1)?.id;
   const modelId = options.modelId && models.some((model) => model.id === options.modelId) ? options.modelId : defaultModelId;
   const model = models.find((item) => item.id === modelId);
 
+  const header = (
+    <header className={cn("flex h-12 shrink-0 items-center px-4 [-webkit-app-region:drag]", !open && !isMobile && "pl-20")}>
+      <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" />
+    </header>
+  );
+
   if (!projects.length) {
     return (
-      <Empty className="[-webkit-app-region:drag]">
-        <EmptyHeader>
-          <EmptyTitle>先添加一个项目</EmptyTitle>
-          <EmptyDescription>选择一个本地代码目录，Agent 会在这个目录里工作。</EmptyDescription>
-        </EmptyHeader>
-        <EmptyContent className="[-webkit-app-region:no-drag]">
-          <Button disabled={!connected} onClick={() => void actions.addProject().then((project) => project && actions.setNewSession({ projectId: project.id }))}>
-            <FolderOpen />
-            选择目录
-          </Button>
-        </EmptyContent>
-      </Empty>
+      <div className="flex min-h-0 flex-1 flex-col">
+        {header}
+        <Empty className="flex-1 [-webkit-app-region:drag]">
+          <EmptyHeader>
+            <EmptyTitle>先添加一个项目</EmptyTitle>
+            <EmptyDescription>选择一个本地代码目录，Agent 会在这个目录里工作。</EmptyDescription>
+          </EmptyHeader>
+          <EmptyContent className="[-webkit-app-region:no-drag]">
+            <Button disabled={!connected} onClick={() => void actions.addProject().then((project) => project && actions.setNewSession({ projectId: project.id }))}>
+              <FolderOpen />
+              选择目录
+            </Button>
+          </EmptyContent>
+        </Empty>
+      </div>
     );
   }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="h-12 shrink-0 [-webkit-app-region:drag]" />
+      {header}
       <div className="flex flex-1 flex-col items-center justify-center px-6 pb-[12vh]">
         <div className="flex w-full max-w-3xl flex-col gap-4">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-1">

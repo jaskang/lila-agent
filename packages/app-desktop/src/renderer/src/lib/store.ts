@@ -27,6 +27,7 @@ export type SessionView = {
 
 /** Settings for a session that does not exist yet; remembered between new sessions. */
 export type NewSessionOptions = { projectId?: string; modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode: ApprovalMode };
+export type DraftImage = ImageInput & { id: string; name: string };
 
 type State = {
   connection: ConnectionState;
@@ -41,14 +42,18 @@ type State = {
   newSession: NewSessionOptions;
   /** Composer text per session; `new` is the new-session composer. */
   drafts: Record<string, string>;
+  /** Pending image attachments per session; preserved across session switches. */
+  draftImages: Record<string, DraftImage[]>;
   paletteOpen: boolean;
+  resourcesOpen: boolean;
 };
 
 export const NEW_DRAFT = "new";
 const SELECTED_KEY = "lila.selectedSession";
 const NEW_SESSION_KEY = "lila.newSession";
-const OPEN_LIMIT = 200;
+const OPEN_LIMIT = 300;
 const EARLIER_LIMIT = 200;
+const MAX_CACHED_VIEWS = 10;
 
 export const APPROVAL_LABEL: Record<ApprovalMode, string> = {
   auto: "自动执行",
@@ -93,7 +98,9 @@ export const useLila = create<State>(() => ({
   selectedId: localStorage.getItem(SELECTED_KEY) ?? undefined,
   newSession: readNewSession(),
   drafts: {},
+  draftImages: {},
   paletteOpen: false,
+  resourcesOpen: false,
 }));
 
 const set = useLila.setState;
@@ -113,6 +120,35 @@ function indexOf(items: TranscriptItem[]): Record<string, number> {
     index[item.id] = at;
   });
   return index;
+}
+
+/** Most-recently-opened sessions, used to cap in-memory transcript views. */
+const recentViews: string[] = [];
+
+function recordViewAccess(sessionId: string): void {
+  const existing = recentViews.indexOf(sessionId);
+  if (existing >= 0) recentViews.splice(existing, 1);
+  recentViews.push(sessionId);
+}
+
+function pruneViews(): void {
+  if (recentViews.length <= MAX_CACHED_VIEWS) return;
+  const keep = new Set([get().selectedId, watching].filter((id): id is string => Boolean(id)));
+  const drop: string[] = [];
+  for (let i = 0; i < recentViews.length && recentViews.length - drop.length > MAX_CACHED_VIEWS; i++) {
+    const candidate = recentViews[i]!;
+    if (!keep.has(candidate)) drop.push(candidate);
+  }
+  if (!drop.length) return;
+  const dropped = new Set(drop);
+  for (let i = recentViews.length - 1; i >= 0; i--) {
+    if (dropped.has(recentViews[i]!)) recentViews.splice(i, 1);
+  }
+  set((state) => {
+    const views = { ...state.views };
+    for (const id of dropped) delete views[id];
+    return { views };
+  });
 }
 
 function setView(sessionId: string, update: (view: SessionView) => SessionView): void {
@@ -190,6 +226,7 @@ async function openSession(sessionId: string): Promise<void> {
   const token = ++openCounter;
   opening.set(sessionId, token);
   watching = sessionId;
+  recordViewAccess(sessionId);
   flush();
   setView(sessionId, (view) => ({ ...view, loading: true, error: undefined }));
   try {
@@ -198,6 +235,7 @@ async function openSession(sessionId: string): Promise<void> {
     // Frames queued before the snapshot are already part of it.
     buffer = buffer.filter((frame) => frame.sessionId !== sessionId);
     setView(sessionId, () => ({ items, index: indexOf(items), hasEarlier, loadingEarlier: false, state, loading: false }));
+    pruneViews();
   } catch (error) {
     if (opening.get(sessionId) !== token) return;
     setView(sessionId, (view) => ({ ...view, loading: false, error: message(error) }));
@@ -209,18 +247,21 @@ async function openSession(sessionId: string): Promise<void> {
 // ---------------------------------------------------------------------------
 // System notifications while the window is in the background.
 
-function notify(title: string, body: string): void {
+function notify(title: string, body: string, sessionId?: string): void {
   if (document.hasFocus() || typeof Notification === "undefined" || Notification.permission !== "granted") return;
   const notification = new Notification(title, { body });
-  notification.onclick = () => window.lila.focus();
+  notification.onclick = () => {
+    if (sessionId && get().sessions[sessionId]) actions.select(sessionId);
+    window.lila.focus();
+  };
 }
 
 function notifyTransition(previous: SessionSummary | undefined, next: SessionSummary): void {
   if (!previous) return;
   const title = next.title || "新会话";
-  if (next.pendingCount > previous.pendingCount) notify("需要你处理", title);
-  else if (previous.status === "running" && next.status === "idle") notify("任务完成", title);
-  else if (previous.status !== "error" && next.status === "error") notify("任务出错", title);
+  if (next.pendingCount > previous.pendingCount) notify("需要你处理", title, next.id);
+  else if (previous.status === "running" && next.status === "idle") notify("任务完成", title, next.id);
+  else if (previous.status !== "error" && next.status === "error") notify("任务出错", title, next.id);
 }
 
 function handlePush(frame: PushMessage): void {
@@ -234,6 +275,9 @@ function handlePush(frame: PushMessage): void {
       return;
     case "reset":
       if (frame.sessionId === watching) void openSession(frame.sessionId);
+      return;
+    case "projects":
+      set({ projects: frame.projects });
       return;
     case "session": {
       const previous = get().sessions[frame.session.id];
@@ -254,12 +298,18 @@ function handlePush(frame: PushMessage): void {
 
 function forget(sessionId: string): void {
   const wasSelected = get().selectedId === sessionId;
+  const idx = recentViews.indexOf(sessionId);
+  if (idx >= 0) recentViews.splice(idx, 1);
   set((state) => {
     const sessions = { ...state.sessions };
     delete sessions[sessionId];
     const views = { ...state.views };
     delete views[sessionId];
-    return { sessions, views, ...(wasSelected ? { selectedId: undefined } : {}) };
+    const drafts = { ...state.drafts };
+    delete drafts[sessionId];
+    const draftImages = { ...state.draftImages };
+    delete draftImages[sessionId];
+    return { sessions, views, drafts, draftImages, ...(wasSelected ? { selectedId: undefined, resourcesOpen: false } : {}) };
   });
   if (wasSelected) {
     localStorage.removeItem(SELECTED_KEY);
@@ -315,7 +365,7 @@ async function attempt<T>(run: () => Promise<T>): Promise<T | undefined> {
 
 export const actions = {
   select(sessionId: string | undefined): void {
-    set({ selectedId: sessionId });
+    set({ selectedId: sessionId, resourcesOpen: false });
     if (sessionId) localStorage.setItem(SELECTED_KEY, sessionId);
     else localStorage.removeItem(SELECTED_KEY);
     if (sessionId && get().connection === "connected") void openSession(sessionId);
@@ -337,8 +387,23 @@ export const actions = {
     set((state) => ({ drafts: { ...state.drafts, [key]: text } }));
   },
 
+  setDraftImages(key: string, images: DraftImage[] | ((current: DraftImage[]) => DraftImage[])): void {
+    set((state) => {
+      const current = state.draftImages[key] ?? [];
+      const next = typeof images === "function" ? images(current) : images;
+      const draftImages = { ...state.draftImages };
+      if (next.length) draftImages[key] = next;
+      else delete draftImages[key];
+      return { draftImages };
+    });
+  },
+
   setPaletteOpen(open: boolean): void {
     set({ paletteOpen: open });
+  },
+
+  setResourcesOpen(open: boolean): void {
+    set({ resourcesOpen: open });
   },
 
   retryModels: loadModels,
@@ -359,6 +424,51 @@ export const actions = {
     return project;
   },
 
+  async removeProject(projectId: string): Promise<boolean> {
+    const result = await attempt(() => client.call({ type: "projects.remove", projectId }));
+    if (!result) return false;
+    const state = get();
+    const removedSessionIds = new Set(
+      Object.values(state.sessions)
+        .filter((session) => session.projectId === projectId)
+        .map((session) => session.id),
+    );
+    for (let i = recentViews.length - 1; i >= 0; i--) {
+      if (removedSessionIds.has(recentViews[i]!)) recentViews.splice(i, 1);
+    }
+    const wasSelected = state.selectedId !== undefined && removedSessionIds.has(state.selectedId);
+    const remainingProjects = state.projects.filter((project) => project.id !== projectId);
+    const nextNewSession =
+      state.newSession.projectId === projectId ? { ...state.newSession, projectId: remainingProjects.at(-1)?.id } : state.newSession;
+    set((current) => {
+      const sessions = { ...current.sessions };
+      const views = { ...current.views };
+      const drafts = { ...current.drafts };
+      const draftImages = { ...current.draftImages };
+      for (const id of removedSessionIds) {
+        delete sessions[id];
+        delete views[id];
+        delete drafts[id];
+        delete draftImages[id];
+      }
+      return {
+        projects: remainingProjects,
+        sessions,
+        views,
+        drafts,
+        draftImages,
+        newSession: nextNewSession,
+        ...(wasSelected ? { selectedId: undefined, resourcesOpen: false } : {}),
+      };
+    });
+    if (wasSelected) {
+      localStorage.removeItem(SELECTED_KEY);
+      watching = undefined;
+    }
+    if (nextNewSession !== state.newSession) localStorage.setItem(NEW_SESSION_KEY, JSON.stringify(nextNewSession));
+    return true;
+  },
+
   /** Creates a session from the new-session composer and sends its first message. */
   async createAndPrompt(text: string, images: ImageInput[]): Promise<boolean> {
     const { projectId, modelId, thinkingLevel, approvalMode } = get().newSession;
@@ -374,8 +484,10 @@ export const actions = {
     );
     if (!created) return false;
     const { session } = created;
-    set((state) => ({ sessions: { ...state.sessions, [session.id]: session } }));
-    actions.select(session.id);
+    set((state) => ({ sessions: { ...state.sessions, [session.id]: session }, selectedId: session.id }));
+    localStorage.setItem(SELECTED_KEY, session.id);
+    // Ensure the socket watches the new session before sending its first prompt so early frames are never missed.
+    if (get().connection === "connected") await openSession(session.id);
     return actions.prompt(session.id, text, images);
   },
 

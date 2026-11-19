@@ -1,9 +1,28 @@
 import * as React from "react";
-import { Bot, CircleAlert, Code2, FilePen, FilePlus, FileSearch, FolderTree, Globe, MessageCircleQuestion, Plug, Search, SquareTerminal, Wrench } from "lucide-react";
+import {
+  ArrowUpRight,
+  Bot,
+  CircleAlert,
+  Code2,
+  ExternalLink,
+  FilePen,
+  FilePlus,
+  FileSearch,
+  FolderOpen,
+  FolderTree,
+  Globe,
+  MessageCircleQuestion,
+  Plug,
+  Search,
+  SquareTerminal,
+  Wrench,
+} from "lucide-react";
+import { toast } from "sonner";
 import type { TranscriptItem } from "@lila/protocol";
 import { Code, DiffView, languageOf } from "@/components/code";
 import { Markdown } from "@/components/markdown";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import {
   Trace,
@@ -15,6 +34,7 @@ import {
   TraceLine,
   TraceTitle,
 } from "@/components/ui/trace";
+import { actions, useLila } from "@/lib/store";
 
 type ToolItem = Extract<TranscriptItem, { kind: "tool" }>;
 
@@ -57,7 +77,66 @@ function Output({ tool, title = "输出", language }: { tool: ToolItem; title?: 
   );
 }
 
-function viewOf(tool: ToolItem): View {
+function resolveFilePath(projectPath: string | undefined, target: string | undefined): string | undefined {
+  if (!target) return undefined;
+  if (target.startsWith("/")) return target;
+  if (!projectPath) return undefined;
+  return `${projectPath.replace(/\/+$/, "")}/${target.replace(/^\.\//, "")}`;
+}
+
+function FileActions({ sessionId, path }: { sessionId: string; path: string | undefined }) {
+  const projectPath = useLila((state) => {
+    const projectId = state.sessions[sessionId]?.projectId;
+    return state.projects.find((project) => project.id === projectId)?.path;
+  });
+  const fullPath = resolveFilePath(projectPath, path);
+  if (!fullPath) return null;
+  return (
+    <div className="flex items-center gap-1">
+      <Button
+        type="button"
+        size="xs"
+        variant="ghost"
+        className="h-6 text-muted-foreground"
+        onClick={() => void window.lila.openPath(fullPath).catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)))}
+      >
+        <ExternalLink />
+        打开文件
+      </Button>
+      <Button type="button" size="xs" variant="ghost" className="h-6 text-muted-foreground" onClick={() => window.lila.revealPath(fullPath)}>
+        <FolderOpen />
+        在访达中显示
+      </Button>
+    </div>
+  );
+}
+
+function SubSessionLink({ sessionId, description, prompt }: { sessionId: string; description?: string | undefined; prompt?: string | undefined }) {
+  const subSessionId = useLila((state) => {
+    const children = Object.values(state.sessions).filter((session) => session.parentId === sessionId);
+    if (!children.length) return undefined;
+    const promptLine = prompt?.trim().split("\n")[0]?.trim();
+    const candidates = [description?.trim(), promptLine].filter((value): value is string => Boolean(value));
+    for (const candidate of candidates) {
+      const normalized = candidate.toLowerCase();
+      const matched = children.find((child) => {
+        const title = child.title.replace(/…$/, "").trim().toLowerCase();
+        return title && (normalized === title || normalized.startsWith(title) || title.startsWith(normalized));
+      });
+      if (matched) return matched.id;
+    }
+    return children.length === 1 ? children[0]?.id : undefined;
+  });
+  if (!subSessionId) return null;
+  return (
+    <Button type="button" size="xs" variant="ghost" className="ms-auto h-6 text-muted-foreground" onClick={() => actions.select(subSessionId)}>
+      查看子会话
+      <ArrowUpRight />
+    </Button>
+  );
+}
+
+function viewOf(tool: ToolItem, sessionId: string): View {
   const { args } = tool;
   const path = str(args.path) ?? str(args.file_path);
   switch (tool.name) {
@@ -80,7 +159,12 @@ function viewOf(tool: ToolItem): View {
         icon: FileSearch,
         title: "读取",
         target: path,
-        body: <Output tool={tool} title={path ?? "内容"} {...(path && languageOf(path) ? { language: languageOf(path) } : {})} />,
+        body: (
+          <>
+            <FileActions sessionId={sessionId} path={path} />
+            <Output tool={tool} title={path ?? "内容"} {...(path && languageOf(path) ? { language: languageOf(path) } : {})} />
+          </>
+        ),
       };
     case "grep":
     case "find":
@@ -102,6 +186,7 @@ function viewOf(tool: ToolItem): View {
         openByDefault: Boolean(tool.diff),
         body: (
           <>
+            <FileActions sessionId={sessionId} path={path} />
             {tool.diff ? <DiffView patch={tool.diff} path={path ?? "文件"} /> : null}
             {!tool.diff && content !== undefined ? (
               <Code code={content} title={path} streaming={tool.status === "running"} {...(path && languageOf(path) ? { language: languageOf(path) } : {})} />
@@ -113,7 +198,7 @@ function viewOf(tool: ToolItem): View {
       };
     }
     case "Agent":
-      return agentView(tool);
+      return agentView(tool, sessionId);
     case "codemode": {
       const code = str(args.code) ?? json(args);
       return {
@@ -176,7 +261,7 @@ const AGENT_STATUS: Record<string, string> = {
   error: "出错",
 };
 
-function agentView(tool: ToolItem): View {
+function agentView(tool: ToolItem, sessionId: string): View {
   const { args, details } = tool;
   const type = str(args.subagent_type) ?? "Agent";
   const description = str(args.description) ?? str(details?.description);
@@ -203,6 +288,7 @@ function agentView(tool: ToolItem): View {
               {stat}
             </span>
           ))}
+          <SubSessionLink sessionId={sessionId} description={description} prompt={prompt} />
         </div>
         {prompt ? <Code code={prompt} title="任务" maxHeight="8rem" /> : null}
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
@@ -216,8 +302,8 @@ function agentView(tool: ToolItem): View {
   };
 }
 
-export const ToolCall = React.memo(function ToolCall({ tool }: { tool: ToolItem }) {
-  const view = viewOf(tool);
+export const ToolCall = React.memo(function ToolCall({ tool, sessionId }: { tool: ToolItem; sessionId: string }) {
+  const view = viewOf(tool, sessionId);
   const Icon = view.icon;
   // Diffs are the point of an edit, so they start open; errors open too. Other details stay folded.
   const wantsOpen = Boolean(view.openByDefault) || tool.status === "error";
