@@ -119,7 +119,7 @@ export function parsePatch(patch: string, fallbackPath: string): DiffFile[] {
   return files.filter((item) => item.lines.length);
 }
 
-export function DiffView({ patch, path }: { patch: string; path: string }) {
+export function DiffView({ patch, path, maxHeight = "24rem" }: { patch: string; path: string; maxHeight?: string }) {
   const files = React.useMemo(() => parsePatch(patch, path), [patch, path]);
   return (
     <>
@@ -135,7 +135,7 @@ export function DiffView({ patch, path }: { patch: string; path: string }) {
               <span className="text-destructive">−{file.removed}</span>
             </span>
           </CodeBlockHeader>
-          <CodeBlockContent style={{ maxHeight: "24rem" }}>
+          <CodeBlockContent style={{ maxHeight }}>
             {file.lines.map((line, index) => (
               <CodeBlockLine
                 key={index}

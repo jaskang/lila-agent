@@ -125,7 +125,7 @@ export function ResourcesSheet({ sessionId, open, onOpenChange }: { sessionId: s
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="w-[min(32rem,90vw)] gap-0 sm:max-w-none">
+      <SheetContent className="gap-0 data-[side=right]:w-[min(32rem,90vw)] data-[side=right]:sm:max-w-none">
         <SheetHeader className="border-b">
           <SheetTitle>能力</SheetTitle>
           <SheetDescription className="truncate font-mono text-xs" title={resources?.cwd}>

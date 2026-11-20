@@ -1,9 +1,9 @@
 import * as React from "react";
-import { Brain, Check, CircleAlert, Copy, Info, PencilLine, Puzzle, TriangleAlert } from "lucide-react";
+import { ArrowUpRight, Brain, Check, CheckCircle2, CircleAlert, Copy, Info, PencilLine, Puzzle, TriangleAlert } from "lucide-react";
 import type { ImageInput, TranscriptItem } from "@lila/protocol";
 import { focusComposer } from "@/components/composer";
 import { Markdown } from "@/components/markdown";
-import { ToolCall } from "@/components/tool-call";
+import { findMatchingSubSession, formatCompactTokens, ToolCall } from "@/components/tool-call";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -14,6 +14,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -25,11 +26,12 @@ import {
   TraceCollapsible,
   TraceCollapsibleContent,
   TraceCollapsibleTrigger,
+  TraceDescription,
   TraceIcon,
   TraceLine,
   TraceTitle,
 } from "@/components/ui/trace";
-import { actions } from "@/lib/store";
+import { actions, useLila } from "@/lib/store";
 
 const NOTICE_ICON = { info: Info, warning: TriangleAlert, error: CircleAlert } as const;
 
@@ -189,6 +191,120 @@ function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: "ass
   );
 }
 
+type NotificationEntry = {
+  id?: string;
+  description: string;
+  status: string;
+  toolUses?: number;
+  turnCount?: number;
+  totalTokens?: number;
+  totalCost?: number;
+  durationMs?: number;
+  error?: string;
+  preview?: string;
+};
+
+function formatDuration(ms: number | undefined): string | undefined {
+  if (!ms || ms <= 0) return undefined;
+  return ms < 1_000 ? `${ms}ms` : ms < 60_000 ? `${(ms / 1_000).toFixed(1)}s` : `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1_000)}s`;
+}
+
+function isErrorStatus(status: string): boolean {
+  return status === "error" || status === "aborted" || status === "stopped";
+}
+
+function NotificationSubLink({ sessionId, entry }: { sessionId: string; entry: NotificationEntry }) {
+  const subSessionId = useLila((state) => findMatchingSubSession(state.sessions, sessionId, { agentId: entry.id, description: entry.description }));
+  if (!subSessionId) return null;
+  return (
+    <Button type="button" size="xs" variant="ghost" className="ms-auto h-6 text-muted-foreground" onClick={() => actions.select(subSessionId)}>
+      查看子会话
+      <ArrowUpRight />
+    </Button>
+  );
+}
+
+function SubagentNotificationCard({
+  item,
+  sessionId,
+}: {
+  item: Extract<TranscriptItem, { kind: "custom" }>;
+  sessionId: string;
+}) {
+  const rawList = Array.isArray(item.details?.notifications) ? (item.details.notifications as NotificationEntry[]) : [];
+  const entries = rawList.filter((entry) => entry && typeof entry.description === "string");
+  const hasError = entries.some((entry) => isErrorStatus(entry.status));
+  const [open, setOpen] = React.useState(hasError);
+
+  if (!entries.length) {
+    if (!item.text) return null;
+    return (
+      <div className="rounded-xl border border-dashed bg-muted/30 px-4 py-3">
+        <Markdown text={item.text} />
+      </div>
+    );
+  }
+
+  const single = entries.length === 1 ? entries[0] : undefined;
+  const totalTokens = entries.reduce((sum, entry) => sum + (entry.totalTokens ?? 0), 0);
+  const totalCost = entries.reduce((sum, entry) => sum + (entry.totalCost ?? 0), 0);
+  const headerMeta = single
+    ? [
+        single.toolUses ? `${single.toolUses} 次工具` : undefined,
+        single.totalTokens ? formatCompactTokens(single.totalTokens) : undefined,
+        formatDuration(single.durationMs),
+      ].filter(Boolean)
+    : [
+        totalTokens > 0 ? formatCompactTokens(totalTokens) : undefined,
+        totalCost > 0 ? `$${totalCost.toFixed(4)}` : undefined,
+      ].filter(Boolean);
+
+  return (
+    <Trace>
+      <TraceCollapsible open={open} onOpenChange={setOpen}>
+        <TraceCollapsibleTrigger>
+          <TraceLine {...(hasError ? { status: "error" as const } : {})}>
+            <TraceIcon>
+              {hasError ? <CircleAlert /> : <CheckCircle2 className="text-emerald-600 dark:text-emerald-400" />}
+            </TraceIcon>
+            <TraceTitle>
+              {single ? (hasError ? "子 Agent 出错" : "子 Agent 完成") : `${entries.length} 个子 Agent 完成`}
+            </TraceTitle>
+            {single ? <TraceDescription className="max-w-[22rem] shrink truncate">{single.description}</TraceDescription> : null}
+            {headerMeta.length ? <TraceDescription className="text-xs tabular-nums">{headerMeta.join(" · ")}</TraceDescription> : null}
+          </TraceLine>
+        </TraceCollapsibleTrigger>
+        <TraceCollapsibleContent>
+          <div className="flex flex-col gap-2 text-foreground">
+            {entries.map((entry, index) => {
+              const err = isErrorStatus(entry.status);
+              const meta = [
+                entry.turnCount ? `${entry.turnCount} 轮` : undefined,
+                entry.toolUses ? `${entry.toolUses} 次工具` : undefined,
+                entry.totalTokens ? formatCompactTokens(entry.totalTokens) : undefined,
+                entry.totalCost ? `$${entry.totalCost.toFixed(4)}` : undefined,
+                formatDuration(entry.durationMs),
+              ].filter(Boolean);
+              return (
+                <div key={entry.id ?? index} className="flex flex-col gap-2 rounded-lg border bg-card px-3 py-2.5">
+                  <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                    <Badge variant={err ? "destructive" : "secondary"}>{err ? "出错" : "已完成"}</Badge>
+                    <span className="font-medium">{entry.description}</span>
+                    {meta.length ? <span className="text-muted-foreground tabular-nums">· {meta.join(" · ")}</span> : null}
+                    <NotificationSubLink sessionId={sessionId} entry={entry} />
+                  </div>
+                  {entry.error ? <p className="text-sm text-destructive">{entry.error}</p> : null}
+                  {entry.preview ? <Markdown text={entry.preview} /> : null}
+                </div>
+              );
+            })}
+          </div>
+        </TraceCollapsibleContent>
+      </TraceCollapsible>
+    </Trace>
+  );
+}
+
 export const TranscriptEntry = React.memo(function TranscriptEntry({
   item,
   sessionId,
@@ -206,6 +322,7 @@ export const TranscriptEntry = React.memo(function TranscriptEntry({
     case "tool":
       return <ToolCall tool={item} sessionId={sessionId} />;
     case "custom":
+      if (item.customType === "subagent-notification") return <SubagentNotificationCard item={item} sessionId={sessionId} />;
       return (
         <div className="rounded-xl border border-dashed bg-muted/30 px-4 py-3">
           <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">

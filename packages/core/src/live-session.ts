@@ -18,15 +18,18 @@ import type {
   SessionStatus,
   SessionSummary,
   SlashCommand,
+  SubagentProgress,
+  SubagentStatus,
   TranscriptItem,
 } from "@lila/protocol";
 import { errorMessage, UserError } from "./errors.ts";
-import type { LilaBridge } from "./lila-extension.ts";
+import type { LilaBridge, SubagentBusEvent } from "./lila-extension.ts";
 import type { Store } from "./store.ts";
 import {
   type AgentMessage,
   assistantItem,
   contentText,
+  customItem,
   displayUserText,
   earlier,
   parseUserItemId,
@@ -52,7 +55,30 @@ type PendingEntry = { request: PendingRequest; settle(answer: PendingAnswer | un
 type ToolThrottle = { at: number; timer?: NodeJS.Timeout; latest?: ToolItem };
 
 const TOOL_UPDATE_INTERVAL_MS = 100;
+const SUBAGENT_PUSH_INTERVAL_MS = 200;
+const MAX_SUBAGENT_ENTRIES = 50;
 const TITLE_LIMIT = 60;
+
+function normalizeSubagentStatus(raw: string | undefined): SubagentStatus {
+  switch (raw) {
+    case "queued":
+    case "running":
+    case "completed":
+    case "steered":
+    case "stopped":
+    case "aborted":
+    case "error":
+      return raw;
+    case "background":
+      return "running";
+    default:
+      return "completed";
+  }
+}
+
+function isActiveSubagent(status: SubagentStatus): boolean {
+  return status === "queued" || status === "running";
+}
 const BUILTIN_COMMANDS: SlashCommand[] = [
   { name: "compact", description: "压缩上下文，用摘要替换较早的对话", source: "builtin" },
   { name: "reload", description: "重新加载技能、提示词、扩展和 MCP 服务", source: "builtin" },
@@ -71,11 +97,36 @@ export function slashCommands(
   return commands;
 }
 
-export function sessionTitle(name: string | undefined, firstMessage: string | undefined): string {
-  if (name?.trim()) return name.trim();
-  const line = firstMessage ? (displayUserText(firstMessage).trim().split("\n")[0]?.trim() ?? "") : "";
-  if (!line) return "新会话";
+/** Matches pi-subagents' default auto-generated session name such as `Explore#9b7891d8`. */
+export function parseAutoSubagentName(name: string | undefined): { type: string; idPrefix: string } | undefined {
+  if (!name) return undefined;
+  const match = /^([^\s#]+)#([0-9a-f]{8})$/i.exec(name.trim());
+  if (!match) return undefined;
+  return { type: match[1]!, idPrefix: match[2]!.toLowerCase() };
+}
+
+function truncateTitle(raw: string): string {
+  const line = raw.trim().split("\n")[0]?.trim() ?? "";
+  if (!line) return "";
   return line.length > TITLE_LIMIT ? `${line.slice(0, TITLE_LIMIT)}…` : line;
+}
+
+export function sessionTitle(
+  name: string | undefined,
+  firstMessage: string | undefined,
+  options?: { isSubsession?: boolean; description?: string | undefined },
+): string {
+  const trimmed = name?.trim();
+  // Replace pi-subagents' opaque `Type#<hash>` auto-name with a human-readable description or prompt line.
+  if (options?.isSubsession && parseAutoSubagentName(trimmed)) {
+    const desc = options.description ? truncateTitle(options.description) : "";
+    if (desc) return desc;
+    const promptLine = firstMessage ? truncateTitle(displayUserText(firstMessage)) : "";
+    if (promptLine) return promptLine;
+  }
+  if (trimmed) return trimmed;
+  const line = firstMessage ? truncateTitle(displayUserText(firstMessage)) : "";
+  return line || "新会话";
 }
 
 export function findModel(services: AgentSessionServices, modelId: string): Model | undefined {
@@ -93,11 +144,14 @@ export class LiveSession implements LilaBridge {
   readonly id: string;
   readonly projectId: string;
   readonly parentId: string | undefined;
+  readonly agentId: string | undefined;
+  readonly #subagentDescription: string | undefined;
   readonly allowedTools = new Set<string>();
   lastActivity = Date.now();
   readonly #store: Store;
   readonly #clients: Clients;
   readonly #onReload?: () => void;
+  readonly #onSubsessionsChanged?: () => void;
   #session!: AgentSession;
   #services!: AgentSessionServices;
   #unsubscribe?: () => void;
@@ -110,16 +164,31 @@ export class LiveSession implements LilaBridge {
   /** Tool items of the current run, with their newest output. */
   readonly #tools = new Map<string, ToolItem>();
   readonly #throttles = new Map<string, ToolThrottle>();
+  readonly #subagents = new Map<string, SubagentProgress>();
+  #subagentPushTimer: NodeJS.Timeout | undefined;
   #notices = 0;
   #lastSummary = "";
 
-  constructor(options: { id: string; projectId: string; parentId?: string | undefined; store: Store; clients: Clients; onReload?: () => void }) {
+  constructor(options: {
+    id: string;
+    projectId: string;
+    parentId?: string | undefined;
+    agentId?: string | undefined;
+    subagentDescription?: string | undefined;
+    store: Store;
+    clients: Clients;
+    onReload?: () => void;
+    onSubsessionsChanged?: () => void;
+  }) {
     this.id = options.id;
     this.projectId = options.projectId;
     this.parentId = options.parentId;
+    this.agentId = options.agentId;
+    this.#subagentDescription = options.subagentDescription;
     this.#store = options.store;
     this.#clients = options.clients;
     this.#onReload = options.onReload;
+    this.#onSubsessionsChanged = options.onSubsessionsChanged;
   }
 
   get session(): AgentSession {
@@ -135,7 +204,9 @@ export class LiveSession implements LilaBridge {
   }
 
   get busy(): boolean {
-    return this.#session.isStreaming || this.#session.isCompacting || this.#pending.size > 0;
+    if (this.#session.isStreaming || this.#session.isCompacting || this.#pending.size > 0) return true;
+    for (const sub of this.#subagents.values()) if (isActiveSubagent(sub.status)) return true;
+    return false;
   }
 
   async attach(services: AgentSessionServices, session: AgentSession, updatedAt?: string): Promise<void> {
@@ -187,15 +258,29 @@ export class LiveSession implements LilaBridge {
     return "idle";
   }
 
+  subagentByPrefix(idPrefix: string): SubagentProgress | undefined {
+    const lower = idPrefix.toLowerCase();
+    for (const entry of this.#subagents.values()) {
+      if (entry.id.toLowerCase().startsWith(lower)) return entry;
+    }
+    return undefined;
+  }
+
   summary(): SessionSummary {
+    const auto = this.parentId ? parseAutoSubagentName(this.#session.sessionName) : undefined;
+    const resolvedAgentId = this.agentId ?? auto?.idPrefix;
     return {
       id: this.id,
       projectId: this.projectId,
-      title: sessionTitle(this.#session.sessionName, this.#firstMessage),
+      title: sessionTitle(this.#session.sessionName, this.#firstMessage, {
+        isSubsession: Boolean(this.parentId),
+        description: this.#subagentDescription,
+      }),
       updatedAt: this.#updatedAt,
       status: this.status,
       pendingCount: this.#pending.size,
       ...(this.parentId ? { parentId: this.parentId } : {}),
+      ...(resolvedAgentId ? { agentId: resolvedAgentId } : {}),
     };
   }
 
@@ -216,6 +301,7 @@ export class LiveSession implements LilaBridge {
       ...(this.#retry ? { retry: this.#retry } : {}),
       pending: Array.from(this.#pending.values()).map((entry) => entry.request),
       statusLines: { ...this.#statusLines },
+      ...(this.#subagents.size ? { subagents: Array.from(this.#subagents.values(), (entry) => ({ ...entry })) } : {}),
     };
   }
 
@@ -372,6 +458,9 @@ export class LiveSession implements LilaBridge {
     for (const entry of Array.from(this.#pending.values())) entry.settle(undefined);
     for (const throttle of this.#throttles.values()) clearTimeout(throttle.timer);
     this.#throttles.clear();
+    clearTimeout(this.#subagentPushTimer);
+    this.#subagentPushTimer = undefined;
+    this.#subagents.clear();
     try {
       await this.#session.abort();
       // Lets extensions such as MCP close their connections and child processes.
@@ -430,6 +519,8 @@ export class LiveSession implements LilaBridge {
       editor: (title, prefill) => dialog({ kind: "editor", title, options: [], ...(prefill ? { prefill } : {}) }, undefined, text),
       notify: (message, type) => this.#notify(type ?? "info", message),
       setStatus: (key, value) => {
+        // pi-subagents writes a TUI status line (`1 running agent`) that duplicates Lila's native sub-agent UI.
+        if (key === "subagents") return;
         if (value === undefined) delete this.#statusLines[key];
         else this.#statusLines[key] = value;
         this.#pushState();
@@ -458,6 +549,177 @@ export class LiveSession implements LilaBridge {
       getToolsExpanded: () => false,
       setToolsExpanded: () => {},
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Sub-agent progress (`pi-subagents` event bus + foreground tool updates)
+
+  onSubagentEvent(event: SubagentBusEvent): void {
+    this.touch();
+    switch (event.type) {
+      case "created": {
+        const existing = this.#subagents.get(event.id);
+        this.#subagents.set(event.id, {
+          id: event.id,
+          type: event.agentType,
+          description: event.description || existing?.description || "",
+          status: existing && isActiveSubagent(existing.status) ? existing.status : "queued",
+          background: event.isBackground,
+          startedAt: existing?.startedAt ?? Date.now(),
+          toolUses: existing?.toolUses ?? 0,
+          turns: existing?.turns ?? 0,
+          tokens: existing?.tokens ?? 0,
+          cost: existing?.cost ?? 0,
+          ...(existing?.model ? { model: existing.model } : {}),
+          ...(existing?.activity ? { activity: existing.activity } : {}),
+        });
+        this.#scheduleSubagentPush(true);
+        break;
+      }
+      case "started": {
+        const existing = this.#subagents.get(event.id);
+        this.#subagents.set(event.id, {
+          id: event.id,
+          type: event.agentType || existing?.type || "Agent",
+          description: event.description || existing?.description || "",
+          status: "running",
+          background: existing?.background ?? false,
+          startedAt: Date.now(),
+          toolUses: existing?.toolUses ?? 0,
+          turns: existing?.turns ?? 0,
+          tokens: existing?.tokens ?? 0,
+          cost: existing?.cost ?? 0,
+          ...(existing?.model ? { model: existing.model } : {}),
+          ...(existing?.activity ? { activity: existing.activity } : {}),
+        });
+        this.#trimSubagents();
+        this.#scheduleSubagentPush(true);
+        this.#onSubsessionsChanged?.();
+        break;
+      }
+      case "usage": {
+        if (event.depth !== undefined && event.depth > 1) return;
+        const existing = this.#subagents.get(event.id) ?? {
+          id: event.id,
+          type: event.agentType,
+          description: event.description,
+          status: "running" as const,
+          background: false,
+          startedAt: Date.now(),
+          toolUses: 0,
+          turns: 0,
+          tokens: 0,
+          cost: 0,
+        };
+        const firstTurn = existing.turns === 0;
+        existing.turns += 1;
+        existing.tokens += event.tokens;
+        existing.cost += event.cost;
+        if (event.model) existing.model = event.model;
+        if (existing.status === "queued") existing.status = "running";
+        this.#subagents.set(event.id, existing);
+        this.#scheduleSubagentPush(false);
+        // Sub-agent session JSONL is flushed once its first message is written.
+        if (firstTurn) this.#onSubsessionsChanged?.();
+        break;
+      }
+      case "compacted": {
+        const existing = this.#subagents.get(event.id);
+        if (!existing) return;
+        existing.activity = event.compactionCount ? `已压缩上下文（第 ${event.compactionCount} 次）` : "已压缩上下文";
+        this.#scheduleSubagentPush(false);
+        break;
+      }
+      case "steered": {
+        const existing = this.#subagents.get(event.id);
+        if (!existing) return;
+        existing.activity = "已收到引导消息";
+        this.#scheduleSubagentPush(false);
+        break;
+      }
+      case "finished": {
+        const existing = this.#subagents.get(event.id);
+        const next: SubagentProgress = {
+          id: event.id,
+          type: event.agentType || existing?.type || "Agent",
+          description: event.description || existing?.description || "",
+          status: normalizeSubagentStatus(event.status),
+          background: existing?.background ?? false,
+          startedAt: existing?.startedAt ?? Date.now(),
+          toolUses: event.toolUses ?? existing?.toolUses ?? 0,
+          turns: existing?.turns ?? 0,
+          tokens: event.tokens ?? existing?.tokens ?? 0,
+          cost: event.cost ?? existing?.cost ?? 0,
+          ...(existing?.model ? { model: existing.model } : {}),
+          ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+          ...(event.result ? { output: event.result } : {}),
+          ...(event.error ? { error: event.error } : {}),
+        };
+        this.#subagents.set(event.id, next);
+        this.#trimSubagents();
+        this.#scheduleSubagentPush(true);
+        this.#onSubsessionsChanged?.();
+        break;
+      }
+      case "disposed":
+        if (!this.#subagents.size) return;
+        this.#subagents.clear();
+        this.#scheduleSubagentPush(true);
+        break;
+    }
+  }
+
+  #trimSubagents(): void {
+    if (this.#subagents.size <= MAX_SUBAGENT_ENTRIES) return;
+    for (const [id, entry] of this.#subagents) {
+      if (this.#subagents.size <= MAX_SUBAGENT_ENTRIES) break;
+      if (!isActiveSubagent(entry.status)) this.#subagents.delete(id);
+    }
+  }
+
+  #syncAgentToolProgress(item: ToolItem): void {
+    if (item.name !== "Agent" || !item.details) return;
+    const details = item.details;
+    const id = typeof details.agentId === "string" && details.agentId ? details.agentId : undefined;
+    if (!id) return;
+    const existing = this.#subagents.get(id);
+    const rawStatus = typeof details.status === "string" ? details.status : undefined;
+    const incoming = rawStatus ? normalizeSubagentStatus(rawStatus) : existing?.status ?? (item.status === "running" ? "running" : item.status === "error" ? "error" : "completed");
+    // Do not regress a sub-agent that has already finished back to running when its spawn tool result lands.
+    const status = existing && !isActiveSubagent(existing.status) && isActiveSubagent(incoming) ? existing.status : incoming;
+    const next: SubagentProgress = {
+      id,
+      type: (typeof details.subagentType === "string" && details.subagentType) || (typeof item.args.subagent_type === "string" && item.args.subagent_type) || existing?.type || "Agent",
+      description: (typeof details.description === "string" && details.description) || (typeof item.args.description === "string" && item.args.description) || existing?.description || "",
+      status,
+      background: rawStatus === "background" || Boolean(item.args.run_in_background) || (existing?.background ?? false),
+      startedAt: existing?.startedAt ?? Date.now(),
+      toolUses: typeof details.toolUses === "number" && details.toolUses > (existing?.toolUses ?? 0) ? details.toolUses : (existing?.toolUses ?? 0),
+      turns: typeof details.turnCount === "number" && details.turnCount > (existing?.turns ?? 0) ? details.turnCount : (existing?.turns ?? 0),
+      tokens: existing?.tokens ?? 0,
+      cost: typeof details.cost === "number" && details.cost > (existing?.cost ?? 0) ? details.cost : (existing?.cost ?? 0),
+      ...(typeof details.modelName === "string" && details.modelName ? { model: details.modelName } : existing?.model ? { model: existing.model } : {}),
+      ...(typeof details.activity === "string" && details.activity && isActiveSubagent(status) ? { activity: details.activity } : existing?.activity && isActiveSubagent(status) ? { activity: existing.activity } : {}),
+      ...(typeof details.durationMs === "number" && details.durationMs > 0 && !isActiveSubagent(status) ? { durationMs: details.durationMs } : existing?.durationMs !== undefined ? { durationMs: existing.durationMs } : {}),
+      ...(existing?.output ? { output: existing.output } : {}),
+      ...(typeof details.error === "string" && details.error ? { error: details.error } : existing?.error ? { error: existing.error } : {}),
+    };
+    this.#subagents.set(id, next);
+    this.#trimSubagents();
+    this.#scheduleSubagentPush(!isActiveSubagent(status));
+  }
+
+  #scheduleSubagentPush(immediate: boolean): void {
+    if (immediate) {
+      clearTimeout(this.#subagentPushTimer);
+      this.#subagentPushTimer = undefined;
+      this.#pushState();
+      return;
+    }
+    this.#subagentPushTimer ??= setTimeout(() => {
+      this.#subagentPushTimer = undefined;
+      this.#pushState();
+    }, SUBAGENT_PUSH_INTERVAL_MS);
   }
 
   // -------------------------------------------------------------------------
@@ -492,6 +754,7 @@ export class LiveSession implements LilaBridge {
 
   #setTool(item: ToolItem, throttle: boolean): void {
     this.#tools.set(item.id, item);
+    this.#syncAgentToolProgress(item);
     if (!throttle) {
       const pending = this.#throttles.get(item.id);
       clearTimeout(pending?.timer);
@@ -636,7 +899,7 @@ export class LiveSession implements LilaBridge {
         break;
       }
       case "custom":
-        if (message.display) this.#send({ kind: "custom", id: `c:${message.timestamp}`, customType: message.customType, text: contentText(message.content) });
+        if (message.display) this.#send(customItem(message, `c:${message.timestamp}`));
         break;
       case "user":
         this.#updatedAt = new Date().toISOString();

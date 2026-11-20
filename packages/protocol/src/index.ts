@@ -50,6 +50,8 @@ export type SessionSummary = {
   pendingCount: number;
   /** Set for a sub-agent's own session: the session that spawned it. */
   parentId?: string;
+  /** pi-subagents agent id (or its 8-char prefix) linking this sub-session to its `Agent` tool card. */
+  agentId?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -76,7 +78,7 @@ export type TranscriptItem =
       durationMs?: number;
     }
   /** Context an extension injected, for example a background subagent's report. Markdown. */
-  | { kind: "custom"; id: string; customType: string; text: string }
+  | { kind: "custom"; id: string; customType: string; text: string; details?: Record<string, unknown> }
   | { kind: "notice"; id: string; tone: "info" | "warning" | "error"; text: string };
 
 export type ItemKind = TranscriptItem["kind"];
@@ -118,6 +120,53 @@ export type PendingAnswer = z.infer<typeof PendingAnswer>;
 // ---------------------------------------------------------------------------
 // Live session state
 
+export type SubagentStatus = "queued" | "running" | "completed" | "steered" | "stopped" | "aborted" | "error";
+
+export type SubagentProgress = {
+  id: string;
+  type: string;
+  description: string;
+  status: SubagentStatus;
+  background: boolean;
+  startedAt: number;
+  activity?: string;
+  model?: string;
+  toolUses: number;
+  turns: number;
+  tokens: number;
+  cost: number;
+  durationMs?: number;
+  output?: string;
+  error?: string;
+};
+
+export type GitFileStatus = "modified" | "added" | "deleted" | "renamed" | "copied" | "untracked" | "unmerged";
+
+export type GitFileChange = {
+  path: string;
+  from?: string;
+  status: GitFileStatus;
+  staged: boolean;
+  unstaged: boolean;
+  added?: number;
+  removed?: number;
+};
+
+export type GitStatus = {
+  isRepo: boolean;
+  branch?: string;
+  ahead?: number;
+  behind?: number;
+  files: GitFileChange[];
+};
+
+export type GitFileDiff = {
+  path: string;
+  patch: string;
+  binary?: boolean;
+  truncated?: boolean;
+};
+
 export type SessionState = {
   status: SessionStatus;
   modelId?: string;
@@ -135,6 +184,8 @@ export type SessionState = {
   pending: PendingRequest[];
   /** Status lines set by extensions (`ctx.ui.setStatus`). */
   statusLines: Record<string, string>;
+  /** Live progress of top-level sub-agents (foreground and background) in this session. */
+  subagents?: SubagentProgress[];
 };
 
 export type SlashCommand = { name: string; description: string; source: "builtin" | "extension" | "prompt" | "skill" };
@@ -203,6 +254,8 @@ export const ClientCommand = z.discriminatedUnion("type", [
   /** Reloads skills, prompts, extensions and MCP servers, for example after editing mcp.json. */
   z.object({ type: z.literal("session.reload"), ...SessionRef }),
   z.object({ type: z.literal("files.search"), requestId: RequestId, projectId: Id, query: z.string(), limit: z.number().int().positive().max(200) }),
+  z.object({ type: z.literal("git.status"), requestId: RequestId, projectId: Id }),
+  z.object({ type: z.literal("git.diff"), requestId: RequestId, projectId: Id, path: z.string().min(1), staged: z.boolean().optional() }),
 ]);
 export type ClientCommand = z.infer<typeof ClientCommand>;
 export type CommandType = ClientCommand["type"];
@@ -230,6 +283,8 @@ export interface CommandResults {
   "session.resources": { resources: SessionResources };
   "session.reload": Empty;
   "files.search": { files: string[] };
+  "git.status": { status: GitStatus };
+  "git.diff": { diff: GitFileDiff };
 }
 
 // ---------------------------------------------------------------------------

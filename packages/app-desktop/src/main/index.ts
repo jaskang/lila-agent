@@ -1,9 +1,13 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, protocol, shell } from "electron";
 import { DEFAULT_CORE_PORT, PROTOCOL_VERSION } from "@lila/protocol";
+
+protocol.registerSchemesAsPrivileged([
+  { scheme: "lila-media", privileges: { standard: true, secure: true, supportFetchAPI: true } },
+]);
 
 const port = Number(process.env.LILA_CORE_PORT ?? DEFAULT_CORE_PORT);
 const coreUrl = `http://127.0.0.1:${port}`;
@@ -11,6 +15,17 @@ const dataDir = process.env.LILA_DATA_DIR ?? join(app.getPath("appData"), "Lila"
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const LOCK_STALE_MS = 30_000;
 const BLOCKED_OPEN_EXTS = new Set([".app", ".command", ".sh", ".bash", ".zsh", ".exe", ".bat", ".cmd", ".dmg", ".pkg"]);
+const MEDIA_MIME: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".avif": "image/avif",
+  ".bmp": "image/bmp",
+  ".ico": "image/x-icon",
+};
 
 let window: BrowserWindow | undefined;
 let quitting = false;
@@ -191,7 +206,7 @@ function createWindow(): void {
     show: false,
     title: "Lila",
     titleBarStyle: "hiddenInset",
-    trafficLightPosition: { x: 14, y: 14 },
+    trafficLightPosition: { x: 18, y: 20 },
     webPreferences: {
       preload: join(import.meta.dirname, "../preload/index.cjs"),
       contextIsolation: true,
@@ -258,11 +273,74 @@ ipcMain.on("lila:reveal-path", (_event, path: string) => {
 
 ipcMain.on("lila:focus", () => showWindow());
 
+function resolveAllowedMedia(rawPath: string, rawBase: string | null): { path: string; mime: string } | undefined {
+  const candidates: string[] = [];
+  if (isAbsolute(rawPath)) {
+    candidates.push(resolve(rawPath));
+    // Web projects often reference files under public/ with a leading slash (e.g. /logo.svg).
+    if (rawBase && isAbsolute(rawBase)) {
+      const trimmed = rawPath.replace(/^\/+/, "");
+      if (trimmed) {
+        candidates.push(resolve(rawBase, trimmed));
+        candidates.push(resolve(rawBase, "public", trimmed));
+      }
+    }
+  } else if (rawBase && isAbsolute(rawBase)) {
+    candidates.push(resolve(rawBase, rawPath));
+  }
+
+  const roots = [...allowedRoots(false), tmpdir()].map((root) => {
+    try {
+      return realpathSync(root);
+    } catch {
+      return resolve(root);
+    }
+  });
+
+  for (const candidate of candidates) {
+    const mime = MEDIA_MIME[extname(candidate).toLowerCase()];
+    if (!mime || !existsSync(candidate)) continue;
+    try {
+      const realPath = realpathSync(candidate);
+      if (roots.some((root) => isWithin(root, realPath))) return { path: realPath, mime };
+    } catch {
+      // Ignore unreadable candidate and try fallback.
+    }
+  }
+  return undefined;
+}
+
+function registerMediaProtocol(): void {
+  protocol.handle("lila-media", (request) => {
+    if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+    const url = new URL(request.url);
+    const rawPath = url.searchParams.get("path");
+    if (!rawPath) return new Response("Bad Request", { status: 400 });
+    const resolved = resolveAllowedMedia(rawPath, url.searchParams.get("base"));
+    if (!resolved) return new Response("Not Found", { status: 404 });
+    try {
+      const data = readFileSync(resolved.path);
+      return new Response(data, {
+        status: 200,
+        headers: {
+          "Content-Type": resolved.mime,
+          "Cache-Control": "no-cache",
+          "Content-Security-Policy": "sandbox",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    } catch {
+      return new Response("Not Found", { status: 404 });
+    }
+  });
+}
+
 app.on("before-quit", () => {
   quitting = true;
 });
 
 void app.whenReady().then(() => {
+  registerMediaProtocol();
   createWindow();
   app.on("activate", showWindow);
 });

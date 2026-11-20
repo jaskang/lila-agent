@@ -70,6 +70,10 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         return { session: await host.createSession(command) };
       case "files.search":
         return { files: await host.searchFiles(command.projectId, command.query, command.limit) };
+      case "git.status":
+        return { status: await host.gitStatus(command.projectId) };
+      case "git.diff":
+        return { diff: await host.gitDiff(command.projectId, command.path, command.staged) };
       case "session.delete":
         await host.deleteSession(command.sessionId);
         return {};

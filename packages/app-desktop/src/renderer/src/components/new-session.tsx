@@ -26,9 +26,10 @@ export function NewSession() {
   const modelId = options.modelId && models.some((model) => model.id === options.modelId) ? options.modelId : defaultModelId;
   const model = models.find((item) => item.id === modelId);
 
+  const showTrigger = !open || isMobile;
   const header = (
-    <header className={cn("flex h-12 shrink-0 items-center px-4 [-webkit-app-region:drag]", !open && !isMobile && "pl-20")}>
-      <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" />
+    <header className={cn("flex h-10 shrink-0 items-center px-4 [-webkit-app-region:drag]", showTrigger && "pl-[74px]")}>
+      {showTrigger ? <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" /> : null}
     </header>
   );
 
@@ -36,12 +37,12 @@ export function NewSession() {
     return (
       <div className="flex min-h-0 flex-1 flex-col">
         {header}
-        <Empty className="flex-1 [-webkit-app-region:drag]">
+        <Empty className="flex-1">
           <EmptyHeader>
             <EmptyTitle>先添加一个项目</EmptyTitle>
             <EmptyDescription>选择一个本地代码目录，Agent 会在这个目录里工作。</EmptyDescription>
           </EmptyHeader>
-          <EmptyContent className="[-webkit-app-region:no-drag]">
+          <EmptyContent>
             <Button disabled={!connected} onClick={() => void actions.addProject().then((project) => project && actions.setNewSession({ projectId: project.id }))}>
               <FolderOpen />
               选择目录

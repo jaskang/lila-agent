@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Blocks, CircleAlert, FolderPlus, MessageCircleQuestion, MessageSquare, Minimize2, PanelLeft, RotateCw, Square, SquarePen } from "lucide-react";
+import { Blocks, CircleAlert, FolderPlus, GitBranch, MessageCircleQuestion, MessageSquare, Minimize2, PanelLeft, RotateCw, Square, SquarePen } from "lucide-react";
 import { CommandDialog, Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from "@/components/ui/command";
 import { useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
@@ -29,6 +29,10 @@ export function CommandPalette() {
           <CommandEmpty>没有匹配的结果</CommandEmpty>
           {selectedId ? (
             <CommandGroup heading="当前会话">
+              <CommandItem value="session-git 改动 diff git 工作区" onSelect={() => run(() => actions.setGitOpen(true))}>
+                <GitBranch />
+                查看工作区 Git 改动
+              </CommandItem>
               <CommandItem value="session-resources 能力 技能 MCP 扩展" onSelect={() => run(() => actions.setResourcesOpen(true))}>
                 <Blocks />
                 打开能力面板（技能 / MCP / 扩展）

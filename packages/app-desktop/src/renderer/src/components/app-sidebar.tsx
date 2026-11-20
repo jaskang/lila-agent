@@ -46,6 +46,7 @@ import {
   SidebarMenuSub,
   SidebarMenuSubButton,
   SidebarMenuSubItem,
+  SidebarTrigger,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { actions, useLila } from "@/lib/store";
@@ -86,41 +87,25 @@ function StatusIcon({ status }: { status: SessionSummary["status"] }) {
   return null;
 }
 
-/** Sessions a sub-agent ran, folded under the session that spawned them, as Pi's `/resume` shows them. */
+/** Active (running/waiting/error) or currently-viewed sub-agent sessions, shown directly under their parent. */
 function SubSessions({ sessions, selectedId }: { sessions: SessionSummary[]; selectedId: string | undefined }) {
-  const hasAttention = sessions.some((session) => session.id === selectedId || session.status !== "idle");
-  const [open, setOpen] = React.useState(hasAttention);
-  const prevAttention = React.useRef(hasAttention);
-  React.useEffect(() => {
-    // Auto-expand when a sub-agent becomes active or selected, while still allowing manual collapse afterwards.
-    if (hasAttention && !prevAttention.current) setOpen(true);
-    prevAttention.current = hasAttention;
-  }, [hasAttention]);
-  const summaryStatus = projectStatus(sessions);
+  const visible = sessions.filter((session) => session.status !== "idle" || session.id === selectedId);
+  if (!visible.length) return null;
   return (
     <SidebarMenuSub>
-      <SidebarMenuSubItem>
-        <SidebarMenuSubButton size="sm" render={<button type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)} />}>
-          {open ? <ChevronDown /> : <ChevronRight />}
-          <span className="text-muted-foreground">{sessions.length} 个子 Agent</span>
-          {!open ? <StatusIcon status={summaryStatus} /> : null}
-        </SidebarMenuSubButton>
-      </SidebarMenuSubItem>
-      {open
-        ? sessions.map((session) => (
-            <SidebarMenuSubItem key={session.id}>
-              <SidebarMenuSubButton
-                size="sm"
-                isActive={session.id === selectedId}
-                render={<button type="button" onClick={() => actions.select(session.id)} />}
-              >
-                <Bot />
-                <span className="truncate">{session.title}</span>
-                <StatusIcon status={session.status} />
-              </SidebarMenuSubButton>
-            </SidebarMenuSubItem>
-          ))
-        : null}
+      {visible.map((session) => (
+        <SidebarMenuSubItem key={session.id}>
+          <SidebarMenuSubButton
+            size="sm"
+            isActive={session.id === selectedId}
+            render={<button type="button" title={session.title} onClick={() => actions.select(session.id)} />}
+          >
+            <Bot />
+            <span className="truncate">{session.title}</span>
+            <StatusIcon status={session.status} />
+          </SidebarMenuSubButton>
+        </SidebarMenuSubItem>
+      ))}
     </SidebarMenuSub>
   );
 }
@@ -360,9 +345,11 @@ export function AppSidebar() {
     });
 
   return (
-    <Sidebar variant="inset">
-      {/* Leaves room for the macOS traffic lights; the strip also drags the window. */}
-      <SidebarHeader className="h-12 [-webkit-app-region:drag]" />
+    <Sidebar variant="inset" className="p-1.5">
+      {/* 6px outer inset + 40px header centers at y = 26px, matching the macOS traffic lights and main card toolbar. */}
+      <SidebarHeader className="mt-1.5 h-10 shrink-0 flex-row items-center gap-1 p-0 pr-1 pl-[74px] [-webkit-app-region:drag] md:mt-0">
+        <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" />
+      </SidebarHeader>
       <SidebarContent>
         <SidebarGroup className="gap-2">
           <SidebarMenu>

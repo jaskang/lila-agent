@@ -46,6 +46,7 @@ type State = {
   draftImages: Record<string, DraftImage[]>;
   paletteOpen: boolean;
   resourcesOpen: boolean;
+  gitOpen: boolean;
 };
 
 export const NEW_DRAFT = "new";
@@ -101,6 +102,7 @@ export const useLila = create<State>(() => ({
   draftImages: {},
   paletteOpen: false,
   resourcesOpen: false,
+  gitOpen: false,
 }));
 
 const set = useLila.setState;
@@ -309,7 +311,7 @@ function forget(sessionId: string): void {
     delete drafts[sessionId];
     const draftImages = { ...state.draftImages };
     delete draftImages[sessionId];
-    return { sessions, views, drafts, draftImages, ...(wasSelected ? { selectedId: undefined, resourcesOpen: false } : {}) };
+    return { sessions, views, drafts, draftImages, ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, gitOpen: false } : {}) };
   });
   if (wasSelected) {
     localStorage.removeItem(SELECTED_KEY);
@@ -365,7 +367,7 @@ async function attempt<T>(run: () => Promise<T>): Promise<T | undefined> {
 
 export const actions = {
   select(sessionId: string | undefined): void {
-    set({ selectedId: sessionId, resourcesOpen: false });
+    set({ selectedId: sessionId, resourcesOpen: false, gitOpen: false });
     if (sessionId) localStorage.setItem(SELECTED_KEY, sessionId);
     else localStorage.removeItem(SELECTED_KEY);
     if (sessionId && get().connection === "connected") void openSession(sessionId);
@@ -404,6 +406,10 @@ export const actions = {
 
   setResourcesOpen(open: boolean): void {
     set({ resourcesOpen: open });
+  },
+
+  setGitOpen(open: boolean): void {
+    set({ gitOpen: open });
   },
 
   retryModels: loadModels,
@@ -458,7 +464,7 @@ export const actions = {
         drafts,
         draftImages,
         newSession: nextNewSession,
-        ...(wasSelected ? { selectedId: undefined, resourcesOpen: false } : {}),
+        ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, gitOpen: false } : {}),
       };
     });
     if (wasSelected) {
@@ -562,6 +568,14 @@ export const actions = {
     } catch {
       return [];
     }
+  },
+
+  async gitStatus(projectId: string) {
+    return (await client.call({ type: "git.status", projectId })).status;
+  },
+
+  async gitDiff(projectId: string, path: string, staged?: boolean) {
+    return (await client.call({ type: "git.diff", projectId, path, ...(staged !== undefined ? { staged } : {}) })).diff;
   },
 
   async loadEarlier(sessionId: string): Promise<void> {

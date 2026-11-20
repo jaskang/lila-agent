@@ -1,0 +1,240 @@
+import { execFile } from "node:child_process";
+import { existsSync, openSync, closeSync, readSync, statSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
+import { promisify } from "node:util";
+import type { GitFileChange, GitFileDiff, GitFileStatus, GitStatus } from "@lila/protocol";
+import { UserError } from "./errors.ts";
+
+const execFileAsync = promisify(execFile);
+const MAX_BUFFER = 16 * 1024 * 1024;
+const MAX_PATCH_CHARS = 120_000;
+const MAX_UNTRACKED_BYTES = 128 * 1024;
+
+type GitExecResult = { stdout: string; stderr: string; code: number };
+
+async function runGit(cwd: string, args: string[]): Promise<GitExecResult> {
+  try {
+    const { stdout, stderr } = await execFileAsync("git", args, { cwd, maxBuffer: MAX_BUFFER });
+    return { stdout, stderr, code: 0 };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number | string };
+    if (err.code === "ENOENT") throw new UserError("系统未安装 git");
+    return {
+      stdout: typeof err.stdout === "string" ? err.stdout : "",
+      stderr: typeof err.stderr === "string" ? err.stderr : "",
+      code: typeof err.code === "number" ? err.code : 1,
+    };
+  }
+}
+
+function mapStatusChar(x: string, y: string): GitFileStatus {
+  const pair = `${x}${y}`;
+  if (pair.includes("U") || pair === "AA" || pair === "DD") return "unmerged";
+  if (x === "R" || y === "R") return "renamed";
+  if (x === "C" || y === "C") return "copied";
+  if (x === "A" || y === "A") return "added";
+  if (x === "D" || y === "D") return "deleted";
+  return "modified";
+}
+
+/** Splits the path field off a porcelain v2 line (`n` space-separated header fields before the path). */
+function fieldAfter(record: string, spaces: number): string {
+  let pos = 0;
+  for (let i = 0; i < spaces; i++) {
+    const next = record.indexOf(" ", pos);
+    if (next < 0) return "";
+    pos = next + 1;
+  }
+  return record.slice(pos);
+}
+
+/** Parses `git diff --numstat -z` into per-path added/removed totals. */
+function parseNumstatZ(output: string): Map<string, { added: number; removed: number }> {
+  const stats = new Map<string, { added: number; removed: number }>();
+  if (!output) return stats;
+  const parts = output.split("\0");
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part) continue;
+    const firstTab = part.indexOf("\t");
+    if (firstTab < 0) continue;
+    const secondTab = part.indexOf("\t", firstTab + 1);
+    if (secondTab < 0) continue;
+    const addedRaw = part.slice(0, firstTab);
+    const removedRaw = part.slice(firstTab + 1, secondTab);
+    let path = part.slice(secondTab + 1);
+    if (!path) {
+      // Rename/copy format in `-z`: `<added>\t<removed>\t\0<orig>\0<new>\0`
+      i += 2;
+      path = parts[i] ?? "";
+    }
+    if (!path || addedRaw === "-" || removedRaw === "-") continue;
+    const added = Number(addedRaw);
+    const removed = Number(removedRaw);
+    if (!Number.isFinite(added) || !Number.isFinite(removed)) continue;
+    const existing = stats.get(path);
+    stats.set(path, { added: (existing?.added ?? 0) + added, removed: (existing?.removed ?? 0) + removed });
+  }
+  return stats;
+}
+
+/** Working-tree git status for a project directory. */
+export async function gitStatus(cwd: string): Promise<GitStatus> {
+  const statusResult = await runGit(cwd, ["status", "--porcelain=v2", "--branch", "-z", "-uall"]);
+  if (statusResult.code !== 0) {
+    if (/not a git repository/i.test(statusResult.stderr)) return { isRepo: false, files: [] };
+    throw new UserError(`读取 Git 状态失败：${statusResult.stderr.trim() || "未知错误"}`);
+  }
+
+  let branch: string | undefined;
+  let ahead: number | undefined;
+  let behind: number | undefined;
+  const files: GitFileChange[] = [];
+
+  const records = statusResult.stdout.split("\0");
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (!record) continue;
+    if (record.startsWith("# branch.head ")) {
+      const value = record.slice("# branch.head ".length).trim();
+      branch = value === "(detached)" ? "HEAD (detached)" : value;
+    } else if (record.startsWith("# branch.ab ")) {
+      const match = /\+(\d+)\s+-(\d+)/.exec(record);
+      if (match) {
+        ahead = Number(match[1]);
+        behind = Number(match[2]);
+      }
+    } else if (record.startsWith("1 ")) {
+      const xy = record.slice(2, 4);
+      const path = fieldAfter(record, 8);
+      if (!path) continue;
+      files.push({
+        path,
+        status: mapStatusChar(xy[0] ?? ".", xy[1] ?? "."),
+        staged: xy[0] !== ".",
+        unstaged: xy[1] !== ".",
+      });
+    } else if (record.startsWith("2 ")) {
+      const xy = record.slice(2, 4);
+      const path = fieldAfter(record, 9);
+      const from = records[++i] ?? "";
+      if (!path) continue;
+      files.push({
+        path,
+        ...(from ? { from } : {}),
+        status: mapStatusChar(xy[0] ?? ".", xy[1] ?? "."),
+        staged: xy[0] !== ".",
+        unstaged: xy[1] !== ".",
+      });
+    } else if (record.startsWith("u ")) {
+      const path = fieldAfter(record, 10);
+      if (!path) continue;
+      files.push({ path, status: "unmerged", staged: true, unstaged: true });
+    } else if (record.startsWith("? ")) {
+      const path = record.slice(2);
+      if (!path) continue;
+      files.push({ path, status: "untracked", staged: false, unstaged: true });
+    }
+  }
+
+  const [unstagedStats, stagedStats] = await Promise.all([
+    runGit(cwd, ["diff", "--numstat", "-z"]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
+    runGit(cwd, ["diff", "--cached", "--numstat", "-z"]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
+  ]);
+
+  for (const file of files) {
+    const a = unstagedStats.get(file.path);
+    const b = stagedStats.get(file.path);
+    if (a || b) {
+      file.added = (a?.added ?? 0) + (b?.added ?? 0);
+      file.removed = (a?.removed ?? 0) + (b?.removed ?? 0);
+    }
+  }
+
+  files.sort((a, b) => {
+    if (a.status === "unmerged" && b.status !== "unmerged") return -1;
+    if (b.status === "unmerged" && a.status !== "unmerged") return 1;
+    return a.path.localeCompare(b.path);
+  });
+
+  return {
+    isRepo: true,
+    ...(branch ? { branch } : {}),
+    ...(ahead !== undefined ? { ahead } : {}),
+    ...(behind !== undefined ? { behind } : {}),
+    files,
+  };
+}
+
+function assertInsideRepo(cwd: string, filePath: string): string {
+  const root = resolve(cwd);
+  const full = resolve(root, filePath);
+  const rel = relative(root, full);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new UserError(`文件路径不在项目目录内：${filePath}`);
+  }
+  return full;
+}
+
+function synthesizeUntrackedPatch(filePath: string, fullPath: string): GitFileDiff {
+  if (!existsSync(fullPath)) return { path: filePath, patch: "" };
+  const stat = statSync(fullPath);
+  if (!stat.isFile()) return { path: filePath, patch: "" };
+  const bytesToRead = Math.min(stat.size, MAX_UNTRACKED_BYTES);
+  const buffer = Buffer.alloc(bytesToRead);
+  const fd = openSync(fullPath, "r");
+  try {
+    readSync(fd, buffer, 0, bytesToRead, 0);
+  } finally {
+    closeSync(fd);
+  }
+  const sampleLen = Math.min(bytesToRead, 8192);
+  for (let i = 0; i < sampleLen; i++) {
+    if (buffer[i] === 0) return { path: filePath, patch: "", binary: true };
+  }
+  const text = buffer.toString("utf8");
+  const lines = text === "" ? [] : text.replace(/\n$/, "").split("\n");
+  const body = lines.map((line) => `+${line}`).join("\n");
+  const patch = `--- /dev/null\n+++ b/${filePath}\n@@ -0,0 +1,${lines.length} @@\n${body}`;
+  return clipPatch(filePath, patch, stat.size > MAX_UNTRACKED_BYTES);
+}
+
+function clipPatch(filePath: string, patch: string, alreadyTruncated = false): GitFileDiff {
+  if (/^Binary files .* differ$/m.test(patch) || /^GIT binary patch$/m.test(patch)) {
+    return { path: filePath, patch: "", binary: true };
+  }
+  if (patch.length <= MAX_PATCH_CHARS) {
+    return { path: filePath, patch, ...(alreadyTruncated ? { truncated: true } : {}) };
+  }
+  const cut = patch.lastIndexOf("\n", MAX_PATCH_CHARS);
+  return { path: filePath, patch: patch.slice(0, cut > 0 ? cut : MAX_PATCH_CHARS), truncated: true };
+}
+
+/** Unified diff for one file in a project repository. */
+export async function gitDiff(cwd: string, filePath: string, staged?: boolean): Promise<GitFileDiff> {
+  const fullPath = assertInsideRepo(cwd, filePath);
+
+  if (staged === true) {
+    const res = await runGit(cwd, ["diff", "--cached", "--", filePath]);
+    return clipPatch(filePath, res.stdout);
+  }
+
+  const untrackedCheck = await runGit(cwd, ["ls-files", "--others", "--exclude-standard", "--", filePath]);
+  const isUntracked = untrackedCheck.code === 0 && untrackedCheck.stdout.trim().length > 0;
+  if (isUntracked) return synthesizeUntrackedPatch(filePath, fullPath);
+
+  if (staged === false) {
+    const res = await runGit(cwd, ["diff", "--", filePath]);
+    return clipPatch(filePath, res.stdout);
+  }
+
+  const combined = await runGit(cwd, ["diff", "HEAD", "--", filePath]);
+  if (combined.code === 0) return clipPatch(filePath, combined.stdout);
+
+  // Unborn HEAD (brand-new repo with no commits yet): fall back to cached + unstaged.
+  const [cached, work] = await Promise.all([
+    runGit(cwd, ["diff", "--cached", "--", filePath]),
+    runGit(cwd, ["diff", "--", filePath]),
+  ]);
+  return clipPatch(filePath, [cached.stdout.trimEnd(), work.stdout.trimEnd()].filter(Boolean).join("\n"));
+}

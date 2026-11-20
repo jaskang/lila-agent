@@ -27,7 +27,7 @@ function ConnectionBanner() {
   }, [connection]);
   if (!visible || connection === "connected") return null;
   return (
-    <div className="absolute inset-x-0 top-14 z-20 mx-auto w-fit max-w-lg px-4">
+    <div className="absolute inset-x-0 top-12 z-20 mx-auto w-fit max-w-lg px-4">
       <Alert variant={connection === "incompatible" ? "destructive" : "default"} className="shadow-md">
         {connection === "connecting" ? <Spinner /> : <WifiOff />}
         <AlertTitle>{connection === "incompatible" ? "core 版本不匹配" : connection === "connecting" ? "正在连接 core…" : "与 core 的连接断开了"}</AlertTitle>
@@ -72,7 +72,7 @@ export function App() {
     <TooltipProvider>
       <SidebarProvider className="h-svh min-h-0">
         <AppSidebar />
-        <SidebarInset className="relative min-h-0 overflow-hidden">
+        <SidebarInset className="relative m-1.5 min-h-0 overflow-hidden rounded-xl bg-background shadow-sm ring-1 ring-border/60 md:peer-data-[variant=inset]:m-1.5 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-1.5">
           <ConnectionBanner />
           {selectedId ? <Conversation key={selectedId} sessionId={selectedId} /> : <NewSession />}
         </SidebarInset>

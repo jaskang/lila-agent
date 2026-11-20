@@ -105,8 +105,148 @@ export function withToolResult(item: ToolItem, result: ToolResultLike | undefine
   return next;
 }
 
-function customItem(message: { customType: string; content: CustomMessage["content"] }, id: string): TranscriptItem {
-  return { kind: "custom", id, customType: message.customType, text: contentText(message.content) };
+type SubagentNotificationSummary = {
+  id?: string;
+  description: string;
+  status: string;
+  toolUses?: number;
+  turnCount?: number;
+  totalTokens?: number;
+  totalCost?: number;
+  durationMs?: number;
+  error?: string;
+  preview?: string;
+};
+
+function unescapeXml(text: string): string {
+  return text
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
+}
+
+function cleanNotificationPreview(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const cleaned = raw
+    .replace(/\n?\.\.\.\(truncated,\s*use get_subagent_result for full output\)\s*$/i, "…")
+    .replace(/\n?Full transcript available at:[^\n]*$/gim, "")
+    .trim();
+  if (!cleaned || cleaned === "No output.") return undefined;
+  return cleaned;
+}
+
+function normalizeNotificationDetail(raw: unknown): SubagentNotificationSummary | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const d = raw as Record<string, unknown>;
+  if (typeof d.description !== "string" && typeof d.id !== "string") return undefined;
+  const preview = cleanNotificationPreview(typeof d.resultPreview === "string" ? d.resultPreview : undefined);
+  return {
+    ...(typeof d.id === "string" && d.id ? { id: d.id } : {}),
+    description: typeof d.description === "string" && d.description ? d.description : "子 Agent",
+    status: typeof d.status === "string" && d.status ? d.status : "completed",
+    ...(typeof d.toolUses === "number" && d.toolUses > 0 ? { toolUses: d.toolUses } : {}),
+    ...(typeof d.turnCount === "number" && d.turnCount > 0 ? { turnCount: d.turnCount } : {}),
+    ...(typeof d.totalTokens === "number" && d.totalTokens > 0 ? { totalTokens: d.totalTokens } : {}),
+    ...(typeof d.totalCost === "number" && d.totalCost > 0 ? { totalCost: d.totalCost } : {}),
+    ...(typeof d.durationMs === "number" && d.durationMs > 0 ? { durationMs: d.durationMs } : {}),
+    ...(typeof d.error === "string" && d.error ? { error: d.error } : {}),
+    ...(preview ? { preview } : {}),
+  };
+}
+
+function xmlTag(block: string, tag: string): string | undefined {
+  const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(block);
+  return match?.[1] !== undefined ? unescapeXml(match[1]) : undefined;
+}
+
+function parseTaskNotificationXml(rawText: string): SubagentNotificationSummary[] {
+  const blocks = [...rawText.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)];
+  const parsed: SubagentNotificationSummary[] = [];
+  for (const match of blocks) {
+    const body = match[1] ?? "";
+    const id = xmlTag(body, "task-id")?.trim();
+    const statusRaw = xmlTag(body, "status")?.trim() ?? "completed";
+    const summary = xmlTag(body, "summary")?.trim() ?? "";
+    const descMatch = /^Agent\s+"([^"]+)"/i.exec(summary);
+    const description = descMatch?.[1] || summary || "子 Agent";
+    const statusLower = statusRaw.toLowerCase();
+    const status =
+      statusLower === "done" || statusLower === "completed"
+        ? "completed"
+        : statusLower.includes("abort")
+          ? "aborted"
+          : statusLower.includes("stop")
+            ? "stopped"
+            : statusLower.includes("err") || statusLower.includes("fail")
+              ? "error"
+              : statusRaw;
+    const totalTokens = Number(xmlTag(body, "total_tokens"));
+    const toolUses = Number(xmlTag(body, "tool_uses"));
+    const totalCost = Number(xmlTag(body, "estimated_cost_usd"));
+    const durationMs = Number(xmlTag(body, "duration_ms"));
+    const preview = cleanNotificationPreview(xmlTag(body, "result"));
+    parsed.push({
+      ...(id ? { id } : {}),
+      description,
+      status,
+      ...(Number.isFinite(toolUses) && toolUses > 0 ? { toolUses } : {}),
+      ...(Number.isFinite(totalTokens) && totalTokens > 0 ? { totalTokens } : {}),
+      ...(Number.isFinite(totalCost) && totalCost > 0 ? { totalCost } : {}),
+      ...(Number.isFinite(durationMs) && durationMs > 0 ? { durationMs } : {}),
+      ...(preview ? { preview } : {}),
+    });
+  }
+  return parsed;
+}
+
+function projectSubagentNotification(rawText: string, details: unknown): { text: string; details?: Record<string, unknown> } {
+  const notifications: SubagentNotificationSummary[] = [];
+  if (details && typeof details === "object" && !Array.isArray(details)) {
+    const record = details as Record<string, unknown>;
+    const first = normalizeNotificationDetail(record);
+    if (first) notifications.push(first);
+    if (Array.isArray(record.others)) {
+      for (const other of record.others) {
+        const normalized = normalizeNotificationDetail(other);
+        if (normalized) notifications.push(normalized);
+      }
+    }
+  }
+  if (!notifications.length) {
+    notifications.push(...parseTaskNotificationXml(rawText));
+  }
+  if (!notifications.length) {
+    return { text: cleanNotificationPreview(rawText) ?? "" };
+  }
+  // Clean markdown fallback for any client that only renders `item.text`.
+  const markdown = notifications
+    .map((entry) => {
+      const header = notifications.length > 1 ? `**${entry.description}**` : "";
+      return [header, entry.error ?? entry.preview ?? ""].filter(Boolean).join("\n\n");
+    })
+    .filter(Boolean)
+    .join("\n\n---\n\n");
+  return {
+    text: markdown,
+    details: { notifications },
+  };
+}
+
+export function customItem(message: { customType: string; content: CustomMessage["content"]; details?: unknown }, id: string): TranscriptItem {
+  const rawText = contentText(message.content);
+  if (message.customType === "subagent-notification") {
+    const projected = projectSubagentNotification(rawText, message.details);
+    return {
+      kind: "custom",
+      id,
+      customType: message.customType,
+      text: projected.text,
+      ...(projected.details ? { details: projected.details } : {}),
+    };
+  }
+  return { kind: "custom", id, customType: message.customType, text: rawText };
 }
 
 export type ProjectOptions = {
@@ -134,13 +274,23 @@ function uniqueId(counts: Map<string, number>, base: string): string {
 export function projectBranch(entries: readonly SessionEntry[], options: ProjectOptions = {}): TranscriptItem[] {
   const items: TranscriptItem[] = [];
   const toolIndex = new Map<string, number>();
+  /** Maps pi-subagents `agentId` → index of its `Agent` tool item so persisted `subagents:record` updates it. */
+  const agentIndex = new Map<string, number>();
   const idCounts = new Map<string, number>();
   let lastAssistantTools: string[] = [];
   let sawMessage = false;
 
+  const trackAgent = (item: ToolItem, index: number) => {
+    if (item.name === "Agent" && typeof item.details?.agentId === "string" && item.details.agentId) {
+      agentIndex.set(item.details.agentId, index);
+    }
+  };
+
   const addTool = (item: ToolItem) => {
-    toolIndex.set(item.id, items.length);
+    const index = items.length;
+    toolIndex.set(item.id, index);
     items.push(item);
+    trackAgent(item, index);
   };
 
   for (const entry of entries) {
@@ -168,8 +318,12 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
             const index = toolIndex.get(result.toolCallId);
             const base: ToolItem = index !== undefined ? (items[index] as ToolItem) : { kind: "tool", id: result.toolCallId, name: result.toolName, args: {}, status: "running", output: "" };
             const next = withToolResult(base, result as ToolResultLike, result.isError ? "error" : "done", result.durationMs);
-            if (index !== undefined) items[index] = next;
-            else addTool(next);
+            if (index !== undefined) {
+              items[index] = next;
+              trackAgent(next, index);
+            } else {
+              addTool(next);
+            }
             break;
           }
           case "bashExecution":
@@ -188,6 +342,36 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
             break;
           default:
             break;
+        }
+        break;
+      }
+      case "custom": {
+        if (entry.customType === "subagents:record" && entry.data && typeof entry.data === "object") {
+          const record = entry.data as Record<string, unknown>;
+          const id = typeof record.id === "string" ? record.id : undefined;
+          const index = id ? agentIndex.get(id) : undefined;
+          if (index !== undefined) {
+            const existing = items[index] as ToolItem;
+            const status = typeof record.status === "string" ? record.status : undefined;
+            const startedAt = typeof record.startedAt === "number" ? record.startedAt : undefined;
+            const completedAt = typeof record.completedAt === "number" ? record.completedAt : undefined;
+            const durationMs = startedAt !== undefined && completedAt !== undefined && completedAt >= startedAt ? completedAt - startedAt : undefined;
+            const isErr = status === "error" || status === "aborted" || status === "stopped";
+            const nextDetails: Record<string, unknown> = {
+              ...existing.details,
+              ...(status ? { status } : {}),
+              ...(durationMs !== undefined ? { durationMs } : {}),
+              ...(typeof record.error === "string" && record.error ? { error: record.error } : {}),
+            };
+            const output = typeof record.result === "string" && record.result ? clipOutput(record.result) : existing.output;
+            items[index] = {
+              ...existing,
+              status: isErr ? "error" : "done",
+              output,
+              details: nextDetails,
+              ...(durationMs !== undefined ? { durationMs } : {}),
+            };
+          }
         }
         break;
       }

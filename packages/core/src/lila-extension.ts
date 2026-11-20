@@ -2,12 +2,34 @@ import type { AgentToolResult, ExtensionAPI, ExtensionFactory } from "@earendil-
 import type { ApprovalMode, PendingAnswer, PendingRequest } from "@lila/protocol";
 import { Type } from "typebox";
 
+export type SubagentBusEvent =
+  | { type: "created"; id: string; agentType: string; description: string; isBackground: boolean }
+  | { type: "started"; id: string; agentType: string; description: string }
+  | { type: "usage"; id: string; agentType: string; description: string; model?: string; depth?: number; tokens: number; cost: number }
+  | { type: "compacted"; id: string; compactionCount?: number }
+  | { type: "steered"; id: string; message?: string }
+  | {
+      type: "finished";
+      id: string;
+      agentType: string;
+      description: string;
+      status: string;
+      toolUses?: number;
+      durationMs?: number;
+      tokens?: number;
+      cost?: number;
+      result?: string;
+      error?: string;
+    }
+  | { type: "disposed" };
+
 /** What the inline extension needs from the live session that hosts it. */
 export interface LilaBridge {
   readonly approvalMode: ApprovalMode;
   /** Tools the user answered "always" for, in this session. */
   readonly allowedTools: Set<string>;
   request(request: Omit<PendingRequest, "id">, options?: { signal?: AbortSignal; timeout?: number }): Promise<PendingAnswer | undefined>;
+  onSubagentEvent?(event: SubagentBusEvent): void;
 }
 
 const READ_ONLY_TOOLS: Record<string, true> = {
@@ -46,9 +68,140 @@ const AskUserParams = Type.Object({
 
 type AskUserDetails = { skipped?: boolean; answers?: Extract<PendingAnswer, { type: "ask" }>["answers"] };
 
-/** Tool approvals and the `ask_user` tool, bound to one live session. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function asStr(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function asNum(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function usageSummary(rawUsage: unknown, rawTokens?: unknown): { tokens: number; cost: number } {
+  const usage = asRecord(rawUsage);
+  const tokensRecord = asRecord(rawTokens);
+  const costRecord = asRecord(usage?.cost);
+  const tokens = asNum(tokensRecord?.total) ?? asNum(usage?.totalTokens) ?? ((asNum(usage?.input) ?? 0) + (asNum(usage?.output) ?? 0));
+  const cost = asNum(costRecord?.total) ?? 0;
+  return { tokens, cost };
+}
+
+/** Tool approvals, `ask_user`, and live subagent progress forwarding bound to one live session. */
 export function createLilaExtension(bridge: LilaBridge): ExtensionFactory {
   return (pi: ExtensionAPI) => {
+    const unsubs: Array<() => void> = [];
+    if (bridge.onSubagentEvent) {
+      const emit = bridge.onSubagentEvent.bind(bridge);
+      unsubs.push(
+        pi.events.on("subagents:created", (raw) => {
+          const data = asRecord(raw);
+          const id = asStr(data?.id);
+          if (!id) return;
+          emit({
+            type: "created",
+            id,
+            agentType: asStr(data?.type) ?? "Agent",
+            description: asStr(data?.description) ?? "",
+            isBackground: Boolean(data?.isBackground),
+          });
+        }),
+        pi.events.on("subagents:started", (raw) => {
+          const data = asRecord(raw);
+          const id = asStr(data?.id);
+          if (!id) return;
+          emit({
+            type: "started",
+            id,
+            agentType: asStr(data?.type) ?? "Agent",
+            description: asStr(data?.description) ?? "",
+          });
+        }),
+        pi.events.on("subagents:usage", (raw) => {
+          const data = asRecord(raw);
+          const id = asStr(data?.id);
+          if (!id) return;
+          const depth = asNum(data?.depth);
+          const model = asStr(data?.model);
+          const { tokens, cost } = usageSummary(data?.usage);
+          emit({
+            type: "usage",
+            id,
+            agentType: asStr(data?.type) ?? "Agent",
+            description: asStr(data?.description) ?? "",
+            ...(model ? { model } : {}),
+            ...(depth !== undefined ? { depth } : {}),
+            tokens,
+            cost,
+          });
+        }),
+        pi.events.on("subagents:compacted", (raw) => {
+          const data = asRecord(raw);
+          const id = asStr(data?.id);
+          if (!id) return;
+          const compactionCount = asNum(data?.compactionCount);
+          emit({ type: "compacted", id, ...(compactionCount !== undefined ? { compactionCount } : {}) });
+        }),
+        pi.events.on("subagents:steered", (raw) => {
+          const data = asRecord(raw);
+          const id = asStr(data?.id);
+          if (!id) return;
+          const message = asStr(data?.message);
+          emit({ type: "steered", id, ...(message ? { message } : {}) });
+        }),
+        pi.events.on("subagents:completed", (raw) => {
+          const data = asRecord(raw);
+          const id = asStr(data?.id);
+          if (!id) return;
+          const { tokens, cost } = usageSummary(data?.usage, data?.tokens);
+          const toolUses = asNum(data?.toolUses);
+          const durationMs = asNum(data?.durationMs);
+          const result = asStr(data?.result);
+          emit({
+            type: "finished",
+            id,
+            agentType: asStr(data?.type) ?? "Agent",
+            description: asStr(data?.description) ?? "",
+            status: asStr(data?.status) ?? "completed",
+            ...(toolUses !== undefined ? { toolUses } : {}),
+            ...(durationMs !== undefined ? { durationMs } : {}),
+            ...(tokens > 0 ? { tokens } : {}),
+            ...(cost > 0 ? { cost } : {}),
+            ...(result ? { result: result.length > 8_000 ? `${result.slice(0, 8_000)}\n…` : result } : {}),
+          });
+        }),
+        pi.events.on("subagents:failed", (raw) => {
+          const data = asRecord(raw);
+          const id = asStr(data?.id);
+          if (!id) return;
+          const { tokens, cost } = usageSummary(data?.usage, data?.tokens);
+          const toolUses = asNum(data?.toolUses);
+          const durationMs = asNum(data?.durationMs);
+          const result = asStr(data?.result);
+          const error = asStr(data?.error);
+          emit({
+            type: "finished",
+            id,
+            agentType: asStr(data?.type) ?? "Agent",
+            description: asStr(data?.description) ?? "",
+            status: asStr(data?.status) ?? "error",
+            ...(toolUses !== undefined ? { toolUses } : {}),
+            ...(durationMs !== undefined ? { durationMs } : {}),
+            ...(tokens > 0 ? { tokens } : {}),
+            ...(cost > 0 ? { cost } : {}),
+            ...(result ? { result: result.length > 8_000 ? `${result.slice(0, 8_000)}\n…` : result } : {}),
+            ...(error ? { error } : {}),
+          });
+        }),
+        pi.events.on("subagents:disposed", () => emit({ type: "disposed" })),
+      );
+      pi.on("session_shutdown", () => {
+        for (const unsub of unsubs.splice(0)) unsub();
+      });
+    }
+
     pi.on("tool_call", async (event, ctx) => {
       // Calls a tool makes (codemode scripts) follow the decision about the calling tool.
       if (event.parentToolCallId) return;
