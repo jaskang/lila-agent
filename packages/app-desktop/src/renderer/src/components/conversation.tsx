@@ -1,13 +1,13 @@
 import * as React from "react";
 import { ArrowLeft, ArrowUpRight, Blocks, Bot, ChevronDown, ChevronRight, ChevronUp, GitBranch, RotateCw } from "lucide-react";
-import type { SessionState, SubagentProgress, TranscriptItem } from "@lila/protocol";
+import type { GitStatus, SessionState, SubagentProgress, TranscriptItem } from "@lila/protocol";
+import { AgentGroup, type AgentToolItem, findMatchingSubSession } from "@/components/agent-card";
 import { Composer } from "@/components/composer";
 import { GitSheet } from "@/components/git-sheet";
 import { MarkdownBasePathProvider } from "@/components/markdown";
 import { PendingPanel } from "@/components/pending-panel";
 import { ResourcesSheet } from "@/components/resources-sheet";
 import { ApprovalSelect, ContextUsage, ModelPicker, ThinkingSelect } from "@/components/session-controls";
-import { AgentGroup, findMatchingSubSession, formatCompactTokens } from "@/components/tool-call";
 import { TranscriptEntry } from "@/components/transcript-item";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,7 +25,20 @@ import {
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "cn";
-import { actions, emptyView, useLila } from "@/lib/store";
+import { formatCompactTokens, formatElapsed } from "@/lib/format";
+import { actions, EMPTY_VIEW, useLila } from "@/lib/store";
+
+const ABORT_ARM_MS = 1_500;
+const BLOCKING_OVERLAY_SELECTOR = [
+  '[data-slot="dialog-content"]',
+  '[data-slot="alert-dialog-content"]',
+  '[data-slot="sheet-content"]',
+  '[data-slot="popover-content"]',
+  '[data-slot="select-content"]',
+  '[data-slot="combobox-content"]',
+  '[data-slot="dropdown-menu-content"]',
+  "[data-composer-suggest]",
+].join(", ");
 
 function SessionToolbar({
   sessionId,
@@ -45,19 +58,38 @@ function SessionToolbar({
   const [editing, setEditing] = React.useState(false);
   const [title, setTitle] = React.useState(session?.title ?? "");
   const inputRef = React.useRef<HTMLInputElement>(null);
+  const savingRef = React.useRef(false);
+
+  const startEditing = () => {
+    setTitle(session?.title ?? "");
+    setEditing(true);
+  };
 
   React.useEffect(() => {
     if (!editing) return;
-    setTitle(session?.title ?? "");
     requestAnimationFrame(() => {
       inputRef.current?.focus();
       inputRef.current?.select();
     });
-  }, [editing, session?.title]);
+  }, [editing]);
 
   async function saveTitle(): Promise<void> {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    const currentTitle = session?.title ?? "";
     const next = title.trim();
-    if (!next || next === session?.title || (await actions.rename(sessionId, next))) setEditing(false);
+    try {
+      if (!next || next === currentTitle) {
+        setTitle(currentTitle);
+        setEditing(false);
+        return;
+      }
+      const ok = await actions.rename(sessionId, next);
+      if (!ok) setTitle(currentTitle);
+      setEditing(false);
+    } finally {
+      savingRef.current = false;
+    }
   }
 
   const showTrigger = !open || isMobile;
@@ -89,15 +121,21 @@ function SessionToolbar({
             onBlur={() => void saveTitle()}
             onKeyDown={(event) => {
               if (event.nativeEvent.isComposing) return;
-              if (event.key === "Enter") void saveTitle();
-              if (event.key === "Escape") setEditing(false);
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void saveTitle();
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                setTitle(session?.title ?? "");
+                setEditing(false);
+              }
             }}
           />
         ) : (
           <h1
             className="cursor-text truncate text-sm font-medium [-webkit-app-region:no-drag]"
             title="双击重命名"
-            onDoubleClick={() => setEditing(true)}
+            onDoubleClick={startEditing}
           >
             {session?.title || "新会话"}
           </h1>
@@ -148,7 +186,7 @@ function StatusLines({ lines }: { lines: Record<string, string> }) {
   return (
     <div className="flex flex-wrap gap-x-3 gap-y-0.5 px-1 text-xs text-muted-foreground">
       {entries.map(([key, text]) => (
-        <span key={key} className="truncate" title={`${key}: ${text}`}>
+        <span key={key} className="min-w-0 max-w-full truncate" title={`${key}: ${text}`}>
           {text}
         </span>
       ))}
@@ -156,20 +194,16 @@ function StatusLines({ lines }: { lines: Record<string, string> }) {
   );
 }
 
-function elapsedLabel(startedAt: number, now: number): string {
-  const seconds = Math.max(0, Math.floor((now - startedAt) / 1_000));
-  if (seconds < 60) return `${seconds}s`;
-  return `${Math.floor(seconds / 60)}m${seconds % 60}s`;
-}
-
 function ActiveSubagentRow({ sessionId, subagent, now }: { sessionId: string; subagent: SubagentProgress; now: number }) {
-  const targetSessionId = useLila((store) => findMatchingSubSession(store.sessions, sessionId, { agentId: subagent.id, description: subagent.description }));
+  const targetSessionId = useLila((store) =>
+    findMatchingSubSession(store.childrenByParent[sessionId], { agentId: subagent.id, description: subagent.description }),
+  );
   const stats = [
     subagent.turns ? `${subagent.turns} 轮` : undefined,
     subagent.toolUses ? `${subagent.toolUses} 次工具` : undefined,
     subagent.tokens ? formatCompactTokens(subagent.tokens) : undefined,
     subagent.cost ? `$${subagent.cost.toFixed(4)}` : undefined,
-    elapsedLabel(subagent.startedAt, now),
+    formatElapsed(subagent.startedAt, now),
   ].filter(Boolean);
 
   return (
@@ -191,7 +225,7 @@ function ActiveSubagentRow({ sessionId, subagent, now }: { sessionId: string; su
       <span className="hidden shrink-0 text-muted-foreground tabular-nums sm:inline">{stats.join(" · ")}</span>
       {targetSessionId ? (
         <Button type="button" size="xs" variant="ghost" className="h-6 shrink-0 px-1.5 text-muted-foreground" onClick={() => actions.select(targetSessionId)}>
-          查看
+          子会话
           <ArrowUpRight />
         </Button>
       ) : null}
@@ -199,7 +233,31 @@ function ActiveSubagentRow({ sessionId, subagent, now }: { sessionId: string; su
   );
 }
 
-type AgentToolItem = Extract<TranscriptItem, { kind: "tool" }>;
+function SingleForegroundSubagentSummary({ sessionId, subagent, now }: { sessionId: string; subagent: SubagentProgress; now: number }) {
+  const targetSessionId = useLila((store) =>
+    findMatchingSubSession(store.childrenByParent[sessionId], { agentId: subagent.id, description: subagent.description }),
+  );
+  const stats = [
+    subagent.tokens ? formatCompactTokens(subagent.tokens) : undefined,
+    subagent.cost ? `$${subagent.cost.toFixed(4)}` : undefined,
+    formatElapsed(subagent.startedAt, now),
+  ].filter(Boolean);
+
+  return (
+    <div className="flex items-center gap-2 rounded-xl border bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
+      <Spinner className="size-3.5 shrink-0" />
+      <span className="min-w-0 truncate">1 个子 Agent 运行中</span>
+      {stats.length ? <span className="shrink-0 tabular-nums">· {stats.join(" · ")}</span> : null}
+      {targetSessionId ? (
+        <Button type="button" size="xs" variant="ghost" className="ms-auto h-6 shrink-0 px-1.5 text-muted-foreground" onClick={() => actions.select(targetSessionId)}>
+          子会话
+          <ArrowUpRight />
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
 type RenderBlock =
   | { kind: "item"; item: TranscriptItem }
   | { kind: "agent-group"; id: string; tools: AgentToolItem[] };
@@ -209,12 +267,12 @@ function groupTranscriptItems(items: readonly TranscriptItem[]): RenderBlock[] {
   const blocks: RenderBlock[] = [];
   for (let i = 0; i < items.length; ) {
     const item = items[i]!;
-    if (item.kind === "tool" && item.name === "Agent") {
+    if (item.kind === "tool" && (item.name === "Agent" || item.subagent)) {
       const tools: AgentToolItem[] = [item];
       let j = i + 1;
       while (j < items.length) {
         const next = items[j]!;
-        if (next.kind === "tool" && next.name === "Agent") {
+        if (next.kind === "tool" && (next.name === "Agent" || next.subagent)) {
           tools.push(next);
           j += 1;
         } else {
@@ -250,7 +308,12 @@ function ActiveSubagentsBar({ sessionId, subagents }: { sessionId: string; subag
   }, [active.length]);
   if (!active.length) return null;
 
-  // Keep the bar to one compact line by default so it doesn't duplicate the transcript's AgentGroup or crowd the viewport.
+  // A single foreground sub-agent is already detailed in the SingleAgentCard directly above; keep a quiet status strip.
+  if (active.length === 1 && !active[0]!.background) {
+    return <SingleForegroundSubagentSummary sessionId={sessionId} subagent={active[0]!} now={now} />;
+  }
+
+  // Keep multi-agent summary to one compact line by default so it doesn't duplicate the transcript's AgentGroup.
   const collapsible = active.length >= 2;
   const showRows = !collapsible || expanded;
   const totalTokens = active.reduce((sum, entry) => sum + entry.tokens, 0);
@@ -317,17 +380,28 @@ function SessionControls({ sessionId, state }: { sessionId: string; state: Sessi
 }
 
 export function Conversation({ sessionId }: { sessionId: string }) {
-  const view = useLila((store) => store.views[sessionId]) ?? emptyView();
+  const view = useLila((store) => store.views[sessionId]) ?? EMPTY_VIEW;
   const projectId = useLila((store) => store.sessions[sessionId]?.projectId);
   const projectPath = useLila((store) => store.projects.find((item) => item.id === projectId)?.path);
   const connected = useLila((store) => store.connection === "connected");
   const resourcesOpen = useLila((store) => store.resourcesOpen);
   const gitOpen = useLila((store) => store.gitOpen);
   const [gitChanges, setGitChanges] = React.useState<number | undefined>();
+  const [abortArmed, setAbortArmed] = React.useState(false);
   const state = view.state;
   const running = state ? state.status === "running" || state.status === "waiting" || state.compacting : false;
   const loaded = state !== undefined;
   const prevRunning = React.useRef(running);
+  const abortTimerRef = React.useRef<number | undefined>(undefined);
+  const abortArmedRef = React.useRef(false);
+  const viewportRef = React.useRef<HTMLDivElement>(null);
+  const scrollTopRef = React.useRef<number | undefined>(undefined);
+  const initialScrollTopRef = React.useRef<number | undefined>(actions.getScrollTop(sessionId));
+  const restoredScrollRef = React.useRef(false);
+
+  const handleGitStatusLoaded = React.useCallback((status: GitStatus) => {
+    setGitChanges(status.isRepo ? status.files.length : undefined);
+  }, []);
 
   const refreshGitCount = React.useCallback(() => {
     if (!projectId || !connected) return;
@@ -348,113 +422,194 @@ export function Conversation({ sessionId }: { sessionId: string }) {
     prevRunning.current = running;
   }, [running, refreshGitCount]);
 
+  const disarmAbort = React.useCallback(() => {
+    window.clearTimeout(abortTimerRef.current);
+    abortTimerRef.current = undefined;
+    abortArmedRef.current = false;
+    setAbortArmed(false);
+  }, []);
+
+  const handleAbort = React.useCallback(() => {
+    disarmAbort();
+    void actions.abort(sessionId);
+  }, [disarmAbort, sessionId]);
+
+  React.useEffect(() => {
+    if (!running) disarmAbort();
+    return () => window.clearTimeout(abortTimerRef.current);
+  }, [running, disarmAbort]);
+
+  // Global double-Escape to abort when no overlay, command palette, or completion menu is open.
+  React.useEffect(() => {
+    if (!running) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.isComposing || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+      const store = useLila.getState();
+      if (store.paletteOpen || store.resourcesOpen || store.gitOpen) return;
+      if (document.querySelector(BLOCKING_OVERLAY_SELECTOR)) return;
+      event.preventDefault();
+      if (abortArmedRef.current) {
+        handleAbort();
+      } else {
+        abortArmedRef.current = true;
+        setAbortArmed(true);
+        window.clearTimeout(abortTimerRef.current);
+        abortTimerRef.current = window.setTimeout(() => {
+          abortArmedRef.current = false;
+          setAbortArmed(false);
+        }, ABORT_ARM_MS);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [running, handleAbort]);
+
+  // Restore saved scrollTop synchronously after MessageScrollerProvider's layout effects and before paint.
+  React.useLayoutEffect(() => {
+    if (!loaded || restoredScrollRef.current) return;
+    restoredScrollRef.current = true;
+    const saved = initialScrollTopRef.current;
+    if (saved !== undefined && viewportRef.current) {
+      viewportRef.current.scrollTop = saved;
+      scrollTopRef.current = saved;
+    }
+  }, [loaded]);
+
+  // Save current scrollTop before leaving this session.
+  React.useEffect(() => {
+    const viewport = viewportRef;
+    return () => {
+      const current = viewport.current?.scrollTop ?? scrollTopRef.current;
+      if (current !== undefined) actions.setScrollTop(sessionId, current);
+    };
+  }, [sessionId]);
+
   const renderBlocks = React.useMemo(() => groupTranscriptItems(view.items), [view.items]);
 
   return (
     <MarkdownBasePathProvider value={projectPath}>
-    <div className="flex min-h-0 flex-1 flex-col">
-      <SessionToolbar
-        sessionId={sessionId}
-        gitChanges={gitChanges}
-        onGit={() => actions.setGitOpen(true)}
-        onResources={() => actions.setResourcesOpen(true)}
-      />
-      <MessageScrollerProvider key={sessionId} autoScroll defaultScrollPosition="last-anchor" scrollPreviousItemPeek={48}>
-        <MessageScroller className="min-h-0 flex-1">
-          <MessageScrollerViewport>
-            <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-4 px-6 pt-6 pb-10">
-              {view.loading && !loaded ? (
-                <MessageScrollerItem messageId="loading">
-                  <Empty className="py-24">
-                    <EmptyHeader>
-                      <EmptyTitle>正在打开会话</EmptyTitle>
-                      <EmptyDescription>正在读取消息和任务状态。</EmptyDescription>
-                    </EmptyHeader>
-                    <Spinner />
-                  </Empty>
-                </MessageScrollerItem>
-              ) : null}
-              {!view.loading && view.error ? (
-                <MessageScrollerItem messageId="load-error">
-                  <Empty className="py-24">
-                    <EmptyHeader>
-                      <EmptyTitle>会话打开失败</EmptyTitle>
-                      <EmptyDescription className="max-w-md break-words">{view.error}</EmptyDescription>
-                    </EmptyHeader>
-                    <Button variant="outline" onClick={() => actions.retrySession(sessionId)}>
-                      <RotateCw />
-                      重试
-                    </Button>
-                  </Empty>
-                </MessageScrollerItem>
-              ) : null}
-              {loaded && !view.error && view.items.length === 0 ? (
-                <MessageScrollerItem messageId="empty">
-                  <Empty className="py-24">
-                    <EmptyHeader>
-                      <EmptyTitle>要做点什么？</EmptyTitle>
-                      <EmptyDescription>Agent 会在项目目录里读代码、改文件、跑命令，过程都会显示在这里。</EmptyDescription>
-                    </EmptyHeader>
-                  </Empty>
-                </MessageScrollerItem>
-              ) : null}
-              {view.hasEarlier ? (
-                <MessageScrollerItem messageId="load-earlier">
-                  <div className="flex justify-center py-1">
-                    <Button variant="ghost" size="sm" disabled={view.loadingEarlier} onClick={() => void actions.loadEarlier(sessionId)}>
-                      {view.loadingEarlier ? <Spinner /> : <ChevronUp />}
-                      {view.loadingEarlier ? "正在加载更早消息…" : "加载更早消息"}
-                    </Button>
-                  </div>
-                </MessageScrollerItem>
-              ) : null}
-              {renderBlocks.map((block) =>
-                block.kind === "agent-group" ? (
-                  <MessageScrollerItem key={block.id} messageId={block.id}>
-                    <AgentGroup tools={block.tools} sessionId={sessionId} />
-                  </MessageScrollerItem>
-                ) : (
-                  <MessageScrollerItem key={block.item.id} messageId={block.item.id} scrollAnchor={block.item.kind === "user"}>
-                    <TranscriptEntry item={block.item} sessionId={sessionId} running={block.item.kind === "user" ? running : false} />
-                  </MessageScrollerItem>
-                ),
-              )}
-              {state && !state.pending.length ? (
-                <MessageScrollerItem messageId="status">
-                  <RunStatus state={state} />
-                </MessageScrollerItem>
-              ) : null}
-            </MessageScrollerContent>
-          </MessageScrollerViewport>
-          <MessageScrollerButton />
-        </MessageScroller>
-      </MessageScrollerProvider>
-      <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-2 px-6 pb-5">
-        {state ? <PendingPanel sessionId={sessionId} pending={state.pending} /> : null}
-        {state ? <ActiveSubagentsBar sessionId={sessionId} subagents={state.subagents} /> : null}
-        {state ? <QueueChips queue={state.queue} /> : null}
-        <Composer
-          draftKey={sessionId}
+      <div className="flex min-h-0 flex-1 flex-col">
+        <SessionToolbar
           sessionId={sessionId}
-          projectId={projectId}
-          running={running}
-          disabled={!loaded}
-          placeholder={running ? "补充说明会在当前工具结束后送达… 双击 Esc 停止" : "继续对话，/ 使用命令和技能，@ 引用文件"}
-          onSubmit={(text, images, mode) => actions.prompt(sessionId, text, images, mode)}
-          onAbort={() => void actions.abort(sessionId)}
-          footer={state ? <SessionControls sessionId={sessionId} state={state} /> : null}
-          trailing={state ? <ContextUsage sessionId={sessionId} state={state} /> : null}
+          gitChanges={gitChanges}
+          onGit={() => actions.setGitOpen(true)}
+          onResources={() => actions.setResourcesOpen(true)}
         />
-        {state ? <StatusLines lines={state.statusLines} /> : null}
+        {!loaded ? (
+          <div className="flex min-h-0 flex-1 items-center justify-center px-6">
+            {!view.loading && view.error ? (
+              <Empty className="py-24">
+                <EmptyHeader>
+                  <EmptyTitle>会话打开失败</EmptyTitle>
+                  <EmptyDescription className="max-w-md break-words">{view.error}</EmptyDescription>
+                </EmptyHeader>
+                <Button variant="outline" onClick={() => actions.retrySession(sessionId)}>
+                  <RotateCw />
+                  重试
+                </Button>
+              </Empty>
+            ) : !connected ? (
+              <Empty className="py-24">
+                <EmptyHeader>
+                  <EmptyTitle>等待重连后加载会话…</EmptyTitle>
+                  <EmptyDescription>与 core 重新连接后会自动恢复消息和任务状态。</EmptyDescription>
+                </EmptyHeader>
+                <Spinner />
+              </Empty>
+            ) : (
+              <Empty className="py-24">
+                <EmptyHeader>
+                  <EmptyTitle>正在打开会话</EmptyTitle>
+                  <EmptyDescription>正在读取消息和任务状态。</EmptyDescription>
+                </EmptyHeader>
+                <Spinner />
+              </Empty>
+            )}
+          </div>
+        ) : (
+          <MessageScrollerProvider
+            key={sessionId}
+            autoScroll
+            defaultScrollPosition={initialScrollTopRef.current !== undefined ? "start" : "end"}
+            scrollPreviousItemPeek={48}
+          >
+            <MessageScroller className="min-h-0 flex-1">
+              <MessageScrollerViewport
+                ref={viewportRef}
+                onScroll={(event) => {
+                  scrollTopRef.current = event.currentTarget.scrollTop;
+                }}
+              >
+                <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-4 px-6 pt-6 pb-10">
+                  {!view.error && view.items.length === 0 ? (
+                    <MessageScrollerItem messageId="empty">
+                      <Empty className="py-24">
+                        <EmptyHeader>
+                          <EmptyTitle>要做点什么？</EmptyTitle>
+                          <EmptyDescription>Agent 会在项目目录里读代码、改文件、跑命令，过程都会显示在这里。</EmptyDescription>
+                        </EmptyHeader>
+                      </Empty>
+                    </MessageScrollerItem>
+                  ) : null}
+                  {view.hasEarlier ? (
+                    <MessageScrollerItem messageId="load-earlier">
+                      <div className="flex justify-center py-1">
+                        <Button variant="ghost" size="sm" disabled={view.loadingEarlier} onClick={() => void actions.loadEarlier(sessionId)}>
+                          {view.loadingEarlier ? <Spinner /> : <ChevronUp />}
+                          {view.loadingEarlier ? "正在加载更早消息…" : "加载更早消息"}
+                        </Button>
+                      </div>
+                    </MessageScrollerItem>
+                  ) : null}
+                  {renderBlocks.map((block) =>
+                    block.kind === "agent-group" ? (
+                      <MessageScrollerItem key={block.id} messageId={block.id}>
+                        <AgentGroup tools={block.tools} sessionId={sessionId} />
+                      </MessageScrollerItem>
+                    ) : (
+                      <MessageScrollerItem key={block.item.id} messageId={block.item.id} scrollAnchor={block.item.kind === "user"}>
+                        <TranscriptEntry item={block.item} sessionId={sessionId} running={block.item.kind === "user" ? running : false} />
+                      </MessageScrollerItem>
+                    ),
+                  )}
+                  {state && !state.pending.length ? (
+                    <MessageScrollerItem messageId="status">
+                      <RunStatus state={state} />
+                    </MessageScrollerItem>
+                  ) : null}
+                </MessageScrollerContent>
+              </MessageScrollerViewport>
+              <MessageScrollerButton />
+            </MessageScroller>
+          </MessageScrollerProvider>
+        )}
+        <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-2 px-6 pb-5">
+          {state ? <PendingPanel sessionId={sessionId} pending={state.pending} /> : null}
+          {state ? <ActiveSubagentsBar sessionId={sessionId} subagents={state.subagents} /> : null}
+          {state ? <QueueChips queue={state.queue} /> : null}
+          <Composer
+            draftKey={sessionId}
+            sessionId={sessionId}
+            projectId={projectId}
+            running={running}
+            disabled={!loaded}
+            abortArmed={abortArmed}
+            placeholder={running ? "补充说明会在当前工具结束后送达… 双击 Esc 停止" : "继续对话，/ 使用命令和技能，@ 引用文件"}
+            onSubmit={(text, images, mode) => actions.prompt(sessionId, text, images, mode)}
+            onAbort={handleAbort}
+            footer={state ? <SessionControls sessionId={sessionId} state={state} /> : null}
+            trailing={state ? <ContextUsage sessionId={sessionId} state={state} /> : null}
+          />
+          {state ? <StatusLines lines={state.statusLines} /> : null}
+        </div>
+        <ResourcesSheet sessionId={sessionId} open={resourcesOpen} onOpenChange={actions.setResourcesOpen} />
+        <GitSheet
+          projectId={projectId}
+          open={gitOpen}
+          onOpenChange={actions.setGitOpen}
+          onStatusLoaded={handleGitStatusLoaded}
+        />
       </div>
-      <ResourcesSheet sessionId={sessionId} open={resourcesOpen} onOpenChange={actions.setResourcesOpen} />
-      <GitSheet
-        projectId={projectId}
-        open={gitOpen}
-        onOpenChange={actions.setGitOpen}
-        onStatusLoaded={(status) => setGitChanges(status.isRepo ? status.files.length : undefined)}
-      />
-    </div>
     </MarkdownBasePathProvider>
   );
 }

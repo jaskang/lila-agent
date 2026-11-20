@@ -40,7 +40,7 @@ async function connect() {
     return response.data as CommandResults[T];
   }
   await until((message) => message.type === "hello");
-  return { ws, call };
+  return { ws, call, inbox, until };
 }
 
 test("rejects sockets without the token", async () => {
@@ -52,7 +52,7 @@ test("rejects sockets without the token", async () => {
   expect(opened).toBe(false);
 });
 
-test("creates a session in an added project and lists it", async () => {
+test("creates a session in an added project, watches and unwatches it, and validates session.open", async () => {
   const client = await connect();
   const { project } = await client.call({ type: "projects.add", requestId: "p", path: mkdtempSync(join(tmpdir(), "lila-project-")) });
   const { session } = await client.call({ type: "session.create", requestId: "s", projectId: project.id, approvalMode: "ask-all" });
@@ -61,8 +61,24 @@ test("creates a session in an added project and lists it", async () => {
   const { sessions } = await client.call({ type: "sessions.list", requestId: "l" });
   expect(sessions.map((item) => item.id)).toContain(session.id);
 
+  // Invalid session.open (unknown id) returns a clean error.
+  await expect(client.call({ type: "session.open", requestId: "bad-open", sessionId: "non-existent-session" })).rejects.toThrow("会话不存在");
+
   const opened = await client.call({ type: "session.open", requestId: "o", sessionId: session.id });
   expect(opened.items).toEqual([]);
   expect(opened.state.approvalMode).toBe("ask-all");
+
+  // Watching receives state pushes on session.configure.
+  client.inbox.length = 0;
+  await client.call({ type: "session.configure", requestId: "cfg-1", sessionId: session.id, approvalMode: "auto" });
+  const stateMsg = await client.until((message) => message.type === "state" && message.sessionId === session.id);
+  expect(stateMsg.type === "state" && stateMsg.state.approvalMode).toBe("auto");
+
+  // After session.unwatch, further session.configure calls do not push state frames to this socket.
+  await client.call({ type: "session.unwatch", requestId: "u" });
+  client.inbox.length = 0;
+  await client.call({ type: "session.configure", requestId: "cfg-2", sessionId: session.id, approvalMode: "ask-exec" });
+  expect(client.inbox.some((message) => message.type === "state" && message.sessionId === session.id)).toBe(false);
+
   client.ws.close();
 }, 60_000);

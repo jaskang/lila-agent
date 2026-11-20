@@ -1,10 +1,8 @@
-import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type {
   AgentSession,
   AgentSessionEvent,
   AgentSessionServices,
-  ExtensionUIContext,
   ExtensionUIDialogOptions,
   ToolInfo,
 } from "@earendil-works/pi-coding-agent";
@@ -19,25 +17,31 @@ import type {
   SessionSummary,
   SlashCommand,
   SubagentProgress,
-  SubagentStatus,
   TranscriptItem,
 } from "@lila/protocol";
 import { errorMessage, UserError } from "./errors.ts";
 import type { LilaBridge, SubagentBusEvent } from "./lila-extension.ts";
+import { PendingBridge } from "./pending-bridge.ts";
 import type { Store } from "./store.ts";
+import { SubagentTracker } from "./subagent-tracker.ts";
 import {
   type AgentMessage,
+  type AssistantItem,
   assistantItem,
+  buildSubagentToolInfo,
   contentText,
+  countBranchIds,
   customItem,
   displayUserText,
   earlier,
+  hasAssistantContent,
   parseUserItemId,
   projectBranch,
   snapshot,
   type ToolItem,
   toolCallItems,
   type UserMessage,
+  uniqueId,
   userItem,
   withToolResult,
 } from "./transcript.ts";
@@ -51,34 +55,11 @@ export interface Clients {
 
 type Command<T extends ClientCommand["type"]> = Extract<ClientCommand, { type: T }>;
 type Model = NonNullable<AgentSession["model"]>;
-type PendingEntry = { request: PendingRequest; settle(answer: PendingAnswer | undefined): void };
 type ToolThrottle = { at: number; timer?: NodeJS.Timeout; latest?: ToolItem };
 
 const TOOL_UPDATE_INTERVAL_MS = 100;
-const SUBAGENT_PUSH_INTERVAL_MS = 200;
-const MAX_SUBAGENT_ENTRIES = 50;
 const TITLE_LIMIT = 60;
 
-function normalizeSubagentStatus(raw: string | undefined): SubagentStatus {
-  switch (raw) {
-    case "queued":
-    case "running":
-    case "completed":
-    case "steered":
-    case "stopped":
-    case "aborted":
-    case "error":
-      return raw;
-    case "background":
-      return "running";
-    default:
-      return "completed";
-  }
-}
-
-function isActiveSubagent(status: SubagentStatus): boolean {
-  return status === "queued" || status === "running";
-}
 const BUILTIN_COMMANDS: SlashCommand[] = [
   { name: "compact", description: "压缩上下文，用摘要替换较早的对话", source: "builtin" },
   { name: "reload", description: "重新加载技能、提示词、扩展和 MCP 服务", source: "builtin" },
@@ -133,12 +114,6 @@ export function findModel(services: AgentSessionServices, modelId: string): Mode
   return services.modelRuntime.getAvailableSnapshot().find((model) => `${model.provider}/${model.id}` === modelId);
 }
 
-/** Identity styling: extensions that style text for the TUI get their plain text back. */
-const plainTheme = new Proxy(
-  {},
-  { get: () => (...args: unknown[]) => args.findLast((arg) => typeof arg === "string") ?? "" },
-) as ExtensionUIContext["theme"];
-
 /** One opened Pi session: its AgentSession, pending user requests and the mapping of its events to frames. */
 export class LiveSession implements LilaBridge {
   readonly id: string;
@@ -151,21 +126,22 @@ export class LiveSession implements LilaBridge {
   readonly #store: Store;
   readonly #clients: Clients;
   readonly #onReload?: () => void;
-  readonly #onSubsessionsChanged?: () => void;
+  readonly #pending: PendingBridge;
+  readonly #subagents: SubagentTracker;
   #session!: AgentSession;
   #services!: AgentSessionServices;
   #unsubscribe?: () => void;
-  readonly #pending = new Map<string, PendingEntry>();
   #statusLines: Record<string, string> = {};
   #retry: SessionState["retry"];
   #updatedAt = new Date().toISOString();
   #firstMessage: string | undefined;
+  #idCounts = new Map<string, number>();
+  #streamingPending: AssistantItem | undefined;
   #streamingId: string | undefined;
+  #streamingSent = false;
   /** Tool items of the current run, with their newest output. */
   readonly #tools = new Map<string, ToolItem>();
   readonly #throttles = new Map<string, ToolThrottle>();
-  readonly #subagents = new Map<string, SubagentProgress>();
-  #subagentPushTimer: NodeJS.Timeout | undefined;
   #notices = 0;
   #lastSummary = "";
 
@@ -188,7 +164,26 @@ export class LiveSession implements LilaBridge {
     this.#store = options.store;
     this.#clients = options.clients;
     this.#onReload = options.onReload;
-    this.#onSubsessionsChanged = options.onSubsessionsChanged;
+    this.#pending = new PendingBridge({
+      onPendingChanged: () => {
+        this.touch();
+        this.#pushState();
+        this.#broadcastSummary();
+      },
+      onNotify: (level, message) => this.#notify(level, message),
+      onStatusLine: (key, value) => {
+        if (value === undefined) delete this.#statusLines[key];
+        else this.#statusLines[key] = value;
+        this.#pushState();
+      },
+    });
+    this.#subagents = new SubagentTracker({
+      onStateChanged: (activeChanged) => {
+        this.#pushState();
+        if (activeChanged) this.#broadcastSummary();
+      },
+      onSubsessionsChanged: () => options.onSubsessionsChanged?.(),
+    });
   }
 
   get session(): AgentSession {
@@ -204,9 +199,7 @@ export class LiveSession implements LilaBridge {
   }
 
   get busy(): boolean {
-    if (this.#session.isStreaming || this.#session.isCompacting || this.#pending.size > 0) return true;
-    for (const sub of this.#subagents.values()) if (isActiveSubagent(sub.status)) return true;
-    return false;
+    return this.#session.isStreaming || this.#session.isCompacting || this.#pending.size > 0 || this.#subagents.hasActive();
   }
 
   async attach(services: AgentSessionServices, session: AgentSession, updatedAt?: string): Promise<void> {
@@ -219,9 +212,10 @@ export class LiveSession implements LilaBridge {
         break;
       }
     }
+    this.#syncIdCounts();
     this.#unsubscribe = session.subscribe((event) => this.#onEvent(event));
     await session.bindExtensions({
-      uiContext: this.#uiContext(),
+      uiContext: this.#pending.createUIContext(),
       mode: "rpc",
       commandContextActions: {
         waitForIdle: () => this.#session.waitForIdle(),
@@ -244,12 +238,16 @@ export class LiveSession implements LilaBridge {
     this.lastActivity = Date.now();
   }
 
+  #syncIdCounts(): void {
+    this.#idCounts = countBranchIds(this.#session.sessionManager.getBranch());
+  }
+
   // -------------------------------------------------------------------------
   // Snapshots
 
   get status(): SessionStatus {
     if (this.#pending.size > 0) return "waiting";
-    if (this.#session.isStreaming || this.#session.isCompacting) return "running";
+    if (this.#session.isStreaming || this.#session.isCompacting || this.#subagents.hasActive()) return "running";
     const messages = this.#session.messages;
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index];
@@ -259,11 +257,7 @@ export class LiveSession implements LilaBridge {
   }
 
   subagentByPrefix(idPrefix: string): SubagentProgress | undefined {
-    const lower = idPrefix.toLowerCase();
-    for (const entry of this.#subagents.values()) {
-      if (entry.id.toLowerCase().startsWith(lower)) return entry;
-    }
-    return undefined;
+    return this.#subagents.byPrefix(idPrefix);
   }
 
   summary(): SessionSummary {
@@ -288,6 +282,7 @@ export class LiveSession implements LilaBridge {
     const session = this.#session;
     const usage = session.getContextUsage();
     const model = session.model;
+    const subagents = this.#subagents.snapshot();
     return {
       status: this.status,
       ...(model ? { modelId: `${model.provider}/${model.id}` } : {}),
@@ -299,9 +294,9 @@ export class LiveSession implements LilaBridge {
       cost: session.getSessionStats().cost,
       compacting: session.isCompacting,
       ...(this.#retry ? { retry: this.#retry } : {}),
-      pending: Array.from(this.#pending.values()).map((entry) => entry.request),
+      pending: this.#pending.list(),
       statusLines: { ...this.#statusLines },
-      ...(this.#subagents.size ? { subagents: Array.from(this.#subagents.values(), (entry) => ({ ...entry })) } : {}),
+      ...(subagents ? { subagents } : {}),
     };
   }
 
@@ -313,7 +308,9 @@ export class LiveSession implements LilaBridge {
     const partial = this.#session.state.streamingMessage;
     if (partial?.role === "assistant") {
       const item = assistantItem(partial, true);
-      live.push(this.#streamingId ? { ...item, id: this.#streamingId } : item);
+      if (hasAssistantContent(item)) {
+        live.push(this.#streamingId ? { ...item, id: this.#streamingId } : item);
+      }
     }
     return live;
   }
@@ -361,7 +358,7 @@ export class LiveSession implements LilaBridge {
 
   async abort(): Promise<void> {
     this.touch();
-    for (const entry of Array.from(this.#pending.values())) entry.settle(undefined);
+    this.#pending.cancelAll();
     await this.#session.abort();
   }
 
@@ -402,15 +399,14 @@ export class LiveSession implements LilaBridge {
     if (!entry || entry.type !== "message") throw new UserError("找不到这条消息，可能已经不在当前分支上");
     const result = await session.navigateTree(entry.id);
     if (result.cancelled) throw new UserError("回退被扩展取消了");
+    this.#syncIdCounts();
     this.#clients.toWatchers(this.id, { type: "reset", sessionId: this.id });
     this.#pushState();
     return displayUserText(result.editorText ?? contentText((entry.message as UserMessage).content));
   }
 
   respond(pendingId: string, answer: PendingAnswer): void {
-    const entry = this.#pending.get(pendingId);
-    if (!entry) throw new UserError("这个请求已经结束了");
-    entry.settle(answer);
+    this.#pending.respond(pendingId, answer);
   }
 
   commands(): SlashCommand[] {
@@ -455,12 +451,10 @@ export class LiveSession implements LilaBridge {
   }
 
   async dispose(): Promise<void> {
-    for (const entry of Array.from(this.#pending.values())) entry.settle(undefined);
+    this.#pending.cancelAll();
     for (const throttle of this.#throttles.values()) clearTimeout(throttle.timer);
     this.#throttles.clear();
-    clearTimeout(this.#subagentPushTimer);
-    this.#subagentPushTimer = undefined;
-    this.#subagents.clear();
+    this.#subagents.dispose();
     try {
       await this.#session.abort();
       // Lets extensions such as MCP close their connections and child processes.
@@ -476,250 +470,15 @@ export class LiveSession implements LilaBridge {
   }
 
   // -------------------------------------------------------------------------
-  // Requests that wait for the user
+  // Extension bridge hooks
 
   request(request: Omit<PendingRequest, "id">, options: ExtensionUIDialogOptions = {}): Promise<PendingAnswer | undefined> {
-    const id = randomUUID();
-    const { signal, timeout } = options;
-    const { promise, resolve } = Promise.withResolvers<PendingAnswer | undefined>();
-    if (signal?.aborted) {
-      resolve(undefined);
-      return promise;
-    }
-    let timer: NodeJS.Timeout | undefined;
-    const onAbort = () => settle(undefined);
-    const settle = (answer: PendingAnswer | undefined) => {
-      if (!this.#pending.delete(id)) return;
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      this.#pendingChanged();
-      resolve(answer);
-    };
-    this.#pending.set(id, { request: { ...request, id }, settle });
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (timeout) timer = setTimeout(onAbort, timeout);
-    this.#pendingChanged();
-    return promise;
+    return this.#pending.request(request, options);
   }
-
-  #pendingChanged(): void {
-    this.touch();
-    this.#pushState();
-    this.#broadcastSummary();
-  }
-
-  #uiContext(): ExtensionUIContext {
-    const dialog = <T>(request: Omit<PendingRequest, "id">, options: ExtensionUIDialogOptions | undefined, map: (answer: PendingAnswer | undefined) => T) =>
-      this.request(request, options).then(map);
-    const text = (answer: PendingAnswer | undefined) => (answer?.type === "text" ? answer.value : undefined);
-    return {
-      select: (title, options, opts) => dialog({ kind: "select", title, options }, opts, (answer) => (answer?.type === "option" ? answer.value : undefined)),
-      confirm: (title, message, opts) => dialog({ kind: "confirm", title, message, options: [] }, opts, (answer) => answer?.type === "confirm" && answer.confirmed),
-      input: (title, placeholder, opts) => dialog({ kind: "input", title, options: [], ...(placeholder ? { placeholder } : {}) }, opts, text),
-      editor: (title, prefill) => dialog({ kind: "editor", title, options: [], ...(prefill ? { prefill } : {}) }, undefined, text),
-      notify: (message, type) => this.#notify(type ?? "info", message),
-      setStatus: (key, value) => {
-        // pi-subagents writes a TUI status line (`1 running agent`) that duplicates Lila's native sub-agent UI.
-        if (key === "subagents") return;
-        if (value === undefined) delete this.#statusLines[key];
-        else this.#statusLines[key] = value;
-        this.#pushState();
-      },
-      // TUI-only capabilities.
-      onTerminalInput: () => () => {},
-      setWorkingMessage: () => {},
-      setWorkingVisible: () => {},
-      setWorkingIndicator: () => {},
-      setHiddenThinkingLabel: () => {},
-      setWidget: () => {},
-      setFooter: () => {},
-      setHeader: () => {},
-      setTitle: () => {},
-      custom: async () => undefined as never,
-      pasteToEditor: () => {},
-      setEditorText: () => {},
-      getEditorText: () => "",
-      addAutocompleteProvider: () => {},
-      setEditorComponent: () => {},
-      getEditorComponent: () => undefined,
-      theme: plainTheme,
-      getAllThemes: () => [],
-      getTheme: () => undefined,
-      setTheme: () => ({ success: false, error: "Lila 不支持主题" }),
-      getToolsExpanded: () => false,
-      setToolsExpanded: () => {},
-    };
-  }
-
-  // -------------------------------------------------------------------------
-  // Sub-agent progress (`pi-subagents` event bus + foreground tool updates)
 
   onSubagentEvent(event: SubagentBusEvent): void {
     this.touch();
-    switch (event.type) {
-      case "created": {
-        const existing = this.#subagents.get(event.id);
-        this.#subagents.set(event.id, {
-          id: event.id,
-          type: event.agentType,
-          description: event.description || existing?.description || "",
-          status: existing && isActiveSubagent(existing.status) ? existing.status : "queued",
-          background: event.isBackground,
-          startedAt: existing?.startedAt ?? Date.now(),
-          toolUses: existing?.toolUses ?? 0,
-          turns: existing?.turns ?? 0,
-          tokens: existing?.tokens ?? 0,
-          cost: existing?.cost ?? 0,
-          ...(existing?.model ? { model: existing.model } : {}),
-          ...(existing?.activity ? { activity: existing.activity } : {}),
-        });
-        this.#scheduleSubagentPush(true);
-        break;
-      }
-      case "started": {
-        const existing = this.#subagents.get(event.id);
-        this.#subagents.set(event.id, {
-          id: event.id,
-          type: event.agentType || existing?.type || "Agent",
-          description: event.description || existing?.description || "",
-          status: "running",
-          background: existing?.background ?? false,
-          startedAt: Date.now(),
-          toolUses: existing?.toolUses ?? 0,
-          turns: existing?.turns ?? 0,
-          tokens: existing?.tokens ?? 0,
-          cost: existing?.cost ?? 0,
-          ...(existing?.model ? { model: existing.model } : {}),
-          ...(existing?.activity ? { activity: existing.activity } : {}),
-        });
-        this.#trimSubagents();
-        this.#scheduleSubagentPush(true);
-        this.#onSubsessionsChanged?.();
-        break;
-      }
-      case "usage": {
-        if (event.depth !== undefined && event.depth > 1) return;
-        const existing = this.#subagents.get(event.id) ?? {
-          id: event.id,
-          type: event.agentType,
-          description: event.description,
-          status: "running" as const,
-          background: false,
-          startedAt: Date.now(),
-          toolUses: 0,
-          turns: 0,
-          tokens: 0,
-          cost: 0,
-        };
-        const firstTurn = existing.turns === 0;
-        existing.turns += 1;
-        existing.tokens += event.tokens;
-        existing.cost += event.cost;
-        if (event.model) existing.model = event.model;
-        if (existing.status === "queued") existing.status = "running";
-        this.#subagents.set(event.id, existing);
-        this.#scheduleSubagentPush(false);
-        // Sub-agent session JSONL is flushed once its first message is written.
-        if (firstTurn) this.#onSubsessionsChanged?.();
-        break;
-      }
-      case "compacted": {
-        const existing = this.#subagents.get(event.id);
-        if (!existing) return;
-        existing.activity = event.compactionCount ? `已压缩上下文（第 ${event.compactionCount} 次）` : "已压缩上下文";
-        this.#scheduleSubagentPush(false);
-        break;
-      }
-      case "steered": {
-        const existing = this.#subagents.get(event.id);
-        if (!existing) return;
-        existing.activity = "已收到引导消息";
-        this.#scheduleSubagentPush(false);
-        break;
-      }
-      case "finished": {
-        const existing = this.#subagents.get(event.id);
-        const next: SubagentProgress = {
-          id: event.id,
-          type: event.agentType || existing?.type || "Agent",
-          description: event.description || existing?.description || "",
-          status: normalizeSubagentStatus(event.status),
-          background: existing?.background ?? false,
-          startedAt: existing?.startedAt ?? Date.now(),
-          toolUses: event.toolUses ?? existing?.toolUses ?? 0,
-          turns: existing?.turns ?? 0,
-          tokens: event.tokens ?? existing?.tokens ?? 0,
-          cost: event.cost ?? existing?.cost ?? 0,
-          ...(existing?.model ? { model: existing.model } : {}),
-          ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
-          ...(event.result ? { output: event.result } : {}),
-          ...(event.error ? { error: event.error } : {}),
-        };
-        this.#subagents.set(event.id, next);
-        this.#trimSubagents();
-        this.#scheduleSubagentPush(true);
-        this.#onSubsessionsChanged?.();
-        break;
-      }
-      case "disposed":
-        if (!this.#subagents.size) return;
-        this.#subagents.clear();
-        this.#scheduleSubagentPush(true);
-        break;
-    }
-  }
-
-  #trimSubagents(): void {
-    if (this.#subagents.size <= MAX_SUBAGENT_ENTRIES) return;
-    for (const [id, entry] of this.#subagents) {
-      if (this.#subagents.size <= MAX_SUBAGENT_ENTRIES) break;
-      if (!isActiveSubagent(entry.status)) this.#subagents.delete(id);
-    }
-  }
-
-  #syncAgentToolProgress(item: ToolItem): void {
-    if (item.name !== "Agent" || !item.details) return;
-    const details = item.details;
-    const id = typeof details.agentId === "string" && details.agentId ? details.agentId : undefined;
-    if (!id) return;
-    const existing = this.#subagents.get(id);
-    const rawStatus = typeof details.status === "string" ? details.status : undefined;
-    const incoming = rawStatus ? normalizeSubagentStatus(rawStatus) : existing?.status ?? (item.status === "running" ? "running" : item.status === "error" ? "error" : "completed");
-    // Do not regress a sub-agent that has already finished back to running when its spawn tool result lands.
-    const status = existing && !isActiveSubagent(existing.status) && isActiveSubagent(incoming) ? existing.status : incoming;
-    const next: SubagentProgress = {
-      id,
-      type: (typeof details.subagentType === "string" && details.subagentType) || (typeof item.args.subagent_type === "string" && item.args.subagent_type) || existing?.type || "Agent",
-      description: (typeof details.description === "string" && details.description) || (typeof item.args.description === "string" && item.args.description) || existing?.description || "",
-      status,
-      background: rawStatus === "background" || Boolean(item.args.run_in_background) || (existing?.background ?? false),
-      startedAt: existing?.startedAt ?? Date.now(),
-      toolUses: typeof details.toolUses === "number" && details.toolUses > (existing?.toolUses ?? 0) ? details.toolUses : (existing?.toolUses ?? 0),
-      turns: typeof details.turnCount === "number" && details.turnCount > (existing?.turns ?? 0) ? details.turnCount : (existing?.turns ?? 0),
-      tokens: existing?.tokens ?? 0,
-      cost: typeof details.cost === "number" && details.cost > (existing?.cost ?? 0) ? details.cost : (existing?.cost ?? 0),
-      ...(typeof details.modelName === "string" && details.modelName ? { model: details.modelName } : existing?.model ? { model: existing.model } : {}),
-      ...(typeof details.activity === "string" && details.activity && isActiveSubagent(status) ? { activity: details.activity } : existing?.activity && isActiveSubagent(status) ? { activity: existing.activity } : {}),
-      ...(typeof details.durationMs === "number" && details.durationMs > 0 && !isActiveSubagent(status) ? { durationMs: details.durationMs } : existing?.durationMs !== undefined ? { durationMs: existing.durationMs } : {}),
-      ...(existing?.output ? { output: existing.output } : {}),
-      ...(typeof details.error === "string" && details.error ? { error: details.error } : existing?.error ? { error: existing.error } : {}),
-    };
-    this.#subagents.set(id, next);
-    this.#trimSubagents();
-    this.#scheduleSubagentPush(!isActiveSubagent(status));
-  }
-
-  #scheduleSubagentPush(immediate: boolean): void {
-    if (immediate) {
-      clearTimeout(this.#subagentPushTimer);
-      this.#subagentPushTimer = undefined;
-      this.#pushState();
-      return;
-    }
-    this.#subagentPushTimer ??= setTimeout(() => {
-      this.#subagentPushTimer = undefined;
-      this.#pushState();
-    }, SUBAGENT_PUSH_INTERVAL_MS);
+    this.#subagents.onEvent(event);
   }
 
   // -------------------------------------------------------------------------
@@ -753,33 +512,36 @@ export class LiveSession implements LilaBridge {
   }
 
   #setTool(item: ToolItem, throttle: boolean): void {
-    this.#tools.set(item.id, item);
-    this.#syncAgentToolProgress(item);
+    const enriched = this.#subagents.syncToolItem(item);
+    this.#tools.set(enriched.id, enriched);
     if (!throttle) {
-      const pending = this.#throttles.get(item.id);
+      const pending = this.#throttles.get(enriched.id);
       clearTimeout(pending?.timer);
-      this.#throttles.delete(item.id);
-      this.#send(item);
+      this.#throttles.delete(enriched.id);
+      this.#send(enriched);
       return;
     }
-    let state = this.#throttles.get(item.id);
-    if (!state) this.#throttles.set(item.id, (state = { at: 0 }));
+    let state = this.#throttles.get(enriched.id);
+    if (!state) this.#throttles.set(enriched.id, (state = { at: 0 }));
     const wait = state.at + TOOL_UPDATE_INTERVAL_MS - Date.now();
     if (wait <= 0) {
       state.at = Date.now();
       state.latest = undefined;
-      this.#send(item);
+      this.#send(enriched);
       return;
     }
-    state.latest = item;
+    state.latest = enriched;
     const current = state;
-    current.timer ??= setTimeout(() => {
-      current.timer = undefined;
-      if (!current.latest) return;
-      current.at = Date.now();
-      this.#send(current.latest);
-      current.latest = undefined;
-    }, wait);
+    if (!current.timer) {
+      current.timer = setTimeout(() => {
+        current.timer = undefined;
+        if (!current.latest) return;
+        current.at = Date.now();
+        this.#send(current.latest);
+        current.latest = undefined;
+      }, wait);
+      current.timer.unref();
+    }
   }
 
   #onEvent(event: AgentSessionEvent): void {
@@ -790,14 +552,21 @@ export class LiveSession implements LilaBridge {
         break;
       case "message_update": {
         const update = event.assistantMessageEvent;
-        if ((update.type === "text_delta" || update.type === "thinking_delta") && this.#streamingId) {
-          this.#clients.toWatchers(this.id, {
-            type: "delta",
-            sessionId: this.id,
-            itemId: this.#streamingId,
-            channel: update.type === "text_delta" ? "text" : "thinking",
-            delta: update.delta,
-          });
+        if ((update.type === "text_delta" || update.type === "thinking_delta") && update.delta) {
+          if (!this.#streamingSent && this.#streamingPending) {
+            this.#streamingId = uniqueId(this.#idCounts, this.#streamingPending.id);
+            this.#streamingSent = true;
+            this.#send({ ...this.#streamingPending, id: this.#streamingId });
+          }
+          if (this.#streamingId) {
+            this.#clients.toWatchers(this.id, {
+              type: "delta",
+              sessionId: this.id,
+              itemId: this.#streamingId,
+              channel: update.type === "text_delta" ? "text" : "thinking",
+              delta: update.delta,
+            });
+          }
         }
         break;
       }
@@ -807,7 +576,17 @@ export class LiveSession implements LilaBridge {
       case "tool_execution_start": {
         if (event.parentToolCallId) break;
         const args = event.args && typeof event.args === "object" ? (event.args as Record<string, unknown>) : {};
-        const base = this.#tools.get(event.toolCallId) ?? { kind: "tool", id: event.toolCallId, name: event.toolName, args, status: "running", output: "" };
+        const existing = this.#tools.get(event.toolCallId);
+        const base: ToolItem =
+          existing ?? {
+            kind: "tool",
+            id: event.toolCallId,
+            name: event.toolName,
+            args,
+            status: "running",
+            output: "",
+            ...(event.toolName === "Agent" ? { subagent: buildSubagentToolInfo(args, undefined, "running", "") } : {}),
+          };
         this.#setTool({ ...base, status: "running" }, false);
         break;
       }
@@ -819,7 +598,14 @@ export class LiveSession implements LilaBridge {
       }
       case "tool_execution_end": {
         if (event.parentToolCallId) break;
-        const base = this.#tools.get(event.toolCallId) ?? { kind: "tool", id: event.toolCallId, name: event.toolName, args: {}, status: "running", output: "" };
+        const base: ToolItem = this.#tools.get(event.toolCallId) ?? {
+          kind: "tool",
+          id: event.toolCallId,
+          name: event.toolName,
+          args: {},
+          status: "running",
+          output: "",
+        };
         this.#setTool(withToolResult(base, event.result, event.isError ? "error" : "done", event.durationMs), false);
         break;
       }
@@ -832,7 +618,10 @@ export class LiveSession implements LilaBridge {
         this.#throttles.clear();
         this.#tools.clear();
         this.#streamingId = undefined;
+        this.#streamingPending = undefined;
+        this.#streamingSent = false;
         this.#retry = undefined;
+        this.#subagents.onAgentSettled();
         this.#pushState();
         this.#broadcastSummary();
         break;
@@ -850,7 +639,10 @@ export class LiveSession implements LilaBridge {
       case "compaction_end":
         // A manual compaction reports its failure through the compact command's notification.
         if (event.errorMessage && event.reason !== "manual") this.#notice("error", event.errorMessage);
-        if (event.result) this.#clients.toWatchers(this.id, { type: "reset", sessionId: this.id });
+        if (event.result) {
+          this.#syncIdCounts();
+          this.#clients.toWatchers(this.id, { type: "reset", sessionId: this.id });
+        }
         this.#pushState();
         this.#broadcastSummary();
         break;
@@ -871,12 +663,19 @@ export class LiveSession implements LilaBridge {
   #messageStart(message: AgentMessage): void {
     if (message.role === "user") {
       this.#firstMessage ??= contentText(message.content);
-      this.#send(userItem(message));
+      const item = userItem(message);
+      this.#send({ ...item, id: uniqueId(this.#idCounts, item.id) });
       this.#broadcastSummary();
     } else if (message.role === "assistant") {
       const item = assistantItem(message, true);
-      this.#streamingId = item.id;
-      this.#send(item);
+      this.#streamingPending = item;
+      this.#streamingId = undefined;
+      this.#streamingSent = false;
+      if (hasAssistantContent(item)) {
+        this.#streamingId = uniqueId(this.#idCounts, item.id);
+        this.#streamingSent = true;
+        this.#send({ ...item, id: this.#streamingId });
+      }
     }
   }
 
@@ -884,8 +683,13 @@ export class LiveSession implements LilaBridge {
     switch (message.role) {
       case "assistant": {
         const item = assistantItem(message, false);
-        this.#send(this.#streamingId ? { ...item, id: this.#streamingId } : item);
+        if (hasAssistantContent(item)) {
+          const id = this.#streamingId ?? uniqueId(this.#idCounts, item.id);
+          this.#send({ ...item, id });
+        }
         this.#streamingId = undefined;
+        this.#streamingPending = undefined;
+        this.#streamingSent = false;
         for (const tool of toolCallItems(message)) this.#setTool(tool, false);
         this.#updatedAt = new Date().toISOString();
         this.#pushState();
@@ -899,7 +703,7 @@ export class LiveSession implements LilaBridge {
         break;
       }
       case "custom":
-        if (message.display) this.#send(customItem(message, `c:${message.timestamp}`));
+        if (message.display) this.#send(customItem(message, uniqueId(this.#idCounts, `c:${message.timestamp}`)));
         break;
       case "user":
         this.#updatedAt = new Date().toISOString();

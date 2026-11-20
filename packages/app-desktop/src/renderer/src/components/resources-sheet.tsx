@@ -1,5 +1,6 @@
 import * as React from "react";
 import { ExternalLink, FolderOpen, RotateCw, TriangleAlert } from "lucide-react";
+import { toast } from "sonner";
 import type { SessionResources } from "@lila/protocol";
 import { parseMcpName } from "@/components/tool-call";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -23,7 +24,14 @@ function Row({ title, description, meta, path }: { title: React.ReactNode; descr
         {description ? <p className="line-clamp-2 text-xs text-muted-foreground">{description}</p> : null}
       </div>
       {path ? (
-        <Button size="icon-xs" variant="ghost" className="opacity-0 group-hover/row:opacity-100" title="打开" aria-label="打开" onClick={() => void window.lila.openPath(path)}>
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          className="opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100"
+          title="打开"
+          aria-label="打开"
+          onClick={() => void window.lila.openPath(path).catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)))}
+        >
           <ExternalLink />
         </Button>
       ) : null}
@@ -62,7 +70,11 @@ function McpTab({ resources, reloading, onReload }: { resources: SessionResource
             <span className="min-w-0 flex-1 truncate font-mono text-xs" title={path}>
               {path}
             </span>
-            <Button size="xs" variant="outline" onClick={() => void window.lila.openPath(path)}>
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() => void window.lila.openPath(path).catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)))}
+            >
               打开
             </Button>
           </div>

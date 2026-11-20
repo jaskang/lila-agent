@@ -5,9 +5,15 @@ import { join } from "node:path";
 import { DEFAULT_CORE_PORT } from "@lila/protocol";
 import { startCore } from "./server.ts";
 
+function defaultDataDir(): string {
+  if (process.platform === "darwin") return join(homedir(), "Library", "Application Support", "Lila");
+  if (process.platform === "win32") return join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Lila");
+  return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "lila");
+}
+
 const port = Number(process.env.LILA_CORE_PORT ?? DEFAULT_CORE_PORT);
 const hostname = process.env.LILA_CORE_HOST || "127.0.0.1";
-const dataDir = process.env.LILA_DATA_DIR ?? join(homedir(), "Library", "Application Support", "Lila");
+const dataDir = process.env.LILA_DATA_DIR || defaultDataDir();
 const tokenPath = join(dataDir, "core-token");
 const pidPath = join(dataDir, "core.pid");
 

@@ -12,6 +12,19 @@ import { Spinner } from "@/components/ui/spinner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { actions, client, useLila } from "@/lib/store";
 
+const SIDEBAR_OPEN_KEY = "lila.sidebarOpen";
+
+function readSidebarOpen(): boolean {
+  try {
+    const saved = localStorage.getItem(SIDEBAR_OPEN_KEY);
+    if (saved === "false") return false;
+    if (saved === "true") return true;
+  } catch {
+    // Ignore storage read errors.
+  }
+  return true;
+}
+
 function ConnectionBanner() {
   const connection = useLila((state) => state.connection);
   const detail = useLila((state) => state.connectionDetail);
@@ -47,16 +60,27 @@ function ConnectionBanner() {
 
 export function App() {
   const selectedId = useLila((state) => state.selectedId);
+  const [sidebarOpen, setSidebarOpen] = React.useState(readSidebarOpen);
+
+  const handleSidebarOpenChange = React.useCallback((open: boolean) => {
+    setSidebarOpen(open);
+    try {
+      localStorage.setItem(SIDEBAR_OPEN_KEY, String(open));
+    } catch {
+      // Ignore storage write errors.
+    }
+  }, []);
 
   React.useEffect(() => {
     client.start();
     if (typeof Notification !== "undefined" && Notification.permission === "default") void Notification.requestPermission();
     const onKey = (event: KeyboardEvent) => {
       if (!event.metaKey || event.shiftKey || event.altKey) return;
-      if (event.key === "n") {
+      const key = event.key.toLowerCase();
+      if (key === "n") {
         event.preventDefault();
         actions.startNew();
-      } else if (event.key === "k") {
+      } else if (key === "k") {
         event.preventDefault();
         actions.setPaletteOpen(!useLila.getState().paletteOpen);
       }
@@ -70,7 +94,7 @@ export function App() {
 
   return (
     <TooltipProvider>
-      <SidebarProvider className="h-svh min-h-0">
+      <SidebarProvider open={sidebarOpen} onOpenChange={handleSidebarOpenChange} className="h-svh min-h-0">
         <AppSidebar />
         <SidebarInset className="relative m-1.5 min-h-0 overflow-hidden rounded-xl bg-background shadow-sm ring-1 ring-border/60 md:peer-data-[variant=inset]:m-1.5 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-1.5">
           <ConnectionBanner />

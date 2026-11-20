@@ -1,5 +1,5 @@
 import { parseSkillBlock, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { ImageInput, TranscriptItem } from "@lila/protocol";
+import type { ImageInput, SubagentNotification, SubagentStatus, SubagentToolInfo, TranscriptItem } from "@lila/protocol";
 
 /**
  * Pure projection from Pi session entries (and live agent messages) to Lila transcript items.
@@ -81,10 +81,108 @@ function clipArgs(args: Record<string, unknown>): Record<string, unknown> {
   return clipped ?? args;
 }
 
+export function normalizeSubagentStatus(raw: string | undefined): SubagentStatus {
+  if (!raw) return "completed";
+  const lower = raw.toLowerCase();
+  switch (lower) {
+    case "queued":
+    case "running":
+    case "completed":
+    case "steered":
+    case "stopped":
+    case "aborted":
+    case "error":
+      return lower;
+    case "background":
+      return "running";
+    case "done":
+      return "completed";
+    default:
+      if (lower.includes("abort")) return "aborted";
+      if (lower.includes("stop")) return "stopped";
+      if (lower.includes("err") || lower.includes("fail")) return "error";
+      return "completed";
+  }
+}
+
+/** Filters status-ticker / background-launch boilerplate produced by pi-subagents. */
+export function isSubagentNoise(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  if (/^\d+ tool uses\.\.\.$/.test(trimmed)) return true;
+  if (/^Agent started in background\.\s+Agent ID:/i.test(trimmed)) return true;
+  return false;
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function asPositiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** Normalizes an `Agent` tool call into a typed `SubagentToolInfo` so clients never parse pi-subagents internals. */
+export function buildSubagentToolInfo(
+  args: Record<string, unknown>,
+  details: Record<string, unknown> | undefined,
+  toolStatus: ToolItem["status"],
+  output: string,
+  durationMs?: number,
+  prev?: SubagentToolInfo,
+): SubagentToolInfo {
+  const rawStatus = asNonEmptyString(details?.status);
+  const status: SubagentStatus = rawStatus
+    ? normalizeSubagentStatus(rawStatus)
+    : toolStatus === "running"
+      ? "running"
+      : toolStatus === "error"
+        ? "error"
+        : "completed";
+  const active = status === "running" || status === "queued";
+  const id = asNonEmptyString(details?.agentId) ?? asNonEmptyString(details?.id) ?? prev?.id;
+  const type = asNonEmptyString(details?.subagentType) ?? asNonEmptyString(details?.type) ?? asNonEmptyString(args.subagent_type) ?? prev?.type ?? "Agent";
+  const description = asNonEmptyString(details?.description) ?? asNonEmptyString(args.description) ?? prev?.description ?? "";
+  const prompt = asNonEmptyString(args.prompt) ?? prev?.prompt;
+  const background = Boolean(rawStatus === "background" || args.run_in_background || prev?.background);
+  const activity = active ? (asNonEmptyString(details?.activity) ?? prev?.activity) : undefined;
+  const model = asNonEmptyString(details?.modelName) ?? asNonEmptyString(details?.model) ?? prev?.model;
+  const turns = asPositiveNumber(details?.turnCount) ?? asPositiveNumber(details?.turns) ?? prev?.turns;
+  const maxTurns = asPositiveNumber(details?.maxTurns) ?? prev?.maxTurns;
+  const toolUses = asPositiveNumber(details?.toolUses) ?? prev?.toolUses;
+  const tokens = asPositiveNumber(details?.totalTokens) ?? asPositiveNumber(details?.tokens) ?? prev?.tokens;
+  const cost = asPositiveNumber(details?.cost) ?? asPositiveNumber(details?.totalCost) ?? prev?.cost;
+  const resolvedDuration = !active ? (asPositiveNumber(details?.durationMs) ?? asPositiveNumber(durationMs) ?? prev?.durationMs) : undefined;
+  const cleanOutput = !isSubagentNoise(output) ? output : prev?.output;
+  const error = asNonEmptyString(details?.error) ?? prev?.error;
+  return {
+    ...(id ? { id } : {}),
+    ...(type ? { type } : {}),
+    description,
+    ...(prompt ? { prompt } : {}),
+    background,
+    status,
+    ...(activity ? { activity } : {}),
+    ...(model ? { model } : {}),
+    ...(turns !== undefined ? { turns } : {}),
+    ...(maxTurns !== undefined ? { maxTurns } : {}),
+    ...(toolUses !== undefined ? { toolUses } : {}),
+    ...(tokens !== undefined ? { tokens } : {}),
+    ...(cost !== undefined ? { cost } : {}),
+    ...(resolvedDuration !== undefined ? { durationMs: resolvedDuration } : {}),
+    ...(cleanOutput ? { output: cleanOutput } : {}),
+    ...(error ? { error } : {}),
+  };
+}
+
 export function toolCallItems(message: AssistantMessage): ToolItem[] {
-  return message.content.flatMap((part) =>
-    part.type === "toolCall" ? [{ kind: "tool" as const, id: part.id, name: part.name, args: clipArgs(part.arguments as Record<string, unknown>), status: "running" as const, output: "" }] : [],
-  );
+  return message.content.flatMap((part) => {
+    if (part.type !== "toolCall") return [];
+    const args = clipArgs(part.arguments as Record<string, unknown>);
+    const item: ToolItem = { kind: "tool", id: part.id, name: part.name, args, status: "running", output: "" };
+    if (part.name === "Agent") item.subagent = buildSubagentToolInfo(args, undefined, "running", "");
+    return [item];
+  });
 }
 
 /** Result payload of a tool run: from a toolResult message or a live tool_execution event. */
@@ -92,31 +190,24 @@ export type ToolResultLike = { content?: readonly ContentPart[]; details?: unkno
 
 /** Applies a (partial or final) tool result to its tool item. */
 export function withToolResult(item: ToolItem, result: ToolResultLike | undefined, status: ToolItem["status"], durationMs?: number): ToolItem {
-  const next: ToolItem = { ...item, status, output: clipOutput(contentText(result?.content)) };
+  const output = clipOutput(contentText(result?.content));
+  const next: ToolItem = { ...item, status, output };
   delete next.details;
   delete next.diff;
+  delete next.subagent;
   const details = result?.details;
+  let record: Record<string, unknown> | undefined;
   if (details && typeof details === "object" && !Array.isArray(details)) {
-    const record = details as Record<string, unknown>;
+    record = details as Record<string, unknown>;
     if (item.name === "edit" && typeof record.patch === "string") next.diff = record.patch;
     if (JSON.stringify(details).length <= DETAILS_LIMIT) next.details = record;
+  }
+  if (item.name === "Agent") {
+    next.subagent = buildSubagentToolInfo(item.args, record, status, output, durationMs, item.subagent);
   }
   if (durationMs !== undefined) next.durationMs = durationMs;
   return next;
 }
-
-type SubagentNotificationSummary = {
-  id?: string;
-  description: string;
-  status: string;
-  toolUses?: number;
-  turnCount?: number;
-  totalTokens?: number;
-  totalCost?: number;
-  durationMs?: number;
-  error?: string;
-  preview?: string;
-};
 
 function unescapeXml(text: string): string {
   return text
@@ -137,7 +228,7 @@ function cleanNotificationPreview(raw: string | undefined): string | undefined {
   return cleaned;
 }
 
-function normalizeNotificationDetail(raw: unknown): SubagentNotificationSummary | undefined {
+function normalizeNotificationDetail(raw: unknown): SubagentNotification | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const d = raw as Record<string, unknown>;
   if (typeof d.description !== "string" && typeof d.id !== "string") return undefined;
@@ -145,7 +236,7 @@ function normalizeNotificationDetail(raw: unknown): SubagentNotificationSummary 
   return {
     ...(typeof d.id === "string" && d.id ? { id: d.id } : {}),
     description: typeof d.description === "string" && d.description ? d.description : "子 Agent",
-    status: typeof d.status === "string" && d.status ? d.status : "completed",
+    status: normalizeSubagentStatus(typeof d.status === "string" ? d.status : undefined),
     ...(typeof d.toolUses === "number" && d.toolUses > 0 ? { toolUses: d.toolUses } : {}),
     ...(typeof d.turnCount === "number" && d.turnCount > 0 ? { turnCount: d.turnCount } : {}),
     ...(typeof d.totalTokens === "number" && d.totalTokens > 0 ? { totalTokens: d.totalTokens } : {}),
@@ -161,27 +252,17 @@ function xmlTag(block: string, tag: string): string | undefined {
   return match?.[1] !== undefined ? unescapeXml(match[1]) : undefined;
 }
 
-function parseTaskNotificationXml(rawText: string): SubagentNotificationSummary[] {
+function parseTaskNotificationXml(rawText: string): SubagentNotification[] {
   const blocks = [...rawText.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)];
-  const parsed: SubagentNotificationSummary[] = [];
+  const parsed: SubagentNotification[] = [];
   for (const match of blocks) {
     const body = match[1] ?? "";
     const id = xmlTag(body, "task-id")?.trim();
-    const statusRaw = xmlTag(body, "status")?.trim() ?? "completed";
+    const statusRaw = xmlTag(body, "status")?.trim();
     const summary = xmlTag(body, "summary")?.trim() ?? "";
     const descMatch = /^Agent\s+"([^"]+)"/i.exec(summary);
     const description = descMatch?.[1] || summary || "子 Agent";
-    const statusLower = statusRaw.toLowerCase();
-    const status =
-      statusLower === "done" || statusLower === "completed"
-        ? "completed"
-        : statusLower.includes("abort")
-          ? "aborted"
-          : statusLower.includes("stop")
-            ? "stopped"
-            : statusLower.includes("err") || statusLower.includes("fail")
-              ? "error"
-              : statusRaw;
+    const status = normalizeSubagentStatus(statusRaw);
     const totalTokens = Number(xmlTag(body, "total_tokens"));
     const toolUses = Number(xmlTag(body, "tool_uses"));
     const totalCost = Number(xmlTag(body, "estimated_cost_usd"));
@@ -201,8 +282,8 @@ function parseTaskNotificationXml(rawText: string): SubagentNotificationSummary[
   return parsed;
 }
 
-function projectSubagentNotification(rawText: string, details: unknown): { text: string; details?: Record<string, unknown> } {
-  const notifications: SubagentNotificationSummary[] = [];
+function projectSubagentNotification(rawText: string, details: unknown): { text: string; notifications?: SubagentNotification[] } {
+  const notifications: SubagentNotification[] = [];
   if (details && typeof details === "object" && !Array.isArray(details)) {
     const record = details as Record<string, unknown>;
     const first = normalizeNotificationDetail(record);
@@ -230,7 +311,7 @@ function projectSubagentNotification(rawText: string, details: unknown): { text:
     .join("\n\n---\n\n");
   return {
     text: markdown,
-    details: { notifications },
+    notifications,
   };
 }
 
@@ -243,7 +324,7 @@ export function customItem(message: { customType: string; content: CustomMessage
       id,
       customType: message.customType,
       text: projected.text,
-      ...(projected.details ? { details: projected.details } : {}),
+      ...(projected.notifications?.length ? { notifications: projected.notifications } : {}),
     };
   }
   return { kind: "custom", id, customType: message.customType, text: rawText };
@@ -264,10 +345,28 @@ export function parseUserItemId(itemId: string): { timestamp: number; occurrence
   return { timestamp, occurrence };
 }
 
-function uniqueId(counts: Map<string, number>, base: string): string {
+export function uniqueId(counts: Map<string, number>, base: string): string {
   const seen = (counts.get(base) ?? 0) + 1;
   counts.set(base, seen);
   return seen === 1 ? base : `${base}#${seen}`;
+}
+
+/** Computes the same per-base ID occurrence map as `projectBranch` so live streaming IDs stay aligned. */
+export function countBranchIds(entries: readonly SessionEntry[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.type === "message") {
+      const message = entry.message;
+      if (message.role === "user") uniqueId(counts, `u:${message.timestamp}`);
+      else if (message.role === "assistant") {
+        if (hasAssistantContent(assistantItem(message, false))) uniqueId(counts, `a:${message.timestamp}`);
+      } else if (message.role === "bashExecution") uniqueId(counts, `b:${message.timestamp}`);
+      else if (message.role === "custom" && message.display) uniqueId(counts, `c:${message.timestamp}`);
+    } else if (entry.type === "custom_message" && entry.display) {
+      uniqueId(counts, `c:${Date.parse(entry.timestamp)}`);
+    }
+  }
+  return counts;
 }
 
 /** Projects the entries of one branch (root to leaf) into transcript items. */
@@ -281,9 +380,9 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
   let sawMessage = false;
 
   const trackAgent = (item: ToolItem, index: number) => {
-    if (item.name === "Agent" && typeof item.details?.agentId === "string" && item.details.agentId) {
-      agentIndex.set(item.details.agentId, index);
-    }
+    if (item.name !== "Agent") return;
+    const agentId = item.subagent?.id ?? asNonEmptyString(item.details?.agentId);
+    if (agentId) agentIndex.set(agentId, index);
   };
 
   const addTool = (item: ToolItem) => {
@@ -348,26 +447,37 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
       case "custom": {
         if (entry.customType === "subagents:record" && entry.data && typeof entry.data === "object") {
           const record = entry.data as Record<string, unknown>;
-          const id = typeof record.id === "string" ? record.id : undefined;
+          const id = asNonEmptyString(record.id);
           const index = id ? agentIndex.get(id) : undefined;
           if (index !== undefined) {
             const existing = items[index] as ToolItem;
-            const status = typeof record.status === "string" ? record.status : undefined;
+            const status = asNonEmptyString(record.status);
             const startedAt = typeof record.startedAt === "number" ? record.startedAt : undefined;
             const completedAt = typeof record.completedAt === "number" ? record.completedAt : undefined;
             const durationMs = startedAt !== undefined && completedAt !== undefined && completedAt >= startedAt ? completedAt - startedAt : undefined;
-            const isErr = status === "error" || status === "aborted" || status === "stopped";
+            const normalizedStatus = status ? normalizeSubagentStatus(status) : undefined;
+            const isErr = normalizedStatus === "error" || normalizedStatus === "aborted" || normalizedStatus === "stopped";
             const nextDetails: Record<string, unknown> = {
               ...existing.details,
+              ...(id ? { agentId: id } : {}),
+              ...(asNonEmptyString(record.type) ? { subagentType: record.type } : {}),
+              ...(asNonEmptyString(record.description) ? { description: record.description } : {}),
               ...(status ? { status } : {}),
               ...(durationMs !== undefined ? { durationMs } : {}),
-              ...(typeof record.error === "string" && record.error ? { error: record.error } : {}),
+              ...(asPositiveNumber(record.toolUses) !== undefined ? { toolUses: record.toolUses } : {}),
+              ...(asPositiveNumber(record.turnCount) !== undefined ? { turnCount: record.turnCount } : {}),
+              ...(asPositiveNumber(record.totalTokens) !== undefined ? { totalTokens: record.totalTokens } : {}),
+              ...(asPositiveNumber(record.cost) !== undefined ? { cost: record.cost } : {}),
+              ...(asNonEmptyString(record.error) ? { error: record.error } : {}),
             };
-            const output = typeof record.result === "string" && record.result ? clipOutput(record.result) : existing.output;
+            const rawOutput = asNonEmptyString(record.result) ? clipOutput(record.result as string) : existing.output;
+            const nextToolStatus: ToolItem["status"] = isErr ? "error" : "done";
+            const nextSubagent = buildSubagentToolInfo(existing.args, nextDetails, nextToolStatus, rawOutput, durationMs, existing.subagent);
             items[index] = {
               ...existing,
-              status: isErr ? "error" : "done",
-              output,
+              status: nextToolStatus,
+              output: rawOutput,
+              subagent: nextSubagent,
               details: nextDetails,
               ...(durationMs !== undefined ? { durationMs } : {}),
             };
@@ -397,7 +507,14 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
   const live = new Set(options.running ? lastAssistantTools : []);
   for (const [id, index] of toolIndex) {
     const item = items[index] as ToolItem;
-    if (item.status === "running" && !live.has(id)) items[index] = { ...item, status: "error", output: item.output || "未完成" };
+    if (item.status === "running" && !live.has(id)) {
+      const output = item.output || "未完成";
+      const next: ToolItem = { ...item, status: "error", output };
+      if (item.name === "Agent") {
+        next.subagent = buildSubagentToolInfo(item.args, { ...item.details, status: "error", error: item.subagent?.error ?? "未完成" }, "error", output, item.durationMs, item.subagent);
+      }
+      items[index] = next;
+    }
   }
   return items;
 }

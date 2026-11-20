@@ -70,17 +70,23 @@ function Shell({
   );
 }
 
-/** Buttons answered with number keys while focus is not in a text field. Does not steal focus from the composer. */
+/** Buttons answered with ⌘1-9 anywhere (including while typing), or bare 1-9 when focus is not in a text field. */
 function Choices({ choices, onAnswer, onCancel }: { choices: Choice[]; onAnswer: Answer; onCancel?: () => void }) {
   React.useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target?.closest("textarea, input, [contenteditable=true]") || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.isComposing || event.ctrlKey || event.altKey || event.shiftKey) return;
+      if (!/^[1-9]$/.test(event.key)) return;
       const choice = choices[Number(event.key) - 1];
-      if (choice) {
+      if (!choice) return;
+      if (event.metaKey) {
         event.preventDefault();
         onAnswer(choice.answer);
+        return;
       }
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("textarea, input, [contenteditable=true]")) return;
+      event.preventDefault();
+      onAnswer(choice.answer);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -88,9 +94,15 @@ function Choices({ choices, onAnswer, onCancel }: { choices: Choice[]; onAnswer:
   return (
     <div className="flex flex-wrap gap-2">
       {choices.map((choice, index) => (
-        <Button key={choice.label} size="sm" variant={choice.variant} onClick={() => onAnswer(choice.answer)}>
+        <Button
+          key={choice.label}
+          size="sm"
+          variant={choice.variant}
+          title={index < 9 ? `快捷键 ⌘${index + 1}（未聚焦输入框时也可直接按 ${index + 1}）` : undefined}
+          onClick={() => onAnswer(choice.answer)}
+        >
           {choice.label}
-          {index < 9 ? <Kbd className="ms-1">{index + 1}</Kbd> : null}
+          {index < 9 ? <Kbd className="ms-1">⌘{index + 1}</Kbd> : null}
         </Button>
       ))}
       {onCancel ? (
@@ -174,7 +186,7 @@ function AskAnswer({ item, onAnswer }: { item: PendingRequest; onAnswer: Answer 
         </QuestionnaireItem>
       ))}
       <QuestionnaireActions>
-        <Button type="button" size="sm" variant="ghost" className="justify-self-start" onClick={() => onAnswer({ type: "cancel" })}>
+        <Button type="button" size="sm" variant="ghost" className="col-start-2 row-start-1 justify-self-end" onClick={() => onAnswer({ type: "cancel" })}>
           跳过
         </Button>
         <QuestionnairePrevious size="sm">上一题</QuestionnairePrevious>

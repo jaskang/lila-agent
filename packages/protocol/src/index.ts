@@ -12,7 +12,7 @@ import { z } from "zod";
  * A client that reconnects simply opens the session again.
  */
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 export const DEFAULT_CORE_PORT = 7457;
 
 const Id = z.string().min(1);
@@ -59,6 +59,42 @@ export type SessionSummary = {
 
 export type ToolStatus = "running" | "done" | "error";
 
+export type SubagentStatus = "queued" | "running" | "completed" | "steered" | "stopped" | "aborted" | "error";
+
+/** Normalized metadata for a sub-agent tool call, produced by core so clients never parse pi-subagents internals. */
+export type SubagentToolInfo = {
+  id?: string;
+  type?: string;
+  description: string;
+  prompt?: string;
+  background: boolean;
+  status: SubagentStatus;
+  activity?: string;
+  model?: string;
+  turns?: number;
+  maxTurns?: number;
+  toolUses?: number;
+  tokens?: number;
+  cost?: number;
+  durationMs?: number;
+  output?: string;
+  error?: string;
+};
+
+/** Normalized background sub-agent completion notice, stripped of raw XML and temp paths by core. */
+export type SubagentNotification = {
+  id?: string;
+  description: string;
+  status: SubagentStatus;
+  toolUses?: number;
+  turnCount?: number;
+  totalTokens?: number;
+  totalCost?: number;
+  durationMs?: number;
+  error?: string;
+  preview?: string;
+};
+
 export type TranscriptItem =
   | { kind: "user"; id: string; text: string; images: ImageInput[]; canRewind: boolean }
   | { kind: "assistant"; id: string; text: string; thinking: string; model?: string; streaming: boolean; error?: string }
@@ -73,12 +109,21 @@ export type TranscriptItem =
       output: string;
       /** Unified patch for edit/write tools. */
       diff?: string;
-      /** Tool-specific details for rich rendering (for example the subagent `Agent` tool), dropped when large. */
+      /** Normalized sub-agent view when this tool call spawned a sub-agent. */
+      subagent?: SubagentToolInfo;
+      /** Tool-specific details for rich rendering, dropped when large. */
       details?: Record<string, unknown>;
       durationMs?: number;
     }
   /** Context an extension injected, for example a background subagent's report. Markdown. */
-  | { kind: "custom"; id: string; customType: string; text: string; details?: Record<string, unknown> }
+  | {
+      kind: "custom";
+      id: string;
+      customType: string;
+      text: string;
+      notifications?: SubagentNotification[];
+      details?: Record<string, unknown>;
+    }
   | { kind: "notice"; id: string; tone: "info" | "warning" | "error"; text: string };
 
 export type ItemKind = TranscriptItem["kind"];
@@ -119,8 +164,6 @@ export type PendingAnswer = z.infer<typeof PendingAnswer>;
 
 // ---------------------------------------------------------------------------
 // Live session state
-
-export type SubagentStatus = "queued" | "running" | "completed" | "steered" | "stopped" | "aborted" | "error";
 
 export type SubagentProgress = {
   id: string;
@@ -225,6 +268,8 @@ export const ClientCommand = z.discriminatedUnion("type", [
   }),
   /** Returns the newest items and makes this socket watch the session; replaces any previous watch. */
   z.object({ type: z.literal("session.open"), ...SessionRef, limit: z.number().int().positive().max(1000).optional() }),
+  /** Stops streaming frames for the previously watched session on this socket. */
+  z.object({ type: z.literal("session.unwatch"), requestId: RequestId }),
   z.object({ type: z.literal("session.earlier"), ...SessionRef, beforeId: Id, limit: z.number().int().positive().max(1000) }),
   z.object({
     type: z.literal("session.prompt"),
@@ -270,6 +315,7 @@ export interface CommandResults {
   "sessions.list": { sessions: SessionSummary[] };
   "session.create": { session: SessionSummary };
   "session.open": { items: TranscriptItem[]; hasEarlier: boolean; state: SessionState };
+  "session.unwatch": Empty;
   "session.earlier": { items: TranscriptItem[]; hasEarlier: boolean };
   "session.prompt": Empty;
   "session.abort": Empty;

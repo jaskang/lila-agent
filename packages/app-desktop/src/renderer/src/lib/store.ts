@@ -37,6 +37,8 @@ type State = {
   defaultModelId?: string;
   modelsError?: string;
   sessions: Record<string, SessionSummary>;
+  /** Parent session id → child sub-agent sessions, sorted by newest first. */
+  childrenByParent: Record<string, SessionSummary[]>;
   views: Record<string, SessionView>;
   selectedId?: string;
   newSession: NewSessionOptions;
@@ -55,6 +57,7 @@ const NEW_SESSION_KEY = "lila.newSession";
 const OPEN_LIMIT = 300;
 const EARLIER_LIMIT = 200;
 const MAX_CACHED_VIEWS = 10;
+const MAX_SCROLL_POSITIONS = 50;
 
 export const APPROVAL_LABEL: Record<ApprovalMode, string> = {
   auto: "自动执行",
@@ -78,7 +81,28 @@ export const THINKING_LABEL: Record<ThinkingLevel, string> = {
   max: "最深入",
 };
 
+export const EMPTY_VIEW: SessionView = Object.freeze({
+  items: [],
+  index: {},
+  hasEarlier: false,
+  loadingEarlier: false,
+  loading: false,
+});
+
 export const emptyView = (): SessionView => ({ items: [], index: {}, hasEarlier: false, loadingEarlier: false, loading: false });
+
+function buildChildrenByParent(sessions: Record<string, SessionSummary>): Record<string, SessionSummary[]> {
+  const children: Record<string, SessionSummary[]> = {};
+  for (const session of Object.values(sessions)) {
+    if (session.parentId) (children[session.parentId] ??= []).push(session);
+  }
+  for (const list of Object.values(children)) list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return children;
+}
+
+function withSessions(sessions: Record<string, SessionSummary>): Pick<State, "sessions" | "childrenByParent"> {
+  return { sessions, childrenByParent: buildChildrenByParent(sessions) };
+}
 
 function readNewSession(): NewSessionOptions {
   try {
@@ -95,6 +119,7 @@ export const useLila = create<State>(() => ({
   projects: [],
   models: [],
   sessions: {},
+  childrenByParent: {},
   views: {},
   selectedId: localStorage.getItem(SELECTED_KEY) ?? undefined,
   newSession: readNewSession(),
@@ -126,6 +151,8 @@ function indexOf(items: TranscriptItem[]): Record<string, number> {
 
 /** Most-recently-opened sessions, used to cap in-memory transcript views. */
 const recentViews: string[] = [];
+/** Per-session scrollTop cache, kept in memory so revisiting a session restores its reading position. */
+const scrollPositions = new Map<string, number>();
 
 function recordViewAccess(sessionId: string): void {
   const existing = recentViews.indexOf(sessionId);
@@ -224,6 +251,19 @@ let watching: string | undefined;
 const opening = new Map<string, number>();
 let openCounter = 0;
 
+function unwatchCurrent(): void {
+  const hadWatch = watching !== undefined;
+  watching = undefined;
+  buffer = [];
+  if (frameHandle !== undefined) {
+    cancelAnimationFrame(frameHandle);
+    frameHandle = undefined;
+  }
+  if (hadWatch && get().connection === "connected") {
+    void client.call({ type: "session.unwatch" }).catch(() => {});
+  }
+}
+
 async function openSession(sessionId: string): Promise<void> {
   const token = ++openCounter;
   opening.set(sessionId, token);
@@ -233,13 +273,13 @@ async function openSession(sessionId: string): Promise<void> {
   setView(sessionId, (view) => ({ ...view, loading: true, error: undefined }));
   try {
     const { items, hasEarlier, state } = await client.call({ type: "session.open", sessionId, limit: OPEN_LIMIT });
-    if (opening.get(sessionId) !== token) return;
+    if (opening.get(sessionId) !== token || watching !== sessionId) return;
     // Frames queued before the snapshot are already part of it.
     buffer = buffer.filter((frame) => frame.sessionId !== sessionId);
     setView(sessionId, () => ({ items, index: indexOf(items), hasEarlier, loadingEarlier: false, state, loading: false }));
     pruneViews();
   } catch (error) {
-    if (opening.get(sessionId) !== token) return;
+    if (opening.get(sessionId) !== token || watching !== sessionId) return;
     setView(sessionId, (view) => ({ ...view, loading: false, error: message(error) }));
   } finally {
     if (opening.get(sessionId) === token) opening.delete(sessionId);
@@ -283,7 +323,7 @@ function handlePush(frame: PushMessage): void {
       return;
     case "session": {
       const previous = get().sessions[frame.session.id];
-      set((state) => ({ sessions: { ...state.sessions, [frame.session.id]: frame.session } }));
+      set((state) => withSessions({ ...state.sessions, [frame.session.id]: frame.session }));
       notifyTransition(previous, frame.session);
       return;
     }
@@ -302,6 +342,7 @@ function forget(sessionId: string): void {
   const wasSelected = get().selectedId === sessionId;
   const idx = recentViews.indexOf(sessionId);
   if (idx >= 0) recentViews.splice(idx, 1);
+  scrollPositions.delete(sessionId);
   set((state) => {
     const sessions = { ...state.sessions };
     delete sessions[sessionId];
@@ -311,11 +352,17 @@ function forget(sessionId: string): void {
     delete drafts[sessionId];
     const draftImages = { ...state.draftImages };
     delete draftImages[sessionId];
-    return { sessions, views, drafts, draftImages, ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, gitOpen: false } : {}) };
+    return {
+      ...withSessions(sessions),
+      views,
+      drafts,
+      draftImages,
+      ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, gitOpen: false } : {}),
+    };
   });
   if (wasSelected) {
     localStorage.removeItem(SELECTED_KEY);
-    watching = undefined;
+    unwatchCurrent();
   }
 }
 
@@ -338,8 +385,11 @@ async function onReady(): Promise<void> {
     const byId = Object.fromEntries(sessions.map((session) => [session.id, session]));
     const selectedId = get().selectedId;
     const missing = selectedId !== undefined && !byId[selectedId];
-    set({ projects, sessions: byId, ...(missing ? { selectedId: undefined } : {}) });
-    if (missing) localStorage.removeItem(SELECTED_KEY);
+    set({ projects, ...withSessions(byId), ...(missing ? { selectedId: undefined } : {}) });
+    if (missing) {
+      localStorage.removeItem(SELECTED_KEY);
+      watching = undefined;
+    }
     const current = get().selectedId;
     if (current) await openSession(current);
   } catch (error) {
@@ -365,12 +415,39 @@ async function attempt<T>(run: () => Promise<T>): Promise<T | undefined> {
   }
 }
 
+function toDraftImages(images: ImageInput[]): DraftImage[] {
+  return images.map((image, index) => ({
+    ...image,
+    id: crypto.randomUUID(),
+    name: `图片 ${index + 1}`,
+  }));
+}
+
 export const actions = {
   select(sessionId: string | undefined): void {
     set({ selectedId: sessionId, resourcesOpen: false, gitOpen: false });
     if (sessionId) localStorage.setItem(SELECTED_KEY, sessionId);
     else localStorage.removeItem(SELECTED_KEY);
-    if (sessionId && get().connection === "connected") void openSession(sessionId);
+    if (!sessionId) {
+      unwatchCurrent();
+      return;
+    }
+    if (get().connection === "connected") void openSession(sessionId);
+    else watching = undefined;
+  },
+
+  getScrollTop(sessionId: string): number | undefined {
+    return scrollPositions.get(sessionId);
+  },
+
+  setScrollTop(sessionId: string, scrollTop: number): void {
+    if (!Number.isFinite(scrollTop) || scrollTop < 0) return;
+    if (scrollPositions.has(sessionId)) scrollPositions.delete(sessionId);
+    scrollPositions.set(sessionId, scrollTop);
+    if (scrollPositions.size > MAX_SCROLL_POSITIONS) {
+      const oldest = scrollPositions.keys().next().value;
+      if (oldest !== undefined) scrollPositions.delete(oldest);
+    }
   },
 
   /** Shows the new-session composer, optionally for one project. */
@@ -442,6 +519,7 @@ export const actions = {
     for (let i = recentViews.length - 1; i >= 0; i--) {
       if (removedSessionIds.has(recentViews[i]!)) recentViews.splice(i, 1);
     }
+    for (const id of removedSessionIds) scrollPositions.delete(id);
     const wasSelected = state.selectedId !== undefined && removedSessionIds.has(state.selectedId);
     const remainingProjects = state.projects.filter((project) => project.id !== projectId);
     const nextNewSession =
@@ -459,7 +537,7 @@ export const actions = {
       }
       return {
         projects: remainingProjects,
-        sessions,
+        ...withSessions(sessions),
         views,
         drafts,
         draftImages,
@@ -469,7 +547,7 @@ export const actions = {
     });
     if (wasSelected) {
       localStorage.removeItem(SELECTED_KEY);
-      watching = undefined;
+      unwatchCurrent();
     }
     if (nextNewSession !== state.newSession) localStorage.setItem(NEW_SESSION_KEY, JSON.stringify(nextNewSession));
     return true;
@@ -479,6 +557,7 @@ export const actions = {
   async createAndPrompt(text: string, images: ImageInput[]): Promise<boolean> {
     const { projectId, modelId, thinkingLevel, approvalMode } = get().newSession;
     if (!projectId) return false;
+    const existingDraftImages = get().draftImages[NEW_DRAFT];
     const created = await attempt(() =>
       client.call({
         type: "session.create",
@@ -490,11 +569,39 @@ export const actions = {
     );
     if (!created) return false;
     const { session } = created;
-    set((state) => ({ sessions: { ...state.sessions, [session.id]: session }, selectedId: session.id }));
+    set((state) => ({
+      ...withSessions({ ...state.sessions, [session.id]: session }),
+      selectedId: session.id,
+    }));
     localStorage.setItem(SELECTED_KEY, session.id);
     // Ensure the socket watches the new session before sending its first prompt so early frames are never missed.
     if (get().connection === "connected") await openSession(session.id);
-    return actions.prompt(session.id, text, images);
+    const ok = await actions.prompt(session.id, text, images);
+    if (!ok) {
+      const migratedImages =
+        existingDraftImages && existingDraftImages.length === images.length
+          ? existingDraftImages
+          : toDraftImages(images);
+      set((state) => {
+        const drafts = { ...state.drafts, [session.id]: text };
+        delete drafts[NEW_DRAFT];
+        const draftImages = { ...state.draftImages };
+        if (migratedImages.length) draftImages[session.id] = migratedImages;
+        else delete draftImages[session.id];
+        delete draftImages[NEW_DRAFT];
+        return { drafts, draftImages };
+      });
+      return false;
+    }
+    // Clear new-session draft after successful handoff (NewSession may already have unmounted).
+    set((state) => {
+      const drafts = { ...state.drafts };
+      delete drafts[NEW_DRAFT];
+      const draftImages = { ...state.draftImages };
+      delete draftImages[NEW_DRAFT];
+      return { drafts, draftImages };
+    });
+    return true;
   },
 
   async prompt(sessionId: string, text: string, images: ImageInput[] = [], mode?: "steer" | "followUp"): Promise<boolean> {
@@ -519,7 +626,7 @@ export const actions = {
   async rename(sessionId: string, title: string): Promise<boolean> {
     const result = await attempt(() => client.call({ type: "session.rename", sessionId, title }));
     if (!result) return false;
-    set((state) => ({ sessions: { ...state.sessions, [result.session.id]: result.session } }));
+    set((state) => withSessions({ ...state.sessions, [result.session.id]: result.session }));
     return true;
   },
 
@@ -540,10 +647,13 @@ export const actions = {
     return done;
   },
 
-  /** Moves the session back to before a user message; its text goes back into the composer. */
-  async rewind(sessionId: string, itemId: string): Promise<void> {
+  /** Moves the session back to before a user message; its text and images go back into the composer. */
+  async rewind(sessionId: string, itemId: string, images: ImageInput[] = []): Promise<boolean> {
     const result = await attempt(() => client.call({ type: "session.rewind", sessionId, itemId }));
-    if (result) actions.setDraft(sessionId, result.text);
+    if (!result) return false;
+    actions.setDraft(sessionId, result.text);
+    actions.setDraftImages(sessionId, toDraftImages(images));
+    return true;
   },
 
   async respond(sessionId: string, pendingId: string, answer: PendingAnswer): Promise<void> {

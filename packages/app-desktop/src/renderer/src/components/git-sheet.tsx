@@ -56,21 +56,39 @@ export function GitSheet({
   const [diff, setDiff] = React.useState<GitFileDiff>();
   const [diffLoading, setDiffLoading] = React.useState(false);
   const [diffError, setDiffError] = React.useState<string>();
+  const [refreshNonce, setRefreshNonce] = React.useState(0);
+
+  const onStatusLoadedRef = React.useRef(onStatusLoaded);
+  onStatusLoadedRef.current = onStatusLoaded;
+  const statusReqRef = React.useRef(0);
+
+  React.useEffect(() => {
+    setStatus(undefined);
+    setError(undefined);
+    setSelectedPath(undefined);
+    setDiff(undefined);
+    setDiffError(undefined);
+    setScope("all");
+  }, [projectId]);
 
   const loadStatus = React.useCallback(async () => {
     if (!projectId) return;
+    const reqId = ++statusReqRef.current;
     setLoading(true);
     setError(undefined);
     try {
       const next = await actions.gitStatus(projectId);
+      if (statusReqRef.current !== reqId) return;
       setStatus(next);
-      onStatusLoaded?.(next);
+      onStatusLoadedRef.current?.(next);
+      setRefreshNonce((nonce) => nonce + 1);
     } catch (failure) {
+      if (statusReqRef.current !== reqId) return;
       setError(failure instanceof Error ? failure.message : String(failure));
     } finally {
-      setLoading(false);
+      if (statusReqRef.current === reqId) setLoading(false);
     }
-  }, [projectId, onStatusLoaded]);
+  }, [projectId]);
 
   React.useEffect(() => {
     if (open) void loadStatus();
@@ -85,6 +103,12 @@ export function GitSheet({
 
   const hasStaged = Boolean(status?.files.some((file) => file.staged));
   const hasUnstaged = Boolean(status?.files.some((file) => file.unstaged));
+
+  React.useEffect(() => {
+    if ((scope === "staged" && !hasStaged) || (scope === "unstaged" && !hasUnstaged)) {
+      setScope("all");
+    }
+  }, [scope, hasStaged, hasUnstaged]);
 
   React.useEffect(() => {
     if (!files.length) {
@@ -122,7 +146,7 @@ export function GitSheet({
     return () => {
       cancelled = true;
     };
-  }, [open, projectId, selectedPath, scope, status]);
+  }, [open, projectId, selectedPath, scope, refreshNonce]);
 
   const fullPath = project && selectedFile ? joinPath(project.path, selectedFile.path) : undefined;
 

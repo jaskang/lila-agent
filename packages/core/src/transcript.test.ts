@@ -92,7 +92,7 @@ test("merges persisted subagents:record entries back onto background Agent tool 
       type: "message",
       message: {
         role: "assistant",
-        content: [{ type: "toolCall", id: "call-bg", name: "Agent", arguments: { subagent_type: "Explore", description: "检查源码" } }],
+        content: [{ type: "toolCall", id: "call-bg", name: "Agent", arguments: { subagent_type: "Explore", description: "检查源码", prompt: "分析目录结构" } }],
         api: "openai",
         provider: "openai",
         model: "gpt",
@@ -123,16 +123,43 @@ test("merges persisted subagents:record entries back onto background Agent tool 
     },
   ] as unknown as SessionEntry[];
 
+  // Before subagents:record arrives, background launch boilerplate is filtered out of `item.subagent.output`.
+  const pendingItems = projectBranch(withSubagent.slice(0, 2));
+  expect(pendingItems[0]).toMatchObject({
+    kind: "tool",
+    id: "call-bg",
+    name: "Agent",
+    subagent: {
+      id: "ag-1",
+      type: "Explore",
+      description: "检查源码",
+      prompt: "分析目录结构",
+      background: true,
+      status: "running",
+    },
+  });
+  expect(pendingItems[0]?.kind === "tool" ? pendingItems[0].subagent?.output : undefined).toBeUndefined();
+
   const items = projectBranch(withSubagent);
   expect(items).toEqual([
     {
       kind: "tool",
       id: "call-bg",
       name: "Agent",
-      args: { subagent_type: "Explore", description: "检查源码" },
+      args: { subagent_type: "Explore", description: "检查源码", prompt: "分析目录结构" },
       status: "done",
       output: "源码结构如下",
-      details: { agentId: "ag-1", status: "completed", durationMs: 15_000 },
+      subagent: {
+        id: "ag-1",
+        type: "Explore",
+        description: "检查源码",
+        prompt: "分析目录结构",
+        background: true,
+        status: "completed",
+        durationMs: 15_000,
+        output: "源码结构如下",
+      },
+      details: { agentId: "ag-1", subagentType: "Explore", description: "检查源码", status: "completed", durationMs: 15_000 },
       durationMs: 15_000,
     },
   ]);
@@ -162,19 +189,17 @@ test("cleans subagent-notification XML and transcript file paths into structured
       id: `c:${Date.parse(new Date(1_000).toISOString())}`,
       customType: "subagent-notification",
       text: "API 放在 src/api/<domain>.ts…",
-      details: {
-        notifications: [
-          {
-            id: "ee9166ea-d698-4b4",
-            description: "检查项目开发规范",
-            status: "completed",
-            toolUses: 3,
-            totalTokens: 2863,
-            durationMs: 23882,
-            preview: "API 放在 src/api/<domain>.ts…",
-          },
-        ],
-      },
+      notifications: [
+        {
+          id: "ee9166ea-d698-4b4",
+          description: "检查项目开发规范",
+          status: "completed",
+          toolUses: 3,
+          totalTokens: 2863,
+          durationMs: 23882,
+          preview: "API 放在 src/api/<domain>.ts…",
+        },
+      ],
     },
   ]);
 });

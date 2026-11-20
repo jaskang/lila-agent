@@ -47,8 +47,10 @@ import {
   SidebarMenuSubButton,
   SidebarMenuSubItem,
   SidebarTrigger,
+  useSidebar,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
+import { cn } from "cn";
 import { actions, useLila } from "@/lib/store";
 
 const RELATIVE = new Intl.RelativeTimeFormat("zh-CN", { numeric: "auto" });
@@ -87,9 +89,19 @@ function StatusIcon({ status }: { status: SessionSummary["status"] }) {
   return null;
 }
 
-/** Active (running/waiting/error) or currently-viewed sub-agent sessions, shown directly under their parent. */
-function SubSessions({ sessions, selectedId }: { sessions: SessionSummary[]; selectedId: string | undefined }) {
-  const visible = sessions.filter((session) => session.status !== "idle" || session.id === selectedId);
+/** Sub-agent sessions under a parent: active or selected show always; completed history shows on demand. */
+function SubSessions({
+  sessions,
+  selectedId,
+  showHistory,
+  onSelectSession,
+}: {
+  sessions: SessionSummary[];
+  selectedId: string | undefined;
+  showHistory: boolean;
+  onSelectSession: (sessionId: string) => void;
+}) {
+  const visible = showHistory ? sessions : sessions.filter((session) => session.status !== "idle" || session.id === selectedId);
   if (!visible.length) return null;
   return (
     <SidebarMenuSub>
@@ -98,7 +110,7 @@ function SubSessions({ sessions, selectedId }: { sessions: SessionSummary[]; sel
           <SidebarMenuSubButton
             size="sm"
             isActive={session.id === selectedId}
-            render={<button type="button" title={session.title} onClick={() => actions.select(session.id)} />}
+            render={<button type="button" title={session.title} onClick={() => onSelectSession(session.id)} />}
           >
             <Bot />
             <span className="truncate">{session.title}</span>
@@ -116,31 +128,59 @@ function SessionRow({
   subSessions,
   selectedId,
   now,
+  onSelectSession,
 }: {
   session: SessionSummary;
   active: boolean;
   subSessions?: SessionSummary[] | undefined;
   selectedId: string | undefined;
   now: number;
+  onSelectSession: (sessionId: string) => void;
 }) {
   const [editing, setEditing] = React.useState(false);
   const [confirming, setConfirming] = React.useState(false);
+  const [showHistorySubs, setShowHistorySubs] = React.useState(false);
   const [title, setTitle] = React.useState(session.title);
   const inputRef = React.useRef<HTMLInputElement>(null);
+  const savingRef = React.useRef(false);
   const busy = session.status === "running" || session.status === "waiting";
+
+  const hiddenIdleCount = React.useMemo(
+    () => (subSessions ?? []).filter((sub) => sub.status === "idle" && sub.id !== selectedId).length,
+    [subSessions, selectedId],
+  );
+  const hasHistoryToggle = hiddenIdleCount > 0;
+
+  const startEditing = () => {
+    setTitle(session.title);
+    setEditing(true);
+  };
 
   React.useEffect(() => {
     if (!editing) return;
-    setTitle(session.title);
     requestAnimationFrame(() => {
       inputRef.current?.focus();
       inputRef.current?.select();
     });
-  }, [editing, session.title]);
+  }, [editing]);
 
   async function save(): Promise<void> {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    const currentTitle = session.title;
     const next = title.trim();
-    if (!next || next === session.title || (await actions.rename(session.id, next))) setEditing(false);
+    try {
+      if (!next || next === currentTitle) {
+        setTitle(currentTitle);
+        setEditing(false);
+        return;
+      }
+      const ok = await actions.rename(session.id, next);
+      if (!ok) setTitle(currentTitle);
+      setEditing(false);
+    } finally {
+      savingRef.current = false;
+    }
   }
 
   if (editing) {
@@ -156,8 +196,14 @@ function SessionRow({
           onBlur={() => void save()}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
-            if (event.key === "Enter") void save();
-            if (event.key === "Escape") setEditing(false);
+            if (event.key === "Enter") {
+              event.preventDefault();
+              void save();
+            } else if (event.key === "Escape") {
+              event.preventDefault();
+              setTitle(session.title);
+              setEditing(false);
+            }
           }}
         />
       </SidebarMenuItem>
@@ -166,19 +212,39 @@ function SessionRow({
 
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton isActive={active} onClick={() => actions.select(session.id)} className="h-auto py-1.5 pr-8">
+      <SidebarMenuButton
+        isActive={active}
+        onClick={() => onSelectSession(session.id)}
+        className={cn("h-auto py-1.5", hasHistoryToggle ? "pr-16" : "pr-8")}
+      >
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="truncate">{session.title || "新会话"}</span>
           <span className="text-xs text-muted-foreground">{ago(session.updatedAt, now)}</span>
         </div>
         <StatusIcon status={session.status} />
       </SidebarMenuButton>
+      {hasHistoryToggle ? (
+        <button
+          type="button"
+          aria-expanded={showHistorySubs}
+          aria-label={showHistorySubs ? "收起历史子会话" : `展开 ${subSessions?.length ?? hiddenIdleCount} 个子会话`}
+          title={showHistorySubs ? "收起历史子会话" : `展开历史子会话（共 ${subSessions?.length ?? hiddenIdleCount} 个）`}
+          onClick={() => setShowHistorySubs((current) => !current)}
+          className={cn(
+            "absolute top-2.5 right-7 z-10 inline-flex h-5 items-center gap-0.5 rounded px-1 font-mono text-[11px] tabular-nums transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+            showHistorySubs ? "bg-sidebar-accent text-sidebar-accent-foreground" : "text-muted-foreground",
+          )}
+        >
+          <Bot className="size-3" />
+          {subSessions?.length ?? hiddenIdleCount}
+        </button>
+      ) : null}
       <DropdownMenu>
         <DropdownMenuTrigger render={<SidebarMenuAction showOnHover className="top-2.5" aria-label="更多操作" />}>
           <MoreHorizontal />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" side="right" className="w-36" finalFocus={false}>
-          <DropdownMenuItem onClick={() => setEditing(true)}>
+          <DropdownMenuItem onClick={startEditing}>
             <Pencil />
             重命名
           </DropdownMenuItem>
@@ -209,7 +275,14 @@ function SessionRow({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      {subSessions?.length ? <SubSessions sessions={subSessions} selectedId={selectedId} /> : null}
+      {subSessions?.length ? (
+        <SubSessions
+          sessions={subSessions}
+          selectedId={selectedId}
+          showHistory={showHistorySubs}
+          onSelectSession={onSelectSession}
+        />
+      ) : null}
     </SidebarMenuItem>
   );
 }
@@ -223,6 +296,8 @@ function ProjectGroup({
   isCollapsed,
   now,
   onToggle,
+  onSelectSession,
+  onStartNew,
 }: {
   project: Project;
   list: SessionSummary[];
@@ -232,6 +307,8 @@ function ProjectGroup({
   isCollapsed: boolean;
   now: number;
   onToggle: () => void;
+  onSelectSession: (sessionId: string) => void;
+  onStartNew: (projectId: string) => void;
 }) {
   const [removing, setRemoving] = React.useState(false);
   const status = projectStatus(allSessions);
@@ -248,7 +325,15 @@ function ProjectGroup({
         {isCollapsed && status !== "idle" ? <StatusIcon status={status} /> : null}
       </SidebarGroupLabel>
       <DropdownMenu>
-        <DropdownMenuTrigger render={<SidebarGroupAction className="right-8 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100 data-popup-open:opacity-100" title="项目操作" aria-label={`${project.name} 的操作`} />}>
+        <DropdownMenuTrigger
+          render={
+            <SidebarGroupAction
+              className="right-8 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100 data-popup-open:opacity-100"
+              title="项目操作"
+              aria-label={`${project.name} 的操作`}
+            />
+          }
+        >
           <MoreHorizontal />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" side="right" className="w-40" finalFocus={false}>
@@ -263,7 +348,7 @@ function ProjectGroup({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      <SidebarGroupAction title={`在 ${project.name} 中新建会话`} onClick={() => actions.startNew(project.id)}>
+      <SidebarGroupAction title={`在 ${project.name} 中新建会话`} onClick={() => onStartNew(project.id)}>
         <Plus />
         <span className="sr-only">新建会话</span>
       </SidebarGroupAction>
@@ -298,6 +383,7 @@ function ProjectGroup({
                 subSessions={childrenByParent[session.id]}
                 selectedId={selectedId}
                 now={now}
+                onSelectSession={onSelectSession}
               />
             ))}
             {!list.length ? <p className="px-2 py-1 text-xs text-muted-foreground">还没有会话</p> : null}
@@ -311,7 +397,9 @@ function ProjectGroup({
 export function AppSidebar() {
   const projects = useLila((state) => state.projects);
   const sessions = useLila((state) => state.sessions);
+  const childrenByParent = useLila((state) => state.childrenByParent);
   const selectedId = useLila((state) => state.selectedId);
+  const { setOpenMobile } = useSidebar();
   const [collapsed, setCollapsed] = React.useState<Record<string, boolean>>(readCollapsed);
   const [query, setQuery] = React.useState("");
   const [now, setNow] = React.useState(() => Date.now());
@@ -322,19 +410,34 @@ export function AppSidebar() {
     return () => window.clearInterval(timer);
   }, []);
 
+  const handleSelectSession = React.useCallback(
+    (sessionId: string) => {
+      actions.select(sessionId);
+      setOpenMobile(false);
+    },
+    [setOpenMobile],
+  );
+
+  const handleStartNew = React.useCallback(
+    (projectId?: string) => {
+      actions.startNew(projectId);
+      setOpenMobile(false);
+    },
+    [setOpenMobile],
+  );
+
   const byProject = React.useMemo(() => {
     const groups: Record<string, SessionSummary[]> = {};
     const allByProject: Record<string, SessionSummary[]> = {};
-    const children: Record<string, SessionSummary[]> = {};
     for (const session of Object.values(sessions)) {
       (allByProject[session.projectId] ??= []).push(session);
       if (filter && !(session.title || "新会话").toLowerCase().includes(filter)) continue;
       // While filtering, matching sub-agent sessions show on their own.
-      if (!filter && session.parentId && sessions[session.parentId]) (children[session.parentId] ??= []).push(session);
-      else (groups[session.projectId] ??= []).push(session);
+      if (!filter && session.parentId && sessions[session.parentId]) continue;
+      (groups[session.projectId] ??= []).push(session);
     }
-    for (const list of [...Object.values(groups), ...Object.values(children)]) list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    return { groups, allByProject, children };
+    for (const list of Object.values(groups)) list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return { groups, allByProject };
   }, [sessions, filter]);
 
   const toggle = (projectId: string) =>
@@ -354,7 +457,7 @@ export function AppSidebar() {
         <SidebarGroup className="gap-2">
           <SidebarMenu>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={() => actions.startNew()}>
+              <SidebarMenuButton onClick={() => handleStartNew()}>
                 <SquarePen />
                 新会话
                 <Kbd className="ms-auto">⌘N</Kbd>
@@ -404,11 +507,13 @@ export function AppSidebar() {
               project={project}
               list={list}
               allSessions={byProject.allByProject[project.id] ?? []}
-              childrenByParent={byProject.children}
+              childrenByParent={filter ? {} : childrenByParent}
               selectedId={selectedId}
               isCollapsed={isCollapsed}
               now={now}
               onToggle={() => toggle(project.id)}
+              onSelectSession={handleSelectSession}
+              onStartNew={handleStartNew}
             />
           );
         })}

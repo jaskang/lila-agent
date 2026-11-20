@@ -110,7 +110,7 @@ function CodeBlockCopyButton({
         data-copied={copied || undefined}
         variant={variant}
         size={size}
-        aria-label={copied ? "Copied" : "Copy"}
+        aria-label={copied ? "已复制" : "复制"}
         className={cn(className)}
         onClick={(event) => {
           onClick?.(event)
@@ -130,7 +130,7 @@ function CodeBlockCopyButton({
         )}
       </Button>
       <span aria-live="polite" className="sr-only">
-        {copied ? "Copied" : ""}
+        {copied ? "已复制" : ""}
       </span>
     </>
   )
@@ -186,9 +186,10 @@ const codeBlockLineVariants = cva(
     variants: {
       variant: {
         default: "",
-        added: "bg-muted after:content-['+']",
+        added:
+          "bg-emerald-500/12 after:text-emerald-600 after:content-['+'] dark:bg-emerald-500/15 dark:after:text-emerald-400",
         removed: "bg-destructive/10 after:text-destructive after:content-['−']",
-        highlighted: "bg-muted",
+        highlighted: "border-y border-border/60 bg-muted/60 text-muted-foreground",
       },
     },
     defaultVariants: {

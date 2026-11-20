@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ExternalLink, ImageOff } from "lucide-react";
+import { ExternalLink, Image as ImageIcon, ImageOff } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
@@ -75,9 +75,24 @@ function toMediaUrl(localPath: string, basePath?: string): string {
   return `lila-media://local?${params.toString()}`;
 }
 
+/** Remote http(s) URLs other than http://localhost or http://127.0.0.1 are never auto-fetched to prevent prompt-injection exfiltration. */
+function parseExternalRemoteImage(raw: string | undefined): { url: string; host: string } | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    const isLocalHttp = parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
+    if (isLocalHttp) return undefined;
+    return { url: parsed.href, host: parsed.host || parsed.href };
+  } catch {
+    return undefined;
+  }
+}
+
 /** If a local dev-server URL (localhost / 127.0.0.1) fails to load, try resolving its pathname in the project directory. */
 function localhostFallbackUrl(raw: string | undefined, basePath?: string): string | undefined {
-  if (!raw || !basePath || !/^https?:\/\//i.test(raw)) return undefined;
+  if (!raw || !basePath || !/^http:\/\//i.test(raw)) return undefined;
   try {
     const parsed = new URL(raw);
     if (parsed.hostname !== "localhost" && parsed.hostname !== "127.0.0.1") return undefined;
@@ -92,8 +107,9 @@ function localhostFallbackUrl(raw: string | undefined, basePath?: string): strin
 function MarkdownImage({ src, alt, title }: { src?: string | undefined; alt?: string | undefined; title?: string | undefined }) {
   const basePath = React.useContext(MarkdownBasePathContext);
   const localPath = resolveLocalFilePath(src, basePath);
-  const primarySrc = localPath ? toMediaUrl(localPath, basePath) : src;
-  const fallbackSrc = React.useMemo(() => (localPath ? undefined : localhostFallbackUrl(src, basePath)), [localPath, src, basePath]);
+  const externalRemote = React.useMemo(() => (localPath ? undefined : parseExternalRemoteImage(src)), [localPath, src]);
+  const primarySrc = localPath ? toMediaUrl(localPath, basePath) : externalRemote ? undefined : src;
+  const fallbackSrc = React.useMemo(() => (localPath || externalRemote ? undefined : localhostFallbackUrl(src, basePath)), [localPath, externalRemote, src, basePath]);
 
   const [useFallback, setUseFallback] = React.useState(false);
   const [failed, setFailed] = React.useState(false);
@@ -103,6 +119,38 @@ function MarkdownImage({ src, alt, title }: { src?: string | undefined; alt?: st
     setUseFallback(false);
     setFailed(false);
   }, [primarySrc, fallbackSrc]);
+
+  if (externalRemote) {
+    const caption = alt?.trim();
+    return (
+      <span
+        data-not-typeset
+        title={externalRemote.url}
+        className="my-1 inline-flex max-w-full items-center gap-2 rounded-lg border bg-muted/40 px-2.5 py-1.5 align-middle text-xs text-muted-foreground"
+      >
+        <ImageIcon className="size-3.5 shrink-0" />
+        <span className="min-w-0 truncate">
+          {caption ? (
+            <>
+              <span className="font-medium text-foreground">{caption}</span>
+              <span className="ms-1.5 text-muted-foreground">({externalRemote.host})</span>
+            </>
+          ) : (
+            externalRemote.host
+          )}
+        </span>
+        <a
+          href={externalRemote.url}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-foreground no-underline hover:bg-muted"
+        >
+          <ExternalLink className="size-3" />
+          在浏览器中打开
+        </a>
+      </span>
+    );
+  }
 
   const activeSrc = useFallback ? fallbackSrc : primarySrc;
 
@@ -187,10 +235,16 @@ function components(streaming: boolean): Components {
   return {
     pre: ({ children }) => <>{children}</>,
     code: ({ className, children }) => {
-      const language = /language-(\w+)/.exec(className ?? "")?.[1];
+      const language = /language-([^\s]+)/.exec(className ?? "")?.[1];
       const value = String(children);
       if (!language && !value.includes("\n")) return <code>{children}</code>;
-      return <Code code={value} {...(language ? { language } : {})} streaming={streaming} />;
+      return (
+        <Code
+          code={value}
+          {...(language ? { language, title: <span className="font-mono text-muted-foreground">{language}</span> } : {})}
+          streaming={streaming}
+        />
+      );
     },
     a: ({ href, children }) => <MarkdownLink href={href}>{children}</MarkdownLink>,
     img: ({ src, alt, title }) => <MarkdownImage src={src} alt={alt} title={title} />,
@@ -206,9 +260,21 @@ const streamingComponents = components(true);
 const settledComponents = components(false);
 const plugins = [remarkGfm];
 
+const LIST_ITEM_RE = /^\s*(?:[-*+]|\d+[.)])\s+/;
+const BLOCKQUOTE_RE = /^\s*>/;
+const INDENTED_CONTINUATION_RE = /^(?: {2,}|\t)\S/;
+
+function nextNonBlankLine(lines: string[], from: number): string | undefined {
+  for (let i = from; i < lines.length; i++) {
+    const candidate = lines[i]!;
+    if (candidate.trim() !== "") return candidate;
+  }
+  return undefined;
+}
+
 /**
  * Splits streaming markdown into settled top-level blocks and the growing tail.
- * Only splits on blank lines outside fenced code blocks so code fences stay intact.
+ * Avoids splitting inside fenced code blocks, loose lists, or multi-paragraph blockquotes.
  */
 function splitStreamingBlocks(text: string): { settled: string[]; active: string } {
   const lines = text.split("\n");
@@ -217,7 +283,8 @@ function splitStreamingBlocks(text: string): { settled: string[]; active: string
   let fenceChar = "";
   let fenceLen = 0;
 
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
     const fence = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
     if (fence) {
       const marker = fence[1]!;
@@ -235,8 +302,17 @@ function splitStreamingBlocks(text: string): { settled: string[]; active: string
 
     if (!fenceChar && line.trim() === "") {
       if (current.length > 0) {
-        settled.push(current.join("\n"));
-        current = [];
+        const next = nextNonBlankLine(lines, i + 1);
+        const currentIsList = LIST_ITEM_RE.test(current[0] ?? "");
+        const keepsTogether =
+          next !== undefined &&
+          (LIST_ITEM_RE.test(next) || BLOCKQUOTE_RE.test(next) || (currentIsList && INDENTED_CONTINUATION_RE.test(next)));
+        if (keepsTogether) {
+          current.push(line);
+        } else {
+          settled.push(current.join("\n"));
+          current = [];
+        }
       }
       continue;
     }

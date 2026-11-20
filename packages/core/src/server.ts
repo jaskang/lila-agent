@@ -23,9 +23,19 @@ export interface Core {
 }
 
 const ALLOWED_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+const MAX_CLIENTS = 64;
+const AUTH_WINDOW_MS = 60_000;
+const AUTH_MAX_FAILURES = 20;
+const MAX_AUTH_IPS = 1_000;
 
-function originAllowed(origin: string | undefined): boolean {
-  return !origin || origin === "null" || origin === "file://" || ALLOWED_ORIGIN.test(origin);
+function isLoopbackHost(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1" || normalized === "[::1]";
+}
+
+function originAllowed(origin: string | undefined, allowNullOrigin: boolean): boolean {
+  if (!origin || origin === "file://" || ALLOWED_ORIGIN.test(origin)) return true;
+  return allowNullOrigin && origin === "null";
 }
 
 function protocolMatches(candidate: string, expected: Buffer): boolean {
@@ -34,7 +44,46 @@ function protocolMatches(candidate: string, expected: Buffer): boolean {
 }
 
 export async function startCore(options: CoreOptions): Promise<Core> {
+  const hostname = options.hostname ?? "127.0.0.1";
+  const loopback = isLoopbackHost(hostname);
   const watching = new Map<WebSocket, string>();
+  const watchSeq = new WeakMap<WebSocket, number>();
+  const authFailures = new Map<string, { count: number; resetAt: number }>();
+
+  const nextWatchSeq = (ws: WebSocket): number => {
+    const next = (watchSeq.get(ws) ?? 0) + 1;
+    watchSeq.set(ws, next);
+    return next;
+  };
+
+  const isAuthRateLimited = (ip: string, now: number): boolean => {
+    const entry = authFailures.get(ip);
+    if (!entry) return false;
+    if (now >= entry.resetAt) {
+      authFailures.delete(ip);
+      return false;
+    }
+    return entry.count >= AUTH_MAX_FAILURES;
+  };
+
+  const recordAuthFailure = (ip: string, now: number): void => {
+    const existing = authFailures.get(ip);
+    if (existing && now < existing.resetAt) {
+      existing.count += 1;
+      return;
+    }
+    if (authFailures.size >= MAX_AUTH_IPS) {
+      for (const [key, entry] of authFailures) {
+        if (now >= entry.resetAt) authFailures.delete(key);
+      }
+      if (authFailures.size >= MAX_AUTH_IPS) {
+        const oldest = authFailures.keys().next().value;
+        if (oldest !== undefined) authFailures.delete(oldest);
+      }
+    }
+    authFailures.set(ip, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+  };
+
   const send = (ws: WebSocket, message: ServerMessage) => {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
   };
@@ -68,6 +117,10 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         return { sessions: await host.listSessions() };
       case "session.create":
         return { session: await host.createSession(command) };
+      case "session.unwatch":
+        nextWatchSeq(ws);
+        watching.delete(ws);
+        return {};
       case "files.search":
         return { files: await host.searchFiles(command.projectId, command.query, command.limit) };
       case "git.status":
@@ -82,10 +135,13 @@ export async function startCore(options: CoreOptions): Promise<Core> {
       default:
         break;
     }
+    const openSeq = command.type === "session.open" ? nextWatchSeq(ws) : 0;
     const live = await host.live(command.sessionId);
     switch (command.type) {
       case "session.open": {
-        watching.set(ws, command.sessionId);
+        if (ws.readyState === ws.OPEN && watchSeq.get(ws) === openSeq) {
+          watching.set(ws, command.sessionId);
+        }
         return live.open(command.limit);
       }
       case "session.earlier":
@@ -144,7 +200,15 @@ export async function startCore(options: CoreOptions): Promise<Core> {
     const { pathname } = new URL(req.url ?? "/", "http://localhost");
     if (pathname === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, app: "lila-core", coreVersion: pkg.version, protocolVersion: PROTOCOL_VERSION, pid: process.pid }));
+      res.end(
+        JSON.stringify({
+          ok: true,
+          app: "lila-core",
+          coreVersion: pkg.version,
+          protocolVersion: PROTOCOL_VERSION,
+          ...(loopback ? { pid: process.pid } : {}),
+        }),
+      );
       return;
     }
     res.writeHead(pathname === "/ws" ? 426 : 404).end();
@@ -164,25 +228,36 @@ export async function startCore(options: CoreOptions): Promise<Core> {
       socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
     };
     if (new URL(req.url ?? "/", "http://localhost").pathname !== "/ws") return reject(404, "Not Found");
-    if (!originAllowed(req.headers.origin)) return reject(403, "Forbidden");
+    if (!originAllowed(req.headers.origin, loopback)) return reject(403, "Forbidden");
+    if (wss.clients.size >= MAX_CLIENTS) return reject(503, "Service Unavailable");
+    const remoteIp = req.socket.remoteAddress ?? "unknown";
+    const now = Date.now();
+    if (isAuthRateLimited(remoteIp, now)) return reject(429, "Too Many Requests");
     const protocols = (req.headers["sec-websocket-protocol"] ?? "").split(",").map((item) => item.trim());
-    if (!protocols.some((candidate) => protocolMatches(candidate, expectedProtocolBytes))) return reject(401, "Unauthorized");
+    if (!protocols.some((candidate) => protocolMatches(candidate, expectedProtocolBytes))) {
+      recordAuthFailure(remoteIp, now);
+      return reject(401, "Unauthorized");
+    }
+    authFailures.delete(remoteIp);
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.on("message", (data) => void handle(ws, data.toString()));
-      ws.on("close", () => watching.delete(ws));
+      ws.on("close", () => {
+        nextWatchSeq(ws);
+        watching.delete(ws);
+      });
       send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, coreVersion: pkg.version });
     });
   });
 
-  const hostname = options.hostname ?? "127.0.0.1";
   const { promise: listening, resolve, reject } = Promise.withResolvers<void>();
   server.once("error", reject);
   server.listen(options.port, hostname, () => resolve());
   await listening;
   const port = (server.address() as AddressInfo).port;
+  const urlHost = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname;
 
   return {
-    url: `http://${hostname}:${port}`,
+    url: `http://${urlHost}:${port}`,
     port,
     async stop() {
       await host.dispose();

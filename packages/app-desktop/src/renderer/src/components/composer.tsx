@@ -14,13 +14,14 @@ import { actions, type DraftImage, useLila } from "@/lib/store";
 const MAX_IMAGES = 10;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TEXT_BYTES = 200 * 1024;
-const ABORT_ARM_MS = 1_500;
 const EMPTY_IMAGES: DraftImage[] = [];
 const TEXT_EXTENSIONS =
   /\.(txt|md|markdown|json|jsonc|ya?ml|toml|ini|env|csv|tsv|log|xml|html?|css|scss|less|[cm]?[jt]sx?|py|rb|go|rs|java|kt|swift|c|cc|cpp|h|hpp|cs|php|sh|bash|zsh|fish|sql|graphql|proto|vue|svelte|lua|dart|ex|exs|r|diff|patch)$/i;
 
 type Suggest = { kind: "slash" | "file"; start: number; query: string };
 type Option = { value: string; label: string; description?: string; group: string; insert: string };
+
+const SLASH_GROUP_ORDER: SlashCommand["source"][] = ["builtin", "skill", "prompt", "extension"];
 
 const SOURCE_LABEL: Record<SlashCommand["source"], string> = {
   builtin: "内置",
@@ -77,6 +78,7 @@ export function Composer({
   projectId,
   running = false,
   disabled = false,
+  abortArmed = false,
   placeholder,
   footer,
   trailing,
@@ -90,6 +92,7 @@ export function Composer({
   projectId?: string | undefined;
   running?: boolean;
   disabled?: boolean;
+  abortArmed?: boolean;
   placeholder: string;
   /** Controls at the start of the bottom bar (model, thinking, approval). */
   footer?: React.ReactNode;
@@ -103,27 +106,20 @@ export function Composer({
   const connected = useLila((state) => state.connection === "connected");
   const [sending, setSending] = React.useState(false);
   const [dragging, setDragging] = React.useState(false);
-  const [abortArmed, setAbortArmed] = React.useState(false);
   const [suggest, setSuggest] = React.useState<Suggest | null>(null);
   const [highlight, setHighlight] = React.useState(0);
   const [commands, setCommands] = React.useState<SlashCommand[] | null>(null);
   const [files, setFiles] = React.useState<{ query: string; files: string[] } | null>(null);
   const ref = React.useRef<HTMLTextAreaElement>(null);
   const fileInput = React.useRef<HTMLInputElement>(null);
-  const abortTimer = React.useRef<number | undefined>(undefined);
+  const listRef = React.useRef<HTMLDivElement>(null);
 
   React.useEffect(() => {
     ref.current?.focus();
     setCommands(null);
+    setFiles(null);
+    setSuggest(null);
   }, [draftKey, sessionId, projectId]);
-
-  React.useEffect(() => {
-    if (!running) {
-      window.clearTimeout(abortTimer.current);
-      setAbortArmed(false);
-    }
-    return () => window.clearTimeout(abortTimer.current);
-  }, [running]);
 
   // Slash commands are fetched when the menu first opens for this session or project.
   React.useEffect(() => {
@@ -153,27 +149,54 @@ export function Composer({
     };
   }, [fileQuery, projectId]);
 
-  const options = React.useMemo<Option[]>(() => {
-    if (!suggest) return [];
+  // Group in fixed display order first, then flatten so keyboard navigation matches visual order 1:1.
+  const { groups, flatOptions } = React.useMemo<{ groups: Array<[string, Option[]]>; flatOptions: Option[] }>(() => {
+    if (!suggest) return { groups: [], flatOptions: [] };
     const query = suggest.query.toLowerCase();
     if (suggest.kind === "slash") {
-      return (commands ?? [])
+      const buckets = new Map<SlashCommand["source"], Option[]>();
+      for (const source of SLASH_GROUP_ORDER) buckets.set(source, []);
+      const filtered = (commands ?? [])
         .filter((command) => command.name.toLowerCase().includes(query))
-        .sort((a, b) => Number(!a.name.toLowerCase().startsWith(query)) - Number(!b.name.toLowerCase().startsWith(query)))
-        .map((command) => ({
+        .sort((a, b) => Number(!a.name.toLowerCase().startsWith(query)) - Number(!b.name.toLowerCase().startsWith(query)));
+      for (const command of filtered) {
+        const list = buckets.get(command.source);
+        if (!list) continue;
+        list.push({
           value: `${command.source}:${command.name}`,
           label: `/${command.name}`,
           description: command.description,
           group: command.source,
           insert: `/${command.name} `,
-        }));
+        });
+      }
+      const ordered: Array<[string, Option[]]> = [];
+      for (const source of SLASH_GROUP_ORDER) {
+        const items = buckets.get(source);
+        if (items?.length) ordered.push([source, items]);
+      }
+      return { groups: ordered, flatOptions: ordered.flatMap(([, items]) => items) };
     }
-    return (files?.files ?? []).map((path) => ({ value: path, label: path, group: "file", insert: `@${path} ` }));
+    const fileItems: Option[] = (files?.files ?? []).map((path) => ({
+      value: path,
+      label: path,
+      group: "file",
+      insert: `@${path} `,
+    }));
+    const ordered: Array<[string, Option[]]> = fileItems.length ? [["file", fileItems]] : [];
+    return { groups: ordered, flatOptions: fileItems };
   }, [suggest, commands, files]);
 
-  React.useEffect(() => setHighlight(0), [options]);
+  React.useEffect(() => setHighlight(0), [flatOptions]);
 
   const menuOpen = suggest !== null;
+
+  React.useEffect(() => {
+    if (!menuOpen || !flatOptions.length) return;
+    const item = listRef.current?.querySelector<HTMLElement>(`[data-option-index="${highlight}"]`);
+    item?.scrollIntoView({ block: "nearest" });
+  }, [highlight, menuOpen, flatOptions]);
+
   const hasText = text.trim().length > 0;
   const canSend = connected && !disabled && !sending && (running ? hasText : hasText || images.length > 0);
 
@@ -260,16 +283,16 @@ export function Composer({
         setSuggest(null);
         return;
       }
-      if (options.length) {
+      if (flatOptions.length) {
         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
           event.preventDefault();
           const step = event.key === "ArrowDown" ? 1 : -1;
-          setHighlight((current) => (current + step + options.length) % options.length);
+          setHighlight((current) => (current + step + flatOptions.length) % flatOptions.length);
           return;
         }
         if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
           event.preventDefault();
-          const option = options[highlight];
+          const option = flatOptions[highlight];
           if (option) choose(option);
           return;
         }
@@ -278,27 +301,10 @@ export function Composer({
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void submit(event.altKey ? "followUp" : "steer");
-      return;
-    }
-    if (event.key === "Escape" && running && onAbort) {
-      event.preventDefault();
-      if (abortArmed) {
-        window.clearTimeout(abortTimer.current);
-        setAbortArmed(false);
-        onAbort();
-      } else {
-        setAbortArmed(true);
-        window.clearTimeout(abortTimer.current);
-        abortTimer.current = window.setTimeout(() => setAbortArmed(false), ABORT_ARM_MS);
-      }
     }
   }
 
-  const groups = React.useMemo(() => {
-    const map = new Map<string, Option[]>();
-    for (const option of options) map.set(option.group, [...(map.get(option.group) ?? []), option]);
-    return [...map];
-  }, [options]);
+  let optionIndex = 0;
 
   return (
     <div
@@ -322,14 +328,17 @@ export function Composer({
       }}
     >
       {menuOpen ? (
-        <div className="absolute inset-x-0 bottom-full z-30 mb-2" onMouseDown={(event) => event.preventDefault()}>
+        <div data-composer-suggest="" className="absolute inset-x-0 bottom-full z-30 mb-2" onMouseDown={(event) => event.preventDefault()}>
           <Command
             shouldFilter={false}
-            value={options[highlight]?.value ?? ""}
-            onValueChange={(value) => setHighlight(Math.max(0, options.findIndex((option) => option.value === value)))}
+            value={flatOptions[highlight]?.value ?? ""}
+            onValueChange={(value) => {
+              const found = flatOptions.findIndex((option) => option.value === value);
+              if (found >= 0) setHighlight(found);
+            }}
             className="h-auto rounded-xl shadow-lg ring-1 ring-foreground/10"
           >
-            <CommandList className="max-h-72">
+            <CommandList ref={listRef} className="max-h-72">
               <CommandEmpty className="py-4">
                 {suggest.kind === "slash"
                   ? commands === null
@@ -343,8 +352,14 @@ export function Composer({
                 <CommandGroup key={group} heading={group === "file" ? "文件" : SOURCE_LABEL[group as SlashCommand["source"]]}>
                   {items.map((option) => {
                     const Icon = option.group === "file" ? FileText : SOURCE_ICON[option.group as SlashCommand["source"]];
+                    const index = optionIndex++;
                     return (
-                      <CommandItem key={option.value} value={option.value} onSelect={() => choose(option)}>
+                      <CommandItem
+                        key={option.value}
+                        value={option.value}
+                        data-option-index={index}
+                        onSelect={() => choose(option)}
+                      >
                         <Icon />
                         <span className="shrink-0 font-mono text-xs">{option.label}</span>
                         {option.description ? <span className="min-w-0 truncate text-xs text-muted-foreground">{option.description}</span> : null}
@@ -398,12 +413,12 @@ export function Composer({
         }}
         className="max-h-72 min-h-16 resize-none border-0 bg-transparent px-4 pt-3 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
       />
-      <div className="flex items-center gap-0.5 px-2 pb-2">
+      <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
         <Button
           type="button"
           size="icon-sm"
           variant="ghost"
-          className="text-muted-foreground"
+          className="shrink-0 text-muted-foreground"
           disabled={disabled}
           aria-label="添加图片或文件"
           title="添加图片或文件"
@@ -421,53 +436,51 @@ export function Composer({
             event.target.value = "";
           }}
         />
-        <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">{footer}</div>
-        {abortArmed ? (
-          <span className="shrink-0 px-1 text-xs text-amber-600 dark:text-amber-400">
-            再按一次 <Kbd>Esc</Kbd> 停止
-          </span>
-        ) : running ? (
-          <span className="hidden shrink-0 px-1 text-xs text-muted-foreground xl:inline">
-            <Kbd>↵</Kbd> 插话 · <Kbd>⌥↵</Kbd> 排队
-          </span>
-        ) : null}
-        {trailing}
-        {running && onAbort ? (
-          <Button
-            type="button"
-            size="icon-sm"
-            variant={hasText ? "secondary" : "default"}
-            className="rounded-full"
-            aria-label="停止"
-            title="停止（双击 Esc）"
-            onClick={() => {
-              window.clearTimeout(abortTimer.current);
-              setAbortArmed(false);
-              onAbort();
-            }}
-          >
-            <Square className="size-3 fill-current" />
-          </Button>
-        ) : null}
-        {!running || hasText || images.length > 0 ? (
-          <Button
-            type="button"
-            size="icon-sm"
-            className="rounded-full"
-            disabled={!canSend}
-            aria-label={running ? "插话" : "发送"}
-            title={
-              running
-                ? hasText
-                  ? "插话：当前工具结束后送达（↵），⌥↵ 排到这一轮之后"
-                  : "运行中插话请先输入文字"
-                : "发送（↵），⇧↵ 换行"
-            }
-            onClick={() => void submit("steer")}
-          >
-            {sending ? <Spinner /> : <ArrowUp />}
-          </Button>
-        ) : null}
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-0.5">{footer}</div>
+        <div className="ms-auto flex shrink-0 items-center gap-1">
+          {abortArmed ? (
+            <span className="shrink-0 px-1 text-xs text-amber-600 dark:text-amber-400">
+              再按一次 <Kbd>Esc</Kbd> 停止
+            </span>
+          ) : running ? (
+            <span className="hidden shrink-0 px-1 text-xs text-muted-foreground md:inline">
+              <Kbd>↵</Kbd> 插话 · <Kbd>⌥↵</Kbd> 排队
+            </span>
+          ) : null}
+          {trailing}
+          {running && onAbort ? (
+            <Button
+              type="button"
+              size="icon-sm"
+              variant={hasText ? "secondary" : "default"}
+              className="rounded-full"
+              aria-label="停止"
+              title="停止（双击 Esc）"
+              onClick={onAbort}
+            >
+              <Square className="size-3 fill-current" />
+            </Button>
+          ) : null}
+          {!running || hasText || images.length > 0 ? (
+            <Button
+              type="button"
+              size="icon-sm"
+              className="rounded-full"
+              disabled={!canSend}
+              aria-label={running ? "插话" : "发送"}
+              title={
+                running
+                  ? hasText
+                    ? "插话：当前工具结束后送达（↵），⌥↵ 排到这一轮之后"
+                    : "运行中插话请先输入文字"
+                  : "发送（↵），⇧↵ 换行"
+              }
+              onClick={() => void submit("steer")}
+            >
+              {sending ? <Spinner /> : <ArrowUp />}
+            </Button>
+          ) : null}
+        </div>
       </div>
     </div>
   );

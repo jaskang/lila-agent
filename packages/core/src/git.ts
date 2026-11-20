@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { existsSync, openSync, closeSync, readSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { closeSync, lstatSync, openSync, readlinkSync, readSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GitFileChange, GitFileDiff, GitFileStatus, GitStatus } from "@lila/protocol";
 import { UserError } from "./errors.ts";
@@ -137,17 +137,19 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
     }
   }
 
-  const [unstagedStats, stagedStats] = await Promise.all([
-    runGit(cwd, ["diff", "--numstat", "-z"]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
-    runGit(cwd, ["diff", "--cached", "--numstat", "-z"]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
-  ]);
+  if (files.length > 0) {
+    const [unstagedStats, stagedStats] = await Promise.all([
+      runGit(cwd, ["diff", "--numstat", "-z"]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
+      runGit(cwd, ["diff", "--cached", "--numstat", "-z"]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
+    ]);
 
-  for (const file of files) {
-    const a = unstagedStats.get(file.path);
-    const b = stagedStats.get(file.path);
-    if (a || b) {
-      file.added = (a?.added ?? 0) + (b?.added ?? 0);
-      file.removed = (a?.removed ?? 0) + (b?.removed ?? 0);
+    for (const file of files) {
+      const a = unstagedStats.get(file.path);
+      const b = stagedStats.get(file.path);
+      if (a || b) {
+        file.added = (a?.added ?? 0) + (b?.added ?? 0);
+        file.removed = (a?.removed ?? 0) + (b?.removed ?? 0);
+      }
     }
   }
 
@@ -176,13 +178,41 @@ function assertInsideRepo(cwd: string, filePath: string): string {
   return full;
 }
 
-function synthesizeUntrackedPatch(filePath: string, fullPath: string): GitFileDiff {
-  if (!existsSync(fullPath)) return { path: filePath, patch: "" };
-  const stat = statSync(fullPath);
+function isWithinReal(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function synthesizeUntrackedPatch(cwd: string, filePath: string, fullPath: string): GitFileDiff {
+  let stat;
+  try {
+    stat = lstatSync(fullPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path: filePath, patch: "" };
+    throw error;
+  }
+
+  const repoRealRoot = realpathSync(resolve(cwd));
+  const parentReal = realpathSync(dirname(fullPath));
+  if (!isWithinReal(repoRealRoot, parentReal)) {
+    throw new UserError(`文件路径不在项目目录内：${filePath}`);
+  }
+
+  if (stat.isSymbolicLink()) {
+    const target = readlinkSync(fullPath);
+    const patch = `--- /dev/null\n+++ b/${filePath}\n@@ -0,0 +1,1 @@\n+${target}`;
+    return clipPatch(filePath, patch);
+  }
+
   if (!stat.isFile()) return { path: filePath, patch: "" };
+  const fileReal = realpathSync(fullPath);
+  if (!isWithinReal(repoRealRoot, fileReal)) {
+    throw new UserError(`文件路径不在项目目录内：${filePath}`);
+  }
+
   const bytesToRead = Math.min(stat.size, MAX_UNTRACKED_BYTES);
   const buffer = Buffer.alloc(bytesToRead);
-  const fd = openSync(fullPath, "r");
+  const fd = openSync(fileReal, "r");
   try {
     readSync(fd, buffer, 0, bytesToRead, 0);
   } finally {
@@ -221,7 +251,7 @@ export async function gitDiff(cwd: string, filePath: string, staged?: boolean): 
 
   const untrackedCheck = await runGit(cwd, ["ls-files", "--others", "--exclude-standard", "--", filePath]);
   const isUntracked = untrackedCheck.code === 0 && untrackedCheck.stdout.trim().length > 0;
-  if (isUntracked) return synthesizeUntrackedPatch(filePath, fullPath);
+  if (isUntracked) return synthesizeUntrackedPatch(cwd, filePath, fullPath);
 
   if (staged === false) {
     const res = await runGit(cwd, ["diff", "--", filePath]);

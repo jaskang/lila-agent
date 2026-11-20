@@ -133,6 +133,7 @@
   --typeset-size: 14px;
   --typeset-leading: 1.65;
   --typeset-flow: 0.9em;
+  font-size: var(--typeset-size);
 }
 
 /* Subtle macOS-like scrollbar with transparent track and thin pill thumb. */

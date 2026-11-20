@@ -1,9 +1,10 @@
 import * as React from "react";
 import { ArrowUpRight, Brain, Check, CheckCircle2, CircleAlert, Copy, Info, PencilLine, Puzzle, TriangleAlert } from "lucide-react";
-import type { ImageInput, TranscriptItem } from "@lila/protocol";
+import type { ImageInput, SubagentNotification, SubagentStatus, TranscriptItem } from "@lila/protocol";
+import { findMatchingSubSession } from "@/components/agent-card";
 import { focusComposer } from "@/components/composer";
 import { Markdown } from "@/components/markdown";
-import { findMatchingSubSession, formatCompactTokens, ToolCall } from "@/components/tool-call";
+import { ToolCall } from "@/components/tool-call";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -31,6 +32,7 @@ import {
   TraceLine,
   TraceTitle,
 } from "@/components/ui/trace";
+import { formatCompactTokens, formatDuration, isSubagentErrorStatus } from "@/lib/format";
 import { actions, useLila } from "@/lib/store";
 
 const NOTICE_ICON = { info: Info, warning: TriangleAlert, error: CircleAlert } as const;
@@ -69,6 +71,12 @@ function CopyAction({ text }: { text: string }) {
 function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptItem, { kind: "user" }>; sessionId: string; running: boolean }) {
   const [preview, setPreview] = React.useState<{ image: ImageInput; index: number } | null>(null);
   const [confirmRewind, setConfirmRewind] = React.useState(false);
+  const hasExistingDraft = React.useMemo(() => {
+    if (!confirmRewind) return false;
+    const state = useLila.getState();
+    return Boolean((state.drafts[sessionId] ?? "").trim() || (state.draftImages[sessionId]?.length ?? 0) > 0);
+  }, [confirmRewind, sessionId]);
+
   return (
     <Message align="end">
       <MessageContent>
@@ -125,14 +133,19 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
         <AlertDialogContent size="sm">
           <AlertDialogHeader>
             <AlertDialogTitle>编辑并重发这条消息？</AlertDialogTitle>
-            <AlertDialogDescription>当前分支中这条消息之后的回复和工具结果将被移出，这条消息的文本会放回输入框。</AlertDialogDescription>
+            <AlertDialogDescription>
+              当前分支中这条消息之后的回复和工具结果将被移出，这条消息的{item.images.length ? "文本和图片" : "文本"}会放回输入框。
+              {hasExistingDraft ? "输入框中未发送的草稿将被替换。" : ""}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
                 setConfirmRewind(false);
-                void actions.rewind(sessionId, item.id).then(focusComposer);
+                void actions.rewind(sessionId, item.id, item.images).then((ok) => {
+                  if (ok) focusComposer();
+                });
               }}
             >
               继续编辑
@@ -191,37 +204,45 @@ function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: "ass
   );
 }
 
-type NotificationEntry = {
-  id?: string;
-  description: string;
-  status: string;
-  toolUses?: number;
-  turnCount?: number;
-  totalTokens?: number;
-  totalCost?: number;
-  durationMs?: number;
-  error?: string;
-  preview?: string;
-};
-
-function formatDuration(ms: number | undefined): string | undefined {
-  if (!ms || ms <= 0) return undefined;
-  return ms < 1_000 ? `${ms}ms` : ms < 60_000 ? `${(ms / 1_000).toFixed(1)}s` : `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1_000)}s`;
-}
-
-function isErrorStatus(status: string): boolean {
-  return status === "error" || status === "aborted" || status === "stopped";
-}
-
-function NotificationSubLink({ sessionId, entry }: { sessionId: string; entry: NotificationEntry }) {
-  const subSessionId = useLila((state) => findMatchingSubSession(state.sessions, sessionId, { agentId: entry.id, description: entry.description }));
+function NotificationSubLink({ sessionId, entry }: { sessionId: string; entry: SubagentNotification }) {
+  const subSessionId = useLila((state) => findMatchingSubSession(state.childrenByParent[sessionId], { agentId: entry.id, description: entry.description }));
   if (!subSessionId) return null;
   return (
-    <Button type="button" size="xs" variant="ghost" className="ms-auto h-6 text-muted-foreground" onClick={() => actions.select(subSessionId)}>
-      查看子会话
+    <Button type="button" size="xs" variant="ghost" className="ms-auto h-6 px-1.5 text-muted-foreground" onClick={() => actions.select(subSessionId)}>
+      子会话
       <ArrowUpRight />
     </Button>
   );
+}
+
+const VALID_SUBAGENT_STATUSES = new Set<SubagentStatus>(["queued", "running", "completed", "steered", "stopped", "aborted", "error"]);
+
+/** Minimal legacy fallback for older persisted custom notifications without typed `item.notifications`. */
+function legacyNotifications(details: Record<string, unknown> | undefined): SubagentNotification[] {
+  const raw = details?.notifications;
+  if (!Array.isArray(raw)) return [];
+  const entries: SubagentNotification[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (typeof record.description !== "string") continue;
+    const rawStatus = typeof record.status === "string" && VALID_SUBAGENT_STATUSES.has(record.status as SubagentStatus)
+      ? (record.status as SubagentStatus)
+      : "completed";
+    entries.push({
+      ...(typeof record.id === "string" ? { id: record.id } : {}),
+      description: record.description,
+      status: rawStatus,
+      ...(typeof record.toolUses === "number" ? { toolUses: record.toolUses } : {}),
+      ...(typeof record.turnCount === "number" ? { turnCount: record.turnCount } : {}),
+      ...(typeof record.totalTokens === "number" ? { totalTokens: record.totalTokens } : {}),
+      ...(typeof record.totalCost === "number" ? { totalCost: record.totalCost } : {}),
+      ...(typeof record.durationMs === "number" ? { durationMs: record.durationMs } : {}),
+      ...(typeof record.error === "string" ? { error: record.error } : {}),
+      ...(typeof record.preview === "string" ? { preview: record.preview } : {}),
+    });
+  }
+  return entries;
 }
 
 function SubagentNotificationCard({
@@ -231,9 +252,8 @@ function SubagentNotificationCard({
   item: Extract<TranscriptItem, { kind: "custom" }>;
   sessionId: string;
 }) {
-  const rawList = Array.isArray(item.details?.notifications) ? (item.details.notifications as NotificationEntry[]) : [];
-  const entries = rawList.filter((entry) => entry && typeof entry.description === "string");
-  const hasError = entries.some((entry) => isErrorStatus(entry.status));
+  const entries = item.notifications ?? legacyNotifications(item.details);
+  const hasError = entries.some((entry) => isSubagentErrorStatus(entry.status));
   const [open, setOpen] = React.useState(hasError);
 
   if (!entries.length) {
@@ -277,7 +297,7 @@ function SubagentNotificationCard({
         <TraceCollapsibleContent>
           <div className="flex flex-col gap-2 text-foreground">
             {entries.map((entry, index) => {
-              const err = isErrorStatus(entry.status);
+              const err = isSubagentErrorStatus(entry.status);
               const meta = [
                 entry.turnCount ? `${entry.turnCount} 轮` : undefined,
                 entry.toolUses ? `${entry.toolUses} 次工具` : undefined,
@@ -322,7 +342,7 @@ export const TranscriptEntry = React.memo(function TranscriptEntry({
     case "tool":
       return <ToolCall tool={item} sessionId={sessionId} />;
     case "custom":
-      if (item.customType === "subagent-notification") return <SubagentNotificationCard item={item} sessionId={sessionId} />;
+      if (item.customType === "subagent-notification" || item.notifications?.length) return <SubagentNotificationCard item={item} sessionId={sessionId} />;
       return (
         <div className="rounded-xl border border-dashed bg-muted/30 px-4 py-3">
           <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">

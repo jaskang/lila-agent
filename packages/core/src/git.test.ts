@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gitDiff, gitStatus } from "./git.ts";
@@ -46,4 +46,25 @@ test("lists staged, unstaged, and untracked changes with diffs", async () => {
   expect(untracked.patch).toContain("+console.log('hi');");
 
   await expect(gitDiff(dir, "../outside.ts")).rejects.toThrow("不在项目目录内");
+});
+
+test("does not follow untracked symlinks pointing outside the repository", async () => {
+  const outsideDir = mkdtempSync(join(tmpdir(), "lila-secret-"));
+  const secretPath = join(outsideDir, "secret.txt");
+  writeFileSync(secretPath, "SUPER_SECRET_TOKEN=do-not-leak\n");
+
+  const dir = mkdtempSync(join(tmpdir(), "lila-git-symlink-"));
+  git(dir, ["init", "-b", "main"]);
+  git(dir, ["config", "user.email", "test@example.com"]);
+  git(dir, ["config", "user.name", "Test"]);
+  writeFileSync(join(dir, "readme.md"), "hello\n");
+  git(dir, ["add", "readme.md"]);
+  git(dir, ["commit", "-m", "init"]);
+
+  symlinkSync(secretPath, join(dir, "leak-link"));
+
+  const diff = await gitDiff(dir, "leak-link");
+  expect(diff.patch).toContain("+++ b/leak-link");
+  expect(diff.patch).toContain(`+${secretPath}`);
+  expect(diff.patch).not.toContain("SUPER_SECRET_TOKEN");
 });

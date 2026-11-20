@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
-import { app, BrowserWindow, dialog, ipcMain, protocol, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, protocol, shell } from "electron";
 import { DEFAULT_CORE_PORT, PROTOCOL_VERSION } from "@lila/protocol";
 
 protocol.registerSchemesAsPrivileged([
@@ -10,11 +11,32 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 const port = Number(process.env.LILA_CORE_PORT ?? DEFAULT_CORE_PORT);
-const coreUrl = `http://127.0.0.1:${port}`;
+const coreHost = process.env.LILA_CORE_HOST || "127.0.0.1";
+const coreUrlHost = coreHost.includes(":") && !coreHost.startsWith("[") ? `[${coreHost}]` : coreHost;
+const coreUrl = `http://${coreUrlHost}:${port}`;
 const dataDir = process.env.LILA_DATA_DIR ?? join(app.getPath("appData"), "Lila");
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
+const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
 const LOCK_STALE_MS = 30_000;
-const BLOCKED_OPEN_EXTS = new Set([".app", ".command", ".sh", ".bash", ".zsh", ".exe", ".bat", ".cmd", ".dmg", ".pkg"]);
+const BLOCKED_OPEN_EXTS = new Set([
+  ".workflow",
+  ".scpt",
+  ".applescript",
+  ".terminal",
+  ".inetloc",
+  ".webloc",
+  ".jar",
+  ".app",
+  ".command",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".exe",
+  ".bat",
+  ".cmd",
+  ".dmg",
+  ".pkg",
+]);
 const MEDIA_MIME: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -96,15 +118,16 @@ async function withCoreLock<T>(run: () => Promise<T>): Promise<T> {
       await new Promise((r) => setTimeout(r, 100));
     }
   }
+  if (!acquired) {
+    throw new Error(`获取 core 启动锁超时：${lockPath}`);
+  }
   try {
     return await run();
   } finally {
-    if (acquired) {
-      try {
-        unlinkSync(lockPath);
-      } catch {
-        // Ignore cleanup failure.
-      }
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // Ignore cleanup failure.
     }
   }
 }
@@ -122,8 +145,30 @@ async function ensureCore(): Promise<void> {
         throw new Error(`端口 ${port} 已被其他进程占用（pid ${current.pid}），无法启动 Lila core`);
       }
       // A core from an older build is still running and cannot talk to this window; replace it.
-      process.kill(current.pid, "SIGTERM");
-      await waitFor(async () => !(await health()), 5_000);
+      let exited = false;
+      try {
+        process.kill(current.pid, "SIGTERM");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") exited = true;
+        else throw error;
+      }
+      if (!exited) {
+        exited = await waitFor(async () => !(await health()), 5_000);
+      }
+      if (!exited) {
+        try {
+          process.kill(current.pid, "SIGKILL");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") exited = true;
+          else throw error;
+        }
+        if (!exited) {
+          exited = await waitFor(async () => !(await health()), 2_000);
+        }
+      }
+      if (!exited) {
+        throw new Error(`旧的 Lila core（pid ${current.pid}）未在规定时间内退出，已中止启动`);
+      }
     }
 
     // Core is plain TypeScript run by this app's own Node (Node strips the types), so it ships as files.
@@ -136,7 +181,7 @@ async function ensureCore(): Promise<void> {
       const child = spawn(process.execPath, [join(coreDir, "src", "main.ts")], {
         cwd: coreDir,
         detached: true,
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", LILA_CORE_PORT: String(port), LILA_DATA_DIR: dataDir },
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", LILA_CORE_HOST: coreHost, LILA_CORE_PORT: String(port), LILA_DATA_DIR: dataDir },
         stdio: ["ignore", log, log],
       });
       child.unref();
@@ -172,19 +217,54 @@ function isWithin(root: string, target: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+function resolveReal(target: string): string {
+  try {
+    return realpathSync(target);
+  } catch {
+    return resolve(target);
+  }
+}
+
+/** Resolves the realpath of an existing target or of its nearest existing ancestor (prevents symlink escape). */
+function resolveRealPath(target: string): string {
+  const resolved = resolve(target);
+  try {
+    if (existsSync(resolved)) return realpathSync(resolved);
+    const missing: string[] = [];
+    let cursor = resolved;
+    while (!existsSync(cursor)) {
+      const parent = dirname(cursor);
+      if (parent === cursor) return resolved;
+      missing.unshift(relative(parent, cursor));
+      cursor = parent;
+    }
+    return resolve(realpathSync(cursor), ...missing);
+  } catch {
+    return resolved;
+  }
+}
+
 function allowedRoots(includeBundle: boolean): string[] {
-  const roots = [agentDir(), join(homedir(), ".agents"), dataDir, ...registeredProjectPaths()];
+  const roots = [agentDir(), join(homedir(), ".agents"), ...registeredProjectPaths()];
   if (includeBundle) {
     roots.push(app.getAppPath(), process.resourcesPath);
     if (!app.isPackaged) roots.push(resolve(app.getAppPath(), "../.."));
   }
-  return roots;
+  return roots.map(resolveReal);
 }
 
-function isAllowedMcpConfigPath(target: string): boolean {
-  const resolved = resolve(target);
-  if (resolved === resolve(join(agentDir(), "mcp.json"))) return true;
-  return registeredProjectPaths().some((projectPath) => resolved === resolve(join(projectPath, ".pi", "mcp.json")));
+function allowedLogFiles(): string[] {
+  return [join(dataDir, "core.log"), join(dataDir, "core.log.1")].map(resolveRealPath);
+}
+
+function isAllowedPath(realTarget: string, includeBundle: boolean): boolean {
+  if (allowedRoots(includeBundle).some((root) => isWithin(root, realTarget))) return true;
+  return allowedLogFiles().includes(realTarget);
+}
+
+function isAllowedMcpConfigPath(realTarget: string): boolean {
+  if (realTarget === resolveRealPath(join(agentDir(), "mcp.json"))) return true;
+  return registeredProjectPaths().some((projectPath) => realTarget === resolveRealPath(join(projectPath, ".pi", "mcp.json")));
 }
 
 function showWindow(): void {
@@ -204,6 +284,7 @@ function createWindow(): void {
     minWidth: 760,
     minHeight: 520,
     show: false,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#171717" : "#ffffff",
     title: "Lila",
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 18, y: 20 },
@@ -224,7 +305,14 @@ function createWindow(): void {
     win.hide();
   });
   win.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === "https:" || parsed.protocol === "http:" || parsed.protocol === "mailto:") {
+        void shell.openExternal(parsed.toString());
+      }
+    } catch {
+      // Ignore malformed URLs.
+    }
     return { action: "deny" };
   });
 
@@ -239,7 +327,7 @@ ipcMain.handle("lila:connection", async () => {
   });
   await ensuring;
   const token = readFileSync(join(dataDir, "core-token"), "utf8").trim();
-  return { url: `ws://127.0.0.1:${port}/ws`, token };
+  return { url: `ws://${coreUrlHost}:${port}/ws`, token };
 });
 
 ipcMain.handle("lila:pick-directory", async () => {
@@ -250,25 +338,31 @@ ipcMain.handle("lila:pick-directory", async () => {
 
 ipcMain.handle("lila:open-path", async (_event, path: string) => {
   const resolved = resolve(path);
-  if (!allowedRoots(false).some((root) => isWithin(root, resolved))) {
+  const realTarget = resolveRealPath(resolved);
+  if (!isAllowedPath(realTarget, false)) {
     throw new Error(`不允许打开该路径：${resolved}`);
   }
-  if (BLOCKED_OPEN_EXTS.has(extname(resolved).toLowerCase())) {
+  if (BLOCKED_OPEN_EXTS.has(extname(resolved).toLowerCase()) || BLOCKED_OPEN_EXTS.has(extname(realTarget).toLowerCase())) {
     throw new Error(`不允许直接打开可执行文件：${resolved}`);
   }
-  // Pi reads MCP servers from mcp.json; give the user an empty one to fill in.
-  if (isAllowedMcpConfigPath(resolved) && !existsSync(resolved)) {
-    mkdirSync(dirname(resolved), { recursive: true });
-    writeFileSync(resolved, '{"mcpServers":{}}\n');
+  if (existsSync(realTarget)) {
+    const info = statSync(realTarget);
+    if (info.isFile() && (info.mode & 0o111) !== 0) {
+      throw new Error(`不允许直接打开可执行文件：${resolved}`);
+    }
+  } else if (isAllowedMcpConfigPath(realTarget)) {
+    // Pi reads MCP servers from mcp.json; give the user an empty one to fill in.
+    mkdirSync(dirname(realTarget), { recursive: true });
+    writeFileSync(realTarget, '{"mcpServers":{}}\n');
   }
-  const error = await shell.openPath(resolved);
+  const error = await shell.openPath(realTarget);
   if (error) throw new Error(error);
 });
 
 ipcMain.on("lila:reveal-path", (_event, path: string) => {
-  const resolved = resolve(path);
-  if (!allowedRoots(true).some((root) => isWithin(root, resolved))) return;
-  shell.showItemInFolder(resolved);
+  const realTarget = resolveRealPath(path);
+  if (!isAllowedPath(realTarget, true)) return;
+  shell.showItemInFolder(realTarget);
 });
 
 ipcMain.on("lila:focus", () => showWindow());
@@ -289,13 +383,9 @@ function resolveAllowedMedia(rawPath: string, rawBase: string | null): { path: s
     candidates.push(resolve(rawBase, rawPath));
   }
 
-  const roots = [...allowedRoots(false), tmpdir()].map((root) => {
-    try {
-      return realpathSync(root);
-    } catch {
-      return resolve(root);
-    }
-  });
+  const roots = allowedRoots(false);
+  const lilaTmpDir = join(tmpdir(), "lila");
+  if (existsSync(lilaTmpDir)) roots.push(resolveReal(lilaTmpDir));
 
   for (const candidate of candidates) {
     const mime = MEDIA_MIME[extname(candidate).toLowerCase()];
@@ -311,7 +401,7 @@ function resolveAllowedMedia(rawPath: string, rawBase: string | null): { path: s
 }
 
 function registerMediaProtocol(): void {
-  protocol.handle("lila-media", (request) => {
+  protocol.handle("lila-media", async (request) => {
     if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
     const url = new URL(request.url);
     const rawPath = url.searchParams.get("path");
@@ -319,7 +409,10 @@ function registerMediaProtocol(): void {
     const resolved = resolveAllowedMedia(rawPath, url.searchParams.get("base"));
     if (!resolved) return new Response("Not Found", { status: 404 });
     try {
-      const data = readFileSync(resolved.path);
+      const info = await stat(resolved.path);
+      if (!info.isFile()) return new Response("Not Found", { status: 404 });
+      if (info.size > MAX_MEDIA_BYTES) return new Response("Payload Too Large", { status: 413 });
+      const data = await readFile(resolved.path);
       return new Response(data, {
         status: 200,
         headers: {
