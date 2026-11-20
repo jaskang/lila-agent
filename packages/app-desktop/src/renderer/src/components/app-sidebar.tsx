@@ -110,10 +110,11 @@ function SubSessions({
           <SidebarMenuSubButton
             size="sm"
             isActive={session.id === selectedId}
+            className="w-full text-start"
             render={<button type="button" title={session.title} onClick={() => onSelectSession(session.id)} />}
           >
             <Bot />
-            <span className="truncate">{session.title}</span>
+            <span className="min-w-0 flex-1 truncate">{session.title}</span>
             <StatusIcon status={session.status} />
           </SidebarMenuSubButton>
         </SidebarMenuSubItem>
@@ -212,49 +213,58 @@ function SessionRow({
 
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton
-        isActive={active}
-        onClick={() => onSelectSession(session.id)}
-        className={cn("h-auto py-1.5", hasHistoryToggle ? "pr-16" : "pr-8")}
+      <div
+        data-active={active || undefined}
+        className="flex min-w-0 items-center gap-1 rounded-md pe-1 hover:bg-sidebar-accent data-active:bg-sidebar-accent"
       >
-        <div className="flex min-w-0 flex-1 flex-col">
-          <span className="truncate">{session.title || "新会话"}</span>
-          <span className="text-xs text-muted-foreground">{ago(session.updatedAt, now)}</span>
-        </div>
-        <StatusIcon status={session.status} />
-      </SidebarMenuButton>
-      {hasHistoryToggle ? (
-        <button
-          type="button"
-          aria-expanded={showHistorySubs}
-          aria-label={showHistorySubs ? "收起历史子会话" : `展开 ${subSessions?.length ?? hiddenIdleCount} 个子会话`}
-          title={showHistorySubs ? "收起历史子会话" : `展开历史子会话（共 ${subSessions?.length ?? hiddenIdleCount} 个）`}
-          onClick={() => setShowHistorySubs((current) => !current)}
-          className={cn(
-            "absolute top-2.5 right-7 z-10 inline-flex h-5 items-center gap-0.5 rounded px-1 font-mono text-[11px] tabular-nums transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-            showHistorySubs ? "bg-sidebar-accent text-sidebar-accent-foreground" : "text-muted-foreground",
-          )}
+        <SidebarMenuButton
+          isActive={active}
+          onClick={() => onSelectSession(session.id)}
+          className="h-auto min-w-0 flex-1 py-1.5 group-has-data-[sidebar=menu-action]/menu-item:pr-2"
         >
-          <Bot className="size-3" />
-          {subSessions?.length ?? hiddenIdleCount}
-        </button>
-      ) : null}
-      <DropdownMenu>
-        <DropdownMenuTrigger render={<SidebarMenuAction showOnHover className="top-2.5" aria-label="更多操作" />}>
-          <MoreHorizontal />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" side="right" className="w-36" finalFocus={false}>
-          <DropdownMenuItem onClick={startEditing}>
-            <Pencil />
-            重命名
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem variant="destructive" disabled={busy} onClick={() => setConfirming(true)}>
-            <Trash2 />
-            删除
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+          <div className="flex min-w-0 flex-1 flex-col">
+            <span className="truncate">{session.title || "新会话"}</span>
+            <span className="text-xs text-muted-foreground">{ago(session.updatedAt, now)}</span>
+          </div>
+          <StatusIcon status={session.status} />
+        </SidebarMenuButton>
+        {hasHistoryToggle ? (
+          <button
+            type="button"
+            aria-expanded={showHistorySubs}
+            aria-label={showHistorySubs ? "收起历史子会话" : `展开 ${subSessions?.length ?? hiddenIdleCount} 个子会话`}
+            title={showHistorySubs ? "收起历史子会话" : `展开历史子会话（共 ${subSessions?.length ?? hiddenIdleCount} 个）`}
+            onClick={() => setShowHistorySubs((current) => !current)}
+            className={cn(
+              "inline-flex h-5 shrink-0 items-center gap-0.5 rounded px-1 font-mono text-[11px] tabular-nums transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+              showHistorySubs ? "bg-sidebar-accent text-sidebar-accent-foreground" : "text-muted-foreground",
+            )}
+          >
+            <Bot className="size-3" />
+            {subSessions?.length ?? hiddenIdleCount}
+          </button>
+        ) : null}
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<SidebarMenuAction showOnHover className="static shrink-0 after:hidden" aria-label="更多操作" />}>
+            <MoreHorizontal />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" side="right" className="w-36" finalFocus={false}>
+            {!session.readOnly ? (
+              <>
+                <DropdownMenuItem onClick={startEditing}>
+                  <Pencil />
+                  重命名
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+              </>
+            ) : null}
+            <DropdownMenuItem variant="destructive" disabled={busy} onClick={() => setConfirming(true)}>
+              <Trash2 />
+              删除
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
       <AlertDialog open={confirming} onOpenChange={setConfirming}>
         <AlertDialogContent size="sm">
           <AlertDialogHeader>

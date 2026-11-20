@@ -4,6 +4,7 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { CommandPalette } from "@/components/command-palette";
 import { Conversation } from "@/components/conversation";
 import { NewSession } from "@/components/new-session";
+import { SubsessionPreview } from "@/components/subsession-preview";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
@@ -60,6 +61,7 @@ function ConnectionBanner() {
 
 export function App() {
   const selectedId = useLila((state) => state.selectedId);
+  const previewId = useLila((state) => state.previewId);
   const [sidebarOpen, setSidebarOpen] = React.useState(readSidebarOpen);
 
   const handleSidebarOpenChange = React.useCallback((open: boolean) => {
@@ -98,7 +100,12 @@ export function App() {
         <AppSidebar />
         <SidebarInset className="relative m-1.5 min-h-0 overflow-hidden rounded-xl bg-background shadow-sm ring-1 ring-border/60 md:peer-data-[variant=inset]:m-1.5 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-1.5">
           <ConnectionBanner />
-          {selectedId ? <Conversation key={selectedId} sessionId={selectedId} /> : <NewSession />}
+          {selectedId ? (
+            <div className="relative flex min-h-0 flex-1">
+              <Conversation key={selectedId} sessionId={selectedId} />
+              {previewId ? <SubsessionPreview key={previewId} sessionId={previewId} /> : null}
+            </div>
+          ) : <NewSession />}
         </SidebarInset>
         <CommandPalette />
       </SidebarProvider>

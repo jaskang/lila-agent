@@ -1,5 +1,5 @@
 import { parseSkillBlock, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { ImageInput, SubagentNotification, SubagentStatus, SubagentToolInfo, TranscriptItem } from "@lila/protocol";
+import { TRANSCRIPT_SEARCH_PAGE_SIZE, TRANSCRIPT_TURNS_PAGE_SIZE, type ImageInput, type RunStatus, type SubagentNotification, type SubagentStatus, type SubagentToolInfo, type TranscriptItem, type TranscriptSearchResults, type TranscriptTurns } from "@lila/protocol";
 
 /**
  * Pure projection from Pi session entries (and live agent messages) to Lila transcript items.
@@ -14,6 +14,16 @@ type CustomMessage = Extract<AgentMessage, { role: "custom" }>;
 type ContentPart = { type: string; text?: string; data?: string; mimeType?: string };
 export type ToolItem = Extract<TranscriptItem, { kind: "tool" }>;
 export type AssistantItem = Extract<TranscriptItem, { kind: "assistant" }>;
+export type RunItem = Extract<TranscriptItem, { kind: "run" }>;
+export const RUN_STARTED = "lila:run-started";
+export const RUN_SETTLED = "lila:run-settled";
+
+export function responseOutcome(reason: AssistantMessage["stopReason"]): RunStatus {
+  if (reason === "error") return "error";
+  if (reason === "aborted") return "aborted";
+  if (reason === "length") return "incomplete";
+  return "completed";
+}
 
 export const DEFAULT_SNAPSHOT_LIMIT = 300;
 const OUTPUT_LIMIT = 20_000;
@@ -232,7 +242,7 @@ function normalizeNotificationDetail(raw: unknown): SubagentNotification | undef
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   const d = raw as Record<string, unknown>;
   if (typeof d.description !== "string" && typeof d.id !== "string") return undefined;
-  const preview = cleanNotificationPreview(typeof d.resultPreview === "string" ? d.resultPreview : undefined);
+  const preview = cleanNotificationPreview(asNonEmptyString(d.resultPreview) ?? asNonEmptyString(d.preview));
   return {
     ...(typeof d.id === "string" && d.id ? { id: d.id } : {}),
     description: typeof d.description === "string" && d.description ? d.description : "子 Agent",
@@ -288,8 +298,9 @@ function projectSubagentNotification(rawText: string, details: unknown): { text:
     const record = details as Record<string, unknown>;
     const first = normalizeNotificationDetail(record);
     if (first) notifications.push(first);
-    if (Array.isArray(record.others)) {
-      for (const other of record.others) {
+    const others = Array.isArray(record.others) ? record.others : record.notifications;
+    if (Array.isArray(others)) {
+      for (const other of others) {
         const normalized = normalizeNotificationDetail(other);
         if (normalized) notifications.push(normalized);
       }
@@ -324,7 +335,7 @@ export function customItem(message: { customType: string; content: CustomMessage
       id,
       customType: message.customType,
       text: projected.text,
-      ...(projected.notifications?.length ? { notifications: projected.notifications } : {}),
+      notifications: projected.notifications ?? [],
     };
   }
   return { kind: "custom", id, customType: message.customType, text: rawText };
@@ -378,6 +389,17 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
   const idCounts = new Map<string, number>();
   let lastAssistantTools: string[] = [];
   let sawMessage = false;
+  let measuredRun: { id: string; hasMessages: boolean } | undefined;
+  let legacyRun: RunItem | undefined;
+
+  function finishRunWithoutRecord() {
+    const item = measuredRun?.hasMessages
+      ? { kind: "run" as const, id: `run:incomplete:${measuredRun.id}`, status: "incomplete" as const }
+      : legacyRun;
+    if (item) items.push(item);
+    measuredRun = undefined;
+    legacyRun = undefined;
+  }
 
   const trackAgent = (item: ToolItem, index: number) => {
     if (item.name !== "Agent") return;
@@ -398,12 +420,18 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
         const message = entry.message;
         switch (message.role) {
           case "user": {
+            if (!measuredRun) finishRunWithoutRecord();
+            else measuredRun.hasMessages = true;
             sawMessage = true;
             const item = userItem(message);
             items.push({ ...item, id: uniqueId(idCounts, item.id) });
             break;
           }
           case "assistant": {
+            if (measuredRun) measuredRun.hasMessages = true;
+            else legacyRun = message.stopReason && message.stopReason !== "toolUse"
+              ? { kind: "run", id: `run:legacy:${entry.id}`, status: responseOutcome(message.stopReason) }
+              : undefined;
             sawMessage = true;
             const item = assistantItem(message, false);
             if (hasAssistantContent(item)) items.push({ ...item, id: uniqueId(idCounts, item.id) });
@@ -445,6 +473,23 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
         break;
       }
       case "custom": {
+        if (entry.customType === RUN_STARTED) {
+          finishRunWithoutRecord();
+          measuredRun = { id: entry.id, hasMessages: false };
+        }
+        if (entry.customType === RUN_SETTLED && entry.data && typeof entry.data === "object") {
+          const { status, durationMs } = entry.data as { status?: unknown; durationMs?: unknown };
+          if (status === "completed" || status === "aborted" || status === "error" || status === "incomplete") {
+            items.push({
+              kind: "run",
+              id: `run:${entry.id}`,
+              status,
+              ...(typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0 ? { durationMs } : {}),
+            });
+            measuredRun = undefined;
+            legacyRun = undefined;
+          }
+        }
         if (entry.customType === "subagents:record" && entry.data && typeof entry.data === "object") {
           const record = entry.data as Record<string, unknown>;
           const id = asNonEmptyString(record.id);
@@ -486,6 +531,7 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
         break;
       }
       case "custom_message":
+        if (!measuredRun && entry.customType === "subagent-notification") finishRunWithoutRecord();
         if (entry.display) items.push(customItem(entry, uniqueId(idCounts, `c:${Date.parse(entry.timestamp)}`)));
         break;
       case "compaction":
@@ -502,6 +548,7 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
         break;
     }
   }
+  if (!options.running) finishRunWithoutRecord();
 
   // A tool call without a result either still runs or was cut off (crash, abort before the result was written).
   const live = new Set(options.running ? lastAssistantTools : []);
@@ -519,6 +566,24 @@ export function projectBranch(entries: readonly SessionEntry[], options: Project
   return items;
 }
 
+export function transcriptTurns(entries: readonly SessionEntry[], offset: number): TranscriptTurns {
+  const prompts: Array<{ itemId: string; message: UserMessage }> = [];
+  const ids = new Map<string, number>();
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.message.role !== "user") continue;
+    prompts.push({ itemId: uniqueId(ids, `u:${entry.message.timestamp}`), message: entry.message });
+  }
+  const total = prompts.length;
+  const end = Math.max(0, total - offset);
+  const start = Math.max(0, end - TRANSCRIPT_TURNS_PAGE_SIZE);
+  const turns = prompts.slice(start, end).map((item, index) => ({
+    itemId: item.itemId,
+    number: start + index + 1,
+    preview: displayUserText(contentText(item.message.content)).replace(/\s+/g, " ").trim().slice(0, 140) || "空消息",
+  })).reverse();
+  return { turns, total };
+}
+
 /** The newest `limit` items. */
 export function snapshot(items: readonly TranscriptItem[], limit = DEFAULT_SNAPSHOT_LIMIT): { items: TranscriptItem[]; hasEarlier: boolean } {
   const start = Math.max(0, items.length - limit);
@@ -531,4 +596,39 @@ export function earlier(items: readonly TranscriptItem[], beforeId: string, limi
   if (end < 0) return { items: [], hasEarlier: false };
   const start = Math.max(0, end - limit);
   return { items: items.slice(start, end), hasEarlier: start > 0 };
+}
+
+/** Search in reverse chronological order, including folded tool details. */
+export function searchTranscript(items: readonly TranscriptItem[], query: string, offset: number): TranscriptSearchResults {
+  const needle = query.toLowerCase();
+  const matches: TranscriptSearchResults["matches"] = [];
+  let total = 0;
+  for (let index = items.length - 1; index >= 0; index--) {
+    const item = items[index]!;
+    if (item.kind === "run") continue;
+    const fields = item.kind === "assistant" ? [item.text, item.thinking, item.error] :
+      item.kind === "tool" ? [item.name, ...Object.values(item.args).map((value) => typeof value === "string" ? value : JSON.stringify(value)), item.output, item.diff] :
+      item.kind === "custom" ? [item.text, ...(item.notifications ?? []).flatMap((entry) => [entry.description, entry.error, entry.preview])] :
+      [item.text];
+    for (const field of fields) {
+      if (!field) continue;
+      const at = field.toLowerCase().indexOf(needle);
+      if (at < 0) continue;
+      if (total >= offset && matches.length < TRANSCRIPT_SEARCH_PAGE_SIZE) {
+        const from = Math.max(0, at - 45);
+        const to = Math.min(field.length, at + Math.min(query.length, 120) + 75);
+        const excerpt = `${from > 0 ? "…" : ""}${field.slice(from, to).replace(/\s+/g, " ")}${to < field.length ? "…" : ""}`;
+        matches.push({ itemId: item.id, kind: item.kind, excerpt });
+      }
+      total++;
+      break;
+    }
+  }
+  return { matches, total };
+}
+
+/** A bounded reading window around a hit. The live transcript stays subscribed separately. */
+export function aroundTranscriptItem(items: readonly TranscriptItem[], itemId: string): TranscriptItem[] {
+  const index = items.findIndex((item) => item.id === itemId);
+  return index < 0 ? [] : items.slice(Math.max(0, index - 24), index + 25);
 }

@@ -32,7 +32,7 @@
 
 - **内核换成 pi-coding-agent SDK。** 会话是 Pi 的 JSONL 文件，与 `pi` 命令行共用配置；MCP、codemode、tool_search、技能、提示模板、AGENTS.md、用户扩展和 Pi 包都生效；子 Agent 用 pi-subagents。
 - **core 改在 Node 上运行**（Electron 自带 Node 24），WebSocket 用 `ws`，token 鉴权、拒绝网页来源。
-- **协议 v3**：打开会话拿快照，之后推 `item`/`delta`/`state`；不再有自存事件库和序号。
+- **协议 v7**：打开会话拿快照，之后推 `item`/`delta`/`state`。轮次目录分页读取当前分支，右侧子会话可独立订阅。
 - **审批与提问**：Lila 内置 Pi 扩展（`tool_call` 钩子 + `ask_user` 工具），任何扩展的对话框都会变成待处理卡片。
 - **子 Agent 会话与实时进度**：pi-subagents 给每个子 Agent 写自己的 Pi 会话（带 `parentSession`），侧栏折叠展示；接入 `subagents:*` 事件总线与前台工具更新，在工具卡片和输入区上方实时展示前/后台子 Agent 的活动、轮次、工具调用、花费与耗时，并支持父子会话互跳。
 - **工作区 Git 改动面板**：顶部栏显示未提交文件数，抽屉内按全部/已暂存/未暂存查看文件列表与 diff（含未跟踪文件与二进制检测），支持直接打开或在访达中定位文件。

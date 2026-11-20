@@ -20,6 +20,7 @@ export interface PendingBridgeCallbacks {
 /** Manages in-flight user prompts (approvals, ask_user, extension UI dialogs) for a live session. */
 export class PendingBridge {
   readonly #pending = new Map<string, PendingEntry>();
+  #closed = false;
   readonly #callbacks: PendingBridgeCallbacks;
 
   constructor(callbacks: PendingBridgeCallbacks) {
@@ -38,7 +39,7 @@ export class PendingBridge {
     const id = randomUUID();
     const { signal, timeout } = options;
     const { promise, resolve } = Promise.withResolvers<PendingAnswer | undefined>();
-    if (signal?.aborted) {
+    if (this.#closed || signal?.aborted) {
       resolve(undefined);
       return promise;
     }
@@ -69,6 +70,11 @@ export class PendingBridge {
 
   cancelAll(): void {
     for (const entry of Array.from(this.#pending.values())) entry.settle(undefined);
+  }
+
+  close(): void {
+    this.#closed = true;
+    this.cancelAll();
   }
 
   createUIContext(): ExtensionUIContext {

@@ -10,6 +10,7 @@ import type {
   ClientCommand,
   PendingAnswer,
   PendingRequest,
+  RunStatus,
   ServerMessage,
   SessionResources,
   SessionState,
@@ -28,6 +29,7 @@ import {
   type AgentMessage,
   type AssistantItem,
   assistantItem,
+  aroundTranscriptItem,
   buildSubagentToolInfo,
   contentText,
   countBranchIds,
@@ -37,9 +39,14 @@ import {
   hasAssistantContent,
   parseUserItemId,
   projectBranch,
+  responseOutcome,
+  RUN_SETTLED,
+  RUN_STARTED,
   snapshot,
+  searchTranscript,
   type ToolItem,
   toolCallItems,
+  transcriptTurns,
   type UserMessage,
   uniqueId,
   userItem,
@@ -81,7 +88,7 @@ export function slashCommands(
 /** Matches pi-subagents' default auto-generated session name such as `Explore#9b7891d8`. */
 export function parseAutoSubagentName(name: string | undefined): { type: string; idPrefix: string } | undefined {
   if (!name) return undefined;
-  const match = /^([^\s#]+)#([0-9a-f]{8})$/i.exec(name.trim());
+  const match = /^(.+?)#([0-9a-f]{8})$/i.exec(name.trim());
   if (!match) return undefined;
   return { type: match[1]!, idPrefix: match[2]!.toLowerCase() };
 }
@@ -118,9 +125,6 @@ export function findModel(services: AgentSessionServices, modelId: string): Mode
 export class LiveSession implements LilaBridge {
   readonly id: string;
   readonly projectId: string;
-  readonly parentId: string | undefined;
-  readonly agentId: string | undefined;
-  readonly #subagentDescription: string | undefined;
   readonly allowedTools = new Set<string>();
   lastActivity = Date.now();
   readonly #store: Store;
@@ -131,6 +135,10 @@ export class LiveSession implements LilaBridge {
   #session!: AgentSession;
   #services!: AgentSessionServices;
   #unsubscribe?: () => void;
+  #access: SessionState["access"] = "starting";
+  #startupError?: string;
+  #initialization!: Promise<void>;
+  #disposed = false;
   #statusLines: Record<string, string> = {};
   #retry: SessionState["retry"];
   #updatedAt = new Date().toISOString();
@@ -144,13 +152,11 @@ export class LiveSession implements LilaBridge {
   readonly #throttles = new Map<string, ToolThrottle>();
   #notices = 0;
   #lastSummary = "";
+  #run: { startedAt: number; outcome: RunStatus } | undefined;
 
   constructor(options: {
     id: string;
     projectId: string;
-    parentId?: string | undefined;
-    agentId?: string | undefined;
-    subagentDescription?: string | undefined;
     store: Store;
     clients: Clients;
     onReload?: () => void;
@@ -158,9 +164,6 @@ export class LiveSession implements LilaBridge {
   }) {
     this.id = options.id;
     this.projectId = options.projectId;
-    this.parentId = options.parentId;
-    this.agentId = options.agentId;
-    this.#subagentDescription = options.subagentDescription;
     this.#store = options.store;
     this.#clients = options.clients;
     this.#onReload = options.onReload;
@@ -199,10 +202,10 @@ export class LiveSession implements LilaBridge {
   }
 
   get busy(): boolean {
-    return this.#session.isStreaming || this.#session.isCompacting || this.#pending.size > 0 || this.#subagents.hasActive();
+    return this.#access === "starting" || this.#session.isStreaming || this.#session.isCompacting || this.#pending.size > 0 || this.#subagents.hasActive();
   }
 
-  async attach(services: AgentSessionServices, session: AgentSession, updatedAt?: string): Promise<void> {
+  attach(services: AgentSessionServices, session: AgentSession, updatedAt?: string): void {
     this.#services = services;
     this.#session = session;
     if (updatedAt) this.#updatedAt = updatedAt;
@@ -214,24 +217,46 @@ export class LiveSession implements LilaBridge {
     }
     this.#syncIdCounts();
     this.#unsubscribe = session.subscribe((event) => this.#onEvent(event));
-    await session.bindExtensions({
-      uiContext: this.#pending.createUIContext(),
-      mode: "rpc",
-      commandContextActions: {
-        waitForIdle: () => this.#session.waitForIdle(),
-        reload: async () => {
-          await this.#session.reload();
-          this.#onReload?.();
-          this.#pushState();
+    // The host registers the session immediately. An extension can ask a question
+    // during startup, so clients need to open it and answer before this resolves.
+    this.#initialization = Promise.resolve()
+      .then(() => this.#disposed ? undefined : session.bindExtensions({
+        uiContext: this.#pending.createUIContext(),
+        mode: "rpc",
+        commandContextActions: {
+          waitForIdle: () => session.waitForIdle(),
+          reload: async () => {
+            await session.reload();
+            this.#onReload?.();
+            this.#pushState();
+          },
+          // One Lila session is one Pi session; extensions cannot replace it from under the client.
+          newSession: async () => ({ cancelled: true }),
+          fork: async () => ({ cancelled: true }),
+          switchSession: async () => ({ cancelled: true }),
+          navigateTree: async () => ({ cancelled: true }),
         },
-        // One Lila session is one Pi session; extensions cannot replace it from under the client.
-        newSession: async () => ({ cancelled: true }),
-        fork: async () => ({ cancelled: true }),
-        switchSession: async () => ({ cancelled: true }),
-        navigateTree: async () => ({ cancelled: true }),
-      },
-      onError: (error) => this.#notify("error", `扩展出错（${error.extensionPath}，${error.event}）：${error.error}`),
-    });
+        onError: (error) => this.#notify("error", `扩展出错（${error.extensionPath}，${error.event}）：${error.error}`),
+      }))
+      .then(
+        () => { this.#access = "ready"; },
+        (error: unknown) => {
+          this.#access = "failed";
+          this.#startupError = errorMessage(error);
+          this.#pending.cancelAll();
+        },
+      )
+      .then(() => {
+        if (this.#disposed) return;
+        this.#pushState();
+        this.#broadcastSummary();
+      });
+  }
+
+  #requireReady(): void {
+    if (this.#disposed) throw new UserError("会话已关闭");
+    if (this.#access === "starting") throw new UserError("请先完成会话初始化");
+    if (this.#access === "failed") throw new UserError(this.#startupError ?? "会话初始化失败");
   }
 
   touch(): void {
@@ -247,6 +272,7 @@ export class LiveSession implements LilaBridge {
 
   get status(): SessionStatus {
     if (this.#pending.size > 0) return "waiting";
+    if (this.#access === "failed") return "error";
     if (this.#session.isStreaming || this.#session.isCompacting || this.#subagents.hasActive()) return "running";
     const messages = this.#session.messages;
     for (let index = messages.length - 1; index >= 0; index--) {
@@ -261,20 +287,13 @@ export class LiveSession implements LilaBridge {
   }
 
   summary(): SessionSummary {
-    const auto = this.parentId ? parseAutoSubagentName(this.#session.sessionName) : undefined;
-    const resolvedAgentId = this.agentId ?? auto?.idPrefix;
     return {
       id: this.id,
       projectId: this.projectId,
-      title: sessionTitle(this.#session.sessionName, this.#firstMessage, {
-        isSubsession: Boolean(this.parentId),
-        description: this.#subagentDescription,
-      }),
+      title: sessionTitle(this.#session.sessionName, this.#firstMessage),
       updatedAt: this.#updatedAt,
       status: this.status,
       pendingCount: this.#pending.size,
-      ...(this.parentId ? { parentId: this.parentId } : {}),
-      ...(resolvedAgentId ? { agentId: resolvedAgentId } : {}),
     };
   }
 
@@ -285,7 +304,10 @@ export class LiveSession implements LilaBridge {
     const subagents = this.#subagents.snapshot();
     return {
       status: this.status,
-      ...(model ? { modelId: `${model.provider}/${model.id}` } : {}),
+      access: this.#access,
+      ...(this.#startupError ? { startupError: this.#startupError } : {}),
+      runActive: session.isStreaming,
+      ...(model && !(model.provider === "unknown" && model.id === "unknown") ? { modelId: `${model.provider}/${model.id}` } : {}),
       thinkingLevel: session.thinkingLevel,
       thinkingLevels: session.getAvailableThinkingLevels(),
       approvalMode: this.approvalMode,
@@ -324,12 +346,27 @@ export class LiveSession implements LilaBridge {
     return earlier(this.#items(), beforeId, limit);
   }
 
+  search(query: string, offset: number) {
+    return searchTranscript(this.#items(), query, offset);
+  }
+
+  turns(offset: number) {
+    return transcriptTurns(this.#session.sessionManager.getBranch(), offset);
+  }
+
+  around(itemId: string): TranscriptItem[] {
+    return aroundTranscriptItem(this.#items(), itemId);
+  }
+
   // -------------------------------------------------------------------------
   // Commands
 
   async prompt(command: Command<"session.prompt">): Promise<void> {
     this.touch();
     const session = this.#session;
+    await this.#initialization;
+    this.#requireReady();
+    if (command.mode && !session.isStreaming) throw new UserError("当前回复已结束，可以重新发送这条消息");
     const streamingBehavior = session.isStreaming ? (command.mode ?? "steer") : undefined;
     const images = command.images?.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType }));
     // prompt() resolves when the whole run ends; answer the client once Pi accepted the input.
@@ -348,7 +385,13 @@ export class LiveSession implements LilaBridge {
       .then(
         () => resolve(),
         (error: unknown) => {
-          if (!accepted) return reject(error);
+          if (!accepted) {
+            const message = errorMessage(error);
+            if (/^No API key found for the selected model|^No model selected/.test(message)) {
+              return reject(new UserError("没有可用模型。请在终端运行 pi，在 Pi 中输入 /login，然后回到 Lila 刷新模型。"));
+            }
+            return reject(error);
+          }
           console.error(`[core] run of ${this.id} failed`, error);
           this.#notify("error", errorMessage(error));
         },
@@ -365,7 +408,11 @@ export class LiveSession implements LilaBridge {
   async configure(command: Command<"session.configure">): Promise<SessionState> {
     this.touch();
     if (command.modelId) {
-      const model = findModel(this.#services, command.modelId);
+      let model = findModel(this.#services, command.modelId);
+      if (!model) {
+        await this.#services.modelRuntime.refresh({ allowNetwork: false });
+        model = findModel(this.#services, command.modelId);
+      }
       if (!model) throw new UserError(`找不到模型 ${command.modelId}，或它还没有配置凭据`);
       await this.#session.setModel(model);
     }
@@ -381,11 +428,13 @@ export class LiveSession implements LilaBridge {
   }
 
   compact(): void {
+    this.#requireReady();
     this.touch();
     this.#session.compact().catch((error: unknown) => this.#notify("error", `压缩失败：${errorMessage(error)}`));
   }
 
   async rewind(itemId: string): Promise<string> {
+    this.#requireReady();
     const session = this.#session;
     if (session.isStreaming || session.isCompacting) throw new UserError("请先停止当前回复再回退");
     const parsed = parseUserItemId(itemId);
@@ -444,6 +493,7 @@ export class LiveSession implements LilaBridge {
   }
 
   async reload(): Promise<void> {
+    this.#requireReady();
     if (this.#session.isStreaming || this.#session.isCompacting) throw new UserError("请等当前回复结束后再重新加载");
     await this.#session.reload();
     this.#onReload?.();
@@ -451,7 +501,8 @@ export class LiveSession implements LilaBridge {
   }
 
   async dispose(): Promise<void> {
-    this.#pending.cancelAll();
+    this.#disposed = true;
+    this.#pending.close();
     for (const throttle of this.#throttles.values()) clearTimeout(throttle.timer);
     this.#throttles.clear();
     this.#subagents.dispose();
@@ -489,6 +540,7 @@ export class LiveSession implements LilaBridge {
   }
 
   #pushState(): void {
+    if (this.#disposed) return;
     this.#clients.toWatchers(this.id, { type: "state", sessionId: this.id, state: this.state() });
   }
 
@@ -504,7 +556,7 @@ export class LiveSession implements LilaBridge {
   #broadcastSummary(force = false): SessionSummary {
     const summary = this.summary();
     const key = `${summary.title}\n${summary.status}\n${summary.pendingCount}\n${summary.updatedAt}`;
-    if (force || key !== this.#lastSummary) {
+    if (!this.#disposed && (force || key !== this.#lastSummary)) {
       this.#lastSummary = key;
       this.#clients.broadcast({ type: "session", session: summary });
     }
@@ -610,10 +662,29 @@ export class LiveSession implements LilaBridge {
         break;
       }
       case "agent_start":
+        if (!this.#run) {
+          this.#run = { startedAt: performance.now(), outcome: "incomplete" };
+          try {
+            this.#session.sessionManager.appendCustomEntry(RUN_STARTED);
+          } catch (error) {
+            console.warn("[core] could not save Run start", error);
+          }
+        }
         this.#pushState();
         this.#broadcastSummary();
         break;
       case "agent_settled":
+        if (this.#run) {
+          const status = event.aborted ? "aborted" : this.#run.outcome;
+          const durationMs = Math.max(0, Math.round(performance.now() - this.#run.startedAt));
+          this.#run = undefined;
+          try {
+            const id = this.#session.sessionManager.appendCustomEntry(RUN_SETTLED, { status, durationMs });
+            this.#send({ kind: "run", id: `run:${id}`, status, durationMs });
+          } catch (error) {
+            console.warn("[core] could not save Run outcome", error);
+          }
+        }
         for (const throttle of this.#throttles.values()) clearTimeout(throttle.timer);
         this.#throttles.clear();
         this.#tools.clear();
@@ -662,6 +733,7 @@ export class LiveSession implements LilaBridge {
 
   #messageStart(message: AgentMessage): void {
     if (message.role === "user") {
+      if (this.#run) this.#run.outcome = "incomplete";
       this.#firstMessage ??= contentText(message.content);
       const item = userItem(message);
       this.#send({ ...item, id: uniqueId(this.#idCounts, item.id) });
@@ -682,6 +754,7 @@ export class LiveSession implements LilaBridge {
   #messageEnd(message: AgentMessage): void {
     switch (message.role) {
       case "assistant": {
+        if (this.#run) this.#run.outcome = responseOutcome(message.stopReason);
         const item = assistantItem(message, false);
         if (hasAssistantContent(item)) {
           const id = this.#streamingId ?? uniqueId(this.#idCounts, item.id);

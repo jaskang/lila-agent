@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { earlier, parseUserItemId, projectBranch, snapshot } from "./transcript.ts";
+import { earlier, parseUserItemId, projectBranch, RUN_SETTLED, RUN_STARTED, snapshot } from "./transcript.ts";
 
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const base = (id: string, parentId: string | null) => ({ id, parentId, timestamp: new Date(1_000).toISOString() });
@@ -83,6 +83,36 @@ test("disambiguates items that share the same millisecond timestamp", () => {
   expect(parseUserItemId("u:100")).toEqual({ timestamp: 100, occurrence: 1 });
   expect(parseUserItemId("u:100#2")).toEqual({ timestamp: 100, occurrence: 2 });
   expect(parseUserItemId("a:100")).toBeUndefined();
+});
+
+test("projects legacy, timed and interrupted Run outcomes without duplicating completed replies", () => {
+  const prompt = { role: "user", content: "检查", timestamp: 100 } as const;
+  const reply = {
+    role: "assistant",
+    content: [{ type: "text", text: "完成" }],
+    api: "anthropic-messages",
+    provider: "anthropic",
+    model: "claude",
+    usage,
+    stopReason: "stop",
+    timestamp: 200,
+  } satisfies Extract<SessionEntry, { type: "message" }>["message"];
+  const entries: SessionEntry[] = [
+    { ...base("legacy-user", null), type: "message", message: prompt },
+    { ...base("legacy-reply", "legacy-user"), type: "message", message: reply },
+    { ...base("start", "legacy-reply"), type: "custom", customType: RUN_STARTED },
+    { ...base("user", "start"), type: "message", message: { ...prompt, timestamp: 300 } },
+    { ...base("reply", "user"), type: "message", message: { ...reply, timestamp: 400 } },
+    { ...base("end", "reply"), type: "custom", customType: RUN_SETTLED, data: { status: "aborted", durationMs: 1700 } },
+    { ...base("restart", "end"), type: "custom", customType: RUN_STARTED },
+    { ...base("new-user", "restart"), type: "message", message: { ...prompt, timestamp: 500 } },
+  ];
+  expect(projectBranch(entries).filter((item) => item.kind === "run")).toEqual([
+    { kind: "run", id: "run:legacy:legacy-reply", status: "completed" },
+    { kind: "run", id: "run:end", status: "aborted", durationMs: 1700 },
+    { kind: "run", id: "run:incomplete:restart", status: "incomplete" },
+  ]);
+  expect(projectBranch(entries, { running: true }).filter((item) => item.kind === "run")).toHaveLength(2);
 });
 
 test("merges persisted subagents:record entries back onto background Agent tool items", () => {

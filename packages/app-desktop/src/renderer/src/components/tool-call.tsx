@@ -52,7 +52,7 @@ export function parseMcpName(name: string): { server: string; tool: string } | u
   return { server, tool: rest.join("__") };
 }
 
-type View = { icon: React.ComponentType; title: string; target?: string | undefined; body: React.ReactNode; openByDefault?: boolean };
+type View = { icon: React.ComponentType; title: string; target?: string | undefined; body: React.ReactNode };
 
 function Output({ tool, title = "输出", language }: { tool: ToolItem; title?: string; language?: string }) {
   if (!tool.output) return null;
@@ -73,7 +73,7 @@ function resolveFilePath(projectPath: string | undefined, target: string | undef
   return `${projectPath.replace(/\/+$/, "")}/${target.replace(/^\.\//, "")}`;
 }
 
-function FileActions({ sessionId, path }: { sessionId: string; path: string | undefined }) {
+export function FileActions({ sessionId, path }: { sessionId: string; path: string | undefined }) {
   const projectPath = useLila((state) => {
     const projectId = state.sessions[sessionId]?.projectId;
     return state.projects.find((project) => project.id === projectId)?.path;
@@ -147,7 +147,6 @@ function viewOf(tool: ToolItem, sessionId: string): View {
         icon: tool.name === "edit" ? FilePen : FilePlus,
         title: tool.name === "edit" ? "修改文件" : "写入文件",
         target: path,
-        openByDefault: Boolean(tool.diff),
         body: (
           <>
             <FileActions sessionId={sessionId} path={path} />
@@ -212,12 +211,11 @@ function viewOf(tool: ToolItem, sessionId: string): View {
   };
 }
 
-export const ToolCall = React.memo(function ToolCall({ tool, sessionId }: { tool: ToolItem; sessionId: string }) {
-  if (tool.name === "Agent" || tool.subagent) return <SingleAgentCard tool={tool} sessionId={sessionId} />;
+export const ToolCall = React.memo(function ToolCall({ tool, sessionId, reveal = false }: { tool: ToolItem; sessionId: string; reveal?: boolean }) {
+  if (tool.subagent) return <SingleAgentCard tool={tool} sessionId={sessionId} reveal={reveal} />;
   const view = viewOf(tool, sessionId);
   const Icon = view.icon;
-  // Diffs are the point of an edit, so they start open; errors open too. Other details stay folded.
-  const wantsOpen = Boolean(view.openByDefault) || tool.status === "error";
+  const wantsOpen = tool.status === "error";
   const [open, setOpen] = React.useState(wantsOpen);
   const [touched, setTouched] = React.useState(false);
   React.useEffect(() => {
@@ -228,7 +226,7 @@ export const ToolCall = React.memo(function ToolCall({ tool, sessionId }: { tool
   return (
     <Trace>
       <TraceCollapsible
-        open={open}
+        open={open || reveal}
         onOpenChange={(next) => {
           setTouched(true);
           setOpen(next);

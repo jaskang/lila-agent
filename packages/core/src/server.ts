@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
-import { ClientCommand, type CommandResults, type CommandType, PROTOCOL_VERSION, type ServerMessage } from "@lila/protocol";
+import { ClientCommand, type CommandResults, type CommandType, PROTOCOL_VERSION, type ServerMessage, type WatchSlot } from "@lila/protocol";
 import { type WebSocket, WebSocketServer } from "ws";
 import pkg from "../package.json" with { type: "json" };
 import { errorMessage, UserError } from "./errors.ts";
@@ -46,14 +46,19 @@ function protocolMatches(candidate: string, expected: Buffer): boolean {
 export async function startCore(options: CoreOptions): Promise<Core> {
   const hostname = options.hostname ?? "127.0.0.1";
   const loopback = isLoopbackHost(hostname);
-  const watching = new Map<WebSocket, string>();
-  const watchSeq = new WeakMap<WebSocket, number>();
+  const watching = { main: new Map<WebSocket, string>(), preview: new Map<WebSocket, string>() };
+  const watchSeq = { main: new WeakMap<WebSocket, number>(), preview: new WeakMap<WebSocket, number>() };
   const authFailures = new Map<string, { count: number; resetAt: number }>();
 
-  const nextWatchSeq = (ws: WebSocket): number => {
-    const next = (watchSeq.get(ws) ?? 0) + 1;
-    watchSeq.set(ws, next);
+  const nextWatchSeq = (ws: WebSocket, slot: WatchSlot): number => {
+    const next = (watchSeq[slot].get(ws) ?? 0) + 1;
+    watchSeq[slot].set(ws, next);
     return next;
+  };
+
+  const unwatch = (ws: WebSocket, slot: WatchSlot) => {
+    nextWatchSeq(ws, slot);
+    watching[slot].delete(ws);
   };
 
   const isAuthRateLimited = (ip: string, now: number): boolean => {
@@ -90,13 +95,15 @@ export async function startCore(options: CoreOptions): Promise<Core> {
   const clients: Clients = {
     toWatchers(sessionId, message) {
       const data = JSON.stringify(message);
-      for (const [ws, watched] of watching) if (watched === sessionId && ws.readyState === ws.OPEN) ws.send(data);
+      for (const ws of wss.clients) {
+        if ((watching.main.get(ws) === sessionId || watching.preview.get(ws) === sessionId) && ws.readyState === ws.OPEN) ws.send(data);
+      }
     },
     broadcast(message) {
       const data = JSON.stringify(message);
       for (const ws of wss.clients) if (ws.readyState === ws.OPEN) ws.send(data);
     },
-    isWatched: (sessionId) => [...watching.values()].includes(sessionId),
+    isWatched: (sessionId) => [...watching.main.values(), ...watching.preview.values()].includes(sessionId),
   };
   const host = new SessionHost(options.dataDir, clients);
   const expectedProtocol = `lila.${options.token}`;
@@ -118,8 +125,7 @@ export async function startCore(options: CoreOptions): Promise<Core> {
       case "session.create":
         return { session: await host.createSession(command) };
       case "session.unwatch":
-        nextWatchSeq(ws);
-        watching.delete(ws);
+        unwatch(ws, command.slot ?? "main");
         return {};
       case "files.search":
         return { files: await host.searchFiles(command.projectId, command.query, command.limit) };
@@ -132,20 +138,30 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         return {};
       case "commands.list":
         return { commands: await host.commands(command.projectId, command.sessionId) };
+      case "session.fork":
+        return { session: await host.forkSubsession(command.sessionId) };
+      case "session.open": {
+        const slot = command.slot ?? "main";
+        const seq = nextWatchSeq(ws, slot);
+        watching[slot].delete(ws);
+        const view = await host.view(command.sessionId, true, slot === "preview");
+        const snapshot = view.open(command.limit);
+        if (ws.readyState === ws.OPEN && watchSeq[slot].get(ws) === seq) watching[slot].set(ws, command.sessionId);
+        return snapshot;
+      }
+      case "session.earlier":
+        return (await host.view(command.sessionId)).earlier(command.beforeId, command.limit);
+      case "session.search":
+        return (await host.view(command.sessionId)).search(command.query, command.offset);
+      case "session.turns":
+        return (await host.view(command.sessionId)).turns(command.offset);
+      case "session.around":
+        return { items: (await host.view(command.sessionId)).around(command.itemId) };
       default:
         break;
     }
-    const openSeq = command.type === "session.open" ? nextWatchSeq(ws) : 0;
     const live = await host.live(command.sessionId);
     switch (command.type) {
-      case "session.open": {
-        if (ws.readyState === ws.OPEN && watchSeq.get(ws) === openSeq) {
-          watching.set(ws, command.sessionId);
-        }
-        return live.open(command.limit);
-      }
-      case "session.earlier":
-        return live.earlier(command.beforeId, command.limit);
       case "session.prompt":
         await live.prompt(command);
         return {};
@@ -242,8 +258,8 @@ export async function startCore(options: CoreOptions): Promise<Core> {
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.on("message", (data) => void handle(ws, data.toString()));
       ws.on("close", () => {
-        nextWatchSeq(ws);
-        watching.delete(ws);
+        unwatch(ws, "main");
+        unwatch(ws, "preview");
       });
       send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, coreVersion: pkg.version });
     });

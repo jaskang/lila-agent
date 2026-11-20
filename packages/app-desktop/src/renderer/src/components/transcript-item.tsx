@@ -1,7 +1,7 @@
 import * as React from "react";
-import { ArrowUpRight, Brain, Check, CheckCircle2, CircleAlert, Copy, Info, PencilLine, Puzzle, TriangleAlert } from "lucide-react";
-import type { ImageInput, SubagentNotification, SubagentStatus, TranscriptItem } from "@lila/protocol";
-import { findMatchingSubSession } from "@/components/agent-card";
+import { Brain, Check, CheckCircle2, CircleAlert, CircleStop, Copy, Info, PencilLine, Puzzle, TriangleAlert } from "lucide-react";
+import type { ImageInput, SubagentNotification, TranscriptItem } from "@lila/protocol";
+import { SubSessionLink } from "@/components/agent-card";
 import { focusComposer } from "@/components/composer";
 import { Markdown } from "@/components/markdown";
 import { ToolCall } from "@/components/tool-call";
@@ -79,7 +79,7 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
 
   return (
     <Message align="end">
-      <MessageContent>
+      <MessageContent className="gap-1">
         {item.images.length ? (
           <div className="flex flex-wrap justify-end gap-2">
             {item.images.map((image, index) => (
@@ -88,12 +88,12 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
                 type="button"
                 aria-label={`放大查看图片 ${index + 1}`}
                 onClick={() => setPreview({ image, index })}
-                className="cursor-zoom-in overflow-hidden rounded-lg border transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="cursor-zoom-in overflow-hidden rounded-lg border transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-focus-visible/transcript-item:outline-2 group-focus-visible/transcript-item:-outline-offset-2 group-focus-visible/transcript-item:outline-ring"
               >
                 <img
                   src={`data:${image.mimeType};base64,${image.data}`}
                   alt={`图片 ${index + 1}`}
-                  className="size-24 object-cover"
+                  className="size-24 max-w-full object-cover"
                 />
               </button>
             ))}
@@ -101,21 +101,25 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
         ) : null}
         {item.text ? (
           <Bubble align="end" variant="muted">
-            <BubbleContent className="text-sm whitespace-pre-wrap">{item.text}</BubbleContent>
+            <BubbleContent className="text-sm whitespace-pre-wrap group-focus-visible/transcript-item:inset-ring-1 group-focus-visible/transcript-item:inset-ring-ring">
+              {item.text}
+            </BubbleContent>
           </Bubble>
         ) : null}
-        <MessageFooter className="gap-0.5 px-0 opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100">
-          {item.text ? <CopyAction text={item.text} /> : null}
-          {item.canRewind ? (
-            <IconAction
-              label={running ? "任务进行中，不能编辑重发" : "编辑重发"}
-              disabled={running}
-              onClick={() => setConfirmRewind(true)}
-            >
-              <PencilLine />
-            </IconAction>
-          ) : null}
-        </MessageFooter>
+        {item.text || item.canRewind ? (
+          <MessageFooter className="pointer-events-none gap-0.5 px-1 pb-1 opacity-0 transition-opacity group-hover/message:pointer-events-auto group-hover/message:opacity-100 group-focus-within/message:pointer-events-auto group-focus-within/message:opacity-100">
+            {item.text ? <CopyAction text={item.text} /> : null}
+            {item.canRewind ? (
+              <IconAction
+                label={running ? "任务进行中，不能编辑重发" : "编辑重发"}
+                disabled={running}
+                onClick={() => setConfirmRewind(true)}
+              >
+                <PencilLine />
+              </IconAction>
+            ) : null}
+          </MessageFooter>
+        ) : null}
       </MessageContent>
       <Dialog open={preview !== null} onOpenChange={(open) => !open && setPreview(null)}>
         <DialogContent className="w-fit max-w-[92vw] p-2 sm:max-w-[92vw]">
@@ -157,15 +161,16 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
   );
 }
 
-function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: "assistant" }> }) {
+function AssistantMessage({ item, reveal }: { item: Extract<TranscriptItem, { kind: "assistant" }>; reveal: boolean }) {
+  const [reasoningOpen, setReasoningOpen] = React.useState(false);
   const thinkingNow = item.streaming && !item.text;
-  const showFooter = !item.streaming && Boolean(item.text || item.model);
+  const showFooter = !item.streaming && Boolean(item.text);
   return (
     <Message>
-      <MessageContent>
+      <MessageContent className="gap-1">
         {item.thinking ? (
           <Trace>
-            <TraceCollapsible>
+            <TraceCollapsible open={reasoningOpen || reveal} onOpenChange={setReasoningOpen}>
               <TraceCollapsibleTrigger>
                 <TraceLine {...(thinkingNow ? { status: "running" as const } : {})}>
                   <TraceIcon>
@@ -190,7 +195,7 @@ function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: "ass
           </Marker>
         ) : null}
         {showFooter ? (
-          <MessageFooter className="items-center gap-1.5 px-0 opacity-0 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100">
+          <MessageFooter className="pointer-events-none w-fit gap-1.5 px-1 pb-1 opacity-0 transition-opacity group-hover/message:pointer-events-auto group-hover/message:opacity-100 group-focus-within/message:pointer-events-auto group-focus-within/message:opacity-100">
             {item.text ? <CopyAction text={item.text} /> : null}
             {item.model ? (
               <span className="truncate font-mono text-[11px] text-muted-foreground" title={item.model}>
@@ -205,54 +210,19 @@ function AssistantMessage({ item }: { item: Extract<TranscriptItem, { kind: "ass
 }
 
 function NotificationSubLink({ sessionId, entry }: { sessionId: string; entry: SubagentNotification }) {
-  const subSessionId = useLila((state) => findMatchingSubSession(state.childrenByParent[sessionId], { agentId: entry.id, description: entry.description }));
-  if (!subSessionId) return null;
-  return (
-    <Button type="button" size="xs" variant="ghost" className="ms-auto h-6 px-1.5 text-muted-foreground" onClick={() => actions.select(subSessionId)}>
-      子会话
-      <ArrowUpRight />
-    </Button>
-  );
-}
-
-const VALID_SUBAGENT_STATUSES = new Set<SubagentStatus>(["queued", "running", "completed", "steered", "stopped", "aborted", "error"]);
-
-/** Minimal legacy fallback for older persisted custom notifications without typed `item.notifications`. */
-function legacyNotifications(details: Record<string, unknown> | undefined): SubagentNotification[] {
-  const raw = details?.notifications;
-  if (!Array.isArray(raw)) return [];
-  const entries: SubagentNotification[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-    if (typeof record.description !== "string") continue;
-    const rawStatus = typeof record.status === "string" && VALID_SUBAGENT_STATUSES.has(record.status as SubagentStatus)
-      ? (record.status as SubagentStatus)
-      : "completed";
-    entries.push({
-      ...(typeof record.id === "string" ? { id: record.id } : {}),
-      description: record.description,
-      status: rawStatus,
-      ...(typeof record.toolUses === "number" ? { toolUses: record.toolUses } : {}),
-      ...(typeof record.turnCount === "number" ? { turnCount: record.turnCount } : {}),
-      ...(typeof record.totalTokens === "number" ? { totalTokens: record.totalTokens } : {}),
-      ...(typeof record.totalCost === "number" ? { totalCost: record.totalCost } : {}),
-      ...(typeof record.durationMs === "number" ? { durationMs: record.durationMs } : {}),
-      ...(typeof record.error === "string" ? { error: record.error } : {}),
-      ...(typeof record.preview === "string" ? { preview: record.preview } : {}),
-    });
-  }
-  return entries;
+  return <SubSessionLink sessionId={sessionId} agentId={entry.id} description={entry.description} className="ms-auto" />;
 }
 
 function SubagentNotificationCard({
   item,
   sessionId,
+  reveal,
 }: {
   item: Extract<TranscriptItem, { kind: "custom" }>;
   sessionId: string;
+  reveal: boolean;
 }) {
-  const entries = item.notifications ?? legacyNotifications(item.details);
+  const entries = item.notifications ?? [];
   const hasError = entries.some((entry) => isSubagentErrorStatus(entry.status));
   const [open, setOpen] = React.useState(hasError);
 
@@ -281,7 +251,7 @@ function SubagentNotificationCard({
 
   return (
     <Trace>
-      <TraceCollapsible open={open} onOpenChange={setOpen}>
+      <TraceCollapsible open={open || reveal} onOpenChange={setOpen}>
         <TraceCollapsibleTrigger>
           <TraceLine {...(hasError ? { status: "error" as const } : {})}>
             <TraceIcon>
@@ -329,20 +299,22 @@ export const TranscriptEntry = React.memo(function TranscriptEntry({
   item,
   sessionId,
   running,
+  reveal = false,
 }: {
   item: TranscriptItem;
   sessionId: string;
   running: boolean;
+  reveal?: boolean;
 }) {
   switch (item.kind) {
     case "user":
       return <UserMessage item={item} sessionId={sessionId} running={running} />;
     case "assistant":
-      return <AssistantMessage item={item} />;
+      return <AssistantMessage item={item} reveal={reveal} />;
     case "tool":
-      return <ToolCall tool={item} sessionId={sessionId} />;
+      return <ToolCall tool={item} sessionId={sessionId} reveal={reveal} />;
     case "custom":
-      if (item.customType === "subagent-notification" || item.notifications?.length) return <SubagentNotificationCard item={item} sessionId={sessionId} />;
+      if (item.notifications !== undefined) return <SubagentNotificationCard item={item} sessionId={sessionId} reveal={reveal} />;
       return (
         <div className="rounded-xl border border-dashed bg-muted/30 px-4 py-3">
           <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
@@ -352,6 +324,18 @@ export const TranscriptEntry = React.memo(function TranscriptEntry({
           <Markdown text={item.text} />
         </div>
       );
+    case "run": {
+      const Icon = item.status === "completed" ? CheckCircle2 : item.status === "aborted" ? CircleStop : CircleAlert;
+      const label = { completed: "本轮已完成", aborted: "本轮已停止", error: "本轮出错", incomplete: "本轮未完成" }[item.status];
+      const duration = formatDuration(item.durationMs);
+      return (
+        <div data-run-status={item.status} className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Icon aria-hidden className="size-3.5 shrink-0" />
+          <span>{label}</span>
+          {duration ? <span className="tabular-nums">· 用时 {duration}</span> : null}
+        </div>
+      );
+    }
     case "notice": {
       const Icon = NOTICE_ICON[item.tone];
       return (

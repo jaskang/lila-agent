@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gitDiff, gitStatus } from "./git.ts";
@@ -67,4 +67,28 @@ test("does not follow untracked symlinks pointing outside the repository", async
   expect(diff.patch).toContain("+++ b/leak-link");
   expect(diff.patch).toContain(`+${secretPath}`);
   expect(diff.patch).not.toContain("SUPER_SECRET_TOKEN");
+});
+
+test("uses project-relative paths and preserves renames inside a repository subdirectory", async () => {
+  const root = mkdtempSync(join(tmpdir(), "lila-git-subdir-"));
+  const dir = join(root, "module");
+  mkdirSync(dir);
+  git(root, ["init", "-b", "main"]);
+  git(root, ["config", "user.email", "test@example.com"]);
+  git(root, ["config", "user.name", "Test"]);
+  writeFileSync(join(dir, "old.ts"), "export const value = 1;\n");
+  git(root, ["add", "."]);
+  git(root, ["commit", "-m", "init"]);
+  git(root, ["mv", "module/old.ts", "module/new.ts"]);
+  writeFileSync(join(root, "outside.ts"), "outside");
+  writeFileSync(join(dir, "untracked.ts"), "inside");
+
+  const { files } = await gitStatus(dir);
+  expect(files.map(({ path }) => path)).toEqual(["new.ts", "untracked.ts"]);
+  expect(files[0]).toMatchObject({ path: "new.ts", from: "old.ts", status: "renamed" });
+  const diff = await gitDiff(dir, "new.ts", true);
+  expect(diff.patch).toContain("similarity index 100%");
+  expect(diff.patch).toContain("rename from old.ts");
+  expect(diff.patch).toContain("rename to new.ts");
+  expect((await gitDiff(dir, "untracked.ts")).patch).toContain("+inside");
 });

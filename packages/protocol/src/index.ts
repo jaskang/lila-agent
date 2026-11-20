@@ -12,7 +12,7 @@ import { z } from "zod";
  * A client that reconnects simply opens the session again.
  */
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 7;
 export const DEFAULT_CORE_PORT = 7457;
 
 const Id = z.string().min(1);
@@ -35,6 +35,8 @@ export type ModelInfo = {
   provider: string;
   label: string;
   reasoning: boolean;
+  thinkingLevels: ThinkingLevel[];
+  defaultThinkingLevel: ThinkingLevel;
   images: boolean;
   contextWindow?: number;
 };
@@ -52,12 +54,15 @@ export type SessionSummary = {
   parentId?: string;
   /** pi-subagents agent id (or its 8-char prefix) linking this sub-session to its `Agent` tool card. */
   agentId?: string;
+  /** The original file remains owned by pi-subagents. */
+  readOnly?: boolean;
 };
 
 // ---------------------------------------------------------------------------
 // Transcript projection
 
 export type ToolStatus = "running" | "done" | "error";
+export type RunStatus = "completed" | "aborted" | "error" | "incomplete";
 
 export type SubagentStatus = "queued" | "running" | "completed" | "steered" | "stopped" | "aborted" | "error";
 
@@ -124,7 +129,15 @@ export type TranscriptItem =
       notifications?: SubagentNotification[];
       details?: Record<string, unknown>;
     }
-  | { kind: "notice"; id: string; tone: "info" | "warning" | "error"; text: string };
+  | { kind: "notice"; id: string; tone: "info" | "warning" | "error"; text: string }
+  | { kind: "run"; id: string; status: RunStatus; durationMs?: number };
+
+export const TRANSCRIPT_SEARCH_PAGE_SIZE = 50;
+export type TranscriptSearchMatch = { itemId: string; kind: TranscriptItem["kind"]; excerpt: string };
+export type TranscriptSearchResults = { matches: TranscriptSearchMatch[]; total: number };
+export const TRANSCRIPT_TURNS_PAGE_SIZE = 30;
+export type TranscriptTurn = { itemId: string; number: number; preview: string };
+export type TranscriptTurns = { turns: TranscriptTurn[]; total: number };
 
 export type ItemKind = TranscriptItem["kind"];
 
@@ -212,6 +225,10 @@ export type GitFileDiff = {
 
 export type SessionState = {
   status: SessionStatus;
+  access: "starting" | "ready" | "read-only" | "failed";
+  startupError?: string;
+  /** The session's own Run, independent of any detached sub-agents. */
+  runActive: boolean;
   modelId?: string;
   thinkingLevel: ThinkingLevel;
   /** Levels the current model accepts; ["off"] for a model without reasoning. */
@@ -251,6 +268,8 @@ export type SessionResources = {
 
 const RequestId = Id;
 const SessionRef = { requestId: RequestId, sessionId: Id };
+const WatchSlot = z.enum(["main", "preview"]);
+export type WatchSlot = z.infer<typeof WatchSlot>;
 
 export const ClientCommand = z.discriminatedUnion("type", [
   z.object({ type: z.literal("projects.list"), requestId: RequestId }),
@@ -266,11 +285,13 @@ export const ClientCommand = z.discriminatedUnion("type", [
     thinkingLevel: ThinkingLevel.optional(),
     approvalMode: ApprovalMode.optional(),
   }),
-  /** Returns the newest items and makes this socket watch the session; replaces any previous watch. */
-  z.object({ type: z.literal("session.open"), ...SessionRef, limit: z.number().int().positive().max(1000).optional() }),
-  /** Stops streaming frames for the previously watched session on this socket. */
-  z.object({ type: z.literal("session.unwatch"), requestId: RequestId }),
+  /** Returns the newest items and replaces the watch in this slot. Preview accepts read-only sub-sessions. */
+  z.object({ type: z.literal("session.open"), ...SessionRef, slot: WatchSlot.optional(), limit: z.number().int().positive().max(1000).optional() }),
+  z.object({ type: z.literal("session.unwatch"), requestId: RequestId, slot: WatchSlot.optional() }),
   z.object({ type: z.literal("session.earlier"), ...SessionRef, beforeId: Id, limit: z.number().int().positive().max(1000) }),
+  z.object({ type: z.literal("session.search"), ...SessionRef, query: z.string().trim().min(1).max(500), offset: z.number().int().nonnegative() }),
+  z.object({ type: z.literal("session.turns"), ...SessionRef, offset: z.number().int().nonnegative() }),
+  z.object({ type: z.literal("session.around"), ...SessionRef, itemId: Id }),
   z.object({
     type: z.literal("session.prompt"),
     ...SessionRef,
@@ -289,6 +310,8 @@ export const ClientCommand = z.discriminatedUnion("type", [
   }),
   z.object({ type: z.literal("session.rename"), ...SessionRef, title: z.string().trim().min(1).max(120) }),
   z.object({ type: z.literal("session.delete"), ...SessionRef }),
+  /** Continues a finished sub-agent's history in an independent, writable session. */
+  z.object({ type: z.literal("session.fork"), ...SessionRef }),
   z.object({ type: z.literal("session.compact"), ...SessionRef }),
   /** Moves the session back to before a user message and returns its text for editing. */
   z.object({ type: z.literal("session.rewind"), ...SessionRef, itemId: Id }),
@@ -317,11 +340,15 @@ export interface CommandResults {
   "session.open": { items: TranscriptItem[]; hasEarlier: boolean; state: SessionState };
   "session.unwatch": Empty;
   "session.earlier": { items: TranscriptItem[]; hasEarlier: boolean };
+  "session.search": TranscriptSearchResults;
+  "session.turns": TranscriptTurns;
+  "session.around": { items: TranscriptItem[] };
   "session.prompt": Empty;
   "session.abort": Empty;
   "session.configure": { state: SessionState };
   "session.rename": { session: SessionSummary };
   "session.delete": Empty;
+  "session.fork": { session: SessionSummary };
   "session.compact": Empty;
   "session.rewind": { text: string };
   "session.respond": Empty;

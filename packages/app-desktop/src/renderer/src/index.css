@@ -168,3 +168,8 @@
 .lila-scroll::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+::highlight(lila-transcript-search) {
+  background-color: color-mix(in oklch, var(--primary) 22%, var(--background));
+  color: var(--foreground);
+}

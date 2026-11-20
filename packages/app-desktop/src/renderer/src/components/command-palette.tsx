@@ -14,7 +14,8 @@ export function CommandPalette() {
   const { toggleSidebar } = useSidebar();
   const projectName = React.useMemo(() => new Map(projects.map((project) => [project.id, project.name])), [projects]);
   const sorted = React.useMemo(() => Object.values(sessions).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)), [sessions]);
-  const running = activeState ? activeState.status === "running" || activeState.status === "waiting" || activeState.compacting : false;
+  const ready = activeState?.access === "ready";
+  const canStop = ready && (activeState.runActive || activeState.compacting);
 
   const run = (action: () => void) => {
     actions.setPaletteOpen(false);
@@ -33,16 +34,18 @@ export function CommandPalette() {
                 <GitBranch />
                 查看工作区 Git 改动
               </CommandItem>
-              <CommandItem value="session-resources 能力 技能 MCP 扩展" onSelect={() => run(() => actions.setResourcesOpen(true))}>
-                <Blocks />
-                打开能力面板（技能 / MCP / 扩展）
-              </CommandItem>
-              {running ? (
+              {ready ? (
+                <CommandItem value="session-resources 能力 技能 MCP 扩展" onSelect={() => run(() => actions.setResourcesOpen(true))}>
+                  <Blocks />
+                  打开能力面板（技能 / MCP / 扩展）
+                </CommandItem>
+              ) : null}
+              {canStop ? (
                 <CommandItem value="session-abort 停止 中断" onSelect={() => run(() => void actions.abort(selectedId))}>
                   <Square />
                   停止当前任务
                 </CommandItem>
-              ) : (
+              ) : ready ? (
                 <>
                   <CommandItem value="session-compact 压缩上下文" onSelect={() => run(() => void actions.compact(selectedId))}>
                     <Minimize2 />
@@ -53,7 +56,7 @@ export function CommandPalette() {
                     重新加载技能、扩展和 MCP
                   </CommandItem>
                 </>
-              )}
+              ) : null}
             </CommandGroup>
           ) : null}
           <CommandGroup heading="命令">

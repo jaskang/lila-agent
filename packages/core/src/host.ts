@@ -1,3 +1,4 @@
+import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai/compat";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
@@ -24,9 +25,11 @@ import { gitDiff as readGitDiff, gitStatus as readGitStatus } from "./git.ts";
 import { createLilaExtension } from "./lila-extension.ts";
 import { type Clients, findModel, LiveSession, parseAutoSubagentName, sessionTitle, slashCommands } from "./live-session.ts";
 import { Store } from "./store.ts";
+import { readSubsessionView, recordedSubagentIds } from "./subsession-view.ts";
 
 const IDLE_DISPOSE_MS = 15 * 60_000;
 const SWEEP_INTERVAL_MS = 60_000;
+const SUBSESSION_REFRESH_MS = 750;
 const WALK_LIMIT = 20_000;
 const WALK_SKIP: Record<string, true> = { node_modules: true, ".git": true };
 const FILE_CACHE_TTL_MS = 8_000;
@@ -106,6 +109,8 @@ export class SessionHost {
   readonly #projectServices = new Map<string, CachedServices>();
   readonly #subsessionSyncTimers = new Map<string, { projectId: string; timer: NodeJS.Timeout }>();
   readonly #sweeper: NodeJS.Timeout;
+  readonly #subsessionRefresh: NodeJS.Timeout;
+  readonly #watchedSubsessions = new Map<string, string>();
   #sweeping = false;
 
   constructor(dataDir: string, clients: Clients) {
@@ -114,6 +119,7 @@ export class SessionHost {
     this.store = new Store(dataDir);
     this.#sweeper = setInterval(() => void this.#sweep(), SWEEP_INTERVAL_MS);
     this.#sweeper.unref();
+    this.#subsessionRefresh = setInterval(() => this.#refreshSubsessionViews(), SUBSESSION_REFRESH_MS).unref();
   }
 
   // -------------------------------------------------------------------------
@@ -213,6 +219,8 @@ export class SessionHost {
         provider: model.provider,
         label: model.name,
         reasoning: model.reasoning,
+        thinkingLevels: getSupportedThinkingLevels(model),
+        defaultThinkingLevel: clampThinkingLevel(model, services.settingsManager.getModelThinkingLevel(model.provider, model.id) ?? services.settingsManager.getDefaultThinkingLevel() ?? "medium"),
         images: model.input.includes("image"),
         contextWindow: model.contextWindow,
       }),
@@ -227,18 +235,17 @@ export class SessionHost {
 
   #enrichSubsession(
     summary: SessionSummary,
-    parentId: string,
+    parentId: string | undefined,
     rawName: string | undefined,
     firstMessage: string | undefined,
+    agentId: string,
   ): void {
-    summary.parentId = parentId;
-    const auto = parseAutoSubagentName(rawName);
-    const parentLive = this.#live.get(parentId);
-    const liveSub = auto && parentLive ? parentLive.subagentByPrefix(auto.idPrefix) : undefined;
-    const agentId = liveSub?.id ?? auto?.idPrefix;
-    if (agentId) summary.agentId = agentId;
+    if (parentId) summary.parentId = parentId;
+    const liveSub = parentId ? this.#live.get(parentId)?.subagentByPrefix(agentId) : undefined;
+    summary.agentId = liveSub?.id ?? agentId;
+    summary.readOnly = true;
     summary.title = sessionTitle(rawName, firstMessage, { isSubsession: true, description: liveSub?.description });
-    if (liveSub && !this.#live.has(summary.id)) {
+    if (liveSub) {
       if (liveSub.status === "running" || liveSub.status === "queued") summary.status = "running";
       else if (liveSub.status === "error" || liveSub.status === "aborted" || liveSub.status === "stopped") summary.status = "error";
       else summary.status = "idle";
@@ -285,10 +292,20 @@ export class SessionHost {
     }
     // Pi records who spawned a session (pi-subagents does for every sub-agent); nest those under their parent.
     const idByPath = new Map(Array.from(nextIndex.values(), (entry) => [entry.path, entry.id]));
+    const recordedByParent = new Map<string, Map<string, string>>();
     for (const [id, meta] of parents) {
-      const parentId = idByPath.get(meta.parentPath);
       const entry = nextIndex.get(id);
-      if (parentId && entry) this.#enrichSubsession(entry.summary, parentId, meta.name, meta.firstMessage);
+      if (!entry) continue;
+      let agentId = parseAutoSubagentName(meta.name)?.idPrefix;
+      if (!agentId) {
+        let recorded = recordedByParent.get(meta.parentPath);
+        if (!recorded) {
+          recorded = recordedSubagentIds(meta.parentPath);
+          recordedByParent.set(meta.parentPath, recorded);
+        }
+        agentId = recorded.get(entry.path);
+      }
+      if (agentId) this.#enrichSubsession(entry.summary, idByPath.get(meta.parentPath), meta.name, meta.firstMessage, agentId);
     }
     this.#index = nextIndex;
     const summaries = new Map(Array.from(nextIndex.values(), (entry) => [entry.id, entry.summary]));
@@ -361,7 +378,7 @@ export class SessionHost {
     return opening;
   }
 
-  async #open(sessionId: string): Promise<LiveSession> {
+  async #entry(sessionId: string): Promise<IndexedSession> {
     let entry = this.#index.get(sessionId);
     if (!entry || !existsSync(entry.path)) {
       await this.listSessions();
@@ -369,24 +386,70 @@ export class SessionHost {
     }
     if (!entry || this.#deletingSessions.has(sessionId)) throw new UserError("会话不存在，可能已经被删除");
     if (this.#removingProjects.has(entry.projectId)) throw new UserError("项目正在移除");
-    this.#openingProjects.set(sessionId, entry.projectId);
+    return entry;
+  }
+
+  #subsessionStatus(entry: IndexedSession): SessionSummary["status"] {
+    const { parentId, agentId, status } = entry.summary;
+    const progress = parentId && agentId ? this.#live.get(parentId)?.subagentByPrefix(agentId) : undefined;
+    if (!progress) return status;
+    if (progress.status === "queued" || progress.status === "running") return "running";
+    if (progress.status === "completed" || progress.status === "steered") return "idle";
+    return "error";
+  }
+
+  async view(sessionId: string, watch = false, preview = false): Promise<Pick<LiveSession, "open" | "earlier" | "search" | "turns" | "around">> {
+    const live = this.#live.get(sessionId);
+    if (live && !preview) return await this.live(sessionId);
+    const entry = await this.#entry(sessionId);
+    if (!entry.summary.readOnly) {
+      if (preview) throw new UserError("侧边预览仅支持子 Agent 会话");
+      return await this.live(sessionId);
+    }
+    const status = this.#subsessionStatus(entry);
+    if (watch) this.#watchedSubsessions.set(sessionId, this.#subsessionVersion(entry, status));
     const project = this.#project(entry.projectId);
-    const parentId = entry.summary.parentId;
-    const agentId = entry.summary.agentId;
-    const parentLive = parentId ? this.#live.get(parentId) : undefined;
-    const subagentDescription = agentId && parentLive ? parentLive.subagentByPrefix(agentId)?.description : undefined;
-    return this.#start(project, SessionManager.open(entry.path), {
+    return readSubsessionView(entry.path, project.path, status, this.store.approvalMode(sessionId));
+  }
+
+  async forkSubsession(sessionId: string): Promise<SessionSummary> {
+    const entry = await this.#entry(sessionId);
+    if (!entry.summary.readOnly) throw new UserError("只有子 Agent 会话可以用此方式继续");
+    if (this.#subsessionStatus(entry) === "running") throw new UserError("请等子 Agent 结束后再继续");
+    const project = this.#project(entry.projectId);
+    const manager = SessionManager.forkFrom(entry.path, project.path);
+    // The fork has its own id and name. The agent keeps ownership of the source.
+    const title = `继续：${entry.summary.title}`;
+    manager.appendSessionInfo(title);
+    const summary: SessionSummary = {
+      id: manager.getSessionId(),
+      projectId: project.id,
+      title,
+      updatedAt: new Date().toISOString(),
+      status: "idle",
+      pendingCount: 0,
+    };
+    const path = manager.getSessionFile();
+    if (!path) throw new UserError("无法创建新会话文件");
+    this.store.setApprovalMode(summary.id, this.store.approvalMode(sessionId));
+    this.#index.set(summary.id, { id: summary.id, projectId: project.id, path, summary });
+    this.#clients.broadcast({ type: "session", session: summary });
+    return summary;
+  }
+
+  async #open(sessionId: string): Promise<LiveSession> {
+    const entry = await this.#entry(sessionId);
+    if (entry.summary.readOnly) throw new UserError("子 Agent 会话是只读的，结束后可继续为新会话");
+    this.#openingProjects.set(sessionId, entry.projectId);
+    return this.#start(this.#project(entry.projectId), SessionManager.open(entry.path), {
       updatedAt: entry.summary.updatedAt,
-      ...(parentId ? { parentId } : {}),
-      ...(agentId ? { agentId } : {}),
-      ...(subagentDescription ? { subagentDescription } : {}),
     });
   }
 
   async #start(
     project: Project,
     sessionManager: SessionManager,
-    options: { modelId?: string; thinkingLevel?: ThinkingLevel; updatedAt?: string; parentId?: string; agentId?: string; subagentDescription?: string },
+    options: { modelId?: string; thinkingLevel?: ThinkingLevel; updatedAt?: string },
   ): Promise<LiveSession> {
     const sessionId = sessionManager.getSessionId();
     if (this.#deletingSessions.has(sessionId) || this.#removingProjects.has(project.id)) {
@@ -395,16 +458,12 @@ export class SessionHost {
     const live = new LiveSession({
       id: sessionId,
       projectId: project.id,
-      parentId: options.parentId,
-      agentId: options.agentId,
-      subagentDescription: options.subagentDescription,
       store: this.store,
       clients: this.#clients,
       onReload: () => this.#invalidateCaches(project.id),
       onSubsessionsChanged: () => this.#scheduleSubsessionSync(project, sessionId),
     });
     const services = await createServices(project.path, live);
-    let attached = false;
     try {
       let model;
       if (options.modelId) {
@@ -418,11 +477,9 @@ export class SessionHost {
         ...(model ? { model } : {}),
         ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
       });
-      await live.attach(services, session, options.updatedAt);
-      attached = true;
+      live.attach(services, session, options.updatedAt);
     } catch (error) {
-      if (attached) await live.dispose();
-      else await settleServices(Promise.resolve(services));
+      await settleServices(Promise.resolve(services));
       throw error;
     }
     if (this.#deletingSessions.has(live.id) || this.#removingProjects.has(project.id) || !this.store.project(project.id)) {
@@ -434,6 +491,16 @@ export class SessionHost {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
+    if (this.#deletingSessions.has(sessionId)) throw new UserError("会话正在删除");
+    // An agent can start before the scheduled index sync discovers its child file.
+    if (!this.#index.has(sessionId) && !this.#live.has(sessionId) && this.#live.size > 0) {
+      await this.listSessions();
+      if (this.#deletingSessions.has(sessionId)) throw new UserError("会话正在删除");
+    }
+    const indexed = this.#index.get(sessionId);
+    if (indexed?.summary.readOnly && this.#subsessionStatus(indexed) === "running") {
+      throw new UserError("请等子 Agent 结束后再删除会话");
+    }
     this.#deletingSessions.add(sessionId);
     try {
       const pendingTimer = this.#subsessionSyncTimers.get(sessionId);
@@ -445,18 +512,24 @@ export class SessionHost {
       if (opening) await opening.catch(() => undefined);
 
       const live = this.#live.get(sessionId);
-      let path = live?.session.sessionFile ?? this.#index.get(sessionId)?.path;
       if (live) await this.#dispose(live, false);
-      if (!path) {
-        await this.listSessions();
-        path = this.#index.get(sessionId)?.path;
+      let path = live?.session.sessionFile ?? indexed?.path;
+      if (!path || !existsSync(path)) {
+        path = undefined;
+        for (const project of this.store.projects) {
+          if (this.#removingProjects.has(project.id)) continue;
+          path = SessionManager.findById(project.path, sessionId);
+          if (path) break;
+        }
       }
-      if (path && existsSync(path)) {
+      if (!path && !live) throw new UserError("找不到要删除的会话文件");
+      if (path) {
         const trash = join(this.#dataDir, "trash");
         mkdirSync(trash, { recursive: true });
         moveToTrash(path, join(trash, basename(path)));
       }
       this.#index.delete(sessionId);
+      this.#watchedSubsessions.delete(sessionId);
       this.store.forgetSession(sessionId);
       this.#clients.broadcast({ type: "session.removed", sessionId });
     } finally {
@@ -510,22 +583,25 @@ export class SessionHost {
     if (this.#deletingSessions.has(parentId) || this.#removingProjects.has(project.id) || !this.store.project(project.id)) return;
     const parentFile = this.#live.get(parentId)?.session.sessionFile ?? this.#index.get(parentId)?.path;
     if (!parentFile) return;
+    let recorded: Map<string, string> | undefined;
     for (const info of await SessionManager.list(project.path)) {
       if (this.#deletingSessions.has(parentId) || this.#removingProjects.has(project.id) || !this.store.project(project.id)) return;
       if (this.#deletingSessions.has(info.id) || info.parentSessionPath !== parentFile) continue;
       const firstMessage = info.messageCount > 0 ? info.firstMessage : undefined;
-      const liveChild = this.#live.get(info.id);
       const summary: SessionSummary = {
         id: info.id,
         projectId: project.id,
         title: sessionTitle(info.name, firstMessage),
         updatedAt: info.modified.toISOString(),
-        status: liveChild?.status ?? "idle",
-        pendingCount: liveChild?.summary().pendingCount ?? 0,
+        status: "idle",
+        pendingCount: 0,
       };
-      this.#enrichSubsession(summary, parentId, info.name, firstMessage);
+      const agentId = parseAutoSubagentName(info.name)?.idPrefix ?? (recorded ??= recordedSubagentIds(parentFile)).get(info.path);
+      if (!agentId) continue;
+      this.#enrichSubsession(summary, parentId, info.name, firstMessage, agentId);
       const prev = this.#index.get(info.id)?.summary;
       this.#index.set(info.id, { id: info.id, projectId: project.id, path: info.path, summary });
+      if (prev?.status !== summary.status) this.#clients.toWatchers(info.id, { type: "reset", sessionId: info.id });
       if (
         !prev ||
         prev.title !== summary.title ||
@@ -539,8 +615,32 @@ export class SessionHost {
     }
   }
 
+  #subsessionVersion(entry: IndexedSession, status = this.#subsessionStatus(entry)): string {
+    const stat = statSync(entry.path, { throwIfNoEntry: false });
+    return stat ? `${status}:${stat.mtimeMs}:${stat.size}` : "";
+  }
+
+  #refreshSubsessionViews(): void {
+    for (const [id, last] of this.#watchedSubsessions) {
+      const entry = this.#index.get(id);
+      if (!entry || !this.#clients.isWatched(id)) {
+        this.#watchedSubsessions.delete(id);
+        continue;
+      }
+      try {
+        const current = this.#subsessionVersion(entry);
+        if (last === current) continue;
+        this.#watchedSubsessions.set(id, current);
+        this.#clients.toWatchers(id, { type: "reset", sessionId: id });
+      } catch (error) {
+        console.error(`[core] refreshing sub-session ${id} failed`, error);
+      }
+    }
+  }
+
   async dispose(): Promise<void> {
     clearInterval(this.#sweeper);
+    clearInterval(this.#subsessionRefresh);
     for (const entry of this.#subsessionSyncTimers.values()) clearTimeout(entry.timer);
     this.#subsessionSyncTimers.clear();
     const modelServices = this.#modelServices;

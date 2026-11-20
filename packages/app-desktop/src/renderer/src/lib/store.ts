@@ -11,6 +11,7 @@ import type {
   SlashCommand,
   ThinkingLevel,
   TranscriptItem,
+  WatchSlot,
 } from "@lila/protocol";
 import { CoreClient, type ConnectionState, type PushMessage } from "./client.ts";
 
@@ -28,6 +29,8 @@ export type SessionView = {
 /** Settings for a session that does not exist yet; remembered between new sessions. */
 export type NewSessionOptions = { projectId?: string; modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode: ApprovalMode };
 export type DraftImage = ImageInput & { id: string; name: string };
+type Draft = { text: string; images: DraftImage[] };
+type DeliveryMode = "steer" | "followUp";
 
 type State = {
   connection: ConnectionState;
@@ -36,16 +39,19 @@ type State = {
   models: ModelInfo[];
   defaultModelId?: string;
   modelsError?: string;
+  modelsLoading: boolean;
   sessions: Record<string, SessionSummary>;
   /** Parent session id → child sub-agent sessions, sorted by newest first. */
   childrenByParent: Record<string, SessionSummary[]>;
   views: Record<string, SessionView>;
   selectedId?: string;
+  previewId?: string;
   newSession: NewSessionOptions;
   /** Composer text per session; `new` is the new-session composer. */
   drafts: Record<string, string>;
   /** Pending image attachments per session; preserved across session switches. */
   draftImages: Record<string, DraftImage[]>;
+  sendingDrafts: Record<string, true>;
   paletteOpen: boolean;
   resourcesOpen: boolean;
   gitOpen: boolean;
@@ -69,16 +75,6 @@ export const APPROVAL_HINT: Record<ApprovalMode, string> = {
   auto: "所有工具直接执行，适合你信任的项目。",
   "ask-exec": "改文件不问，运行命令、MCP 和子 Agent 前先问你。",
   "ask-all": "改文件和运行命令前都先问你。",
-};
-
-export const THINKING_LABEL: Record<ThinkingLevel, string> = {
-  off: "不思考",
-  minimal: "最少思考",
-  low: "少量思考",
-  medium: "适中思考",
-  high: "深入思考",
-  xhigh: "很深入",
-  max: "最深入",
 };
 
 export const EMPTY_VIEW: SessionView = Object.freeze({
@@ -118,6 +114,7 @@ export const useLila = create<State>(() => ({
   connection: "connecting",
   projects: [],
   models: [],
+  modelsLoading: false,
   sessions: {},
   childrenByParent: {},
   views: {},
@@ -125,6 +122,7 @@ export const useLila = create<State>(() => ({
   newSession: readNewSession(),
   drafts: {},
   draftImages: {},
+  sendingDrafts: {},
   paletteOpen: false,
   resourcesOpen: false,
   gitOpen: false,
@@ -162,7 +160,8 @@ function recordViewAccess(sessionId: string): void {
 
 function pruneViews(): void {
   if (recentViews.length <= MAX_CACHED_VIEWS) return;
-  const keep = new Set([get().selectedId, watching].filter((id): id is string => Boolean(id)));
+  const { selectedId, previewId } = get();
+  const keep = new Set([selectedId, previewId, watching.main, watching.preview]);
   const drop: string[] = [];
   for (let i = 0; i < recentViews.length && recentViews.length - drop.length > MAX_CACHED_VIEWS; i++) {
     const candidate = recentViews[i]!;
@@ -246,40 +245,50 @@ function flush(): void {
   });
 }
 
-/** The session this socket watches, and opens in flight (frames before the snapshot are already in it). */
-let watching: string | undefined;
+/** Independent watches for the conversation and the read-only preview. */
+const watching: Partial<Record<WatchSlot, string>> = {};
 const opening = new Map<string, number>();
 let openCounter = 0;
+let selectionVersion = 0;
+let newDraftTarget = { key: NEW_DRAFT };
 
-function unwatchCurrent(): void {
-  const hadWatch = watching !== undefined;
-  watching = undefined;
-  buffer = [];
-  if (frameHandle !== undefined) {
+function unwatchSession(slot: WatchSlot): void {
+  const id = watching[slot];
+  if (!id) return;
+  delete watching[slot];
+  buffer = buffer.filter((frame) => frame.sessionId !== id);
+  if (!buffer.length && frameHandle !== undefined) {
     cancelAnimationFrame(frameHandle);
     frameHandle = undefined;
   }
-  if (hadWatch && get().connection === "connected") {
-    void client.call({ type: "session.unwatch" }).catch(() => {});
+  if (get().connection === "connected") {
+    void client.call({ type: "session.unwatch", slot }).catch(() => {});
   }
 }
 
-async function openSession(sessionId: string): Promise<void> {
+function closePreview(): void {
+  set({ previewId: undefined });
+  unwatchSession("preview");
+}
+
+async function openSession(sessionId: string, slot: WatchSlot = "main"): Promise<void> {
   const token = ++openCounter;
   opening.set(sessionId, token);
-  watching = sessionId;
+  watching[slot] = sessionId;
   recordViewAccess(sessionId);
   flush();
   setView(sessionId, (view) => ({ ...view, loading: true, error: undefined }));
   try {
-    const { items, hasEarlier, state } = await client.call({ type: "session.open", sessionId, limit: OPEN_LIMIT });
-    if (opening.get(sessionId) !== token || watching !== sessionId) return;
+    const current = get().views[sessionId];
+    const limit = current?.state?.access === "read-only" ? Math.min(1_000, Math.max(OPEN_LIMIT, current.items.length)) : OPEN_LIMIT;
+    const { items, hasEarlier, state } = await client.call({ type: "session.open", sessionId, limit, slot });
+    if (opening.get(sessionId) !== token || watching[slot] !== sessionId) return;
     // Frames queued before the snapshot are already part of it.
     buffer = buffer.filter((frame) => frame.sessionId !== sessionId);
     setView(sessionId, () => ({ items, index: indexOf(items), hasEarlier, loadingEarlier: false, state, loading: false }));
     pruneViews();
   } catch (error) {
-    if (opening.get(sessionId) !== token || watching !== sessionId) return;
+    if (opening.get(sessionId) !== token || watching[slot] !== sessionId) return;
     setView(sessionId, (view) => ({ ...view, loading: false, error: message(error) }));
   } finally {
     if (opening.get(sessionId) === token) opening.delete(sessionId);
@@ -311,12 +320,13 @@ function handlePush(frame: PushMessage): void {
     case "item":
     case "delta":
     case "state":
-      if (frame.sessionId !== watching) return;
+      if (frame.sessionId !== watching.main && frame.sessionId !== watching.preview) return;
       buffer.push(frame);
       frameHandle ??= requestAnimationFrame(flush);
       return;
     case "reset":
-      if (frame.sessionId === watching) void openSession(frame.sessionId);
+      if (frame.sessionId === watching.main) void openSession(frame.sessionId);
+      else if (frame.sessionId === watching.preview) void openSession(frame.sessionId, "preview");
       return;
     case "projects":
       set({ projects: frame.projects });
@@ -340,6 +350,7 @@ function handlePush(frame: PushMessage): void {
 
 function forget(sessionId: string): void {
   const wasSelected = get().selectedId === sessionId;
+  if (wasSelected || get().previewId === sessionId) closePreview();
   const idx = recentViews.indexOf(sessionId);
   if (idx >= 0) recentViews.splice(idx, 1);
   scrollPositions.delete(sessionId);
@@ -352,26 +363,33 @@ function forget(sessionId: string): void {
     delete drafts[sessionId];
     const draftImages = { ...state.draftImages };
     delete draftImages[sessionId];
+    const sendingDrafts = { ...state.sendingDrafts };
+    delete sendingDrafts[sessionId];
     return {
       ...withSessions(sessions),
       views,
       drafts,
       draftImages,
+      sendingDrafts,
       ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, gitOpen: false } : {}),
     };
   });
   if (wasSelected) {
     localStorage.removeItem(SELECTED_KEY);
-    unwatchCurrent();
+    unwatchSession("main");
   }
 }
 
 async function loadModels(): Promise<void> {
+  if (get().modelsLoading) return;
+  set({ modelsLoading: true });
   try {
     const { models, defaultModelId } = await client.call({ type: "models.list" });
     set({ models, defaultModelId, modelsError: undefined });
   } catch (error) {
     set({ modelsError: message(error) });
+  } finally {
+    set({ modelsLoading: false });
   }
 }
 
@@ -388,10 +406,16 @@ async function onReady(): Promise<void> {
     set({ projects, ...withSessions(byId), ...(missing ? { selectedId: undefined } : {}) });
     if (missing) {
       localStorage.removeItem(SELECTED_KEY);
-      watching = undefined;
+      unwatchSession("main");
     }
-    const current = get().selectedId;
-    if (current) await openSession(current);
+    const { selectedId: current, previewId } = get();
+    const preview = previewId ? byId[previewId] : undefined;
+    const canPreview = preview?.readOnly && current && preview.parentId === current;
+    if (previewId && !canPreview) closePreview();
+    await Promise.all([
+      current ? openSession(current) : undefined,
+      canPreview ? openSession(preview.id, "preview") : undefined,
+    ]);
   } catch (error) {
     report(error);
   }
@@ -423,18 +447,82 @@ function toDraftImages(images: ImageInput[]): DraftImage[] {
   }));
 }
 
+const EMPTY_DRAFT: Draft = { text: "", images: [] };
+
+function readDraft(key: string, state = get()): Draft {
+  return { text: state.drafts[key] ?? "", images: state.draftImages[key] ?? [] };
+}
+
+function writeDraft(state: State, key: string, draft: Draft): Pick<State, "drafts" | "draftImages"> {
+  const drafts = { ...state.drafts };
+  const draftImages = { ...state.draftImages };
+  if (draft.text) drafts[key] = draft.text;
+  else delete drafts[key];
+  if (draft.images.length) draftImages[key] = draft.images;
+  else delete draftImages[key];
+  return { drafts, draftImages };
+}
+
+/** Reserving a submission immediately leaves a fresh draft for anything typed while awaiting core. */
+function beginDraftSubmission(key: string): Draft | undefined {
+  const state = get();
+  const draft = readDraft(key, state);
+  if (state.sendingDrafts[key] || (!draft.text.trim() && !draft.images.length)) return;
+  set({ ...writeDraft(state, key, EMPTY_DRAFT), sendingDrafts: { ...state.sendingDrafts, [key]: true } });
+  return draft;
+}
+
+function finishDraftSubmission(key: string, unsent?: Draft): void {
+  set((state) => {
+    if (!state.sendingDrafts[key]) return state;
+    const sendingDrafts = { ...state.sendingDrafts };
+    delete sendingDrafts[key];
+    if (!unsent) return { sendingDrafts };
+    const next = readDraft(key, state);
+    return {
+      ...writeDraft(state, key, {
+        text: [unsent.text, next.text].filter(Boolean).join("\n\n"),
+        images: [...unsent.images, ...next.images],
+      }),
+      sendingDrafts,
+    };
+  });
+}
+
+async function sendDraftContents(sessionId: string, draft: Draft, mode?: DeliveryMode): Promise<void> {
+  let accepted = false;
+  try {
+    accepted = await actions.prompt(sessionId, draft.text.trim(), draft.images.map(({ mimeType, data }) => ({ mimeType, data })), mode);
+  } finally {
+    finishDraftSubmission(sessionId, accepted ? undefined : draft);
+  }
+}
+
 export const actions = {
   select(sessionId: string | undefined): void {
+    selectionVersion++;
+    if (get().selectedId !== sessionId) closePreview();
     set({ selectedId: sessionId, resourcesOpen: false, gitOpen: false });
     if (sessionId) localStorage.setItem(SELECTED_KEY, sessionId);
     else localStorage.removeItem(SELECTED_KEY);
     if (!sessionId) {
-      unwatchCurrent();
+      unwatchSession("main");
       return;
     }
     if (get().connection === "connected") void openSession(sessionId);
-    else watching = undefined;
+    else delete watching.main;
   },
+
+  previewSubsession(sessionId: string): void {
+    const { selectedId, sessions, connection, previewId } = get();
+    const child = sessions[sessionId];
+    if (!selectedId || !child?.readOnly || child.parentId !== selectedId || sessionId === previewId) return;
+    unwatchSession("preview");
+    set({ previewId: sessionId });
+    if (connection === "connected") void openSession(sessionId, "preview");
+  },
+
+  closePreview,
 
   getScrollTop(sessionId: string): number | undefined {
     return scrollPositions.get(sessionId);
@@ -460,6 +548,12 @@ export const actions = {
     const next = { ...get().newSession, ...patch };
     set({ newSession: next });
     localStorage.setItem(NEW_SESSION_KEY, JSON.stringify(next));
+  },
+
+  /** An attachment read can finish after the composer moved into the created session. */
+  captureDraftTarget(key: string): () => string {
+    const target = key === NEW_DRAFT ? newDraftTarget : { key };
+    return () => target.key;
   },
 
   setDraft(key: string, text: string): void {
@@ -492,7 +586,8 @@ export const actions = {
   retryModels: loadModels,
 
   retrySession(sessionId: string): void {
-    void openSession(sessionId);
+    if (get().previewId === sessionId) void openSession(sessionId, "preview");
+    else if (get().selectedId === sessionId) void openSession(sessionId);
   },
 
   async addProject(): Promise<Project | undefined> {
@@ -529,11 +624,13 @@ export const actions = {
       const views = { ...current.views };
       const drafts = { ...current.drafts };
       const draftImages = { ...current.draftImages };
+      const sendingDrafts = { ...current.sendingDrafts };
       for (const id of removedSessionIds) {
         delete sessions[id];
         delete views[id];
         delete drafts[id];
         delete draftImages[id];
+        delete sendingDrafts[id];
       }
       return {
         projects: remainingProjects,
@@ -541,67 +638,72 @@ export const actions = {
         views,
         drafts,
         draftImages,
+        sendingDrafts,
         newSession: nextNewSession,
         ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, gitOpen: false } : {}),
       };
     });
     if (wasSelected) {
       localStorage.removeItem(SELECTED_KEY);
-      unwatchCurrent();
+      closePreview();
+      unwatchSession("main");
     }
     if (nextNewSession !== state.newSession) localStorage.setItem(NEW_SESSION_KEY, JSON.stringify(nextNewSession));
     return true;
   },
 
-  /** Creates a session from the new-session composer and sends its first message. */
-  async createAndPrompt(text: string, images: ImageInput[]): Promise<boolean> {
-    const { projectId, modelId, thinkingLevel, approvalMode } = get().newSession;
-    if (!projectId) return false;
-    const existingDraftImages = get().draftImages[NEW_DRAFT];
+  /** Creates a session, then hands the next draft to it while the submitted one waits for acceptance. */
+  async createAndPrompt(projectId: string, modelId: string, thinkingLevel?: ThinkingLevel): Promise<void> {
+    const { approvalMode } = get().newSession;
+    const submitted = beginDraftSubmission(NEW_DRAFT);
+    if (!submitted) return;
+    const version = selectionVersion;
     const created = await attempt(() =>
-      client.call({
-        type: "session.create",
-        projectId,
-        approvalMode,
-        ...(modelId ? { modelId } : {}),
-        ...(thinkingLevel ? { thinkingLevel } : {}),
-      }),
+      client.call({ type: "session.create", projectId, modelId, approvalMode, ...(thinkingLevel ? { thinkingLevel } : {}) }),
     );
-    if (!created) return false;
-    const { session } = created;
-    set((state) => ({
-      ...withSessions({ ...state.sessions, [session.id]: session }),
-      selectedId: session.id,
-    }));
-    localStorage.setItem(SELECTED_KEY, session.id);
-    // Ensure the socket watches the new session before sending its first prompt so early frames are never missed.
-    if (get().connection === "connected") await openSession(session.id);
-    const ok = await actions.prompt(session.id, text, images);
-    if (!ok) {
-      const migratedImages =
-        existingDraftImages && existingDraftImages.length === images.length
-          ? existingDraftImages
-          : toDraftImages(images);
-      set((state) => {
-        const drafts = { ...state.drafts, [session.id]: text };
-        delete drafts[NEW_DRAFT];
-        const draftImages = { ...state.draftImages };
-        if (migratedImages.length) draftImages[session.id] = migratedImages;
-        else delete draftImages[session.id];
-        delete draftImages[NEW_DRAFT];
-        return { drafts, draftImages };
-      });
-      return false;
+    if (!created) {
+      finishDraftSubmission(NEW_DRAFT, submitted);
+      void loadModels();
+      return;
     }
-    // Clear new-session draft after successful handoff (NewSession may already have unmounted).
+    const { session } = created;
+    const followSession = selectionVersion === version && get().selectedId === undefined;
+    if (followSession) {
+      newDraftTarget.key = session.id;
+      newDraftTarget = { key: NEW_DRAFT };
+    }
     set((state) => {
-      const drafts = { ...state.drafts };
-      delete drafts[NEW_DRAFT];
-      const draftImages = { ...state.draftImages };
-      delete draftImages[NEW_DRAFT];
-      return { drafts, draftImages };
+      const sendingDrafts = { ...state.sendingDrafts, [session.id]: true as const };
+      delete sendingDrafts[NEW_DRAFT];
+      const transferred = followSession
+        ? writeDraft({ ...state, ...writeDraft(state, NEW_DRAFT, EMPTY_DRAFT) }, session.id, readDraft(NEW_DRAFT, state))
+        : {};
+      return {
+        ...withSessions({ ...state.sessions, [session.id]: session }),
+        ...transferred,
+        sendingDrafts,
+        ...(followSession ? { selectedId: session.id } : {}),
+      };
     });
-    return true;
+    if (followSession) {
+      localStorage.setItem(SELECTED_KEY, session.id);
+      if (get().connection === "connected") await openSession(session.id);
+    }
+    await sendDraftContents(session.id, submitted);
+  },
+
+  async sendDraft(sessionId: string, mode?: DeliveryMode): Promise<void> {
+    const draft = beginDraftSubmission(sessionId);
+    if (draft) await sendDraftContents(sessionId, draft, mode);
+  },
+
+  async continueSubsession(sessionId: string): Promise<void> {
+    const version = selectionVersion;
+    const result = await attempt(() => client.call({ type: "session.fork", sessionId }));
+    if (!result) return;
+    const { session } = result;
+    set((state) => withSessions({ ...state.sessions, [session.id]: session }));
+    if (selectionVersion === version) actions.select(session.id);
   },
 
   async prompt(sessionId: string, text: string, images: ImageInput[] = [], mode?: "steer" | "followUp"): Promise<boolean> {
@@ -618,9 +720,11 @@ export const actions = {
     await attempt(() => client.call({ type: "session.abort", sessionId }));
   },
 
-  async configure(sessionId: string, patch: { modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode?: ApprovalMode }): Promise<void> {
+  async configure(sessionId: string, patch: { modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode?: ApprovalMode }): Promise<boolean> {
     const result = await attempt(() => client.call({ type: "session.configure", sessionId, ...patch }));
-    if (result) setView(sessionId, (view) => ({ ...view, state: result.state }));
+    if (!result) return false;
+    setView(sessionId, (view) => ({ ...view, state: result.state }));
+    return true;
   },
 
   async rename(sessionId: string, title: string): Promise<boolean> {
@@ -686,6 +790,14 @@ export const actions = {
 
   async gitDiff(projectId: string, path: string, staged?: boolean) {
     return (await client.call({ type: "git.diff", projectId, path, ...(staged !== undefined ? { staged } : {}) })).diff;
+  },
+
+  async searchTranscript(sessionId: string, query: string, offset: number) {
+    return client.call({ type: "session.search", sessionId, query, offset });
+  },
+
+  async transcriptAround(sessionId: string, itemId: string) {
+    return (await client.call({ type: "session.around", sessionId, itemId })).items;
   },
 
   async loadEarlier(sessionId: string): Promise<void> {

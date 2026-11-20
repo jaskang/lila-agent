@@ -1,13 +1,12 @@
 import * as React from "react";
-import { ArrowUp, FileText, Paperclip, Puzzle, Sparkles, Square, SquareSlash, X } from "lucide-react";
+import { ArrowUp, Clock3, FileText, Paperclip, Puzzle, Sparkles, Square, SquareSlash, X } from "lucide-react";
 import { toast } from "sonner";
-import type { ImageInput, SlashCommand } from "@lila/protocol";
+import type { SlashCommand } from "@lila/protocol";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentGroup, AttachmentMedia } from "@/components/ui/attachment";
-import { Button } from "@/components/ui/button";
 import { Command, CommandEmpty, CommandGroup, CommandItem, CommandList } from "@/components/ui/command";
 import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
-import { Textarea } from "@/components/ui/textarea";
+import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } from "@/components/ui/input-group";
 import { cn } from "cn";
 import { actions, type DraftImage, useLila } from "@/lib/store";
 
@@ -78,6 +77,7 @@ export function Composer({
   projectId,
   running = false,
   disabled = false,
+  sendDisabled = false,
   abortArmed = false,
   placeholder,
   footer,
@@ -92,19 +92,20 @@ export function Composer({
   projectId?: string | undefined;
   running?: boolean;
   disabled?: boolean;
+  sendDisabled?: boolean;
   abortArmed?: boolean;
   placeholder: string;
   /** Controls at the start of the bottom bar (model, thinking, approval). */
   footer?: React.ReactNode;
   /** Shown next to the send button, for example the context ring. */
   trailing?: React.ReactNode;
-  onSubmit: (text: string, images: ImageInput[], mode?: "steer" | "followUp") => Promise<boolean>;
-  onAbort?: () => void;
+  onSubmit: (mode?: "steer" | "followUp") => Promise<void>;
+  onAbort?: (() => void) | undefined;
 }) {
   const text = useLila((state) => state.drafts[draftKey] ?? "");
   const images = useLila((state) => state.draftImages[draftKey] ?? EMPTY_IMAGES);
   const connected = useLila((state) => state.connection === "connected");
-  const [sending, setSending] = React.useState(false);
+  const sending = useLila((state) => Boolean(state.sendingDrafts[draftKey]));
   const [dragging, setDragging] = React.useState(false);
   const [suggest, setSuggest] = React.useState<Suggest | null>(null);
   const [highlight, setHighlight] = React.useState(0);
@@ -198,7 +199,7 @@ export function Composer({
   }, [highlight, menuOpen, flatOptions]);
 
   const hasText = text.trim().length > 0;
-  const canSend = connected && !disabled && !sending && (running ? hasText : hasText || images.length > 0);
+  const canSend = connected && !disabled && !sendDisabled && !sending && (running ? hasText : hasText || images.length > 0);
 
   function syncSuggest(value: string, caret: number): void {
     setSuggest(findSuggest(value, caret, Boolean(projectId), Boolean(projectId)));
@@ -219,6 +220,7 @@ export function Composer({
   }
 
   async function addFiles(list: FileList | File[]): Promise<void> {
+    const draftTarget = actions.captureDraftTarget(draftKey);
     const incoming = Array.from(list);
     const added: DraftImage[] = [];
     const blocks: string[] = [];
@@ -249,30 +251,25 @@ export function Composer({
         toast.error(error instanceof Error ? error.message : String(error));
       }
     }
+    const target = draftTarget();
     if (added.length) {
-      actions.setDraftImages(draftKey, (current) => {
+      actions.setDraftImages(target, (current) => {
         const room = MAX_IMAGES - current.length;
         if (added.length > room) toast.warning(`最多添加 ${MAX_IMAGES} 张图片`);
         return [...current, ...added.slice(0, Math.max(room, 0))];
       });
     }
     if (blocks.length) {
-      const current = useLila.getState().drafts[draftKey] ?? "";
-      actions.setDraft(draftKey, [current.trimEnd(), ...blocks].filter(Boolean).join("\n\n") + "\n");
+      const current = useLila.getState().drafts[target] ?? "";
+      actions.setDraft(target, [current.trimEnd(), ...blocks].filter(Boolean).join("\n\n") + "\n");
     }
     ref.current?.focus();
   }
 
   async function submit(mode?: "steer" | "followUp"): Promise<void> {
     if (!canSend) return;
-    setSending(true);
-    const ok = await onSubmit(text.trim(), images.map(({ mimeType, data }) => ({ mimeType, data })), running ? (mode ?? "steer") : undefined);
-    setSending(false);
-    if (ok) {
-      actions.setDraft(draftKey, "");
-      actions.setDraftImages(draftKey, []);
-      setSuggest(null);
-    }
+    setSuggest(null);
+    await onSubmit(running ? (mode ?? "steer") : undefined);
   }
 
   function onKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>): void {
@@ -300,6 +297,7 @@ export function Composer({
     }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
+      if (event.altKey && !running) return;
       void submit(event.altKey ? "followUp" : "steer");
     }
   }
@@ -307,9 +305,9 @@ export function Composer({
   let optionIndex = 0;
 
   return (
-    <div
+    <InputGroup
       className={cn(
-        "relative rounded-2xl border bg-background shadow-xs transition-colors focus-within:border-ring",
+        "rounded-2xl bg-background shadow-xs has-disabled:bg-background has-disabled:opacity-100 dark:bg-background dark:has-disabled:bg-background",
         dragging && "border-primary ring-3 ring-primary/20",
       )}
       onDragOver={(event) => {
@@ -373,28 +371,31 @@ export function Composer({
         </div>
       ) : null}
       {images.length ? (
-        <AttachmentGroup className="px-3 pt-3">
-          {images.map((image) => (
-            <Attachment key={image.id} size="xs" orientation="vertical" className="w-16" title={image.name}>
-              <AttachmentMedia variant="image">
-                <img src={`data:${image.mimeType};base64,${image.data}`} alt={image.name} />
-              </AttachmentMedia>
-              <AttachmentActions className="top-1! right-1!">
-                <AttachmentAction
-                  variant="secondary"
-                  aria-label={`移除 ${image.name}`}
-                  onClick={() => actions.setDraftImages(draftKey, (current) => current.filter((item) => item.id !== image.id))}
-                >
-                  <X />
-                </AttachmentAction>
-              </AttachmentActions>
-            </Attachment>
-          ))}
-        </AttachmentGroup>
+        <InputGroupAddon align="block-start" className="px-3 pt-2 pb-0">
+          <AttachmentGroup>
+            {images.map((image) => (
+              <Attachment key={image.id} size="xs" orientation="vertical" className="w-16" title={image.name}>
+                <AttachmentMedia variant="image">
+                  <img src={`data:${image.mimeType};base64,${image.data}`} alt={image.name} />
+                </AttachmentMedia>
+                <AttachmentActions className="top-1! right-1!">
+                  <AttachmentAction
+                    variant="secondary"
+                    aria-label={`移除 ${image.name}`}
+                    onClick={() => actions.setDraftImages(draftKey, (current) => current.filter((item) => item.id !== image.id))}
+                  >
+                    <X />
+                  </AttachmentAction>
+                </AttachmentActions>
+              </Attachment>
+            ))}
+          </AttachmentGroup>
+        </InputGroupAddon>
       ) : null}
-      <Textarea
+      <InputGroupTextarea
         ref={ref}
         data-composer
+        aria-label="消息"
         value={text}
         disabled={disabled}
         placeholder={placeholder}
@@ -411,10 +412,10 @@ export function Composer({
           event.preventDefault();
           void addFiles(pasted);
         }}
-        className="max-h-72 min-h-16 resize-none border-0 bg-transparent px-4 pt-3 text-sm shadow-none focus-visible:ring-0 dark:bg-transparent"
+        className="max-h-72 min-h-11 w-full flex-none px-3 pt-2.5 pb-1.5 text-sm"
       />
-      <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
-        <Button
+      <InputGroupAddon align="block-end" className="flex-wrap gap-1 px-2 py-1.5">
+        <InputGroupButton
           type="button"
           size="icon-sm"
           variant="ghost"
@@ -425,7 +426,7 @@ export function Composer({
           onClick={() => fileInput.current?.click()}
         >
           <Paperclip />
-        </Button>
+        </InputGroupButton>
         <input
           ref={fileInput}
           type="file"
@@ -442,14 +443,23 @@ export function Composer({
             <span className="shrink-0 px-1 text-xs text-amber-600 dark:text-amber-400">
               再按一次 <Kbd>Esc</Kbd> 停止
             </span>
-          ) : running ? (
-            <span className="hidden shrink-0 px-1 text-xs text-muted-foreground md:inline">
-              <Kbd>↵</Kbd> 插话 · <Kbd>⌥↵</Kbd> 排队
-            </span>
+          ) : null}
+          {running ? (
+            <InputGroupButton
+              size="xs"
+              variant="ghost"
+              title="当前 Run 结束后发送（⌥↵）"
+              aria-keyshortcuts="Alt+Enter"
+              disabled={!canSend}
+              onClick={() => void submit("followUp")}
+            >
+              <Clock3 />
+              排队
+            </InputGroupButton>
           ) : null}
           {trailing}
-          {running && onAbort ? (
-            <Button
+          {onAbort ? (
+            <InputGroupButton
               type="button"
               size="icon-sm"
               variant={hasText ? "secondary" : "default"}
@@ -459,12 +469,13 @@ export function Composer({
               onClick={onAbort}
             >
               <Square className="size-3 fill-current" />
-            </Button>
+            </InputGroupButton>
           ) : null}
           {!running || hasText || images.length > 0 ? (
-            <Button
+            <InputGroupButton
               type="button"
               size="icon-sm"
+              variant="default"
               className="rounded-full"
               disabled={!canSend}
               aria-label={running ? "插话" : "发送"}
@@ -478,10 +489,10 @@ export function Composer({
               onClick={() => void submit("steer")}
             >
               {sending ? <Spinner /> : <ArrowUp />}
-            </Button>
+            </InputGroupButton>
           ) : null}
         </div>
-      </div>
-    </div>
+      </InputGroupAddon>
+    </InputGroup>
   );
 }

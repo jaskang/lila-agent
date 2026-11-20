@@ -1,19 +1,22 @@
 import * as React from "react";
-import { ArrowLeft, ArrowUpRight, Blocks, Bot, ChevronDown, ChevronRight, ChevronUp, GitBranch, RotateCw } from "lucide-react";
-import type { GitStatus, SessionState, SubagentProgress, TranscriptItem } from "@lila/protocol";
-import { AgentGroup, type AgentToolItem, findMatchingSubSession } from "@/components/agent-card";
+import { ArrowDown, ArrowLeft, Blocks, ChevronUp, GitBranch, RotateCw, Search } from "lucide-react";
+import type { GitStatus, SessionState, TranscriptItem, TranscriptSearchMatch } from "@lila/protocol";
+import { ComposerStatus } from "@/components/composer-status";
+import { ConversationSearch } from "@/components/conversation-search";
+import { ReplyChangesSheet, type ChangeSelection } from "@/components/reply-changes";
 import { Composer } from "@/components/composer";
 import { GitSheet } from "@/components/git-sheet";
 import { MarkdownBasePathProvider } from "@/components/markdown";
 import { PendingPanel } from "@/components/pending-panel";
 import { ResourcesSheet } from "@/components/resources-sheet";
-import { ApprovalSelect, ContextUsage, ModelPicker, ThinkingSelect } from "@/components/session-controls";
-import { TranscriptEntry } from "@/components/transcript-item";
+import { ApprovalSelect, ContextUsage, ModelPicker, ModelSetup } from "@/components/session-controls";
+import { SubsessionActions } from "@/components/subsession-preview";
+import { TranscriptBlocks } from "@/components/transcript-blocks";
+import { TurnRail } from "@/components/turn-directory";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
-import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import {
   MessageScroller,
   MessageScrollerButton,
@@ -21,11 +24,12 @@ import {
   MessageScrollerItem,
   MessageScrollerProvider,
   MessageScrollerViewport,
+  useMessageScroller,
 } from "@/components/ui/message-scroller";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "cn";
-import { formatCompactTokens, formatElapsed } from "@/lib/format";
+import { layoutTranscript } from "@/lib/transcript-layout";
 import { actions, EMPTY_VIEW, useLila } from "@/lib/store";
 
 const ABORT_ARM_MS = 1_500;
@@ -45,11 +49,15 @@ function SessionToolbar({
   gitChanges,
   onGit,
   onResources,
+  onSearch,
+  readOnly,
 }: {
   sessionId: string;
   gitChanges?: number | undefined;
   onGit: () => void;
   onResources: () => void;
+  onSearch: () => void;
+  readOnly: boolean;
 }) {
   const session = useLila((store) => store.sessions[sessionId]);
   const parentSession = useLila((store) => (session?.parentId ? store.sessions[session.parentId] : undefined));
@@ -133,9 +141,9 @@ function SessionToolbar({
           />
         ) : (
           <h1
-            className="cursor-text truncate text-sm font-medium [-webkit-app-region:no-drag]"
-            title="双击重命名"
-            onDoubleClick={startEditing}
+            className={cn("truncate text-sm font-medium", !readOnly && "cursor-text [-webkit-app-region:no-drag]")}
+            title={readOnly ? undefined : "双击重命名"}
+            onDoubleClick={readOnly ? undefined : startEditing}
           >
             {session?.title || "新会话"}
           </h1>
@@ -144,6 +152,9 @@ function SessionToolbar({
           {project?.name}
         </span>
       </div>
+      <Button type="button" size="icon-sm" variant="ghost" aria-label="查找会话内容" title="查找会话内容（⌘F）" onClick={onSearch} className="text-muted-foreground [-webkit-app-region:no-drag]">
+        <Search />
+      </Button>
       {project ? (
         <Button variant="ghost" size="sm" className="font-normal text-muted-foreground [-webkit-app-region:no-drag]" onClick={onGit}>
           <GitBranch />
@@ -155,28 +166,13 @@ function SessionToolbar({
           ) : null}
         </Button>
       ) : null}
-      <Button variant="ghost" size="sm" className="font-normal text-muted-foreground [-webkit-app-region:no-drag]" onClick={onResources}>
-        <Blocks />
-        能力
-      </Button>
+      {!readOnly ? (
+        <Button variant="ghost" size="sm" className="font-normal text-muted-foreground [-webkit-app-region:no-drag]" onClick={onResources}>
+          <Blocks />
+          能力
+        </Button>
+      ) : null}
     </header>
-  );
-}
-
-function RunStatus({ state }: { state: SessionState }) {
-  if (state.status !== "running" && !state.compacting) return null;
-  const text = state.retry
-    ? `重试中（${state.retry.attempt}/${state.retry.max}）：${state.retry.message}`
-    : state.compacting
-      ? "正在压缩上下文…"
-      : "正在工作…";
-  return (
-    <Marker>
-      <MarkerIcon>
-        <Spinner />
-      </MarkerIcon>
-      <MarkerContent className={state.retry ? "text-amber-700 dark:text-amber-400" : "shimmer"}>{text}</MarkerContent>
-    </Marker>
   );
 }
 
@@ -194,189 +190,74 @@ function StatusLines({ lines }: { lines: Record<string, string> }) {
   );
 }
 
-function ActiveSubagentRow({ sessionId, subagent, now }: { sessionId: string; subagent: SubagentProgress; now: number }) {
-  const targetSessionId = useLila((store) =>
-    findMatchingSubSession(store.childrenByParent[sessionId], { agentId: subagent.id, description: subagent.description }),
-  );
-  const stats = [
-    subagent.turns ? `${subagent.turns} 轮` : undefined,
-    subagent.toolUses ? `${subagent.toolUses} 次工具` : undefined,
-    subagent.tokens ? formatCompactTokens(subagent.tokens) : undefined,
-    subagent.cost ? `$${subagent.cost.toFixed(4)}` : undefined,
-    formatElapsed(subagent.startedAt, now),
-  ].filter(Boolean);
-
-  return (
-    <div className="flex items-center gap-2 rounded-lg px-2 py-1 text-xs hover:bg-muted/50">
-      <Spinner className="size-3.5 shrink-0 text-muted-foreground" />
-      <Badge variant="secondary" className="h-5 shrink-0 gap-1 font-normal">
-        <Bot className="size-3" />
-        {subagent.type}
-      </Badge>
-      {subagent.background ? (
-        <Badge variant="outline" className="h-5 shrink-0 font-normal text-muted-foreground">
-          后台
-        </Badge>
-      ) : null}
-      <span className="min-w-0 flex-1 truncate" title={subagent.activity ? `${subagent.description} · ${subagent.activity}` : subagent.description}>
-        <span className="font-medium">{subagent.description || "子 Agent"}</span>
-        {subagent.activity ? <span className="ms-1.5 font-mono text-muted-foreground">· {subagent.activity}</span> : null}
-      </span>
-      <span className="hidden shrink-0 text-muted-foreground tabular-nums sm:inline">{stats.join(" · ")}</span>
-      {targetSessionId ? (
-        <Button type="button" size="xs" variant="ghost" className="h-6 shrink-0 px-1.5 text-muted-foreground" onClick={() => actions.select(targetSessionId)}>
-          子会话
-          <ArrowUpRight />
-        </Button>
-      ) : null}
-    </div>
-  );
-}
-
-function SingleForegroundSubagentSummary({ sessionId, subagent, now }: { sessionId: string; subagent: SubagentProgress; now: number }) {
-  const targetSessionId = useLila((store) =>
-    findMatchingSubSession(store.childrenByParent[sessionId], { agentId: subagent.id, description: subagent.description }),
-  );
-  const stats = [
-    subagent.tokens ? formatCompactTokens(subagent.tokens) : undefined,
-    subagent.cost ? `$${subagent.cost.toFixed(4)}` : undefined,
-    formatElapsed(subagent.startedAt, now),
-  ].filter(Boolean);
-
-  return (
-    <div className="flex items-center gap-2 rounded-xl border bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
-      <Spinner className="size-3.5 shrink-0" />
-      <span className="min-w-0 truncate">1 个子 Agent 运行中</span>
-      {stats.length ? <span className="shrink-0 tabular-nums">· {stats.join(" · ")}</span> : null}
-      {targetSessionId ? (
-        <Button type="button" size="xs" variant="ghost" className="ms-auto h-6 shrink-0 px-1.5 text-muted-foreground" onClick={() => actions.select(targetSessionId)}>
-          子会话
-          <ArrowUpRight />
-        </Button>
-      ) : null}
-    </div>
-  );
-}
-
-type RenderBlock =
-  | { kind: "item"; item: TranscriptItem }
-  | { kind: "agent-group"; id: string; tools: AgentToolItem[] };
-
-/** Groups consecutive parallel `Agent` tool calls into one compact summary block. */
-function groupTranscriptItems(items: readonly TranscriptItem[]): RenderBlock[] {
-  const blocks: RenderBlock[] = [];
-  for (let i = 0; i < items.length; ) {
-    const item = items[i]!;
-    if (item.kind === "tool" && (item.name === "Agent" || item.subagent)) {
-      const tools: AgentToolItem[] = [item];
-      let j = i + 1;
-      while (j < items.length) {
-        const next = items[j]!;
-        if (next.kind === "tool" && (next.name === "Agent" || next.subagent)) {
-          tools.push(next);
-          j += 1;
-        } else {
-          break;
-        }
-      }
-      if (tools.length >= 2) {
-        blocks.push({ kind: "agent-group", id: `ag:${tools[0]!.id}`, tools });
-      } else {
-        blocks.push({ kind: "item", item });
-      }
-      i = j;
-      continue;
-    }
-    blocks.push({ kind: "item", item });
-    i += 1;
-  }
-  return blocks;
-}
-
-function ActiveSubagentsBar({ sessionId, subagents }: { sessionId: string; subagents?: SubagentProgress[] | undefined }) {
-  const active = React.useMemo(
-    () => (subagents ?? []).filter((entry) => entry.status === "queued" || entry.status === "running"),
-    [subagents],
-  );
-  const [expanded, setExpanded] = React.useState(false);
-  const [now, setNow] = React.useState(() => Date.now());
-  React.useEffect(() => {
-    if (!active.length) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, [active.length]);
-  if (!active.length) return null;
-
-  // A single foreground sub-agent is already detailed in the SingleAgentCard directly above; keep a quiet status strip.
-  if (active.length === 1 && !active[0]!.background) {
-    return <SingleForegroundSubagentSummary sessionId={sessionId} subagent={active[0]!} now={now} />;
-  }
-
-  // Keep multi-agent summary to one compact line by default so it doesn't duplicate the transcript's AgentGroup.
-  const collapsible = active.length >= 2;
-  const showRows = !collapsible || expanded;
-  const totalTokens = active.reduce((sum, entry) => sum + entry.tokens, 0);
-  const totalCost = active.reduce((sum, entry) => sum + entry.cost, 0);
-  const summaryStats = [
-    totalTokens > 0 ? formatCompactTokens(totalTokens) : undefined,
-    totalCost > 0 ? `$${totalCost.toFixed(4)}` : undefined,
-  ].filter(Boolean);
-
-  return (
-    <div className="flex flex-col gap-0.5 rounded-xl border bg-muted/30 p-1.5">
-      {collapsible ? (
-        <button
-          type="button"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((current) => !current)}
-          className="flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-xs hover:bg-muted/50"
-        >
-          <Spinner className="size-3.5 shrink-0 text-muted-foreground" />
-          <span className="font-medium">{active.length} 个子 Agent 运行中</span>
-          {summaryStats.length ? <span className="text-muted-foreground tabular-nums">· {summaryStats.join(" · ")}</span> : null}
-          <span className="ms-auto flex items-center gap-0.5 text-muted-foreground">
-            {expanded ? "收起" : "展开"}
-            {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
-          </span>
-        </button>
-      ) : null}
-      {showRows
-        ? active.map((subagent) => <ActiveSubagentRow key={subagent.id} sessionId={sessionId} subagent={subagent} now={now} />)
-        : null}
-    </div>
-  );
-}
-
-function QueueChips({ queue }: { queue: SessionState["queue"] }) {
-  if (!queue.steering.length && !queue.followUp.length) return null;
-  return (
-    <div className="flex flex-wrap gap-1.5 px-1">
-      {queue.steering.map((text, index) => (
-        <Badge key={`s-${index}`} variant="secondary" className="max-w-full" title={text}>
-          <span className="text-muted-foreground">插话</span>
-          <span className="truncate">{text}</span>
-        </Badge>
-      ))}
-      {queue.followUp.map((text, index) => (
-        <Badge key={`f-${index}`} variant="outline" className="max-w-full" title={text}>
-          <span className="text-muted-foreground">排队</span>
-          <span className="truncate">{text}</span>
-        </Badge>
-      ))}
-    </div>
-  );
-}
-
 function SessionControls({ sessionId, state }: { sessionId: string; state: SessionState }) {
   const models = useLila((store) => store.models);
   return (
     <>
-      <ModelPicker models={models} value={state.modelId} onChange={(modelId) => void actions.configure(sessionId, { modelId })} />
-      <ThinkingSelect levels={state.thinkingLevels} value={state.thinkingLevel} onChange={(thinkingLevel) => void actions.configure(sessionId, { thinkingLevel })} />
+      <ModelPicker
+        models={models}
+        modelId={state.modelId}
+        thinkingLevel={state.thinkingLevel}
+        currentLevels={state.modelId ? state.thinkingLevels : undefined}
+        onApply={(modelId, thinkingLevel) => actions.configure(sessionId, {
+          ...(modelId !== state.modelId ? { modelId } : {}),
+          thinkingLevel,
+        })}
+      />
       <ApprovalSelect value={state.approvalMode} onChange={(approvalMode) => void actions.configure(sessionId, { approvalMode })} />
     </>
   );
+}
+
+function revealSearchMatch(target: HTMLElement, query: string): void {
+  const needle = query.toLowerCase();
+  const nodes = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+  for (let node = nodes.nextNode(); node; node = nodes.nextNode()) {
+    const text = node.textContent ?? "";
+    const start = text.toLowerCase().indexOf(needle);
+    if (start < 0 || start >= text.length || !node.parentElement?.getClientRects().length) continue;
+    const range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, Math.min(text.length, start + query.length));
+    CSS.highlights?.set("lila-transcript-search", new Highlight(range));
+    node.parentElement.scrollIntoView({ block: "center", inline: "nearest" });
+    return;
+  }
+  target.scrollIntoView({ block: "center", inline: "nearest" });
+}
+
+type TranscriptTarget = { id: string; query: string; version: number };
+
+function TranscriptNavigation({ viewportRef, target, scrollToLatest }: {
+  viewportRef: React.RefObject<HTMLDivElement | null>;
+  target: TranscriptTarget | undefined;
+  scrollToLatest: React.RefObject<boolean>;
+}) {
+  const { scrollToEnd, scrollToMessage } = useMessageScroller();
+
+  React.useEffect(() => {
+    if (!target && !scrollToLatest.current) return;
+    const frame = requestAnimationFrame(() => {
+      if (scrollToLatest.current) {
+        scrollToLatest.current = false;
+        scrollToEnd();
+      } else if (target) {
+        const row = viewportRef.current?.querySelector<HTMLElement>(`[data-transcript-item="${CSS.escape(target.id)}"]`);
+        if (target.query) {
+          if (row) revealSearchMatch(row, target.query);
+        } else {
+          scrollToMessage(target.id);
+          row?.focus({ preventScroll: true });
+        }
+      }
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      CSS.highlights?.delete("lila-transcript-search");
+    };
+  }, [scrollToEnd, scrollToLatest, scrollToMessage, target, viewportRef]);
+
+  return null;
 }
 
 export function Conversation({ sessionId }: { sessionId: string }) {
@@ -389,9 +270,26 @@ export function Conversation({ sessionId }: { sessionId: string }) {
   const [gitChanges, setGitChanges] = React.useState<number | undefined>();
   const [abortArmed, setAbortArmed] = React.useState(false);
   const state = view.state;
-  const running = state ? state.status === "running" || state.status === "waiting" || state.compacting : false;
+  const child = useLila((store) => store.sessions[sessionId]?.readOnly === true);
+  const readOnly = child || state?.access === "read-only";
+  const ready = state?.access === "ready";
+  const running = state?.runActive === true;
+  const canStop = connected && ready && (running || state.compacting);
   const loaded = state !== undefined;
-  const prevRunning = React.useRef(running);
+  const gitWorkActive = state?.status === "running" || state?.status === "waiting" || state?.compacting === true;
+  const prevGitWorkActive = React.useRef(gitWorkActive);
+  const [searchOpen, setSearchOpen] = React.useState(false);
+  const [searchFocus, setSearchFocus] = React.useState(0);
+  const [transcriptTarget, setTranscriptTarget] = React.useState<TranscriptTarget>();
+  const [history, setHistory] = React.useState<TranscriptItem[]>();
+  const [review, setReview] = React.useState<ChangeSelection>();
+  const latestItem = view.items.at(-1);
+  const replyVisible = latestItem?.kind === "assistant" && latestItem.streaming && Boolean(latestItem.text || latestItem.thinking);
+  const toolRunning = latestItem?.kind === "tool" && latestItem.status === "running";
+  const showResponseStatus = running && connected && !readOnly && !history
+    && !state.pending.length && !state.retry && !state.compacting && !replyVisible && !toolRunning;
+  const searchVersion = React.useRef(0);
+  const scrollToLatest = React.useRef(false);
   const abortTimerRef = React.useRef<number | undefined>(undefined);
   const abortArmedRef = React.useRef(false);
   const viewportRef = React.useRef<HTMLDivElement>(null);
@@ -417,10 +315,10 @@ export function Conversation({ sessionId }: { sessionId: string }) {
   }, [refreshGitCount]);
 
   React.useEffect(() => {
-    // Refresh git badge right after an agent run settles.
-    if (prevRunning.current && !running) refreshGitCount();
-    prevRunning.current = running;
-  }, [running, refreshGitCount]);
+    // The background agents can keep changing files after the parent Run.
+    if (prevGitWorkActive.current && !gitWorkActive) refreshGitCount();
+    prevGitWorkActive.current = gitWorkActive;
+  }, [gitWorkActive, refreshGitCount]);
 
   const disarmAbort = React.useCallback(() => {
     window.clearTimeout(abortTimerRef.current);
@@ -435,13 +333,13 @@ export function Conversation({ sessionId }: { sessionId: string }) {
   }, [disarmAbort, sessionId]);
 
   React.useEffect(() => {
-    if (!running) disarmAbort();
+    if (!canStop) disarmAbort();
     return () => window.clearTimeout(abortTimerRef.current);
-  }, [running, disarmAbort]);
+  }, [canStop, disarmAbort]);
 
   // Global double-Escape to abort when no overlay, command palette, or completion menu is open.
   React.useEffect(() => {
-    if (!running) return;
+    if (!canStop || searchOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.isComposing || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
       const store = useLila.getState();
@@ -462,7 +360,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [running, handleAbort]);
+  }, [canStop, handleAbort, searchOpen]);
 
   // Restore saved scrollTop synchronously after MessageScrollerProvider's layout effects and before paint.
   React.useLayoutEffect(() => {
@@ -484,17 +382,84 @@ export function Conversation({ sessionId }: { sessionId: string }) {
     };
   }, [sessionId]);
 
-  const renderBlocks = React.useMemo(() => groupTranscriptItems(view.items), [view.items]);
+  const openSearch = React.useCallback(() => {
+    setSearchOpen(true);
+    setSearchFocus((current) => current + 1);
+  }, []);
+
+  const clearSearchHit = React.useCallback(() => {
+    searchVersion.current++;
+    setTranscriptTarget(undefined);
+  }, []);
+
+  const closeSearch = React.useCallback(() => {
+    clearSearchHit();
+    scrollToLatest.current = Boolean(history);
+    setHistory(undefined);
+    setSearchOpen(false);
+  }, [clearSearchHit, history]);
+
+  const jumpToItem = React.useCallback(async (itemId: string, query = ""): Promise<boolean> => {
+    const version = ++searchVersion.current;
+    const index = useLila.getState().views[sessionId]?.index;
+    if (index?.[itemId] !== undefined) {
+      setHistory(undefined);
+    } else {
+      try {
+        const items = await actions.transcriptAround(sessionId, itemId);
+        if (version !== searchVersion.current || !items.some((item) => item.id === itemId)) return false;
+        setHistory(items);
+      } catch {
+        return false;
+      }
+    }
+    if (!query) setSearchOpen(false);
+    setTranscriptTarget({ id: itemId, query, version });
+    return true;
+  }, [sessionId]);
+  const showSearchHit = React.useCallback((hit: TranscriptSearchMatch, query: string) => jumpToItem(hit.itemId, query), [jumpToItem]);
+
+  React.useEffect(() => () => { searchVersion.current++; }, []);
+
+  React.useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.isComposing || event.defaultPrevented || document.querySelector(BLOCKING_OVERLAY_SELECTOR)) return;
+      if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        openSearch();
+      } else if (searchOpen && event.key === "Escape") {
+        event.preventDefault();
+        closeSearch();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [openSearch, closeSearch, searchOpen]);
+
+  const visibleItems = history ?? view.items;
+  const hasTurnRail = visibleItems.some((item) => item.kind === "user");
+  const renderBlocks = React.useMemo(() => layoutTranscript(visibleItems, projectPath), [visibleItems, projectPath]);
 
   return (
     <MarkdownBasePathProvider value={projectPath}>
-      <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <SessionToolbar
           sessionId={sessionId}
           gitChanges={gitChanges}
           onGit={() => actions.setGitOpen(true)}
           onResources={() => actions.setResourcesOpen(true)}
+          onSearch={openSearch}
+          readOnly={readOnly}
         />
+        {searchOpen ? (
+          <ConversationSearch sessionId={sessionId} connected={connected} onHit={showSearchHit} onClear={clearSearchHit} onClose={closeSearch} focusRequest={searchFocus} />
+        ) : null}
+        {history ? (
+          <div className="mx-auto flex w-full max-w-3xl items-center justify-between px-5 py-1 text-xs text-muted-foreground">
+            历史消息
+            <Button type="button" variant="ghost" size="xs" onClick={closeSearch}><ArrowDown />返回最新</Button>
+          </div>
+        ) : null}
         {!loaded ? (
           <div className="flex min-h-0 flex-1 items-center justify-center px-6">
             {!view.loading && view.error ? (
@@ -528,20 +493,21 @@ export function Conversation({ sessionId }: { sessionId: string }) {
           </div>
         ) : (
           <MessageScrollerProvider
-            key={sessionId}
-            autoScroll
-            defaultScrollPosition={initialScrollTopRef.current !== undefined ? "start" : "end"}
+            key={history ? "history" : sessionId}
+            autoScroll={!transcriptTarget?.query && !history}
+            defaultScrollPosition={history || initialScrollTopRef.current !== undefined ? "start" : "end"}
             scrollPreviousItemPeek={48}
           >
-            <MessageScroller className="min-h-0 flex-1">
+            <TranscriptNavigation viewportRef={viewportRef} target={transcriptTarget} scrollToLatest={scrollToLatest} />
+            <MessageScroller className="@container min-h-0 flex-1">
               <MessageScrollerViewport
                 ref={viewportRef}
                 onScroll={(event) => {
-                  scrollTopRef.current = event.currentTarget.scrollTop;
+                  if (!history) scrollTopRef.current = event.currentTarget.scrollTop;
                 }}
               >
-                <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-4 px-6 pt-6 pb-10">
-                  {!view.error && view.items.length === 0 ? (
+                <MessageScrollerContent className={cn("mx-auto w-full max-w-3xl gap-2.5 px-5 pt-4 pb-7", hasTurnRail && "ps-10 @min-[52rem]:ps-5")}>
+                  {ready && !state.pending.length && !view.error && view.items.length === 0 ? (
                     <MessageScrollerItem messageId="empty">
                       <Empty className="py-24">
                         <EmptyHeader>
@@ -551,7 +517,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                       </Empty>
                     </MessageScrollerItem>
                   ) : null}
-                  {view.hasEarlier ? (
+                  {!history && view.hasEarlier ? (
                     <MessageScrollerItem messageId="load-earlier">
                       <div className="flex justify-center py-1">
                         <Button variant="ghost" size="sm" disabled={view.loadingEarlier} onClick={() => void actions.loadEarlier(sessionId)}>
@@ -561,47 +527,56 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                       </div>
                     </MessageScrollerItem>
                   ) : null}
-                  {renderBlocks.map((block) =>
-                    block.kind === "agent-group" ? (
-                      <MessageScrollerItem key={block.id} messageId={block.id}>
-                        <AgentGroup tools={block.tools} sessionId={sessionId} />
-                      </MessageScrollerItem>
-                    ) : (
-                      <MessageScrollerItem key={block.item.id} messageId={block.item.id} scrollAnchor={block.item.kind === "user"}>
-                        <TranscriptEntry item={block.item} sessionId={sessionId} running={block.item.kind === "user" ? running : false} />
-                      </MessageScrollerItem>
-                    ),
-                  )}
-                  {state && !state.pending.length ? (
-                    <MessageScrollerItem messageId="status">
-                      <RunStatus state={state} />
+                  <TranscriptBlocks blocks={renderBlocks} sessionId={sessionId}
+                    revealId={transcriptTarget?.query ? transcriptTarget.id : undefined}
+                    running={!ready || running || state.compacting}
+                    onReview={setReview}
+                  />
+                  {showResponseStatus ? (
+                    <MessageScrollerItem messageId="response-status">
+                      <p role="status" className="flex items-center gap-2 py-1 text-sm text-muted-foreground">
+                        <Spinner aria-hidden className="size-3.5 shrink-0" />
+                        正在响应…
+                      </p>
                     </MessageScrollerItem>
                   ) : null}
                 </MessageScrollerContent>
               </MessageScrollerViewport>
-              <MessageScrollerButton />
+              {hasTurnRail ? <TurnRail items={visibleItems} onJump={jumpToItem} /> : null}
+              {!history ? <MessageScrollerButton /> : null}
             </MessageScroller>
           </MessageScrollerProvider>
         )}
-        <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-2 px-6 pb-5">
+        <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-1.5 px-5 pb-4">
+          {state && !readOnly ? <ComposerStatus sessionId={sessionId} state={state} /> : null}
           {state ? <PendingPanel sessionId={sessionId} pending={state.pending} /> : null}
-          {state ? <ActiveSubagentsBar sessionId={sessionId} subagents={state.subagents} /> : null}
-          {state ? <QueueChips queue={state.queue} /> : null}
-          <Composer
-            draftKey={sessionId}
-            sessionId={sessionId}
-            projectId={projectId}
-            running={running}
-            disabled={!loaded}
-            abortArmed={abortArmed}
-            placeholder={running ? "补充说明会在当前工具结束后送达… 双击 Esc 停止" : "继续对话，/ 使用命令和技能，@ 引用文件"}
-            onSubmit={(text, images, mode) => actions.prompt(sessionId, text, images, mode)}
-            onAbort={handleAbort}
-            footer={state ? <SessionControls sessionId={sessionId} state={state} /> : null}
-            trailing={state ? <ContextUsage sessionId={sessionId} state={state} /> : null}
-          />
+          {state?.access === "failed" ? (
+            <p role="alert" className="break-words px-1 text-sm text-destructive">会话初始化失败：{state.startupError}</p>
+          ) : null}
+          {readOnly ? (
+            <SubsessionActions sessionId={sessionId} state={state} />
+          ) : (
+            <>
+              {ready && !state.modelId ? <ModelSetup /> : null}
+              <Composer
+                draftKey={sessionId}
+                sessionId={sessionId}
+                projectId={projectId}
+                running={running}
+                disabled={!loaded}
+                sendDisabled={!ready || state.compacting}
+                abortArmed={abortArmed}
+                placeholder={running ? "补充说明会在当前工具结束后送达… 双击 Esc 停止" : "继续对话，/ 使用命令和技能，@ 引用文件"}
+                onSubmit={(mode) => actions.sendDraft(sessionId, mode)}
+                onAbort={canStop ? handleAbort : undefined}
+                footer={ready ? <SessionControls sessionId={sessionId} state={state} /> : null}
+                trailing={ready ? <ContextUsage sessionId={sessionId} state={state} /> : null}
+              />
+            </>
+          )}
           {state ? <StatusLines lines={state.statusLines} /> : null}
         </div>
+        <ReplyChangesSheet sessionId={sessionId} selection={review} onChange={setReview} />
         <ResourcesSheet sessionId={sessionId} open={resourcesOpen} onOpenChange={actions.setResourcesOpen} />
         <GitSheet
           projectId={projectId}

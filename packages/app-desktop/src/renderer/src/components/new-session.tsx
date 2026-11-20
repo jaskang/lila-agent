@@ -1,7 +1,6 @@
-import { FolderOpen, FolderPlus, RotateCw } from "lucide-react";
-import type { ThinkingLevel } from "@lila/protocol";
+import { FolderOpen, FolderPlus } from "lucide-react";
 import { Composer } from "@/components/composer";
-import { ApprovalSelect, ModelPicker, ThinkingSelect } from "@/components/session-controls";
+import { ApprovalSelect, ModelPicker, ModelSetup } from "@/components/session-controls";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -9,8 +8,6 @@ import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { cn } from "cn";
 import { actions, NEW_DRAFT, useLila } from "@/lib/store";
 
-/** Before a session exists core cannot tell the exact levels; these are the ones every reasoning model accepts. */
-const REASONING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 const ADD_PROJECT = "__add__";
 
 export function NewSession() {
@@ -23,8 +20,9 @@ export function NewSession() {
   const { open, isMobile } = useSidebar();
 
   const projectId = projects.some((project) => project.id === options.projectId) ? options.projectId : projects.at(-1)?.id;
-  const modelId = options.modelId && models.some((model) => model.id === options.modelId) ? options.modelId : defaultModelId;
-  const model = models.find((item) => item.id === modelId);
+  const model = models.find((item) => item.id === options.modelId) ?? models.find((item) => item.id === defaultModelId) ?? models[0];
+
+  const thinkingLevel = model?.thinkingLevels.find((level) => level === options.thinkingLevel) ?? model?.defaultThinkingLevel;
 
   const showTrigger = !open || isMobile;
   const header = (
@@ -89,29 +87,26 @@ export function NewSession() {
             </Select>
             <h1 className="text-2xl font-semibold tracking-tight">里做什么？</h1>
           </div>
+          {!model || modelsError ? <ModelSetup /> : null}
           <Composer
             draftKey={NEW_DRAFT}
             projectId={projectId}
             disabled={!connected || !projectId}
+            sendDisabled={!model}
             placeholder="描述你要完成的任务，@ 引用文件，可以粘贴或拖入图片"
-            onSubmit={(text, images) => {
-              if (projectId !== options.projectId) actions.setNewSession({ projectId });
-              return actions.createAndPrompt(text, images);
+            onSubmit={async () => {
+              if (projectId && model) await actions.createAndPrompt(projectId, model.id, thinkingLevel);
             }}
             footer={
               <>
-                {modelsError ? (
-                  <Button size="sm" variant="ghost" className="text-destructive" title={modelsError} onClick={() => void actions.retryModels()}>
-                    <RotateCw />
-                    读取模型失败，重试
-                  </Button>
-                ) : (
-                  <ModelPicker models={models} value={modelId} onChange={(next) => actions.setNewSession({ modelId: next })} />
-                )}
-                <ThinkingSelect
-                  levels={model?.reasoning ? REASONING_LEVELS : []}
-                  value={options.thinkingLevel}
-                  onChange={(thinkingLevel) => actions.setNewSession({ thinkingLevel })}
+                <ModelPicker
+                  models={models}
+                  modelId={model?.id}
+                  thinkingLevel={thinkingLevel}
+                  onApply={(modelId, thinkingLevel) => {
+                    actions.setNewSession({ modelId, thinkingLevel });
+                    return true;
+                  }}
                 />
                 <ApprovalSelect value={options.approvalMode} onChange={(approvalMode) => actions.setNewSession({ approvalMode })} />
               </>

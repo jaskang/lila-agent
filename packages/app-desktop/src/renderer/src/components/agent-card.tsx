@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowUpRight, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleAlert } from "lucide-react";
+import { Bot, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, PanelRightOpen } from "lucide-react";
 import type { SessionSummary, SubagentProgress, TranscriptItem } from "@lila/protocol";
 import { Markdown } from "@/components/markdown";
 import { Badge } from "@/components/ui/badge";
@@ -20,10 +20,6 @@ import { formatCompactTokens, formatDuration, formatElapsed, isSubagentErrorStat
 import { actions, useLila } from "@/lib/store";
 
 export type AgentToolItem = Extract<TranscriptItem, { kind: "tool" }>;
-
-function str(value: unknown): string | undefined {
-  return typeof value === "string" && value ? value : undefined;
-}
 
 const AGENT_STATUS: Record<string, string> = {
   running: "运行中",
@@ -46,19 +42,19 @@ export function findMatchingSubSession(
       const childAgentId = child.agentId?.toLowerCase();
       return childAgentId && (childAgentId === agentId || agentId.startsWith(childAgentId) || childAgentId.startsWith(agentId));
     });
-    if (byId) return byId.id;
+    return byId?.id;
   }
   const promptLine = match.prompt?.trim().split("\n")[0]?.trim();
   const candidates = [match.description?.trim(), promptLine].filter((value): value is string => Boolean(value));
   for (const candidate of candidates) {
     const normalized = candidate.toLowerCase();
-    const matched = children.find((child) => {
+    const matching = children.filter((child) => {
       const title = child.title.replace(/…$/, "").trim().toLowerCase();
       return title && (normalized === title || normalized.startsWith(title) || title.startsWith(normalized));
     });
-    if (matched) return matched.id;
+    if (matching.length === 1) return matching[0]?.id;
   }
-  return children.length === 1 ? children[0]?.id : undefined;
+  return undefined;
 }
 
 type ResolvedAgent = {
@@ -86,11 +82,10 @@ type ResolvedAgent = {
 
 function resolveAgent(tool: AgentToolItem, live: SubagentProgress | undefined, now: number): ResolvedAgent {
   const sub = tool.subagent;
-  const { args } = tool;
   const agentId = sub?.id;
-  const type = live?.type || sub?.type || str(args.subagent_type) || "Agent";
-  const description = live?.description || sub?.description || str(args.description);
-  const background = Boolean(live?.background ?? sub?.background ?? args.run_in_background);
+  const type = live?.type || sub?.type || "Agent";
+  const description = live?.description || sub?.description;
+  const background = Boolean(live?.background ?? sub?.background);
   const status = live?.status ?? sub?.status ?? (tool.status === "running" ? "running" : tool.status === "error" ? "error" : "completed");
   const active = status === "running" || status === "queued" || tool.status === "running";
   const isError = isSubagentErrorStatus(status);
@@ -108,7 +103,7 @@ function resolveAgent(tool: AgentToolItem, live: SubagentProgress | undefined, n
       ? formatElapsed(live.startedAt, now)
       : undefined
     : formatDuration(durationMs);
-  const prompt = sub?.prompt ?? str(args.prompt);
+  const prompt = sub?.prompt;
   const output = live?.output ?? (sub ? sub.output : tool.output || undefined);
   const error = live?.error ?? sub?.error;
 
@@ -136,7 +131,7 @@ function resolveAgent(tool: AgentToolItem, live: SubagentProgress | undefined, n
   };
 }
 
-function SubSessionLink({
+export function SubSessionLink({
   sessionId,
   agentId,
   description,
@@ -149,21 +144,27 @@ function SubSessionLink({
   prompt?: string | undefined;
   className?: string | undefined;
 }) {
-  const subSessionId = useLila((state) => findMatchingSubSession(state.childrenByParent[sessionId], { agentId, description, prompt }));
+  const subSessionId = useLila((state) => state.selectedId === sessionId
+    ? findMatchingSubSession(state.childrenByParent[sessionId], { agentId, description, prompt })
+    : undefined);
+  const previewed = useLila((state) => Boolean(subSessionId && state.previewId === subSessionId));
   if (!subSessionId) return null;
   return (
     <Button
       type="button"
       size="xs"
       variant="ghost"
-      className={cn("h-6 shrink-0 px-1.5 text-muted-foreground", className)}
+      aria-label={description ? `侧边查看：${description}` : "侧边查看"}
+      aria-pressed={previewed}
+      className={cn("h-6 shrink-0 px-1.5 text-muted-foreground aria-pressed:bg-accent", className)}
       onClick={(event) => {
         event.stopPropagation();
-        actions.select(subSessionId);
+        if (previewed) actions.closePreview();
+        else actions.previewSubsession(subSessionId);
       }}
     >
-      子会话
-      <ArrowUpRight />
+      侧边查看
+      <PanelRightOpen />
     </Button>
   );
 }
@@ -212,7 +213,7 @@ function AgentDetailsBody({ info, sessionId, showSubLink = true }: { info: Resol
   );
 }
 
-export function SingleAgentCard({ tool, sessionId }: { tool: AgentToolItem; sessionId: string }) {
+export function SingleAgentCard({ tool, sessionId, reveal = false }: { tool: AgentToolItem; sessionId: string; reveal?: boolean }) {
   const agentId = tool.subagent?.id;
   const live = useLila<SubagentProgress | undefined>((state) =>
     agentId ? state.views[sessionId]?.state?.subagents?.find((entry) => entry.id === agentId) : undefined,
@@ -243,7 +244,7 @@ export function SingleAgentCard({ tool, sessionId }: { tool: AgentToolItem; sess
   return (
     <Trace>
       <TraceCollapsible
-        open={open}
+        open={open || reveal}
         onOpenChange={(next) => {
           setTouched(true);
           setOpen(next);
@@ -303,37 +304,32 @@ function AgentGroupRow({
 
   return (
     <div className="flex flex-col">
-      <div
-        role="button"
-        tabIndex={0}
-        aria-expanded={open}
-        onClick={onToggle}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            onToggle();
-          }
-        }}
-        className="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs transition-colors hover:bg-muted/50 focus-visible:bg-muted/50 focus-visible:outline-none"
-      >
-        <span className="shrink-0 text-muted-foreground">{open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}</span>
-        <span className="shrink-0">
-          {info.active ? (
-            <Spinner className="size-3.5 text-muted-foreground" />
-          ) : info.isError ? (
-            <CircleAlert className="size-3.5 text-destructive" />
-          ) : (
-            <CheckCircle2 className="size-3.5 text-emerald-600 dark:text-emerald-400" />
-          )}
-        </span>
-        <Badge variant="secondary" className="h-5 shrink-0 px-1.5 font-normal">
-          {info.type}
-        </Badge>
-        <span className="min-w-0 flex-1 truncate" title={info.activity ? `${info.description ?? ""} · ${info.activity}` : info.description}>
-          <span className="font-medium text-foreground">{info.description || "子 Agent"}</span>
-          {info.activity ? <span className="ms-1.5 font-mono text-muted-foreground">· {info.activity}</span> : null}
-        </span>
-        {compactMeta.length ? <span className="hidden shrink-0 text-muted-foreground tabular-nums sm:inline">{compactMeta.join(" · ")}</span> : null}
+      <div className="flex min-w-0 items-center gap-1 pe-3 hover:bg-muted/50">
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={onToggle}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 ps-3 py-2 text-start text-xs focus-visible:bg-muted/50 focus-visible:outline-none"
+        >
+          <span className="shrink-0 text-muted-foreground">{open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}</span>
+          <span className="shrink-0">
+            {info.active ? (
+              <Spinner className="size-3.5 text-muted-foreground" />
+            ) : info.isError ? (
+              <CircleAlert className="size-3.5 text-destructive" />
+            ) : (
+              <CheckCircle2 className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+            )}
+          </span>
+          <Badge variant="secondary" className="h-5 shrink-0 px-1.5 font-normal">
+            {info.type}
+          </Badge>
+          <span className="min-w-0 flex-1 truncate" title={info.activity ? `${info.description ?? ""} · ${info.activity}` : info.description}>
+            <span className="font-medium text-foreground">{info.description || "子 Agent"}</span>
+            {info.activity ? <span className="ms-1.5 font-mono text-muted-foreground">· {info.activity}</span> : null}
+          </span>
+          {compactMeta.length ? <span className="hidden shrink-0 text-muted-foreground tabular-nums sm:inline">{compactMeta.join(" · ")}</span> : null}
+        </button>
         <SubSessionLink sessionId={sessionId} agentId={info.agentId} description={info.description} prompt={info.prompt} />
       </div>
       {open ? (

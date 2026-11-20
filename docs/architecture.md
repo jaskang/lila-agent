@@ -12,7 +12,7 @@ Electron 应用
                               │
 core（Node，独立常驻进程）←────┘←── 以后的手机端（经 Tailscale）
   ├─ server.ts：鉴权、命令分发、按会话推送
-  ├─ 会话宿主：每个 Lila 会话一个 Pi AgentSession（pi-coding-agent SDK）
+  ├─ 会话宿主：每个 Lila 管理的可写会话一个 Pi AgentSession（pi-coding-agent SDK）
   │    ├─ Pi 资源加载：AGENTS.md、技能、提示模板、用户扩展、Pi 包
   │    ├─ 内置扩展：MCP、codemode、tool_search、子 Agent（pi-subagents）
   │    └─ Lila 扩展：工具审批、ask_user 提问
@@ -28,9 +28,10 @@ core（Node，独立常驻进程）←────┘←── 以后的手机�
 - **core 是独立的 Node 进程。** 用 Electron 自带的 Node（`ELECTRON_RUN_AS_NODE=1`）运行，Pi 官方支持 Node ≥ 22.19，Node 24 原生去掉 TS 类型，开发和打包都不需要额外的运行时或编译步骤。应用退出后 core 继续跑完任务；应用启动时复用已在运行的 core，协议版本不一致就替换它。
 - **所有客户端都走 WebSocket 并鉴权。** core 首次启动生成 `core-token`（0600），客户端用 `lila.<token>` 子协议连接；core 拒绝网页 `Origin`。
 - **界面只认 Lila 的协议。** `packages/protocol` 定义命令（Zod 校验）和推送消息（TS 类型）。Pi 的消息结构只在 core 的 transcript 投影里出现，以后的手机端不必理解 Pi 的内部类型。
-- **打开会话 = 拿快照 + 收推送。** `session.open` 返回最近的条目和当前状态（含正在流式输出的部分），之后 core 推 `item`（新增/替换条目）、`delta`（流式文本）、`state`。断线重连就重新 open，不需要序号补发。回退、压缩这类改变形状的操作推 `reset`，客户端重新 open。
-- **审批和提问是 Pi 扩展。** Lila 内置的扩展在 `tool_call` 钩子里按会话的审批方式拦截工具，等用户在界面上回答；任何 Pi 扩展调用 `ctx.ui.select/confirm/input/editor` 也会变成同样的待处理卡片。待处理项只在内存里：core 重启时正在跑的任务本来也会中断。
+- **打开会话 = 拿快照 + 收推送。** `session.open` 返回最近的条目和当前状态（含正在流式输出的部分），之后 core 推 `item`（新增/替换条目）、`delta`（流式文本）、`state`。断线重连就重新 open，不需要序号补发。会话内查找由 core 匹配完整投影，客户端只读取命中条目附近的窗口。回退、压缩这类改变形状的操作推 `reset`，客户端重新 open。协议分别报告本会话的 Run 和后台子 Agent；子 Agent 的原会话始终由 pi-subagents 写入，桌面实时读取已落盘的记录，结束后可从该记录继续为新会话。
+- **审批和提问是 Pi 扩展。** Lila 内置的扩展在 `tool_call` 钩子里按会话的审批方式拦截工具，等用户在界面上回答；任何 Pi 扩展调用 `ctx.ui.select/confirm/input/editor` 也会变成同样的待处理卡片。会话在扩展初始化完成前即可订阅和应答，首条消息会等初始化完成再送达。待处理项只在内存里：core 重启时正在跑的任务本来也会中断。
 - **界面线程只管渲染。** 代码高亮在 Worker，流式帧按动画帧合并。
+- **轮次目录按用户消息定位。** core 分页返回整条分支的消息预览，并复用查找的历史窗口定位。右侧只读子会话使用独立订阅，主会话继续接收推送。实测的 Run 状态和耗时以 Pi 自定义条目随会话记录保存，旧记录可根据结尾的助手消息显示状态。
 - **界面组件用现成的。** shadcn/ui（Base UI 版）及其 AI 组件：Message Scroller、Message、Bubble、Trace、Code Block、Questionnaire、Marker、Attachment，加上 Command、Dropdown Menu、Alert Dialog、Sheet、Tabs 等。
 
 ## 能力从哪来

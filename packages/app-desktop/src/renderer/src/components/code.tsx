@@ -251,6 +251,8 @@ export function parsePatch(patch: string, fallbackPath: string): DiffFile[] {
 
 export function DiffView({ patch, path, maxHeight = "24rem" }: { patch: string; path: string; maxHeight?: string }) {
   const files = React.useMemo(() => parsePatch(patch, path), [patch, path]);
+  // A pure rename or mode change has Git headers and no line hunks.
+  if (!files.length && patch.trim()) return <Code code={patch.trimEnd()} language="diff" title={path} maxHeight={maxHeight} />;
   return (
     <>
       {files.map((file, fileIndex) => {

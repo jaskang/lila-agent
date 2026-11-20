@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { closeSync, lstatSync, openSync, readlinkSync, readSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { GitFileChange, GitFileDiff, GitFileStatus, GitStatus } from "@lila/protocol";
 import { UserError } from "./errors.ts";
@@ -14,7 +14,7 @@ type GitExecResult = { stdout: string; stderr: string; code: number };
 
 async function runGit(cwd: string, args: string[]): Promise<GitExecResult> {
   try {
-    const { stdout, stderr } = await execFileAsync("git", args, { cwd, maxBuffer: MAX_BUFFER });
+    const { stdout, stderr } = await execFileAsync("git", ["--literal-pathspecs", ...args], { cwd, maxBuffer: MAX_BUFFER });
     return { stdout, stderr, code: 0 };
   } catch (error) {
     const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number | string };
@@ -78,13 +78,20 @@ function parseNumstatZ(output: string): Map<string, { added: number; removed: nu
   return stats;
 }
 
-/** Working-tree git status for a project directory. */
-export async function gitStatus(cwd: string): Promise<GitStatus> {
-  const statusResult = await runGit(cwd, ["status", "--porcelain=v2", "--branch", "-z", "-uall"]);
+/** Porcelain v2 paths are repository-relative even when a pathspec limits the scan. */
+async function readStatus(cwd: string, includeUntracked = true): Promise<GitStatus> {
+  const [statusResult, prefixResult] = await Promise.all([
+    runGit(cwd, ["status", "--porcelain=v2", "--branch", "-z", includeUntracked ? "-uall" : "-uno", "--", "."]),
+    runGit(cwd, ["rev-parse", "--show-prefix"]),
+  ]);
   if (statusResult.code !== 0) {
     if (/not a git repository/i.test(statusResult.stderr)) return { isRepo: false, files: [] };
     throw new UserError(`读取 Git 状态失败：${statusResult.stderr.trim() || "未知错误"}`);
   }
+
+  if (prefixResult.code !== 0) throw new UserError("无法确定项目在 Git 仓库中的路径");
+  const prefix = prefixResult.stdout.replace(/\r?\n$/, "");
+  const toProjectPath = (path: string) => path.startsWith(prefix) ? path.slice(prefix.length) : "";
 
   let branch: string | undefined;
   let ahead: number | undefined;
@@ -106,7 +113,7 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
       }
     } else if (record.startsWith("1 ")) {
       const xy = record.slice(2, 4);
-      const path = fieldAfter(record, 8);
+      const path = toProjectPath(fieldAfter(record, 8));
       if (!path) continue;
       files.push({
         path,
@@ -116,8 +123,8 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
       });
     } else if (record.startsWith("2 ")) {
       const xy = record.slice(2, 4);
-      const path = fieldAfter(record, 9);
-      const from = records[++i] ?? "";
+      const path = toProjectPath(fieldAfter(record, 9));
+      const from = toProjectPath(records[++i] ?? "");
       if (!path) continue;
       files.push({
         path,
@@ -127,29 +134,13 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
         unstaged: xy[1] !== ".",
       });
     } else if (record.startsWith("u ")) {
-      const path = fieldAfter(record, 10);
+      const path = toProjectPath(fieldAfter(record, 10));
       if (!path) continue;
       files.push({ path, status: "unmerged", staged: true, unstaged: true });
     } else if (record.startsWith("? ")) {
-      const path = record.slice(2);
+      const path = toProjectPath(record.slice(2));
       if (!path) continue;
       files.push({ path, status: "untracked", staged: false, unstaged: true });
-    }
-  }
-
-  if (files.length > 0) {
-    const [unstagedStats, stagedStats] = await Promise.all([
-      runGit(cwd, ["diff", "--numstat", "-z"]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
-      runGit(cwd, ["diff", "--cached", "--numstat", "-z"]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
-    ]);
-
-    for (const file of files) {
-      const a = unstagedStats.get(file.path);
-      const b = stagedStats.get(file.path);
-      if (a || b) {
-        file.added = (a?.added ?? 0) + (b?.added ?? 0);
-        file.removed = (a?.removed ?? 0) + (b?.removed ?? 0);
-      }
     }
   }
 
@@ -168,11 +159,38 @@ export async function gitStatus(cwd: string): Promise<GitStatus> {
   };
 }
 
+/** Working-tree changes and line counts, all relative to the project directory. */
+export async function gitStatus(cwd: string): Promise<GitStatus> {
+  const status = await readStatus(cwd);
+  const { files } = status;
+  if (files.length > 0) {
+    const [unstagedStats, stagedStats] = await Promise.all([
+      runGit(cwd, ["diff", "--relative", "--numstat", "-z", "--", "."]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
+      runGit(cwd, ["diff", "--cached", "--relative", "--numstat", "-z", "--", "."]).then((res) => (res.code === 0 ? parseNumstatZ(res.stdout) : new Map())),
+    ]);
+
+    for (const file of files) {
+      const a = unstagedStats.get(file.path);
+      const b = stagedStats.get(file.path);
+      if (a || b) {
+        file.added = (a?.added ?? 0) + (b?.added ?? 0);
+        file.removed = (a?.removed ?? 0) + (b?.removed ?? 0);
+      }
+    }
+  }
+
+  return status;
+}
+
+function relativeOutside(path: string): boolean {
+  return path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path);
+}
+
 function assertInsideRepo(cwd: string, filePath: string): string {
   const root = resolve(cwd);
   const full = resolve(root, filePath);
   const rel = relative(root, full);
-  if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+  if (!rel || relativeOutside(rel)) {
     throw new UserError(`文件路径不在项目目录内：${filePath}`);
   }
   return full;
@@ -180,7 +198,7 @@ function assertInsideRepo(cwd: string, filePath: string): string {
 
 function isWithinReal(root: string, target: string): boolean {
   const rel = relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return !relativeOutside(rel);
 }
 
 function synthesizeUntrackedPatch(cwd: string, filePath: string, fullPath: string): GitFileDiff {
@@ -243,28 +261,39 @@ function clipPatch(filePath: string, patch: string, alreadyTruncated = false): G
 /** Unified diff for one file in a project repository. */
 export async function gitDiff(cwd: string, filePath: string, staged?: boolean): Promise<GitFileDiff> {
   const fullPath = assertInsideRepo(cwd, filePath);
+  const path = relative(resolve(cwd), fullPath).split(sep).join("/");
 
-  if (staged === true) {
-    const res = await runGit(cwd, ["diff", "--cached", "--", filePath]);
-    return clipPatch(filePath, res.stdout);
+  if (staged !== true) {
+    const untrackedCheck = await runGit(cwd, ["ls-files", "--others", "--exclude-standard", "--", path]);
+    if (untrackedCheck.code === 0 && untrackedCheck.stdout.length > 0) {
+      return synthesizeUntrackedPatch(cwd, filePath, fullPath);
+    }
   }
 
-  const untrackedCheck = await runGit(cwd, ["ls-files", "--others", "--exclude-standard", "--", filePath]);
-  const isUntracked = untrackedCheck.code === 0 && untrackedCheck.stdout.trim().length > 0;
-  if (isUntracked) return synthesizeUntrackedPatch(cwd, filePath, fullPath);
-
-  if (staged === false) {
-    const res = await runGit(cwd, ["diff", "--", filePath]);
-    return clipPatch(filePath, res.stdout);
+  // The old path must be part of the pathspec for Git to emit rename/copy metadata.
+  const diff = ["diff", "--relative"];
+  const paths = [path];
+  if (staged !== false) {
+    const status = await readStatus(cwd, false);
+    const change = status.files.find((file) => file.path === path);
+    if (change?.from) {
+      paths.push(change.from);
+      diff.push(change.status === "copied" ? "--find-copies" : "--find-renames");
+    }
   }
 
-  const combined = await runGit(cwd, ["diff", "HEAD", "--", filePath]);
+  if (staged !== undefined) {
+    const result = await runGit(cwd, [...diff, ...(staged ? ["--cached"] : []), "--", ...paths]);
+    return clipPatch(filePath, result.stdout);
+  }
+
+  const combined = await runGit(cwd, [...diff, "HEAD", "--", ...paths]);
   if (combined.code === 0) return clipPatch(filePath, combined.stdout);
 
   // Unborn HEAD (brand-new repo with no commits yet): fall back to cached + unstaged.
   const [cached, work] = await Promise.all([
-    runGit(cwd, ["diff", "--cached", "--", filePath]),
-    runGit(cwd, ["diff", "--", filePath]),
+    runGit(cwd, [...diff, "--cached", "--", ...paths]),
+    runGit(cwd, [...diff, "--", ...paths]),
   ]);
   return clipPatch(filePath, [cached.stdout.trimEnd(), work.stdout.trimEnd()].filter(Boolean).join("\n"));
 }

@@ -2,6 +2,7 @@ import * as React from "react";
 import { MessageCircleQuestion, ShieldAlert } from "lucide-react";
 import type { PendingAnswer, PendingRequest } from "@lila/protocol";
 import { Button } from "@/components/ui/button";
+import { Item, ItemContent, ItemMedia, ItemTitle } from "@/components/ui/item";
 import { Input } from "@/components/ui/input";
 import { Kbd } from "@/components/ui/kbd";
 import {
@@ -50,23 +51,19 @@ function Shell({
   children: React.ReactNode;
 }) {
   return (
-    <section aria-live="polite" className="rounded-xl border border-amber-500/40 bg-amber-50/80 p-4 shadow-sm dark:bg-amber-950/30">
-      <div className="flex items-start gap-3">
-        <span className="mt-0.5 text-amber-600 dark:text-amber-400">{icon}</span>
-        <div className="flex min-w-0 flex-1 flex-col gap-3">
-          <div className="flex min-w-0 flex-col gap-1">
-            <div className="flex items-baseline gap-2">
-              <p className="min-w-0 flex-1 text-sm font-medium">{title}</p>
-              {extra ? <span className="shrink-0 text-xs text-muted-foreground">还有 {extra} 个</span> : null}
-            </div>
-            {message ? (
-              <pre className="max-h-48 overflow-auto rounded-md bg-background/70 p-2 font-mono text-xs whitespace-pre-wrap">{message}</pre>
-            ) : null}
-          </div>
-          {children}
+    <Item variant="outline" size="sm" role="region" aria-label={title} className="items-start gap-2 border-amber-500/40 bg-amber-50/80 dark:bg-amber-950/30">
+      <ItemMedia variant="icon" className="mt-0.5 text-amber-600 dark:text-amber-400">{icon}</ItemMedia>
+      <ItemContent className="min-w-0 gap-2">
+        <div className="flex items-center gap-2">
+          <ItemTitle className="min-w-0 flex-1">{title}</ItemTitle>
+          {extra ? <span className="shrink-0 text-xs text-muted-foreground">还有 {extra} 个</span> : null}
         </div>
-      </div>
-    </section>
+        {message ? (
+          <pre className="max-h-40 overflow-auto rounded-md bg-background/70 p-2 font-mono text-xs whitespace-pre-wrap">{message}</pre>
+        ) : null}
+        {children}
+      </ItemContent>
+    </Item>
   );
 }
 
