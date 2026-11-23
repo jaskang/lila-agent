@@ -1,8 +1,9 @@
-//! Root `LilaApp` view built with `gpui-kit`: transparent blurred window,
-//! custom `TitleBar`, frosted sidebar, rounded workspace card, virtualized
-//! transcript, floating composer, ⌘K command palette dialog, and live theme toggle.
+//! Root `LilaApp` view built with `gpui-kit`: full-bleed macOS split view with
+//! a full-height translucent sidebar, 1px hairline divider, unified 38px drag
+//! chrome, virtualized transcript, floating composer, and ⌘K command palette.
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -12,7 +13,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Sizable as _, Theme, TitleBar, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
     Anchor, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
@@ -26,8 +27,8 @@ use crate::store::{AppStore, AppStoreEvent, ToastTone};
 use crate::ui::composer::ComposerView;
 use crate::ui::pending::PendingPanelView;
 use crate::ui::sidebar::render_sidebar;
-use crate::ui::theme_setup;
 use crate::ui::transcript::render_transcript;
+use crate::ui::{TRAFFIC_LIGHT_INSET, theme_setup, window_drag_bar};
 
 actions!(lila, [NewSession, ToggleSidebar, OpenPalette]);
 
@@ -98,8 +99,11 @@ impl LilaApp {
         }
     }
 
-    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let store = self.store.clone();
+    fn open_command_palette_with_store(
+        store: Entity<AppStore>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let query_input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索会话或命令…"));
         let initial_focus = Cell::new(true);
 
@@ -140,7 +144,7 @@ impl LilaApp {
                 PaletteEntry {
                     id: "act:toggle-theme".to_owned(),
                     group: "操作",
-                    label: "切换浅色 / 深色主题".to_owned(),
+                    label: "切换浅色 / 深色外观".to_owned(),
                     shortcut: None,
                 },
             ];
@@ -204,8 +208,8 @@ impl LilaApp {
                                 .px_2()
                                 .pt_2()
                                 .pb_1()
-                                .text_size(px(10.0))
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_size(px(10.5))
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
                                 .text_color(cx.theme().muted_foreground)
                                 .child(item.group),
                         );
@@ -266,7 +270,7 @@ impl LilaApp {
 
             dialog
                 .title("命令面板")
-                .w(px(520.0))
+                .w(px(500.0))
                 .child(
                     v_flex()
                         .gap_2()
@@ -294,40 +298,55 @@ impl LilaApp {
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .p_8()
+                .px_6()
+                .pb(px(48.0))
                 .child(
                     v_flex()
-                        .w_full()
-                        .max_w(px(520.0))
                         .items_center()
-                        .gap_4()
-                        .p_8()
-                        .rounded_2xl()
-                        .border_1()
-                        .border_color(theme_setup::glass_rim_border(cx))
-                        .bg(theme_setup::card_bg(cx))
-                        .shadow_lg()
+                        .gap_3()
                         .child(
                             div()
-                                .text_xl()
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .w(px(40.0))
+                                .h(px(40.0))
+                                .rounded_full()
+                                .bg(theme_setup::subtle_surface_bg(cx))
+                                .border_1()
+                                .border_color(theme_setup::card_border(cx))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(IconName::FolderOpen)
+                                        .size(px(18.0))
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
                                 .text_color(cx.theme().foreground)
-                                .child("欢迎使用 Lila"),
+                                .child("选择一个本地项目开始"),
                         )
                         .child(
                             div()
-                                .text_sm()
+                                .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("先添加一个本地项目目录，即可开始与 Agent 协作。"),
+                                .child("Agent 会在这个目录中阅读代码、修改文件并运行命令。"),
                         )
                         .child(
-                            Button::new("welcome-add-project")
-                                .primary()
-                                .disabled(!connected)
-                                .label("选择项目目录…")
-                                .on_click(move |_, _, cx| {
-                                    st_add.update(cx, |s, cx| s.add_project(cx));
-                                }),
+                            div().pt_2().child(
+                                Button::new("welcome-add-project")
+                                    .primary()
+                                    .small()
+                                    .rounded(px(999.0))
+                                    .disabled(!connected)
+                                    .icon(IconName::FolderOpen)
+                                    .label("添加项目目录…")
+                                    .on_click(move |_, _, cx| {
+                                        st_add.update(cx, |s, cx| s.add_project(cx));
+                                    }),
+                            ),
                         ),
                 )
                 .into_any_element();
@@ -346,9 +365,17 @@ impl LilaApp {
             .offset(px(6.0))
             .trigger(
                 Button::new("new-proj-trigger")
-                    .small()
-                    .icon(IconName::FolderOpen)
-                    .label(proj_name),
+                    .ghost()
+                    .xsmall()
+                    .rounded(px(999.0))
+                    .icon(
+                        Icon::new(IconName::Folder)
+                            .size(px(12.0))
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .label(proj_name)
+                    .dropdown_caret(true)
+                    .tooltip(proj_path),
             )
             .content(move |_, _, cx| {
                 let mut col = v_flex().w(px(300.0)).gap(px(2.0));
@@ -358,9 +385,12 @@ impl LilaApp {
                     let pid = p.id.clone();
                     let pop_ent = cx.entity();
                     col = col.child(
-                        v_flex()
+                        h_flex()
                             .id(SharedString::from(format!("np-opt-{}", p.id)))
                             .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
                             .px_2()
                             .py(px(6.0))
                             .rounded_md()
@@ -374,33 +404,53 @@ impl LilaApp {
                                 pop_ent.update(cx, |st, cx| st.dismiss(window, cx));
                             })
                             .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                    .text_color(cx.theme().foreground)
-                                    .child(p.name),
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .text_color(cx.theme().foreground)
+                                            .truncate()
+                                            .child(p.name),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .truncate()
+                                            .child(p.path),
+                                    ),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .truncate()
-                                    .child(p.path),
-                            ),
+                            .when(is_curr, |el| {
+                                el.child(
+                                    Icon::new(IconName::Check)
+                                        .size(px(12.0))
+                                        .text_color(cx.theme().foreground),
+                                )
+                            }),
                     );
                 }
                 let st_more = st_pop.clone();
                 let pop_ent2 = cx.entity();
                 col = col.child(
-                    Button::new("np-add-more")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .label("添加本地项目…")
-                        .on_click(move |_, window, cx| {
-                            pop_ent2.update(cx, |st, cx| st.dismiss(window, cx));
-                            st_more.update(cx, |s, cx| s.add_project(cx));
-                        }),
+                    div()
+                        .pt_1()
+                        .mt_1()
+                        .border_t_1()
+                        .border_color(theme_setup::hairline(cx))
+                        .child(
+                            Button::new("np-add-more")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .label("添加本地项目…")
+                                .on_click(move |_, window, cx| {
+                                    pop_ent2.update(cx, |st, cx| st.dismiss(window, cx));
+                                    st_more.update(cx, |s, cx| s.add_project(cx));
+                                }),
+                        ),
                 );
                 div()
                     .id("np-scroll")
@@ -414,37 +464,25 @@ impl LilaApp {
             .items_center()
             .justify_center()
             .px_6()
-            .py_8()
+            .pb(px(64.0))
             .child(
                 v_flex()
                     .w_full()
-                    .max_w(px(740.0))
+                    .max_w(px(720.0))
                     .gap_4()
                     .child(
-                        v_flex()
-                            .gap_2()
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .px_1()
                             .child(
                                 div()
-                                    .text_2xl()
-                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_xl()
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
                                     .text_color(cx.theme().foreground)
-                                    .child("开始新对话"),
+                                    .child("要做点什么？"),
                             )
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(project_selector)
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(proj_path),
-                                    ),
-                            ),
+                            .child(project_selector),
                     )
                     .child(self.composer.clone()),
             )
@@ -466,12 +504,33 @@ impl Render for LilaApp {
         let active_summary = selected_id
             .as_deref()
             .and_then(|id| store.sessions.get(id).cloned());
+        let active_project_name = active_summary.as_ref().and_then(|s| {
+            store
+                .projects
+                .iter()
+                .find(|p| p.id == s.project_id)
+                .map(|p| p.name.clone())
+        });
         let parent_id = active_summary.as_ref().and_then(|s| s.parent_id.clone());
         let is_readonly_sub = parent_id.is_some();
         let conn = store.connection;
         let conn_detail = store.connection_detail.clone();
-        let is_dark = cx.theme().is_dark();
+        let muted_icon = cx.theme().muted_foreground;
 
+        let st_pal = self.store.clone();
+        let open_palette: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
+            Self::open_command_palette_with_store(st_pal.clone(), window, cx);
+        });
+
+        let sidebar_el =
+            sidebar_open.then(|| render_sidebar(&self.store, open_palette.clone(), window, cx));
+
+        let st_toggle = self.store.clone();
+        let st_new = self.store.clone();
+        let st_back = self.store.clone();
+        let st_reload = self.store.clone();
+
+        let has_session = active_summary.is_some();
         let title_text = active_summary
             .as_ref()
             .map(|s| {
@@ -481,82 +540,131 @@ impl Render for LilaApp {
                     s.title.clone()
                 }
             })
-            .unwrap_or_else(|| "Lila".to_owned());
+            .unwrap_or_default();
 
-        let st_toggle = self.store.clone();
-        let st_back = self.store.clone();
-
-        let title_bar = TitleBar::new().child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .pr_3()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            Button::new("tb-toggle-sb")
+        // Full-bleed workspace top bar aligned flush with the sidebar top bar.
+        let workspace_bar = window_drag_bar("workspace-top-bar", window, cx)
+            .when(!sidebar_open, |el| el.pl(px(TRAFFIC_LIGHT_INSET)))
+            .when(sidebar_open, |el| el.pl_4())
+            .pr_3()
+            .justify_between()
+            .when(has_session, |el| {
+                el.border_b_1().border_color(theme_setup::hairline(cx))
+            })
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .when(!sidebar_open, |el| {
+                        el.child(
+                            Button::new("ws-open-sb")
                                 .ghost()
                                 .xsmall()
-                                .icon(if sidebar_open {
-                                    IconName::PanelLeftClose
-                                } else {
-                                    IconName::PanelLeftOpen
-                                })
+                                .icon(Icon::new(IconName::PanelLeft).text_color(muted_icon))
+                                .tooltip("展开侧边栏 (⌘B)")
                                 .on_click(move |_, _, cx| {
                                     st_toggle.update(cx, |s, cx| s.toggle_sidebar(cx));
                                 }),
                         )
-                        .when_some(parent_id.clone(), |el, pid| {
-                            el.child(
-                                Button::new("tb-back-parent")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::ArrowLeft)
-                                    .label("返回父会话")
-                                    .on_click(move |_, _, cx| {
-                                        st_back.update(cx, |s, cx| {
-                                            s.select_session(Some(pid.clone()), cx);
-                                        });
-                                    }),
-                            )
-                        })
                         .child(
-                            div()
-                                .text_sm()
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(cx.theme().foreground)
-                                .truncate()
-                                .child(title_text),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            Button::new("tb-theme-toggle")
+                            Button::new("ws-new-session")
                                 .ghost()
                                 .xsmall()
-                                .icon(if is_dark { IconName::Sun } else { IconName::Moon })
-                                .on_click(|_, window, cx| {
-                                    theme_setup::toggle_theme_mode(window, cx);
+                                .icon(Icon::new(IconName::Plus).text_color(muted_icon))
+                                .tooltip("新建对话 (⌘N)")
+                                .on_click(move |_, _, cx| {
+                                    st_new.update(cx, |s, cx| s.start_new(None, cx));
                                 }),
                         )
-                        .child(
-                            Button::new("tb-palette")
+                    })
+                    .when_some(parent_id.clone(), |el, pid| {
+                        el.child(
+                            Button::new("ws-back-parent")
                                 .ghost()
                                 .xsmall()
-                                .icon(IconName::Search)
-                                .label("⌘K")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_command_palette(window, cx);
-                                })),
-                        ),
-                ),
-        );
+                                .icon(Icon::new(IconName::ArrowLeft).text_color(muted_icon))
+                                .tooltip("返回父会话")
+                                .on_click(move |_, _, cx| {
+                                    st_back.update(cx, |s, cx| {
+                                        s.select_session(Some(pid.clone()), cx);
+                                    });
+                                }),
+                        )
+                    })
+                    .when(has_session, |el| {
+                        el.child(
+                            Icon::new(if is_readonly_sub {
+                                IconName::Bot
+                            } else {
+                                IconName::SquareTerminal
+                            })
+                            .size(px(13.0))
+                            .text_color(muted_icon.opacity(0.8)),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.5))
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .text_color(cx.theme().foreground)
+                                .child(title_text),
+                        )
+                        .when_some(active_project_name, |el, pname| {
+                            el.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.5))
+                                    .text_color(cx.theme().muted_foreground.opacity(0.65))
+                                    .child(pname),
+                            )
+                        })
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(2.0))
+                    .when_some(
+                        selected_id.clone().filter(|_| !is_readonly_sub),
+                        |el, sid| {
+                            el.child(
+                                Button::new("ws-reload")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(
+                                        Icon::new(IconName::RefreshCw)
+                                            .size(px(13.0))
+                                            .text_color(muted_icon.opacity(0.75)),
+                                    )
+                                    .tooltip("重新加载技能与 MCP")
+                                    .on_click(move |_, _, cx| {
+                                        st_reload.update(cx, |s, cx| s.reload(sid.clone(), cx));
+                                    }),
+                            )
+                        },
+                    )
+                    .when(!sidebar_open, |el| {
+                        let pal = open_palette.clone();
+                        el.child(
+                            Button::new("ws-palette")
+                                .ghost()
+                                .xsmall()
+                                .icon(
+                                    Icon::new(IconName::Search)
+                                        .size(px(13.0))
+                                        .text_color(muted_icon.opacity(0.75)),
+                                )
+                                .tooltip("搜索与命令 (⌘K)")
+                                .on_click(move |_, window, cx| {
+                                    pal(window, cx);
+                                }),
+                        )
+                    }),
+            );
 
         let conn_banner = (conn != ConnectionState::Connected).then(|| {
             let label = match conn {
@@ -568,10 +676,10 @@ impl Render for LilaApp {
             h_flex()
                 .w_full()
                 .px_4()
-                .py(px(6.0))
-                .bg(cx.theme().muted)
+                .py(px(5.0))
+                .bg(theme_setup::subtle_surface_bg(cx))
                 .border_b_1()
-                .border_color(theme_setup::card_border(cx))
+                .border_color(theme_setup::hairline(cx))
                 .items_center()
                 .gap_2()
                 .child(
@@ -608,24 +716,24 @@ impl Render for LilaApp {
                     v_flex()
                         .w_full()
                         .items_center()
-                        .px_4()
+                        .px_6()
                         .pb_4()
                         .pt_2()
                         .child(
                             v_flex()
                                 .w_full()
-                                .max_w(px(820.0))
+                                .max_w(px(760.0))
                                 .gap_2()
                                 .child(self.pending.clone())
                                 .child(if is_readonly_sub {
                                     h_flex()
                                         .w_full()
-                                        .p_3()
+                                        .px_4()
+                                        .py_3()
                                         .rounded_2xl()
                                         .border_1()
-                                        .border_color(theme_setup::glass_rim_border(cx))
-                                        .bg(theme_setup::card_bg(cx))
-                                        .shadow_md()
+                                        .border_color(theme_setup::composer_border(cx))
+                                        .bg(theme_setup::composer_bg(cx))
                                         .items_center()
                                         .justify_between()
                                         .child(
@@ -640,7 +748,8 @@ impl Render for LilaApp {
                                             Button::new("fork-subsession")
                                                 .primary()
                                                 .xsmall()
-                                                .label("在此基础上继续对话")
+                                                .rounded(px(999.0))
+                                                .label("继续对话")
                                                 .on_click(move |_, _, cx| {
                                                     st_fork.update(cx, |s, cx| {
                                                         s.continue_subsession(sid_fork.clone(), cx);
@@ -658,9 +767,7 @@ impl Render for LilaApp {
             self.render_new_session_center(cx).into_any_element()
         };
 
-        let sidebar_el = sidebar_open.then(|| render_sidebar(&self.store, window, cx));
-
-        v_flex()
+        h_flex()
             .id("lila-root")
             .track_focus(&self.focus_handle)
             .size_full()
@@ -671,30 +778,19 @@ impl Render for LilaApp {
                 this.store.update(cx, |s, cx| s.toggle_sidebar(cx));
             }))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
-                this.open_command_palette(window, cx);
+                Self::open_command_palette_with_store(this.store.clone(), window, cx);
             }))
-            .child(title_bar)
+            .when_some(sidebar_el, |el, sb| el.child(sb))
             .child(
-                h_flex()
+                v_flex()
                     .flex_1()
-                    .min_h_0()
-                    .p_2()
-                    .gap_2()
-                    .when_some(sidebar_el, |el, sb| el.child(sb))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .h_full()
-                            .min_w_0()
-                            .rounded_2xl()
-                            .border_1()
-                            .border_color(theme_setup::glass_rim_border(cx))
-                            .bg(theme_setup::workspace_bg(cx))
-                            .shadow_md()
-                            .overflow_hidden()
-                            .when_some(conn_banner, |el, b| el.child(b))
-                            .child(workspace_content),
-                    ),
+                    .h_full()
+                    .min_w_0()
+                    .bg(theme_setup::workspace_bg(cx))
+                    .overflow_hidden()
+                    .child(workspace_bar)
+                    .when_some(conn_banner, |el, b| el.child(b))
+                    .child(workspace_content),
             )
     }
 }

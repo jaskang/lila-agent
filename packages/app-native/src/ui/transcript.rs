@@ -1,6 +1,7 @@
 //! Virtualized transcript powered by `gpui-component`'s `MessageScroller` and
-//! `TextView::markdown` (with Claude-style `stream_fade`, syntax highlighting,
-//! frosted content cards, collapsible activity/changes, subagent cards, and rewind).
+//! `TextView::markdown`: borderless editorial assistant prose, neutral user
+//! bubbles with hover-only rewind, whisper-quiet collapsible traces, vector
+//! icons, and clean diff blocks.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,7 +11,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _, px, rgb,
@@ -39,6 +40,10 @@ fn summarize_tool_args(args: &HashMap<String, Value>) -> String {
         }
     }
     String::new()
+}
+
+fn short_model_name(model_id: &str) -> &str {
+    model_id.split_once('/').map(|(_, rest)| rest).unwrap_or(model_id)
 }
 
 fn handle_markdown_link(
@@ -132,8 +137,8 @@ pub fn render_transcript(
             .child(
                 div()
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("还没有消息，发一句话开始吧。"),
+                    .text_color(cx.theme().muted_foreground.opacity(0.8))
+                    .child("发一句话开始对话"),
             )
             .into_any_element();
     }
@@ -151,6 +156,7 @@ pub fn render_transcript(
                         .ghost()
                         .xsmall()
                         .disabled(loading_earlier)
+                        .icon(IconName::ChevronUp)
                         .label(if loading_earlier {
                             "正在加载更早消息…"
                         } else {
@@ -177,10 +183,17 @@ pub fn render_transcript(
                     .is_some_and(|s| s.parent_id.is_some());
 
                 let inner = match block {
-                    TranscriptBlock::Activity { id, item_ids } => {
-                        render_activity_group(&st_row, id, item_ids, &sid, pp.as_deref(), running, read_only, cx)
-                            .into_any_element()
-                    }
+                    TranscriptBlock::Activity { id, item_ids } => render_activity_group(
+                        &st_row,
+                        id,
+                        item_ids,
+                        &sid,
+                        pp.as_deref(),
+                        running,
+                        read_only,
+                        cx,
+                    )
+                    .into_any_element(),
                     TranscriptBlock::Changes { id, changes } => {
                         render_changes_block(&st_row, id, changes, cx).into_any_element()
                     }
@@ -197,9 +210,9 @@ pub fn render_transcript(
                 h_flex()
                     .w_full()
                     .justify_center()
-                    .px_4()
-                    .py(px(5.0))
-                    .child(div().w_full().max_w(px(820.0)).child(inner))
+                    .px_6()
+                    .py(px(6.0))
+                    .child(div().w_full().max_w(px(760.0)).child(inner))
                     .into_any_element()
             })
             .flex_1()
@@ -225,16 +238,17 @@ fn render_item(
             images,
             can_rewind,
         } => {
+            let group_name: SharedString = format!("user-msg-{id}").into();
+
             let mut bubble = v_flex()
-                .max_w(gpui_kit::relative(0.82))
-                .px_4()
-                .py(px(10.0))
+                .max_w(gpui_kit::relative(0.78))
+                .px(px(14.0))
+                .py(px(9.0))
                 .rounded_2xl()
                 .border_1()
                 .border_color(theme_setup::user_bubble_border(cx))
                 .bg(theme_setup::user_bubble_bg(cx))
-                .shadow_xs()
-                .gap_2();
+                .gap(px(6.0));
 
             if !body.is_empty() {
                 bubble = bubble.child(
@@ -246,34 +260,61 @@ fn render_item(
             }
             if !images.is_empty() {
                 bubble = bubble.child(
-                    div()
+                    h_flex()
+                        .items_center()
+                        .gap(px(5.0))
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!("📎 附带 {} 张图片", images.len())),
+                        .child(Icon::new(IconName::File).size(px(12.0)))
+                        .child(format!("附带 {} 张图片", images.len())),
                 );
             }
 
-            let mut outer = v_flex().w_full().items_end().gap_1().child(bubble);
+            let mut outer = v_flex()
+                .group(group_name.clone())
+                .w_full()
+                .items_end()
+                .gap(px(2.0))
+                .pt_2()
+                .child(bubble);
+
             if can_rewind && !running && !read_only {
                 let st_rw = store_entity.clone();
                 let sid_rw = session_id.to_owned();
                 let id_rw = id.clone();
                 let imgs_rw = images;
                 outer = outer.child(
-                    Button::new(SharedString::from(format!("rewind-{id}")))
-                        .ghost()
-                        .xsmall()
-                        .label("编辑重发")
-                        .on_click(move |_, _, cx| {
-                            st_rw.update(cx, |s, cx| {
-                                s.rewind(sid_rw.clone(), id_rw.clone(), imgs_rw.clone(), cx);
-                            });
-                        }),
+                    div()
+                        .opacity(0.0)
+                        .group_hover(group_name, |s| s.opacity(1.0))
+                        .child(
+                            Button::new(SharedString::from(format!("rewind-{id}")))
+                                .ghost()
+                                .xsmall()
+                                .icon(
+                                    Icon::new(IconName::Undo2)
+                                        .size(px(11.0))
+                                        .text_color(cx.theme().muted_foreground),
+                                )
+                                .label("编辑重发")
+                                .text_color(cx.theme().muted_foreground)
+                                .on_click(move |_, _, cx| {
+                                    st_rw.update(cx, |s, cx| {
+                                        s.rewind(
+                                            sid_rw.clone(),
+                                            id_rw.clone(),
+                                            imgs_rw.clone(),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        ),
                 );
             }
             outer.into_any_element()
         }
 
+        // Borderless editorial prose directly on the workspace canvas (no box-in-box).
         TranscriptItem::Assistant {
             id,
             text: body,
@@ -282,26 +323,7 @@ fn render_item(
             streaming,
             error,
         } => {
-            let mut card = v_flex()
-                .w_full()
-                .px_4()
-                .py_3()
-                .gap_2()
-                .rounded_2xl()
-                .border_1()
-                .border_color(theme_setup::card_border(cx))
-                .bg(theme_setup::card_bg(cx))
-                .shadow_xs();
-
-            if let Some(m) = model.filter(|m| !m.is_empty()) {
-                card = card.child(
-                    div()
-                        .text_size(px(10.0))
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .text_color(cx.theme().muted_foreground)
-                        .child(m),
-                );
-            }
+            let mut col = v_flex().w_full().py_1().gap(px(8.0));
 
             if !thinking.is_empty() {
                 let think_key = format!("think:{id}");
@@ -309,50 +331,56 @@ fn render_item(
                 let st_tog = store_entity.clone();
                 let k_tog = think_key.clone();
                 let char_count = thinking.chars().count();
+                let chevron = if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                };
 
-                card = card.child(
+                col = col.child(
                     Collapsible::new()
                         .open(expanded)
-                        .px_3()
-                        .py(px(6.0))
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(theme_setup::card_border(cx))
-                        .bg(theme_setup::inset_card_bg(cx))
                         .child(
                             h_flex()
                                 .id(SharedString::from(format!("think-hdr-{id}")))
-                                .w_full()
                                 .items_center()
-                                .justify_between()
+                                .gap(px(6.0))
+                                .py(px(2.0))
                                 .cursor_pointer()
+                                .hover(|s| s.text_color(cx.theme().foreground))
                                 .on_click(move |_, _, cx| {
                                     st_tog.update(cx, |s, cx| s.toggle_expanded(k_tog.clone(), cx));
                                 })
                                 .child(
+                                    Icon::new(chevron)
+                                        .size(px(12.0))
+                                        .text_color(cx.theme().muted_foreground.opacity(0.7)),
+                                )
+                                .child(
                                     div()
-                                        .text_size(px(11.0))
-                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(if expanded {
-                                            "▾ 思考过程"
+                                        .child(if streaming && body.is_empty() {
+                                            "思考中…"
                                         } else {
-                                            "▸ 思考过程"
+                                            "思考过程"
                                         }),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(10.0))
-                                        .text_color(cx.theme().muted_foreground.opacity(0.75))
+                                        .text_size(px(10.5))
+                                        .text_color(cx.theme().muted_foreground.opacity(0.55))
                                         .child(format!("{char_count} 字")),
                                 ),
                         )
                         .content(
                             div()
-                                .mt(px(6.0))
-                                .pt(px(6.0))
-                                .border_t_1()
-                                .border_color(theme_setup::card_border(cx))
+                                .mt(px(4.0))
+                                .ml(px(5.0))
+                                .pl_3()
+                                .py(px(2.0))
+                                .border_l_2()
+                                .border_color(theme_setup::hairline(cx))
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(thinking),
@@ -363,7 +391,7 @@ fn render_item(
             if !body.is_empty() {
                 let st_link = store_entity.clone();
                 let pp_owned = project_path.map(str::to_owned);
-                card = card.child(
+                col = col.child(
                     TextView::markdown(SharedString::from(format!("md-{id}")), body)
                         .selectable(true)
                         .stream_fade(streaming)
@@ -374,21 +402,36 @@ fn render_item(
             }
 
             if let Some(err) = error {
-                card = card.child(
-                    div()
+                col = col.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
                         .px_3()
                         .py_2()
                         .rounded_lg()
                         .border_1()
-                        .border_color(cx.theme().danger.opacity(0.4))
-                        .bg(cx.theme().danger.opacity(0.1))
+                        .border_color(cx.theme().danger.opacity(0.32))
+                        .bg(cx.theme().danger.opacity(0.08))
                         .text_xs()
                         .text_color(cx.theme().danger)
+                        .child(Icon::new(IconName::CircleAlert).size(px(13.0)))
                         .child(err),
                 );
             }
 
-            card.into_any_element()
+            if !streaming
+                && let Some(m) = model.filter(|m| !m.is_empty())
+            {
+                col = col.child(
+                    div()
+                        .text_size(px(10.5))
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_color(cx.theme().muted_foreground.opacity(0.5))
+                        .child(short_model_name(&m).to_owned()),
+                );
+            }
+
+            col.into_any_element()
         }
 
         TranscriptItem::Tool {
@@ -411,20 +454,21 @@ fn render_item(
         }
 
         TranscriptItem::Notice { tone, text: msg, .. } => {
-            let color = match tone.as_str() {
-                "error" => cx.theme().danger,
-                "warning" => rgb(0xd97706).into(),
-                _ => cx.theme().muted_foreground,
+            let (icon, color) = match tone.as_str() {
+                "error" => (IconName::CircleAlert, cx.theme().danger),
+                "warning" => (IconName::TriangleAlert, rgb(0xf59e0b).into()),
+                _ => (IconName::Info, cx.theme().muted_foreground),
             };
-            div()
+            h_flex()
+                .items_center()
+                .gap_2()
                 .px_3()
-                .py_2()
-                .rounded_xl()
-                .border_1()
-                .border_color(theme_setup::card_border(cx))
-                .bg(theme_setup::inset_card_bg(cx))
+                .py(px(6.0))
+                .rounded_lg()
+                .bg(theme_setup::subtle_surface_bg(cx))
                 .text_xs()
                 .text_color(color)
+                .child(Icon::new(icon).size(px(13.0)).text_color(color))
                 .child(msg)
                 .into_any_element()
         }
@@ -438,7 +482,7 @@ fn render_item(
             if let Some(list) = notifications
                 && !list.is_empty()
             {
-                let mut col = v_flex().w_full().gap_2();
+                let mut col = v_flex().w_full().gap(px(6.0));
                 for (idx, notification) in list.into_iter().enumerate() {
                     col = col.child(render_subagent_notification_card(
                         store_entity,
@@ -455,10 +499,8 @@ fn render_item(
             div()
                 .px_3()
                 .py_2()
-                .rounded_xl()
-                .border_1()
-                .border_color(theme_setup::card_border(cx))
-                .bg(theme_setup::inset_card_bg(cx))
+                .rounded_lg()
+                .bg(theme_setup::subtle_surface_bg(cx))
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(body)
@@ -478,16 +520,12 @@ fn render_item(
             h_flex()
                 .w_full()
                 .items_center()
-                .justify_center()
-                .py_1()
+                .gap(px(6.0))
+                .py(px(2.0))
                 .child(
                     div()
-                        .px_2()
-                        .py(px(2.0))
-                        .rounded_full()
-                        .bg(theme_setup::inset_card_bg(cx))
-                        .text_size(px(10.0))
-                        .text_color(cx.theme().muted_foreground)
+                        .text_size(px(11.0))
+                        .text_color(cx.theme().muted_foreground.opacity(0.55))
                         .child(label),
                 )
                 .into_any_element()
@@ -501,24 +539,19 @@ fn render_subagent_notification_card(
     notification: SubagentNotification,
     cx: &App,
 ) -> impl IntoElement {
-    let tone = if notification.status.is_error() {
-        BadgeTone::Red
-    } else {
-        BadgeTone::Green
-    };
+    let is_err = notification.status.is_error();
     let st_open = store_entity.clone();
     let target_id = notification.id.clone();
 
     let mut card = v_flex()
         .w_full()
         .px_3()
-        .py_2()
+        .py(px(8.0))
         .gap_1()
-        .rounded_2xl()
+        .rounded_xl()
         .border_1()
         .border_color(theme_setup::card_border(cx))
-        .bg(theme_setup::card_bg(cx))
-        .shadow_xs()
+        .bg(theme_setup::subtle_surface_bg(cx))
         .child(
             h_flex()
                 .items_center()
@@ -530,7 +563,19 @@ fn render_subagent_notification_card(
                         .min_w_0()
                         .items_center()
                         .gap_2()
-                        .child(pill_badge(notification.status.label(), tone, cx))
+                        .child(
+                            Icon::new(if is_err {
+                                IconName::CircleAlert
+                            } else {
+                                IconName::Bot
+                            })
+                            .size(px(13.0))
+                            .text_color(if is_err {
+                                cx.theme().danger
+                            } else {
+                                cx.theme().muted_foreground
+                            }),
+                        )
                         .child(
                             div()
                                 .flex_1()
@@ -547,7 +592,9 @@ fn render_subagent_notification_card(
                         Button::new(SharedString::from(format!("open-sub-notif-{id}")))
                             .ghost()
                             .xsmall()
-                            .label("查看子会话 →")
+                            .icon(IconName::ArrowRight)
+                            .label("子会话")
+                            .text_color(cx.theme().muted_foreground)
                             .on_click(move |_, _, cx| {
                                 st_open.update(cx, |s, cx| {
                                     s.select_session(Some(tid.clone()), cx);
@@ -583,13 +630,8 @@ fn render_subagent_tool_card(
     let st_tog = store_entity.clone();
     let k_tog = key.clone();
 
-    let tone = if sub.status.is_error() {
-        BadgeTone::Red
-    } else if matches!(sub.status, crate::protocol::SubagentStatus::Running) {
-        BadgeTone::Blue
-    } else {
-        BadgeTone::Green
-    };
+    let is_running = matches!(sub.status, crate::protocol::SubagentStatus::Running);
+    let is_err = sub.status.is_error();
 
     let mut meta_parts = Vec::new();
     if let Some(u) = sub.tool_uses {
@@ -610,12 +652,11 @@ fn render_subagent_tool_card(
     Collapsible::new()
         .open(expanded)
         .px_3()
-        .py_2()
-        .rounded_2xl()
+        .py(px(7.0))
+        .rounded_xl()
         .border_1()
         .border_color(theme_setup::card_border(cx))
-        .bg(theme_setup::card_bg(cx))
-        .shadow_xs()
+        .bg(theme_setup::subtle_surface_bg(cx))
         .child(
             h_flex()
                 .w_full()
@@ -633,7 +674,26 @@ fn render_subagent_tool_card(
                         .on_click(move |_, _, cx| {
                             st_tog.update(cx, |s, cx| s.toggle_expanded(k_tog.clone(), cx));
                         })
-                        .child(pill_badge(sub.status.label(), tone, cx))
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(12.0))
+                            .text_color(cx.theme().muted_foreground.opacity(0.7)),
+                        )
+                        .child(
+                            Icon::new(IconName::Bot)
+                                .size(px(13.0))
+                                .text_color(if is_err {
+                                    cx.theme().danger
+                                } else if is_running {
+                                    rgb(0x64a8ff).into()
+                                } else {
+                                    cx.theme().muted_foreground
+                                }),
+                        )
                         .child(
                             div()
                                 .flex_1()
@@ -644,11 +704,22 @@ fn render_subagent_tool_card(
                                 .text_color(cx.theme().foreground)
                                 .child(sub.description),
                         )
+                        .when(is_running || is_err, |el| {
+                            el.child(pill_badge(
+                                sub.status.label(),
+                                if is_err {
+                                    BadgeTone::Red
+                                } else {
+                                    BadgeTone::Blue
+                                },
+                                cx,
+                            ))
+                        })
                         .when(!meta.is_empty(), |el| {
                             el.child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_size(px(10.5))
+                                    .text_color(cx.theme().muted_foreground.opacity(0.75))
                                     .child(meta),
                             )
                         }),
@@ -658,7 +729,9 @@ fn render_subagent_tool_card(
                         Button::new(SharedString::from(format!("jump-sub-{id}")))
                             .ghost()
                             .xsmall()
-                            .label("打开 →")
+                            .icon(IconName::ArrowRight)
+                            .tooltip("打开子会话")
+                            .text_color(cx.theme().muted_foreground)
                             .on_click(move |_, _, cx| {
                                 st_jump.update(cx, |s, cx| {
                                     s.select_session(Some(tid.clone()), cx);
@@ -673,13 +746,13 @@ fn render_subagent_tool_card(
                 .pt_2()
                 .gap_2()
                 .border_t_1()
-                .border_color(theme_setup::card_border(cx));
+                .border_color(theme_setup::hairline(cx));
             if let Some(err) = sub.error {
                 inner = inner.child(
                     div()
                         .p_2()
                         .rounded_lg()
-                        .bg(cx.theme().danger.opacity(0.12))
+                        .bg(cx.theme().danger.opacity(0.1))
                         .text_xs()
                         .text_color(cx.theme().danger)
                         .child(err),
@@ -710,20 +783,32 @@ fn render_tool_row(
     let st_tog = store_entity.clone();
     let id_tog = id.clone();
 
-    let (status_label, tone) = match status {
-        ToolStatus::Running => ("运行中", BadgeTone::Blue),
-        ToolStatus::Done => ("完成", BadgeTone::Green),
-        ToolStatus::Error => ("失败", BadgeTone::Red),
+    let status_icon = match status {
+        ToolStatus::Running => Icon::new(IconName::LoaderCircle)
+            .size(px(12.0))
+            .text_color(if cx.theme().is_dark() {
+                rgb(0x64a8ff)
+            } else {
+                rgb(0x0071e3)
+            }),
+        ToolStatus::Done => Icon::new(IconName::Check)
+            .size(px(12.0))
+            .text_color(cx.theme().muted_foreground.opacity(0.55)),
+        ToolStatus::Error => Icon::new(IconName::CircleAlert)
+            .size(px(12.0))
+            .text_color(cx.theme().danger),
     };
 
     Collapsible::new()
         .open(expanded)
-        .px_3()
-        .py(px(7.0))
-        .rounded_xl()
-        .border_1()
-        .border_color(theme_setup::card_border(cx))
-        .bg(theme_setup::inset_card_bg(cx))
+        .rounded_lg()
+        .when(expanded, |el| {
+            el.px(px(8.0))
+                .py(px(6.0))
+                .bg(theme_setup::subtle_surface_bg(cx))
+                .border_1()
+                .border_color(theme_setup::card_border(cx))
+        })
         .child(
             h_flex()
                 .id(SharedString::from(format!("tool-hdr-{id}")))
@@ -731,6 +816,12 @@ fn render_tool_row(
                 .items_center()
                 .justify_between()
                 .gap_2()
+                .rounded_lg()
+                .when(!expanded, |el| {
+                    el.px(px(8.0))
+                        .py(px(5.0))
+                        .hover(|s| s.bg(cx.theme().list_hover))
+                })
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     st_tog.update(cx, |s, cx| s.toggle_expanded(id_tog.clone(), cx));
@@ -740,13 +831,26 @@ fn render_tool_row(
                         .flex_1()
                         .min_w_0()
                         .items_center()
-                        .gap_2()
+                        .gap(px(6.0))
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(11.0))
+                            .text_color(cx.theme().muted_foreground.opacity(0.6)),
+                        )
                         .child(
                             div()
                                 .text_xs()
                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(cx.theme().foreground)
-                                .child(format!("{} {name}", if expanded { "▾" } else { "▸" })),
+                                .text_color(if is_error {
+                                    cx.theme().danger
+                                } else {
+                                    cx.theme().foreground.opacity(0.88)
+                                })
+                                .child(name),
                         )
                         .when(!summary.is_empty(), |el| {
                             el.child(
@@ -754,13 +858,14 @@ fn render_tool_row(
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_xs()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(11.0))
                                     .text_color(cx.theme().muted_foreground)
                                     .child(summary),
                             )
                         }),
                 )
-                .child(pill_badge(status_label, tone, cx)),
+                .child(status_icon),
         )
         .content({
             let mut inner = v_flex()
@@ -768,7 +873,7 @@ fn render_tool_row(
                 .pt_2()
                 .gap_2()
                 .border_t_1()
-                .border_color(theme_setup::card_border(cx));
+                .border_color(theme_setup::hairline(cx));
             if let Some(patch) = diff {
                 inner = inner.child(render_diff_code_block(patch, cx));
             }
@@ -782,11 +887,11 @@ fn render_tool_row(
                 inner = inner.child(
                     div()
                         .p_2()
-                        .rounded_lg()
+                        .rounded_md()
                         .bg(theme_setup::card_bg(cx))
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(px(11.0))
-                        .text_color(cx.theme().foreground.opacity(0.9))
+                        .text_color(cx.theme().foreground.opacity(0.88))
                         .child(clipped),
                 );
             }
@@ -795,9 +900,10 @@ fn render_tool_row(
 }
 
 fn render_diff_code_block(patch: String, cx: &App) -> impl IntoElement {
+    let is_dark = cx.theme().is_dark();
     let mut lines_col = v_flex()
         .p_2()
-        .rounded_lg()
+        .rounded_md()
         .bg(theme_setup::card_bg(cx))
         .border_1()
         .border_color(theme_setup::card_border(cx))
@@ -807,11 +913,19 @@ fn render_diff_code_block(patch: String, cx: &App) -> impl IntoElement {
 
     for line in patch.lines().take(180) {
         let color = if line.starts_with('+') && !line.starts_with("+++") {
-            rgb(0x16a34a).into()
+            if is_dark {
+                rgb(0x4ade80).into()
+            } else {
+                rgb(0x15803d).into()
+            }
         } else if line.starts_with('-') && !line.starts_with("---") {
             cx.theme().danger
         } else if line.starts_with("@@") {
-            rgb(0x2563eb).into()
+            if is_dark {
+                rgb(0x64a8ff).into()
+            } else {
+                rgb(0x0066cc).into()
+            }
         } else {
             cx.theme().muted_foreground
         };
@@ -836,11 +950,12 @@ fn render_activity_group(
     let count = item_ids.len();
 
     let mut content = v_flex()
-        .mt_2()
-        .pt_2()
-        .gap(px(6.0))
-        .border_t_1()
-        .border_color(theme_setup::card_border(cx));
+        .mt_1()
+        .ml(px(5.0))
+        .pl_3()
+        .gap(px(4.0))
+        .border_l_1()
+        .border_color(theme_setup::hairline(cx));
     if expanded {
         let store = store_entity.read(cx);
         for id in item_ids {
@@ -860,36 +975,30 @@ fn render_activity_group(
 
     Collapsible::new()
         .open(expanded)
-        .px_3()
-        .py(px(7.0))
-        .rounded_xl()
-        .border_1()
-        .border_color(theme_setup::card_border(cx))
-        .bg(theme_setup::inset_card_bg(cx))
         .child(
             h_flex()
                 .id(SharedString::from(format!("act-hdr-{block_id}")))
-                .w_full()
                 .items_center()
-                .justify_between()
+                .gap(px(6.0))
+                .py(px(3.0))
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     st_tog.update(cx, |s, cx| s.toggle_expanded(k_tog.clone(), cx));
                 })
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "{} 已完成 {count} 项中间步骤",
-                            if expanded { "▾" } else { "▸" }
-                        )),
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(12.0))
+                    .text_color(cx.theme().muted_foreground.opacity(0.65)),
                 )
                 .child(
                     div()
-                        .text_size(px(10.0))
-                        .text_color(cx.theme().muted_foreground.opacity(0.75))
-                        .child(if expanded { "收起" } else { "展开" }),
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("已完成 {count} 项步骤")),
                 ),
         )
         .content(content)
@@ -911,15 +1020,25 @@ fn render_changes_block(
         .pt_2()
         .gap_2()
         .border_t_1()
-        .border_color(theme_setup::card_border(cx));
+        .border_color(theme_setup::hairline(cx));
     if expanded {
         for c in changes {
             let mut entry = v_flex().gap_1().child(
-                div()
-                    .text_size(px(11.0))
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .text_color(cx.theme().foreground)
-                    .child(c.path),
+                h_flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(
+                        Icon::new(IconName::FileText)
+                            .size(px(11.0))
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(11.0))
+                            .text_color(cx.theme().foreground.opacity(0.9))
+                            .child(c.path),
+                    ),
             );
             match c.kind {
                 FileChangeKind::Patch(patch) => {
@@ -935,11 +1054,11 @@ fn render_changes_block(
                     entry = entry.child(
                         div()
                             .p_2()
-                            .rounded_lg()
-                            .bg(theme_setup::inset_card_bg(cx))
+                            .rounded_md()
+                            .bg(theme_setup::card_bg(cx))
                             .font_family(cx.theme().mono_font_family.clone())
                             .text_size(px(11.0))
-                            .text_color(cx.theme().foreground.opacity(0.9))
+                            .text_color(cx.theme().foreground.opacity(0.88))
                             .child(clipped),
                     );
                 }
@@ -951,12 +1070,11 @@ fn render_changes_block(
     Collapsible::new()
         .open(expanded)
         .px_3()
-        .py_2()
-        .rounded_2xl()
+        .py(px(7.0))
+        .rounded_xl()
         .border_1()
         .border_color(theme_setup::card_border(cx))
-        .bg(theme_setup::card_bg(cx))
-        .shadow_xs()
+        .bg(theme_setup::subtle_surface_bg(cx))
         .child(
             h_flex()
                 .id(SharedString::from(format!("chg-hdr-{block_id}")))
@@ -968,20 +1086,36 @@ fn render_changes_block(
                     st_tog.update(cx, |s, cx| s.toggle_expanded(k_tog.clone(), cx));
                 })
                 .child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .text_color(cx.theme().foreground)
-                        .child(format!(
-                            "{} 修改了 {count} 个文件",
-                            if expanded { "▾" } else { "▸" }
-                        )),
+                    h_flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(12.0))
+                            .text_color(cx.theme().muted_foreground.opacity(0.7)),
+                        )
+                        .child(
+                            Icon::new(IconName::FileText)
+                                .size(px(12.0))
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .text_color(cx.theme().foreground.opacity(0.9))
+                                .child(format!("修改了 {count} 个文件")),
+                        ),
                 )
                 .child(
                     div()
-                        .text_size(px(10.0))
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if expanded { "收起 diff" } else { "查看 diff" }),
+                        .text_size(px(10.5))
+                        .text_color(cx.theme().muted_foreground.opacity(0.7))
+                        .child(if expanded { "收起" } else { "查看改动" }),
                 ),
         )
         .content(content)

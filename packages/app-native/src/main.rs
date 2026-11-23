@@ -1,8 +1,8 @@
 //! Desktop entry point for Lila (`gpui-kit` + `packages/core`).
 
-use gpui_kit::component::TitleBar;
 use gpui_kit::{
-    AppContext as _, Bounds, WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size,
+    AppContext as _, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, point, px, size,
 };
 
 use lila_native::store::AppStore;
@@ -25,7 +25,13 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(760.0), px(520.0))),
                 window_background: WindowBackgroundAppearance::Blurred,
-                ..TitleBar::window_options()
+                titlebar: Some(TitlebarOptions {
+                    title: None,
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(14.0), px(13.0))),
+                }),
+                app_owns_titlebar_drag: true,
+                ..Default::default()
             };
 
             gpui_kit::open_window(options, cx, |window, cx| {

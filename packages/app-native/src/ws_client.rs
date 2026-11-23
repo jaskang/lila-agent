@@ -239,17 +239,19 @@ impl CoreRpc {
         io_runtime().spawn(async move {
             let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
             let mut attempt: usize = 0;
+            let mut last_error: Option<String> = None;
 
             while !bg_stopped.load(Ordering::SeqCst) {
                 let _ = evt_tx.send(TransportEvent::Connection {
                     state: ConnectionState::Connecting,
-                    detail: None,
+                    detail: last_error.clone(),
                 });
 
                 let conn_info = match ensure_core().await {
                     Ok(info) => info,
                     Err(err) => {
                         eprintln!("[lila-native] ensure_core failed: {err}");
+                        last_error = Some(err.clone());
                         let _ = evt_tx.send(TransportEvent::Connection {
                             state: ConnectionState::Disconnected,
                             detail: Some(err),
@@ -368,6 +370,7 @@ impl CoreRpc {
                                                 break;
                                             }
                                             attempt = 0;
+                                            last_error = None;
                                             ready = true;
                                             let _ = evt_tx.send(TransportEvent::Connection {
                                                 state: ConnectionState::Connected,

@@ -1,6 +1,6 @@
-//! Multi-line message composer built on `gpui-component`'s `Textarea` with
-//! `/` slash commands, `@` file mentions, image attachments, live status bar,
-//! and model/thinking/approval/context controls.
+//! Multi-line floating glass composer built on `gpui-component`'s `Textarea` with
+//! `/` slash commands, `@` file mentions, image attachments, live status strip,
+//! quiet controls, and circular primary send/stop buttons.
 
 use std::rc::Rc;
 
@@ -8,7 +8,7 @@ use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
@@ -96,7 +96,7 @@ impl ComposerView {
 
         let textarea = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("输入消息…（Enter 发送，Shift+Enter 换行，/ 命令，@ 引用文件）")
+                .placeholder("发送消息…  / 命令 · @ 文件")
                 .auto_grow(2, 8)
                 .default_value(initial_text)
         });
@@ -118,7 +118,6 @@ impl ComposerView {
                     if *shift {
                         return;
                     }
-                    // If autocomplete popup is open, pick first option on Enter.
                     if let Some(first) = this.current_options().into_iter().next() {
                         this.apply_completion(first, window, cx);
                         return;
@@ -314,7 +313,6 @@ impl Render for ComposerView {
         let is_new = selected_id.is_none();
         let session_state = store.main_slot.state.clone();
 
-        // Build controls row (model / thinking / approval / context)
         let (model_id, thinking, thinking_levels, approval) = if is_new {
             let mid = store.effective_new_model_id();
             let reasoning = mid
@@ -387,6 +385,7 @@ impl Render for ComposerView {
                     }
                 });
             }),
+            cx,
         );
 
         let st_a = self.store.clone();
@@ -404,16 +403,15 @@ impl Render for ComposerView {
                     }
                 });
             }),
+            cx,
         );
 
         let ctx_el = selected_id
             .clone()
             .and_then(|sid| render_context_meter(self.store.clone(), sid, cx));
 
-        // Status bar above composer (running subagents / queues / retry / status_lines)
         let status_bar = render_status_bar(&self.store, cx);
 
-        // Autocomplete popup
         let options = self.current_options();
         let autocomplete = (!options.is_empty()).then(|| {
             let mut list = v_flex().p_1().gap(px(2.0));
@@ -457,9 +455,9 @@ impl Render for ComposerView {
                 .w_full()
                 .rounded_xl()
                 .border_1()
-                .border_color(theme_setup::glass_rim_border(cx))
+                .border_color(theme_setup::composer_border(cx))
                 .bg(cx.theme().popover)
-                .shadow_lg()
+                .shadow_md()
                 .child(
                     div()
                         .id("comp-opt-scroll")
@@ -480,13 +478,15 @@ impl Render for ComposerView {
             .child(
                 v_flex()
                     .w_full()
-                    .p_3()
-                    .gap_2()
+                    .px_3()
+                    .pt(px(10.0))
+                    .pb_2()
+                    .gap(px(6.0))
                     .rounded_2xl()
                     .border_1()
-                    .border_color(theme_setup::glass_rim_border(cx))
-                    .bg(theme_setup::card_bg(cx))
-                    .shadow_md()
+                    .border_color(theme_setup::composer_border(cx))
+                    .bg(theme_setup::composer_bg(cx))
+                    .shadow_sm()
                     .when(!images.is_empty(), |el| {
                         let mut row = h_flex().flex_wrap().gap_2();
                         for img in images.clone() {
@@ -496,24 +496,32 @@ impl Render for ComposerView {
                             row = row.child(
                                 h_flex()
                                     .items_center()
-                                    .gap_1()
-                                    .px_2()
-                                    .py_1()
+                                    .gap(px(5.0))
+                                    .pl_2()
+                                    .pr_1()
+                                    .py(px(3.0))
                                     .rounded_lg()
                                     .border_1()
                                     .border_color(theme_setup::card_border(cx))
-                                    .bg(theme_setup::inset_card_bg(cx))
+                                    .bg(theme_setup::subtle_surface_bg(cx))
+                                    .child(
+                                        Icon::new(IconName::File)
+                                            .size(px(12.0))
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(cx.theme().foreground)
-                                            .child(format!("🖼 {}", img.name)),
+                                            .child(img.name),
                                     )
                                     .child(
                                         Button::new(SharedString::from(format!("rm-img-{}", img.id)))
                                             .ghost()
                                             .xsmall()
-                                            .icon(IconName::Close)
+                                            .compact()
+                                            .rounded(px(999.0))
+                                            .icon(Icon::new(IconName::Close).size(px(11.0)))
                                             .on_click(move |_, _, cx| {
                                                 st_rm.update(cx, |s, cx| {
                                                     s.remove_draft_image(&dk_rm, &id_rm, cx);
@@ -539,7 +547,7 @@ impl Render for ComposerView {
                                 h_flex()
                                     .items_center()
                                     .flex_wrap()
-                                    .gap_1()
+                                    .gap(px(2.0))
                                     .child(model_el)
                                     .when_some(thinking_el, |el, t| el.child(t))
                                     .child(approval_el),
@@ -547,16 +555,18 @@ impl Render for ComposerView {
                             .child(
                                 h_flex()
                                     .items_center()
-                                    .gap_1()
+                                    .gap(px(6.0))
                                     .when_some(ctx_el, |el, c| el.child(c))
                                     .when(busy && !can_send, |el| {
                                         let st_ab = st_abort.clone();
                                         let sid_ab = sid_abort.clone();
                                         el.child(
                                             Button::new("composer-stop")
-                                                .danger()
+                                                .primary()
                                                 .xsmall()
-                                                .label("停止")
+                                                .rounded(px(999.0))
+                                                .icon(Icon::new(IconName::Square).size(px(11.0)))
+                                                .tooltip("停止运行")
                                                 .on_click(move |_, _, cx| {
                                                     if let Some(ref sid) = sid_ab {
                                                         st_ab.update(cx, |s, cx| {
@@ -571,8 +581,14 @@ impl Render for ComposerView {
                                             Button::new("composer-send")
                                                 .primary()
                                                 .xsmall()
+                                                .rounded(px(999.0))
                                                 .disabled(!can_send)
-                                                .label(if busy { "引导发送" } else { "发送 ↵" })
+                                                .icon(Icon::new(IconName::ArrowUp).size(px(14.0)))
+                                                .tooltip(if busy {
+                                                    "引导发送 (↵)"
+                                                } else {
+                                                    "发送 (↵)"
+                                                })
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.submit(None, cx);
                                                 })),
@@ -618,13 +634,16 @@ fn render_status_bar(store_entity: &Entity<AppStore>, cx: &App) -> Option<impl I
         .rounded_xl()
         .border_1()
         .border_color(theme_setup::card_border(cx))
-        .bg(theme_setup::inset_card_bg(cx));
+        .bg(theme_setup::subtle_surface_bg(cx));
 
     if !running_subs.is_empty() {
-        let mut row = h_flex().flex_wrap().items_center().gap_1().child(
-            div()
+        let mut row = h_flex().flex_wrap().items_center().gap(px(6.0)).child(
+            h_flex()
+                .items_center()
+                .gap(px(4.0))
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
+                .child(Icon::new(IconName::Bot).size(px(12.0)))
                 .child("子任务运行中"),
         );
         for sub in running_subs {
@@ -635,7 +654,7 @@ fn render_status_bar(store_entity: &Entity<AppStore>, cx: &App) -> Option<impl I
                 Button::new(SharedString::from(format!("run-sub-{}", sub.id)))
                     .ghost()
                     .xsmall()
-                    .label(format!("● {} · {elapsed}", sub.description))
+                    .label(format!("{} · {elapsed}", sub.description))
                     .on_click(move |_, _, cx| {
                         st_c.update(cx, |s, cx| s.select_session(Some(sid.clone()), cx));
                     }),
@@ -682,7 +701,7 @@ fn render_status_bar(store_entity: &Entity<AppStore>, cx: &App) -> Option<impl I
         bar = bar.child(
             div()
                 .text_xs()
-                .text_color(rgb(0xd97706))
+                .text_color(rgb(0xf59e0b))
                 .child(format!("正在重试 ({}/{}){detail}", retry.attempt, retry.max)),
         );
     }

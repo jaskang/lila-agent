@@ -413,6 +413,23 @@ pub async fn ensure_core() -> Result<CoreConnectionInfo, String> {
 
             let node_bin = resolve_node_binary()?;
             let core_dir = resolve_core_dir()?;
+
+            // Fast-fail in dev checkout when workspace deps or @lila/protocol build output are missing.
+            if let Some(packages_dir) = core_dir.parent() {
+                let protocol_pkg = packages_dir.join("protocol/package.json");
+                let protocol_dist = packages_dir.join("protocol/dist/index.js");
+                let has_deps = core_dir.join("node_modules").is_dir()
+                    || packages_dir
+                        .parent()
+                        .is_some_and(|root| root.join("node_modules").is_dir());
+                if protocol_pkg.is_file() && (!has_deps || !protocol_dist.is_file()) {
+                    return Err(
+                        "缺少 core 依赖或 @lila/protocol 构建产物，请在仓库根目录运行：bun install && bun run build:protocol"
+                            .to_owned(),
+                    );
+                }
+            }
+
             if !dir.is_dir() {
                 fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
             }
@@ -449,19 +466,29 @@ pub async fn ensure_core() -> Result<CoreConnectionInfo, String> {
                 });
             }
 
-            cmd.spawn()
+            let mut child = cmd
+                .spawn()
                 .map_err(|e| format!("启动 core 失败 ({}): {e}", node_bin.display()))?;
 
-            let ready = wait_for(
-                || async {
-                    check_health(&host, port)
-                        .await
-                        .and_then(|h| h.protocol_version)
-                        == Some(PROTOCOL_VERSION)
-                },
-                Duration::from_secs(10),
-            )
-            .await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut ready = false;
+            while Instant::now() < deadline {
+                if check_health(&host, port)
+                    .await
+                    .and_then(|h| h.protocol_version)
+                    == Some(PROTOCOL_VERSION)
+                {
+                    ready = true;
+                    break;
+                }
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(format!(
+                        "core 进程提前退出（{status}），日志见 {}",
+                        log_path.display()
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
 
             if !ready {
                 return Err(format!(

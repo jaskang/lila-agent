@@ -1,4 +1,5 @@
-//! Session controls: searchable ModelPicker, ThinkingPicker, ApprovalPicker, and ContextMeter.
+//! Session controls: searchable ModelPicker, ThinkingPicker, ApprovalPicker, and ContextMeter
+//! styled as quiet, low-contrast macOS controls with native dropdown carets and vector icons.
 
 use std::rc::Rc;
 
@@ -7,7 +8,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     Anchor, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, div, prelude::FluentBuilder as _, px, rgb,
@@ -16,6 +17,7 @@ use gpui_kit::{
 use crate::format::format_compact_tokens;
 use crate::protocol::{ApprovalMode, ModelInfo, ThinkingLevel};
 use crate::store::AppStore;
+use crate::ui::theme_setup;
 
 pub fn render_model_picker(
     id: &'static str,
@@ -45,7 +47,9 @@ pub fn render_model_picker(
         .xsmall()
         .disabled(disabled)
         .label(label)
-        .icon(IconName::ChevronDown);
+        .dropdown_caret(true)
+        .text_color(cx.theme().muted_foreground)
+        .tooltip("切换模型");
 
     Popover::new(SharedString::from(id))
         .anchor(Anchor::BottomLeft)
@@ -157,10 +161,9 @@ pub fn render_model_picker(
                                 )
                                 .when(is_sel, |el| {
                                     el.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().primary)
-                                            .child("✓"),
+                                        Icon::new(IconName::Check)
+                                            .size(px(12.0))
+                                            .text_color(cx.theme().foreground),
                                     )
                                 }),
                         );
@@ -188,6 +191,7 @@ pub fn render_thinking_picker(
     levels: Vec<ThinkingLevel>,
     disabled: bool,
     on_select: Rc<dyn Fn(ThinkingLevel, &mut App)>,
+    cx: &App,
 ) -> Option<impl IntoElement> {
     if levels.len() <= 1 {
         return None;
@@ -197,8 +201,10 @@ pub fn render_thinking_picker(
         .ghost()
         .xsmall()
         .disabled(disabled)
-        .label(format!("思考: {}", current.label()))
-        .icon(IconName::ChevronDown);
+        .label(current.label())
+        .dropdown_caret(true)
+        .text_color(cx.theme().muted_foreground)
+        .tooltip("推理思考深度");
 
     Some(
         Popover::new(SharedString::from(id))
@@ -206,7 +212,7 @@ pub fn render_thinking_picker(
             .offset(px(6.0))
             .trigger(trigger)
             .content(move |_, _, cx| {
-                let mut col = v_flex().w(px(150.0)).gap(px(2.0));
+                let mut col = v_flex().w(px(144.0)).gap(px(2.0));
                 for lvl in levels.clone() {
                     let is_sel = lvl == current;
                     let cb = on_select.clone();
@@ -234,7 +240,11 @@ pub fn render_thinking_picker(
                                     .child(lvl.label()),
                             )
                             .when(is_sel, |el| {
-                                el.child(div().text_xs().text_color(cx.theme().primary).child("✓"))
+                                el.child(
+                                    Icon::new(IconName::Check)
+                                        .size(px(12.0))
+                                        .text_color(cx.theme().foreground),
+                                )
                             }),
                     );
                 }
@@ -248,20 +258,23 @@ pub fn render_approval_picker(
     current: ApprovalMode,
     disabled: bool,
     on_select: Rc<dyn Fn(ApprovalMode, &mut App)>,
+    cx: &App,
 ) -> impl IntoElement {
     let trigger = Button::new(SharedString::from(format!("{id}-trigger")))
         .ghost()
         .xsmall()
         .disabled(disabled)
         .label(current.label())
-        .icon(IconName::ChevronDown);
+        .dropdown_caret(true)
+        .text_color(cx.theme().muted_foreground)
+        .tooltip("工具审批模式");
 
     Popover::new(SharedString::from(id))
         .anchor(Anchor::BottomLeft)
         .offset(px(6.0))
         .trigger(trigger)
         .content(move |_, _, cx| {
-            let mut col = v_flex().w(px(270.0)).gap_1();
+            let mut col = v_flex().w(px(268.0)).gap(px(2.0));
             for mode in ApprovalMode::ALL {
                 let is_sel = mode == current;
                 let cb = on_select.clone();
@@ -294,13 +307,15 @@ pub fn render_approval_picker(
                                 )
                                 .when(is_sel, |el| {
                                     el.child(
-                                        div().text_xs().text_color(cx.theme().primary).child("✓"),
+                                        Icon::new(IconName::Check)
+                                            .size(px(12.0))
+                                            .text_color(cx.theme().foreground),
                                     )
                                 }),
                         )
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(px(10.5))
                                 .text_color(cx.theme().muted_foreground)
                                 .child(mode.hint()),
                         ),
@@ -347,10 +362,16 @@ pub fn render_context_meter(
     let compacting = s.compacting;
     let run_active = s.run_active;
 
-    let mut trigger = Button::new("ctx-meter-trigger").ghost().xsmall().label(label);
-    if high_pct {
-        trigger = trigger.text_color(rgb(0xd97706));
-    }
+    let trigger = Button::new("ctx-meter-trigger")
+        .ghost()
+        .xsmall()
+        .label(label)
+        .text_color(if high_pct {
+            rgb(0xf59e0b).into()
+        } else {
+            cx.theme().muted_foreground
+        })
+        .tooltip("上下文用量与压缩");
 
     Some(
         Popover::new("ctx-meter-popover")
@@ -366,12 +387,12 @@ pub fn render_context_meter(
                 let pop2 = cx.entity();
 
                 v_flex()
-                    .w(px(248.0))
+                    .w(px(244.0))
                     .gap_2()
                     .child(
                         div()
                             .text_xs()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .text_color(cx.theme().foreground)
                             .child("会话用量"),
                     )
@@ -392,7 +413,9 @@ pub fn render_context_meter(
                     .child(
                         h_flex()
                             .gap_2()
-                            .pt_1()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(theme_setup::hairline(cx))
                             .child(
                                 Button::new("ctx-compact")
                                     .xsmall()

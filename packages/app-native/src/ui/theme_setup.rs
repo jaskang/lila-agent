@@ -1,5 +1,5 @@
-//! Theme initialization, JSON live hot-reload from `themes/`, and Lila's
-//! frosted card surface helpers built on top of `gpui-kit` Theme tokens.
+//! Theme initialization, JSON live hot-reload from `themes/`, and macOS-inspired
+//! translucent glass surface tokens built on top of `gpui-kit` Theme colors.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -84,55 +84,99 @@ pub fn toggle_theme_mode(window: &mut Window, cx: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
-// Frosted card surface colors derived directly from active Theme JSON tokens
-// so editing `themes/lila.json` live-updates cards, bubbles, and glass layers.
+// Translucent macOS-inspired surface tokens derived from the active Theme JSON.
 
+/// Full-bleed main workspace background.
 pub fn workspace_bg(cx: &App) -> Hsla {
     cx.theme().background
 }
 
-pub fn card_bg(cx: &App) -> Hsla {
-    cx.theme().popover
+/// Subtle hairline divider (1px vertical split & faint toolbar bottom line).
+pub fn hairline(cx: &App) -> Hsla {
+    cx.theme().sidebar_border
 }
 
-pub fn inset_card_bg(cx: &App) -> Hsla {
-    cx.theme().muted
-}
-
+/// Subtle translucent border for inset blocks, code containers, and cards.
 pub fn card_border(cx: &App) -> Hsla {
     cx.theme().border
 }
 
-pub fn glass_rim_border(cx: &App) -> Hsla {
+/// Elevated glass surface for popovers, composer, and focused sheets.
+pub fn composer_bg(cx: &App) -> Hsla {
     if cx.theme().is_dark() {
-        rgba(0xffffff26).into()
+        rgba(0xffffff0b).into()
+    } else {
+        rgba(0xffffffd8).into()
+    }
+}
+
+/// Hairline rim around the floating composer & interactive glass containers.
+pub fn composer_border(cx: &App) -> Hsla {
+    if cx.theme().is_dark() {
+        rgba(0xffffff1a).into()
+    } else {
+        rgba(0x00000016).into()
+    }
+}
+
+/// Soft translucent capsule fill for the selected sidebar item (Apple glass pill).
+pub fn pill_active_bg(cx: &App) -> Hsla {
+    cx.theme().sidebar_accent
+}
+
+/// Subtle glass rim around the selected sidebar capsule.
+pub fn pill_active_border(cx: &App) -> Hsla {
+    if cx.theme().is_dark() {
+        rgba(0xffffff22).into()
+    } else {
+        rgba(0x00000010).into()
+    }
+}
+
+/// Whisper-quiet surface for collapsible traces, code blocks, and notices.
+pub fn subtle_surface_bg(cx: &App) -> Hsla {
+    cx.theme().muted
+}
+
+/// Secondary elevated card surface (dialogs / subsession banners / diffs).
+pub fn card_bg(cx: &App) -> Hsla {
+    if cx.theme().is_dark() {
+        rgba(0xffffff08).into()
     } else {
         rgba(0xffffffc8).into()
     }
 }
 
+/// Neutral translucent bubble for user messages (monochromatic, zero neon tint).
 pub fn user_bubble_bg(cx: &App) -> Hsla {
-    cx.theme()
-        .ring
-        .opacity(if cx.theme().is_dark() { 0.20 } else { 0.12 })
+    if cx.theme().is_dark() {
+        rgba(0xffffff13).into()
+    } else {
+        rgba(0x0000000a).into()
+    }
 }
 
 pub fn user_bubble_border(cx: &App) -> Hsla {
-    cx.theme()
-        .ring
-        .opacity(if cx.theme().is_dark() { 0.36 } else { 0.30 })
+    if cx.theme().is_dark() {
+        rgba(0xffffff16).into()
+    } else {
+        rgba(0x0000000d).into()
+    }
 }
 
+/// Restrained attention surface for pending approvals and questions.
 pub fn attention_bg(cx: &App) -> Hsla {
-    cx.theme()
-        .warning
-        .opacity(if cx.theme().is_dark() { 0.18 } else { 0.12 })
+    if cx.theme().is_dark() {
+        rgba(0x28272be6).into()
+    } else {
+        rgba(0xffffffeb).into()
+    }
 }
 
 pub fn attention_border(cx: &App) -> Hsla {
     cx.theme()
         .warning
-        .opacity(if cx.theme().is_dark() { 0.48 } else { 0.42 })
+        .opacity(if cx.theme().is_dark() { 0.42 } else { 0.38 })
 }
 
 #[cfg(test)]

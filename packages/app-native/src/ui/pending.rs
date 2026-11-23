@@ -1,4 +1,5 @@
 //! Pending requests card: approval, confirm, select, input, editor, and multi-question ask_user.
+//! Styled as a calm frosted surface with restrained amber accent instead of loud tinted fills.
 
 use std::collections::HashMap;
 
@@ -6,10 +7,10 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    Render, SharedString, Styled as _, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 
 use crate::protocol::{AskQuestionAnswer, PendingAnswer, PendingRequest};
@@ -168,26 +169,39 @@ impl Render for PendingPanelView {
             .border_1()
             .border_color(theme_setup::attention_border(cx))
             .bg(theme_setup::attention_bg(cx))
-            .shadow_md()
+            .shadow_sm()
             .child(
                 h_flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
                     .child(
-                        div()
+                        h_flex()
                             .flex_1()
-                            .text_xs()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().foreground)
-                            .child(first.title.clone()),
+                            .min_w_0()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .size(px(13.0))
+                                    .text_color(rgb(0xf59e0b)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .text_color(cx.theme().foreground)
+                                    .child(first.title.clone()),
+                            ),
                     )
                     .when(extra > 0, |el| {
                         el.child(
                             div()
                                 .text_size(px(11.0))
                                 .text_color(cx.theme().muted_foreground)
-                                .child(format!("还有 {extra} 个待处理")),
+                                .child(format!("还有 {extra} 个")),
                         )
                     }),
             );
@@ -198,11 +212,13 @@ impl Render for PendingPanelView {
                     .id("pending-msg-scroll")
                     .max_h(px(160.0))
                     .overflow_y_scrollbar()
-                    .p_2()
+                    .px(px(10.0))
+                    .py_2()
                     .rounded_lg()
-                    .bg(theme_setup::card_bg(cx))
-                    .text_xs()
-                    .text_color(cx.theme().foreground)
+                    .bg(theme_setup::subtle_surface_bg(cx))
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(px(11.5))
+                    .text_color(cx.theme().foreground.opacity(0.9))
                     .child(msg),
             );
         }
@@ -221,7 +237,7 @@ impl Render for PendingPanelView {
                     if choice.primary {
                         b = b.primary();
                     } else if choice.danger {
-                        b = b.danger();
+                        b = b.ghost().text_color(cx.theme().danger);
                     }
                     b = b.on_click(move |_, _, cx| {
                         st_c.update(cx, |s, cx| {
@@ -359,7 +375,7 @@ impl Render for PendingPanelView {
                         .gap_1()
                         .p_2()
                         .rounded_lg()
-                        .bg(theme_setup::card_bg(cx))
+                        .bg(theme_setup::subtle_surface_bg(cx))
                         .child(
                             div()
                                 .text_xs()
