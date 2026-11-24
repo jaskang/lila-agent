@@ -227,14 +227,28 @@ pub struct CoreRpc {
     cmd_tx: mpsc::UnboundedSender<OutgoingCommand>,
     stopped: Arc<AtomicBool>,
     next_id: Arc<AtomicU64>,
+    reconnect_notify: Arc<tokio::sync::Notify>,
 }
 
 impl CoreRpc {
+    /// Inert RPC handle used for offline `--demo` UI preview mode.
+    pub fn noop() -> Self {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<OutgoingCommand>();
+        Self {
+            cmd_tx,
+            stopped: Arc::new(AtomicBool::new(true)),
+            next_id: Arc::new(AtomicU64::new(1)),
+            reconnect_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
     pub fn start() -> (Self, mpsc::UnboundedReceiver<TransportEvent>) {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<OutgoingCommand>();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel::<TransportEvent>();
         let stopped = Arc::new(AtomicBool::new(false));
         let bg_stopped = stopped.clone();
+        let reconnect_notify = Arc::new(tokio::sync::Notify::new());
+        let bg_notify = reconnect_notify.clone();
 
         io_runtime().spawn(async move {
             let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -258,7 +272,12 @@ impl CoreRpc {
                         });
                         let delay = RETRY_DELAYS_MS[attempt.min(RETRY_DELAYS_MS.len() - 1)];
                         attempt += 1;
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                            _ = bg_notify.notified() => {
+                                attempt = 0;
+                            }
+                        }
                         continue;
                     }
                 };
@@ -291,7 +310,12 @@ impl CoreRpc {
                         });
                         let delay = RETRY_DELAYS_MS[attempt.min(RETRY_DELAYS_MS.len() - 1)];
                         attempt += 1;
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                            _ = bg_notify.notified() => {
+                                attempt = 0;
+                            }
+                        }
                         continue;
                     }
                 };
@@ -448,7 +472,12 @@ impl CoreRpc {
                 });
                 let delay = RETRY_DELAYS_MS[attempt.min(RETRY_DELAYS_MS.len() - 1)];
                 attempt += 1;
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                    _ = bg_notify.notified() => {
+                        attempt = 0;
+                    }
+                }
             }
         });
 
@@ -456,8 +485,13 @@ impl CoreRpc {
             cmd_tx,
             stopped,
             next_id: Arc::new(AtomicU64::new(1)),
+            reconnect_notify,
         };
         (rpc, evt_rx)
+    }
+
+    pub fn reconnect_now(&self) {
+        self.reconnect_notify.notify_one();
     }
 
     pub async fn call<T: DeserializeOwned>(&self, mut command: Value) -> Result<T, String> {

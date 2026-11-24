@@ -1,43 +1,68 @@
-//! Root `LilaApp` view built with `gpui-kit`: full-bleed macOS split view with
-//! a full-height translucent sidebar, 1px hairline divider, unified 38px drag
-//! chrome, virtualized transcript, floating composer, and ⌘K command palette.
+//! Desktop window, command palette, and session workspace.
 
 use std::cell::Cell;
 use std::rc::Rc;
 
-use gpui_kit::base::Disableable as _;
+use gpui_kit::base::{Disableable as _, InteractiveElementExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::message_scroller::MessageScrollerState;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::popover::Popover;
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    Anchor, App, AppContext as _, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, SharedString,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, KeyBinding, MouseButton, MouseMoveEvent, ParentElement as _, Render,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, actions, div,
     prelude::FluentBuilder as _, px,
 };
 
+use crate::format::shorten_home_path;
 use crate::protocol::ConnectionState;
 use crate::store::{AppStore, AppStoreEvent, ToastTone};
-use crate::ui::composer::ComposerView;
+use crate::ui::composer::{self, ComposerView};
 use crate::ui::pending::PendingPanelView;
 use crate::ui::sidebar::render_sidebar;
+use crate::ui::theme_setup::ThemePreference;
 use crate::ui::transcript::render_transcript;
-use crate::ui::{TRAFFIC_LIGHT_INSET, theme_setup, window_drag_bar};
+use crate::ui::{
+    BadgeTone, SHELL_INSET, WORKSPACE_BAR_HEIGHT, WORKSPACE_TRAFFIC_LIGHT_INSET, pill_badge,
+    theme_setup, window_drag_bar, workspace_card,
+};
 
-actions!(lila, [NewSession, ToggleSidebar, OpenPalette]);
+actions!(
+    lila,
+    [
+        NewSession,
+        ToggleSidebar,
+        OpenPalette,
+        AbortRun,
+        PrevSession,
+        NextSession
+    ]
+);
 
 pub fn bind_global_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewSession, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("cmd-k", OpenPalette, None),
+        KeyBinding::new("cmd-.", AbortRun, None),
+        KeyBinding::new("cmd-[", PrevSession, None),
+        KeyBinding::new("cmd-]", NextSession, None),
     ]);
+    composer::bind_keys(cx);
+}
+
+enum PaletteAction {
+    NewSession,
+    AddProject,
+    ToggleSidebar,
+    ToggleTheme,
+    Compact(String),
+    Reload(String),
+    OpenSession(String),
 }
 
 pub struct LilaApp {
@@ -46,6 +71,7 @@ pub struct LilaApp {
     scroller: Entity<MessageScrollerState>,
     composer: Entity<ComposerView>,
     pending: Entity<PendingPanelView>,
+    sidebar_resizing: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -53,6 +79,7 @@ impl LilaApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = AppStore::global(cx);
         let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         let composer = cx.new(|cx| ComposerView::new(store.clone(), window, cx));
         let pending = cx.new(|cx| PendingPanelView::new(store.clone(), window, cx));
@@ -78,6 +105,62 @@ impl LilaApp {
                     let count = *block_count;
                     scroller_sub.update(cx, |s, cx| s.reset(count, cx));
                 }
+                AppStoreEvent::TranscriptSync {
+                    prev_count,
+                    next_count,
+                } => {
+                    let prev = *prev_count;
+                    let next = *next_count;
+                    scroller_sub.update(cx, |s, cx| {
+                        let current = s.item_count();
+                        if current != next {
+                            if prev == current && next > prev {
+                                // Fast path when appending new rows at tail.
+                                s.append(next - prev, cx);
+                            } else {
+                                s.splice(0..current, next, cx);
+                            }
+                        } else if next > 0 {
+                            // Keep heights fresh for streaming tail / live sub-agent updates.
+                            let start = next.saturating_sub(4);
+                            s.remeasure_items(start..next, cx);
+                        }
+                    });
+                }
+                AppStoreEvent::TranscriptPrepend { added_count } => {
+                    let added = *added_count;
+                    scroller_sub.update(cx, |s, cx| {
+                        s.prepend(added, cx);
+                    });
+                }
+                AppStoreEvent::TranscriptRemeasure => {
+                    scroller_sub.update(cx, |s, cx| s.remeasure(cx));
+                }
+                AppStoreEvent::FocusComposer => {
+                    let composer = composer_sub.clone();
+                    let store = AppStore::global(cx);
+                    window.defer(cx, move |window, cx| {
+                        let store = store.read(cx);
+                        let can_focus = match store.selected_id.as_deref() {
+                            None => store.active_project().is_some(),
+                            Some(sid) => {
+                                let is_readonly = store
+                                    .sessions
+                                    .get(sid)
+                                    .is_some_and(|s| s.parent_id.is_some());
+                                let has_pending = store
+                                    .main_slot
+                                    .state
+                                    .as_ref()
+                                    .is_some_and(|st| !st.pending.is_empty());
+                                !is_readonly && !has_pending
+                            }
+                        };
+                        if can_focus {
+                            composer.read(cx).focus_handle(cx).focus(window, cx);
+                        }
+                    });
+                }
                 AppStoreEvent::DraftSync { text, .. } => {
                     let t = text.clone();
                     composer_sub.update(cx, |c, cx| c.sync_text(t, window, cx));
@@ -85,8 +168,11 @@ impl LilaApp {
             },
         );
 
-        let app_sub = window.observe_window_appearance(|window, cx| {
-            Theme::sync_system_appearance(Some(window), cx);
+        let store_app = store.clone();
+        let app_sub = window.observe_window_appearance(move |window, cx| {
+            if store_app.read(cx).theme_preference == ThemePreference::System {
+                theme_setup::apply_theme_preference(ThemePreference::System, Some(window), cx);
+            }
         });
 
         Self {
@@ -95,194 +181,155 @@ impl LilaApp {
             scroller,
             composer,
             pending,
+            sidebar_resizing: false,
             _subscriptions: vec![obs, ev_sub, app_sub],
         }
     }
 
-    fn open_command_palette_with_store(
-        store: Entity<AppStore>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let query_input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索会话或命令…"));
+    fn open_command_palette_with_store(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
+        let command = cx.new(|cx| CommandState::new(window, cx));
         let initial_focus = Cell::new(true);
+        let state = store.read(cx);
+        let connected = state.connection == ConnectionState::Connected;
+        let theme_label = format!("切换外观（当前：{}）", state.theme_preference.label());
+        let mut actions = vec![vec![
+            PaletteAction::NewSession,
+            PaletteAction::AddProject,
+            PaletteAction::ToggleSidebar,
+            PaletteAction::ToggleTheme,
+        ]];
+        let mut groups = vec![
+            CommandGroup::new()
+                .label("操作")
+                .item(CommandItem::new().label("新建会话").icon(IconName::Plus))
+                .item(
+                    CommandItem::new()
+                        .label("添加项目…")
+                        .icon(IconName::FolderOpen)
+                        .disabled(!connected),
+                )
+                .item(
+                    CommandItem::new()
+                        .label("切换侧栏")
+                        .icon(IconName::PanelLeft),
+                )
+                .item(CommandItem::new().label(theme_label).icon(IconName::Palette)),
+        ];
+
+        if let Some(session) = state
+            .selected_id
+            .as_ref()
+            .and_then(|id| state.sessions.get(id))
+            && session.parent_id.is_none()
+        {
+            actions.push(vec![
+                PaletteAction::Compact(session.id.clone()),
+                PaletteAction::Reload(session.id.clone()),
+            ]);
+            groups.push(
+                CommandGroup::new()
+                    .label("当前会话")
+                    .item(
+                        CommandItem::new()
+                            .label("压缩当前会话上下文")
+                            .disabled(!connected || state.is_busy()),
+                    )
+                    .item(
+                        CommandItem::new()
+                            .label("重新加载技能与 MCP")
+                            .disabled(!connected),
+                    ),
+            );
+        }
+
+        let mut sessions: Vec<_> = state.sessions.values().collect();
+        sessions.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut session_actions = Vec::with_capacity(sessions.len());
+        let mut session_items = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let title = if session.title.is_empty() {
+                "新会话"
+            } else {
+                &session.title
+            };
+            let project = state.projects.iter().find(|p| p.id == session.project_id);
+            let label =
+                project.map_or_else(|| title.to_owned(), |p| format!("{title} · {}", p.name));
+            session_actions.push(PaletteAction::OpenSession(session.id.clone()));
+            session_items.push(CommandItem::new().label(label).icon(
+                if session.parent_id.is_some() {
+                    IconName::Bot
+                } else {
+                    IconName::SquareTerminal
+                },
+            ));
+        }
+        actions.push(session_actions);
+        groups.push(CommandGroup::new().label("会话").items(session_items));
+        let actions = Rc::new(actions);
 
         window.open_dialog(cx, move |dialog, window, cx| {
             if initial_focus.replace(false) {
-                query_input.focus_handle(cx).focus(window, cx);
+                command.update(cx, |state, cx| state.focus(window, cx));
             }
-            let query = query_input.read(cx).value().trim().to_lowercase();
-            let st_read = store.read(cx);
-            let selected_id = st_read.selected_id.clone();
-
-            struct PaletteEntry {
-                id: String,
-                group: &'static str,
-                label: String,
-                shortcut: Option<&'static str>,
-            }
-
-            let mut entries = vec![
-                PaletteEntry {
-                    id: "act:new".to_owned(),
-                    group: "操作",
-                    label: "新建对话".to_owned(),
-                    shortcut: Some("⌘N"),
-                },
-                PaletteEntry {
-                    id: "act:add-project".to_owned(),
-                    group: "操作",
-                    label: "添加本地项目…".to_owned(),
-                    shortcut: None,
-                },
-                PaletteEntry {
-                    id: "act:toggle-sidebar".to_owned(),
-                    group: "操作",
-                    label: "切换侧边栏".to_owned(),
-                    shortcut: Some("⌘B"),
-                },
-                PaletteEntry {
-                    id: "act:toggle-theme".to_owned(),
-                    group: "操作",
-                    label: "切换浅色 / 深色外观".to_owned(),
-                    shortcut: None,
-                },
-            ];
-
-            if let Some(ref sid) = selected_id {
-                entries.push(PaletteEntry {
-                    id: format!("act:compact:{sid}"),
-                    group: "当前会话",
-                    label: "压缩当前会话上下文".to_owned(),
-                    shortcut: None,
-                });
-                entries.push(PaletteEntry {
-                    id: format!("act:reload:{sid}"),
-                    group: "当前会话",
-                    label: "重新加载技能与 MCP".to_owned(),
-                    shortcut: None,
-                });
-            }
-
-            let mut sessions: Vec<_> = st_read.sessions.values().cloned().collect();
-            sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            for s in sessions.into_iter().take(40) {
-                let title = if s.title.is_empty() {
-                    "新会话".to_owned()
-                } else {
-                    s.title
-                };
-                entries.push(PaletteEntry {
-                    id: format!("sess:{}", s.id),
-                    group: "会话",
-                    label: title,
-                    shortcut: None,
-                });
-            }
-
-            let filtered: Vec<_> = entries
-                .into_iter()
-                .filter(|e| {
-                    query.is_empty()
-                        || e.label.to_lowercase().contains(&query)
-                        || e.group.contains(&query)
-                })
-                .collect();
-
-            let mut list = v_flex().gap(px(2.0));
-            if filtered.is_empty() {
-                list = list.child(
-                    div()
-                        .py_6()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("没有匹配的命令或会话"),
-                );
-            } else {
-                let mut last_group: Option<&str> = None;
-                for item in filtered {
-                    if last_group != Some(item.group) {
-                        last_group = Some(item.group);
-                        list = list.child(
-                            div()
-                                .px_2()
-                                .pt_2()
-                                .pb_1()
-                                .text_size(px(10.5))
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(cx.theme().muted_foreground)
-                                .child(item.group),
-                        );
-                    }
-                    let st_run = store.clone();
-                    let raw = item.id.clone();
-                    list = list.child(
+            let store = store.clone();
+            let actions = actions.clone();
+            let palette = groups.iter().cloned().fold(
+                Command::new(&command)
+                    .bordered(false)
+                    .placeholder("搜索会话、项目或命令…")
+                    .max_h(px(320.0))
+                    .empty(|_, _, cx| {
+                        div()
+                            .p_4()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("没有匹配的命令或会话")
+                    })
+                    .footer(|_, _, cx| {
                         h_flex()
-                            .id(SharedString::from(format!("pal-{}", item.id)))
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .px_2()
-                            .py(px(6.0))
-                            .rounded_lg()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(cx.theme().accent))
-                            .on_click(move |_, window, cx| {
-                                window.close_dialog(cx);
-                                if raw == "act:new" {
-                                    st_run.update(cx, |s, cx| s.start_new(None, cx));
-                                } else if raw == "act:add-project" {
-                                    st_run.update(cx, |s, cx| s.add_project(cx));
-                                } else if raw == "act:toggle-sidebar" {
-                                    st_run.update(cx, |s, cx| s.toggle_sidebar(cx));
-                                } else if raw == "act:toggle-theme" {
-                                    theme_setup::toggle_theme_mode(window, cx);
-                                } else if let Some(sid) = raw.strip_prefix("act:compact:") {
-                                    st_run.update(cx, |s, cx| s.compact(sid.to_owned(), cx));
-                                } else if let Some(sid) = raw.strip_prefix("act:reload:") {
-                                    st_run.update(cx, |s, cx| s.reload(sid.to_owned(), cx));
-                                } else if let Some(sid) = raw.strip_prefix("sess:") {
-                                    st_run.update(cx, |s, cx| {
-                                        s.select_session(Some(sid.to_owned()), cx);
-                                    });
-                                }
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(cx.theme().foreground)
-                                    .child(item.label),
-                            )
-                            .when_some(item.shortcut, |el, sc| {
-                                el.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(sc),
-                                )
-                            }),
-                    );
-                }
-            }
-
-            dialog
-                .title("命令面板")
-                .w(px(500.0))
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .child(Input::new(&query_input))
-                        .child(
-                            div()
-                                .id("palette-scroll")
-                                .max_h(px(340.0))
-                                .overflow_y_scrollbar()
-                                .child(list),
-                        ),
-                )
+                            .justify_end()
+                            .gap_3()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(theme_setup::hairline(cx))
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("↑↓ 选择")
+                            .child("↵ 确认")
+                    })
+                    .on_confirm(move |index, window, cx| {
+                        let Some(action) = actions
+                            .get(index.section)
+                            .and_then(|group| group.get(index.row))
+                        else {
+                            return;
+                        };
+                        window.close_dialog(cx);
+                        if matches!(action, PaletteAction::ToggleTheme) {
+                            let next = store.update(cx, |s, cx| s.cycle_theme_preference(cx));
+                            theme_setup::apply_theme_preference(next, Some(window), cx);
+                            return;
+                        }
+                        store.update(cx, |s, cx| match action {
+                            PaletteAction::NewSession => s.start_new(None, cx),
+                            PaletteAction::AddProject => s.add_project(cx),
+                            PaletteAction::ToggleSidebar => s.toggle_sidebar(cx),
+                            PaletteAction::Compact(id) => s.compact(id.clone(), cx),
+                            PaletteAction::Reload(id) => s.reload(id.clone(), cx),
+                            PaletteAction::OpenSession(id) => {
+                                s.select_session(Some(id.clone()), cx)
+                            }
+                            PaletteAction::ToggleTheme => {}
+                        });
+                    }),
+                Command::group,
+            );
+            dialog.title("命令面板").w(px(500.0)).child(palette)
         });
     }
 
@@ -299,16 +346,16 @@ impl LilaApp {
                 .items_center()
                 .justify_center()
                 .px_6()
-                .pb(px(48.0))
+                .pb(px(56.0))
                 .child(
                     v_flex()
                         .items_center()
                         .gap_3()
                         .child(
                             div()
-                                .w(px(40.0))
-                                .h(px(40.0))
-                                .rounded_full()
+                                .w(px(42.0))
+                                .h(px(42.0))
+                                .rounded(px(theme_setup::RADIUS_MD))
                                 .bg(theme_setup::subtle_surface_bg(cx))
                                 .border_1()
                                 .border_color(theme_setup::card_border(cx))
@@ -318,13 +365,13 @@ impl LilaApp {
                                 .child(
                                     Icon::new(IconName::FolderOpen)
                                         .size(px(18.0))
-                                        .text_color(cx.theme().muted_foreground),
+                                        .text_color(theme_setup::accent_ember(cx)),
                                 ),
                         )
                         .child(
                             div()
-                                .text_lg()
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .text_size(px(22.0))
+                                .font_weight(gpui_kit::FontWeight::NORMAL)
                                 .text_color(cx.theme().foreground)
                                 .child("选择一个本地项目开始"),
                         )
@@ -332,14 +379,13 @@ impl LilaApp {
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("Agent 会在这个目录中阅读代码、修改文件并运行命令。"),
+                                .child("Agent 会在该目录中阅读代码、修改文件并执行命令。"),
                         )
                         .child(
                             div().pt_2().child(
                                 Button::new("welcome-add-project")
                                     .primary()
-                                    .small()
-                                    .rounded(px(999.0))
+                                    .rounded(px(theme_setup::RADIUS_SM))
                                     .disabled(!connected)
                                     .icon(IconName::FolderOpen)
                                     .label("添加项目目录…")
@@ -355,136 +401,87 @@ impl LilaApp {
         let Some(proj) = active_proj else {
             return div().flex_1().into_any_element();
         };
-        let proj_id = proj.id.clone();
-        let proj_name = proj.name.clone();
         let proj_path = proj.path.clone();
-        let st_pop = self.store.clone();
-
-        let project_selector = Popover::new("new-session-project-picker")
-            .anchor(Anchor::TopLeft)
-            .offset(px(6.0))
-            .trigger(
-                Button::new("new-proj-trigger")
-                    .ghost()
-                    .xsmall()
-                    .rounded(px(999.0))
-                    .icon(
-                        Icon::new(IconName::Folder)
-                            .size(px(12.0))
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .label(proj_name)
-                    .dropdown_caret(true)
-                    .tooltip(proj_path),
-            )
-            .content(move |_, _, cx| {
-                let mut col = v_flex().w(px(300.0)).gap(px(2.0));
-                for p in projects.clone() {
-                    let is_curr = p.id == proj_id;
-                    let st_p = st_pop.clone();
-                    let pid = p.id.clone();
-                    let pop_ent = cx.entity();
-                    col = col.child(
-                        h_flex()
-                            .id(SharedString::from(format!("np-opt-{}", p.id)))
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .px_2()
-                            .py(px(6.0))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(is_curr, |el| el.bg(cx.theme().accent))
-                            .hover(|s| s.bg(cx.theme().accent))
-                            .on_click(move |_, window, cx| {
-                                st_p.update(cx, |s, cx| {
-                                    s.update_new_session(|ns| ns.project_id = Some(pid.clone()), cx);
-                                });
-                                pop_ent.update(cx, |st, cx| st.dismiss(window, cx));
-                            })
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                            .text_color(cx.theme().foreground)
-                                            .truncate()
-                                            .child(p.name),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.0))
-                                            .text_color(cx.theme().muted_foreground)
-                                            .truncate()
-                                            .child(p.path),
-                                    ),
-                            )
-                            .when(is_curr, |el| {
-                                el.child(
-                                    Icon::new(IconName::Check)
-                                        .size(px(12.0))
-                                        .text_color(cx.theme().foreground),
-                                )
-                            }),
-                    );
-                }
-                let st_more = st_pop.clone();
-                let pop_ent2 = cx.entity();
-                col = col.child(
-                    div()
-                        .pt_1()
-                        .mt_1()
-                        .border_t_1()
-                        .border_color(theme_setup::hairline(cx))
-                        .child(
-                            Button::new("np-add-more")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Plus)
-                                .label("添加本地项目…")
-                                .on_click(move |_, window, cx| {
-                                    pop_ent2.update(cx, |st, cx| st.dismiss(window, cx));
-                                    st_more.update(cx, |s, cx| s.add_project(cx));
-                                }),
-                        ),
-                );
-                div()
-                    .id("np-scroll")
-                    .max_h(px(280.0))
-                    .overflow_y_scrollbar()
-                    .child(col)
-            });
+        let short_path = shorten_home_path(&proj_path);
 
         v_flex()
             .flex_1()
             .items_center()
             .justify_center()
             .px_6()
-            .pb(px(64.0))
+            .pb(px(72.0))
             .child(
                 v_flex()
                     .w_full()
-                    .max_w(px(720.0))
-                    .gap_4()
+                    .max_w(px(680.0))
+                    .gap(px(16.0))
                     .child(
                         h_flex()
                             .items_center()
-                            .justify_between()
-                            .px_1()
+                            .px(px(2.0))
+                            .gap(px(9.0))
                             .child(
                                 div()
-                                    .text_xl()
-                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .size(px(7.0))
+                                    .rounded_full()
+                                    .bg(theme_setup::accent_ember(cx)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(22.0))
+                                    .font_weight(gpui_kit::FontWeight::NORMAL)
                                     .text_color(cx.theme().foreground)
                                     .child("要做点什么？"),
-                            )
-                            .child(project_selector),
+                            ),
                     )
-                    .child(self.composer.clone()),
+                    .child(self.composer.clone())
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .px(px(4.0))
+                            .child(
+                                h_flex()
+                                    .id("new-session-open-dir")
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .cursor_pointer()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .hover(|s| s.text_color(cx.theme().foreground))
+                                    .on_click(move |_, _, _| {
+                                        let _ =
+                                            crate::shell_bridge::reveal_whitelisted_path(&proj_path);
+                                    })
+                                    .child(
+                                        Icon::new(IconName::Folder)
+                                            .size(px(11.0))
+                                            .text_color(cx.theme().muted_foreground.opacity(0.6)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_size(px(12.0))
+                                            .child(short_path),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(12.0))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("/ 命令")
+                                    .child("@ 文件")
+                                    .child("⌘K 面板"),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -515,7 +512,8 @@ impl Render for LilaApp {
         let is_readonly_sub = parent_id.is_some();
         let conn = store.connection;
         let conn_detail = store.connection_detail.clone();
-        let muted_icon = cx.theme().muted_foreground;
+        let demo_mode = store.demo_mode;
+        let muted_icon = cx.theme().foreground.opacity(0.85);
 
         let st_pal = self.store.clone();
         let open_palette: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
@@ -542,26 +540,29 @@ impl Render for LilaApp {
             })
             .unwrap_or_default();
 
-        // Full-bleed workspace top bar aligned flush with the sidebar top bar.
-        let workspace_bar = window_drag_bar("workspace-top-bar", window, cx)
-            .when(!sidebar_open, |el| el.pl(px(TRAFFIC_LIGHT_INSET)))
-            .when(sidebar_open, |el| el.pl_4())
-            .pr_3()
-            .justify_between()
+        let workspace_bar = window_drag_bar("workspace-top-bar", WORKSPACE_BAR_HEIGHT, window, cx)
+            .pl(px(if sidebar_open {
+                12.0
+            } else {
+                WORKSPACE_TRAFFIC_LIGHT_INSET
+            }))
+            .pr(px(10.0))
             .when(has_session, |el| {
                 el.border_b_1().border_color(theme_setup::hairline(cx))
             })
+            .justify_between()
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
                     .items_center()
-                    .gap_2()
+                    .gap(px(8.0))
                     .when(!sidebar_open, |el| {
                         el.child(
                             Button::new("ws-open-sb")
                                 .ghost()
                                 .xsmall()
+                                .rounded(px(theme_setup::RADIUS_SM))
                                 .icon(Icon::new(IconName::PanelLeft).text_color(muted_icon))
                                 .tooltip("展开侧边栏 (⌘B)")
                                 .on_click(move |_, _, cx| {
@@ -572,8 +573,9 @@ impl Render for LilaApp {
                             Button::new("ws-new-session")
                                 .ghost()
                                 .xsmall()
+                                .rounded(px(theme_setup::RADIUS_SM))
                                 .icon(Icon::new(IconName::Plus).text_color(muted_icon))
-                                .tooltip("新建对话 (⌘N)")
+                                .tooltip("新建会话 (⌘N)")
                                 .on_click(move |_, _, cx| {
                                     st_new.update(cx, |s, cx| s.start_new(None, cx));
                                 }),
@@ -584,6 +586,7 @@ impl Render for LilaApp {
                             Button::new("ws-back-parent")
                                 .ghost()
                                 .xsmall()
+                                .rounded(px(theme_setup::RADIUS_SM))
                                 .icon(Icon::new(IconName::ArrowLeft).text_color(muted_icon))
                                 .tooltip("返回父会话")
                                 .on_click(move |_, _, cx| {
@@ -595,19 +598,10 @@ impl Render for LilaApp {
                     })
                     .when(has_session, |el| {
                         el.child(
-                            Icon::new(if is_readonly_sub {
-                                IconName::Bot
-                            } else {
-                                IconName::SquareTerminal
-                            })
-                            .size(px(13.0))
-                            .text_color(muted_icon.opacity(0.8)),
-                        )
-                        .child(
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(12.5))
+                                .text_size(px(14.0))
                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                                 .text_color(cx.theme().foreground)
                                 .child(title_text),
@@ -615,11 +609,16 @@ impl Render for LilaApp {
                         .when_some(active_project_name, |el, pname| {
                             el.child(
                                 div()
-                                    .flex_shrink_0()
-                                    .text_size(px(11.5))
-                                    .text_color(cx.theme().muted_foreground.opacity(0.65))
+                                    .max_w(px(140.0))
+                                    .truncate()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(12.0))
+                                    .text_color(cx.theme().muted_foreground)
                                     .child(pname),
                             )
+                        })
+                        .when(is_readonly_sub, |el| {
+                            el.child(pill_badge("只读子会话", BadgeTone::Muted, cx))
                         })
                     }),
             )
@@ -628,6 +627,9 @@ impl Render for LilaApp {
                     .flex_shrink_0()
                     .items_center()
                     .gap(px(2.0))
+                    .when(demo_mode, |el| {
+                        el.child(pill_badge("演示模式", BadgeTone::Amber, cx))
+                    })
                     .when_some(
                         selected_id.clone().filter(|_| !is_readonly_sub),
                         |el, sid| {
@@ -635,10 +637,12 @@ impl Render for LilaApp {
                                 Button::new("ws-reload")
                                     .ghost()
                                     .xsmall()
+                                    .rounded(px(theme_setup::RADIUS_SM))
+                                    .disabled(conn != ConnectionState::Connected)
                                     .icon(
                                         Icon::new(IconName::RefreshCw)
                                             .size(px(13.0))
-                                            .text_color(muted_icon.opacity(0.75)),
+                                            .text_color(muted_icon.opacity(0.8)),
                                     )
                                     .tooltip("重新加载技能与 MCP")
                                     .on_click(move |_, _, cx| {
@@ -653,10 +657,11 @@ impl Render for LilaApp {
                             Button::new("ws-palette")
                                 .ghost()
                                 .xsmall()
+                                .rounded(px(theme_setup::RADIUS_SM))
                                 .icon(
                                     Icon::new(IconName::Search)
                                         .size(px(13.0))
-                                        .text_color(muted_icon.opacity(0.75)),
+                                        .text_color(muted_icon.opacity(0.8)),
                                 )
                                 .tooltip("搜索与命令 (⌘K)")
                                 .on_click(move |_, window, cx| {
@@ -668,36 +673,71 @@ impl Render for LilaApp {
 
         let conn_banner = (conn != ConnectionState::Connected).then(|| {
             let label = match conn {
-                ConnectionState::Connecting => "正在连接 core…",
-                ConnectionState::Disconnected => "与 core 断开连接，正在重连…",
-                ConnectionState::Incompatible => "core 协议版本不兼容",
+                ConnectionState::Connecting => "正在连接 Lila 服务…",
+                ConnectionState::Disconnected => "连接中断，正在重连…",
+                ConnectionState::Incompatible => "Lila 服务版本不兼容",
                 ConnectionState::Connected => "",
             };
-            h_flex()
-                .w_full()
-                .px_4()
-                .py(px(5.0))
-                .bg(theme_setup::subtle_surface_bg(cx))
-                .border_b_1()
-                .border_color(theme_setup::hairline(cx))
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .text_color(cx.theme().foreground)
-                        .child(label),
-                )
-                .when_some(conn_detail, |el, d| {
-                    el.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .truncate()
-                            .child(d),
+            let st_retry = self.store.clone();
+            let st_log = self.store.clone();
+            div().px_3().pt_3().child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(theme_setup::RADIUS_MD))
+                    .border_1()
+                    .border_color(theme_setup::attention_border(cx))
+                    .bg(theme_setup::attention_bg(cx))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_x_2()
+                            .child(div().text_sm().child(label))
+                            .when_some(conn_detail, |el, detail| {
+                                el.child(
+                                    div()
+                                        .min_w_0()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_size(px(12.0))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(detail),
+                                )
+                            }),
                     )
-                })
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                Button::new("conn-retry")
+                                    .ghost()
+                                    .xsmall()
+                                    .rounded(px(theme_setup::RADIUS_SM))
+                                    .label("立即重试")
+                                    .on_click(move |_, _, cx| {
+                                        st_retry.read(cx).reconnect_now();
+                                    }),
+                            )
+                            .child(
+                                Button::new("conn-log")
+                                    .ghost()
+                                    .xsmall()
+                                    .rounded(px(theme_setup::RADIUS_SM))
+                                    .label("查看日志")
+                                    .on_click(move |_, _, cx| {
+                                        st_log.update(cx, |s, cx| s.open_core_log(cx));
+                                    }),
+                            ),
+                    ),
+            )
         });
 
         let workspace_content = if let Some(sid) = selected_id.clone() {
@@ -717,20 +757,20 @@ impl Render for LilaApp {
                         .w_full()
                         .items_center()
                         .px_6()
-                        .pb_4()
-                        .pt_2()
+                        .pb(px(14.0))
+                        .pt(px(8.0))
                         .child(
                             v_flex()
                                 .w_full()
-                                .max_w(px(760.0))
-                                .gap_2()
+                                .max_w(px(theme_setup::CONTENT_MAX_W))
+                                .gap(px(8.0))
                                 .child(self.pending.clone())
                                 .child(if is_readonly_sub {
                                     h_flex()
                                         .w_full()
                                         .px_4()
-                                        .py_3()
-                                        .rounded_2xl()
+                                        .py(px(10.0))
+                                        .rounded(px(theme_setup::RADIUS_LG))
                                         .border_1()
                                         .border_color(theme_setup::composer_border(cx))
                                         .bg(theme_setup::composer_bg(cx))
@@ -740,15 +780,13 @@ impl Render for LilaApp {
                                             div()
                                                 .text_xs()
                                                 .text_color(cx.theme().muted_foreground)
-                                                .child(
-                                                    "子代理会话为只读视图，可派生成独立会话继续对话。",
-                                                ),
+                                                .child("可从此子会话创建独立会话，继续对话。"),
                                         )
                                         .child(
                                             Button::new("fork-subsession")
                                                 .primary()
                                                 .xsmall()
-                                                .rounded(px(999.0))
+                                                .rounded(px(theme_setup::RADIUS_SM))
                                                 .label("继续对话")
                                                 .on_click(move |_, _, cx| {
                                                     st_fork.update(cx, |s, cx| {
@@ -767,10 +805,87 @@ impl Render for LilaApp {
             self.render_new_session_center(cx).into_any_element()
         };
 
+        let resizing = self.sidebar_resizing;
+        let resize_sash = sidebar_open.then(|| {
+            div()
+                .id("sidebar-resize-sash")
+                .w(px(SHELL_INSET))
+                .h_full()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_col_resize()
+                .group("sash-grp")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.sidebar_resizing = true;
+                        cx.notify();
+                    }),
+                )
+                .on_double_click(cx.listener(|this, _, _, cx| {
+                    this.sidebar_resizing = false;
+                    this.store.update(cx, |s, cx| {
+                        s.set_sidebar_width(theme_setup::SIDEBAR_DEFAULT_W, true, cx);
+                    });
+                }))
+                .child(
+                    div()
+                        .w(px(2.0))
+                        .h(px(36.0))
+                        .rounded_full()
+                        .when(resizing, |el| el.bg(theme_setup::accent_ember(cx)))
+                        .when(!resizing, |el| {
+                            el.opacity(0.0)
+                                .bg(theme_setup::hairline(cx))
+                                .group_hover("sash-grp", |s| s.opacity(1.0))
+                        }),
+                )
+        });
+
         h_flex()
             .id("lila-root")
             .track_focus(&self.focus_handle)
             .size_full()
+            .bg(theme_setup::shell_bg(cx))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if !this.sidebar_resizing {
+                    return;
+                }
+                if event.pressed_button != Some(MouseButton::Left) {
+                    this.sidebar_resizing = false;
+                    let cur = this.store.read(cx).sidebar_width;
+                    this.store
+                        .update(cx, |s, cx| s.set_sidebar_width(cur, true, cx));
+                    return;
+                }
+                let next_w = f32::from(event.position.x);
+                this.store
+                    .update(cx, |s, cx| s.set_sidebar_width(next_w, false, cx));
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.sidebar_resizing {
+                        this.sidebar_resizing = false;
+                        let cur = this.store.read(cx).sidebar_width;
+                        this.store
+                            .update(cx, |s, cx| s.set_sidebar_width(cur, true, cx));
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.sidebar_resizing {
+                        this.sidebar_resizing = false;
+                        let cur = this.store.read(cx).sidebar_width;
+                        this.store
+                            .update(cx, |s, cx| s.set_sidebar_width(cur, true, cx));
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &NewSession, _, cx| {
                 this.store.update(cx, |s, cx| s.start_new(None, cx));
             }))
@@ -780,17 +895,45 @@ impl Render for LilaApp {
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 Self::open_command_palette_with_store(this.store.clone(), window, cx);
             }))
-            .when_some(sidebar_el, |el, sb| el.child(sb))
+            .on_action(cx.listener(|this, _: &AbortRun, _, cx| {
+                let sid = {
+                    let st = this.store.read(cx);
+                    if st.is_busy() {
+                        st.selected_id.clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(sid) = sid {
+                    this.store.update(cx, |s, cx| s.abort(sid, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PrevSession, _, cx| {
+                this.store
+                    .update(cx, |s, cx| s.select_adjacent_session(-1, cx));
+            }))
+            .on_action(cx.listener(|this, _: &NextSession, _, cx| {
+                this.store
+                    .update(cx, |s, cx| s.select_adjacent_session(1, cx));
+            }))
+            .when_some(sidebar_el, |el, sidebar| el.child(sidebar))
+            .when_some(resize_sash, |el, sash| el.child(sash))
             .child(
                 v_flex()
                     .flex_1()
                     .h_full()
                     .min_w_0()
-                    .bg(theme_setup::workspace_bg(cx))
-                    .overflow_hidden()
-                    .child(workspace_bar)
-                    .when_some(conn_banner, |el, b| el.child(b))
-                    .child(workspace_content),
+                    .py(px(SHELL_INSET))
+                    .pr(px(SHELL_INSET))
+                    .when(!sidebar_open, |el| el.pl(px(SHELL_INSET)))
+                    .child(
+                        workspace_card(cx)
+                            .flex_1()
+                            .min_h_0()
+                            .child(workspace_bar)
+                            .when_some(conn_banner, |el, banner| el.child(banner))
+                            .child(workspace_content),
+                    ),
             )
     }
 }

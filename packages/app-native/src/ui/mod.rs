@@ -9,21 +9,41 @@ pub mod theme_setup;
 pub mod transcript;
 
 use gpui_kit::base::InteractiveElementExt as _;
-use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::{
     App, Div, Hsla, InteractiveElement as _, MouseButton, MouseMoveEvent, ParentElement as _,
-    SharedString, Stateful, Styled as _, Window, WindowControlArea, div, px, rgb, rgba,
+    SharedString, Stateful, Styled as _, Window, WindowControlArea, div, px,
 };
 
 use crate::protocol::SessionStatus;
 
-/// Unified top chrome height shared by the full-height sidebar and workspace pane.
-pub const TOP_BAR_HEIGHT: f32 = 38.0;
-/// Left inset reserved for macOS traffic lights (`x = 14`, 3 lights ≈ 52px + breathing room).
+pub const TOP_BAR_HEIGHT: f32 = 44.0;
+pub const WORKSPACE_BAR_HEIGHT: f32 = 38.0;
+pub const SHELL_INSET: f32 = 6.0;
+
+/// Leading space for the native macOS traffic lights when controls sit flush to window left.
 #[cfg(target_os = "macos")]
 pub const TRAFFIC_LIGHT_INSET: f32 = 76.0;
 #[cfg(not(target_os = "macos"))]
-pub const TRAFFIC_LIGHT_INSET: f32 = 12.0;
+pub const TRAFFIC_LIGHT_INSET: f32 = 4.0;
+
+/// Leading space inside the inset workspace card when the sidebar is collapsed.
+#[cfg(target_os = "macos")]
+pub const WORKSPACE_TRAFFIC_LIGHT_INSET: f32 = 72.0;
+#[cfg(not(target_os = "macos"))]
+pub const WORKSPACE_TRAFFIC_LIGHT_INSET: f32 = 10.0;
+
+/// Single elevated workspace paper card with `12px` radius and 1px hairline border.
+pub fn workspace_card(cx: &App) -> Div {
+    v_flex()
+        .w_full()
+        .rounded(px(theme_setup::RADIUS_LG))
+        .border_1()
+        .border_color(theme_setup::card_border(cx))
+        .bg(theme_setup::workspace_bg(cx))
+        .shadow(vec![theme_setup::workspace_shadow(cx)])
+        .overflow_hidden()
+}
 
 #[derive(Default)]
 struct DragRegionState {
@@ -35,6 +55,7 @@ struct DragRegionState {
 /// through without triggering a window move.
 pub fn window_drag_bar(
     id: impl Into<SharedString>,
+    height: f32,
     window: &mut Window,
     cx: &mut App,
 ) -> Stateful<Div> {
@@ -47,7 +68,7 @@ pub fn window_drag_bar(
 
     h_flex()
         .id(key)
-        .h(px(TOP_BAR_HEIGHT))
+        .h(px(height))
         .w_full()
         .flex_shrink_0()
         .items_center()
@@ -101,32 +122,51 @@ pub enum BadgeTone {
 }
 
 pub fn pill_badge(label: impl Into<SharedString>, tone: BadgeTone, cx: &App) -> Div {
-    let dark = cx.theme().is_dark();
+    let tint_alpha = if cx.theme().is_dark() { 0.16 } else { 0.11 };
     let (bg, fg): (Hsla, Hsla) = match tone {
-        BadgeTone::Muted => (theme_setup::subtle_surface_bg(cx), cx.theme().muted_foreground),
-        BadgeTone::Blue => (
-            rgba(0x0a84ff22).into(),
-            if dark { rgb(0x64a8ff).into() } else { rgb(0x0066cc).into() },
-        ),
-        BadgeTone::Amber => (
-            rgba(0xf59e0b22).into(),
-            if dark { rgb(0xfbbf24).into() } else { rgb(0xb45309).into() },
-        ),
-        BadgeTone::Green => (
-            rgba(0x30d15820).into(),
-            if dark { rgb(0x4ade80).into() } else { rgb(0x15803d).into() },
-        ),
-        BadgeTone::Red => (cx.theme().danger.opacity(0.15), cx.theme().danger),
+        BadgeTone::Muted => (theme_setup::chip_bg(cx), cx.theme().muted_foreground),
+        BadgeTone::Blue => {
+            let c = theme_setup::running_fg(cx);
+            (c.opacity(tint_alpha), c)
+        }
+        BadgeTone::Amber => {
+            let c = theme_setup::warning_fg(cx);
+            (c.opacity(tint_alpha), c)
+        }
+        BadgeTone::Green => {
+            let c = theme_setup::success_fg(cx);
+            (c.opacity(tint_alpha), c)
+        }
+        BadgeTone::Red => {
+            let c = theme_setup::danger_fg(cx);
+            (c.opacity(tint_alpha), c)
+        }
     };
 
     div()
-        .px(px(7.0))
+        .px(px(6.0))
         .py(px(1.5))
-        .rounded_full()
+        .rounded(px(theme_setup::RADIUS_SM))
         .bg(bg)
         .text_color(fg)
-        .text_size(px(10.0))
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(px(11.0))
         .font_weight(gpui_kit::FontWeight::MEDIUM)
+        .child(label.into())
+}
+
+/// Monospace keyboard shortcut badge (`⌘K`, `⌘N`) with hairline outline.
+pub fn kbd_chip(label: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(px(theme_setup::RADIUS_SM))
+        .border_1()
+        .border_color(theme_setup::kbd_border(cx))
+        .bg(theme_setup::kbd_bg(cx))
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(px(11.0))
+        .text_color(cx.theme().muted_foreground.opacity(0.85))
         .child(label.into())
 }
 
@@ -134,13 +174,9 @@ pub fn pill_badge(label: impl Into<SharedString>, tone: BadgeTone, cx: &App) -> 
 /// idle sessions stay quiet so the sidebar stays calm.
 pub fn status_dot(status: SessionStatus, cx: &App) -> Option<Div> {
     let color: Hsla = match status {
-        SessionStatus::Running => if cx.theme().is_dark() {
-            rgb(0x64a8ff).into()
-        } else {
-            rgb(0x0071e3).into()
-        },
-        SessionStatus::Waiting => rgb(0xf59e0b).into(),
-        SessionStatus::Error => cx.theme().danger,
+        SessionStatus::Running => theme_setup::running_fg(cx),
+        SessionStatus::Waiting => theme_setup::warning_fg(cx),
+        SessionStatus::Error => theme_setup::danger_fg(cx),
         SessionStatus::Idle => return None,
     };
     Some(div().w(px(6.0)).h(px(6.0)).flex_shrink_0().rounded_full().bg(color))

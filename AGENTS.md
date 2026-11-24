@@ -20,8 +20,9 @@ This is a single-context repository. Read `GLOSSARY.md` and relevant ADRs under 
 ## 编码规则
 
 - 开发前先读 `docs/architecture.md` 和 `docs/plan.md`（从「下一个任务」开始）。
-- 优先考虑社区现成的非常成熟方案, 避免自行实现一套复杂的库或组件
-- 界面优先用 shadcn/ui（Base UI 版本）的现成组件，包括它的 AI 组件，不要自己重写。
+- 优先考虑社区现成的非常成熟方案，避免自行实现一套复杂的库或组件。
+- 桌面端基于 Rust + `gpui-kit`（`packages/app-native`），界面优先复用 `gpui-component` 现成组件，颜色与圆角统一走 `packages/app-native/themes/lila.json` 与 `ui/theme_setup.rs` 语义 Token，禁止在 UI 组件里散落硬编码 `rgb()`/`rgba()`。
+- 视觉与交互规范见根目录 `DESIGN.md`。
 
 ## 提交和推送
 
