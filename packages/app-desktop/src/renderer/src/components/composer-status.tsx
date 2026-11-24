@@ -66,10 +66,15 @@ export function ComposerStatus({ sessionId, state }: { sessionId: string; state:
   const Icon = pending ? (pending.kind === "approval" ? ShieldAlert : MessageCircleQuestion)
     : sessionStatus || active.length ? Spinner : Clock3;
 
+  const activePreview = !sessionStatus && active.length > 0
+    ? active.map((entry) => entry.description?.trim() || entry.type).filter(Boolean).join("、")
+    : undefined;
+
   const summary = (
     <TraceLine className="py-0.5" {...(pending ? { status: "pending" as const } : {})}>
       <TraceIcon><Icon aria-hidden /></TraceIcon>
-      <TraceTitle role="status" className="font-medium">{title}</TraceTitle>
+      <TraceTitle role="status" className="shrink-0 font-medium">{title}</TraceTitle>
+      {activePreview ? <TraceDescription className="min-w-0 shrink truncate text-xs">{activePreview}</TraceDescription> : null}
       {sessionStatus && active.length > 0 ? <TraceDescription className="text-xs">{active.length} 个子 Agent</TraceDescription> : null}
       {queued > 0 ? <TraceDescription className="text-xs">{queued} 条待发送</TraceDescription> : null}
     </TraceLine>

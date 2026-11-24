@@ -1,11 +1,10 @@
 import * as React from "react";
-import { ArrowDown, ArrowLeft, Blocks, ChevronUp, GitBranch, RotateCw, Search } from "lucide-react";
-import type { GitStatus, SessionState, TranscriptItem, TranscriptSearchMatch } from "@lila/protocol";
+import { ArrowDown, ArrowLeft, Blocks, ChevronUp, FolderTree, GitBranch, RotateCw, Search } from "lucide-react";
+import type { SessionState, TranscriptItem, TranscriptSearchMatch } from "@lila/protocol";
 import { ComposerStatus } from "@/components/composer-status";
 import { ConversationSearch } from "@/components/conversation-search";
-import { ReplyChangesSheet, type ChangeSelection } from "@/components/reply-changes";
+import type { ChangeSelection } from "@/components/reply-changes";
 import { Composer } from "@/components/composer";
-import { GitSheet } from "@/components/git-sheet";
 import { MarkdownBasePathProvider } from "@/components/markdown";
 import { PendingPanel } from "@/components/pending-panel";
 import { ResourcesSheet } from "@/components/resources-sheet";
@@ -28,6 +27,7 @@ import {
 } from "@/components/ui/message-scroller";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
+import { Trace, TraceIcon, TraceLine, TraceTitle } from "@/components/ui/trace";
 import { cn } from "cn";
 import { layoutTranscript } from "@/lib/transcript-layout";
 import { actions, EMPTY_VIEW, useLila } from "@/lib/store";
@@ -47,14 +47,12 @@ const BLOCKING_OVERLAY_SELECTOR = [
 function SessionToolbar({
   sessionId,
   gitChanges,
-  onGit,
   onResources,
   onSearch,
   readOnly,
 }: {
   sessionId: string;
   gitChanges?: number | undefined;
-  onGit: () => void;
   onResources: () => void;
   onSearch: () => void;
   readOnly: boolean;
@@ -62,6 +60,7 @@ function SessionToolbar({
   const session = useLila((store) => store.sessions[sessionId]);
   const parentSession = useLila((store) => (session?.parentId ? store.sessions[session.parentId] : undefined));
   const project = useLila((store) => store.projects.find((item) => item.id === session?.projectId));
+  const rightPanel = useLila((store) => store.rightPanel);
   const { open, isMobile } = useSidebar();
   const [editing, setEditing] = React.useState(false);
   const [title, setTitle] = React.useState(session?.title ?? "");
@@ -103,7 +102,7 @@ function SessionToolbar({
   const showTrigger = !open || isMobile;
 
   return (
-    <header className={cn("flex h-10 shrink-0 items-center gap-2 border-b border-border/60 px-4 [-webkit-app-region:drag]", showTrigger && "pl-[74px]")}>
+    <header className={cn("flex h-11 shrink-0 items-center gap-2 border-b border-border/60 px-4 [-webkit-app-region:drag]", showTrigger && "pl-[74px]")}>
       {showTrigger ? <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" /> : null}
       {parentSession ? (
         <Button
@@ -156,20 +155,44 @@ function SessionToolbar({
         <Search />
       </Button>
       {project ? (
-        <Button variant="ghost" size="sm" className="font-normal text-muted-foreground [-webkit-app-region:no-drag]" onClick={onGit}>
-          <GitBranch />
-          改动
-          {gitChanges ? (
-            <Badge variant="secondary" className="h-4 min-w-4 px-1 font-mono text-[11px] tabular-nums">
-              {gitChanges}
-            </Badge>
-          ) : null}
-        </Button>
+        <>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label="项目文件"
+            title="项目文件（⌘E）"
+            aria-pressed={rightPanel === "files"}
+            className={cn("font-normal text-muted-foreground [-webkit-app-region:no-drag]", rightPanel === "files" && "bg-accent text-foreground")}
+            onClick={() => actions.toggleRightPanel("files")}
+          >
+            <FolderTree />
+            <span className="hidden @min-[30rem]:inline">文件</span>
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label="工作区改动"
+            title="工作区改动（⇧⌘G）"
+            aria-pressed={rightPanel === "changes"}
+            className={cn("font-normal text-muted-foreground [-webkit-app-region:no-drag]", rightPanel === "changes" && "bg-accent text-foreground")}
+            onClick={() => actions.toggleRightPanel("changes")}
+          >
+            <GitBranch />
+            <span className="hidden @min-[30rem]:inline">改动</span>
+            {gitChanges ? (
+              <Badge variant="secondary" className="h-4 min-w-4 px-1 font-mono text-[11px] tabular-nums">
+                {gitChanges}
+              </Badge>
+            ) : null}
+          </Button>
+        </>
       ) : null}
       {!readOnly ? (
-        <Button variant="ghost" size="sm" className="font-normal text-muted-foreground [-webkit-app-region:no-drag]" onClick={onResources}>
+        <Button variant="ghost" size="sm" aria-label="能力面板" title="能力面板（技能 / MCP / 扩展）" className="font-normal text-muted-foreground [-webkit-app-region:no-drag]" onClick={onResources}>
           <Blocks />
-          能力
+          <span className="hidden @min-[30rem]:inline">能力</span>
         </Button>
       ) : null}
     </header>
@@ -228,10 +251,11 @@ function revealSearchMatch(target: HTMLElement, query: string): void {
 
 type TranscriptTarget = { id: string; query: string; version: number };
 
-function TranscriptNavigation({ viewportRef, target, scrollToLatest }: {
+function TranscriptNavigation({ viewportRef, target, scrollToLatest, scrollEndSeq }: {
   viewportRef: React.RefObject<HTMLDivElement | null>;
   target: TranscriptTarget | undefined;
   scrollToLatest: React.RefObject<boolean>;
+  scrollEndSeq: number;
 }) {
   const { scrollToEnd, scrollToMessage } = useMessageScroller();
 
@@ -257,6 +281,14 @@ function TranscriptNavigation({ viewportRef, target, scrollToLatest }: {
     };
   }, [scrollToEnd, scrollToLatest, scrollToMessage, target, viewportRef]);
 
+  React.useEffect(() => {
+    if (!scrollEndSeq) return;
+    const frame = requestAnimationFrame(() => {
+      scrollToEnd({ behavior: "auto" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [scrollEndSeq, scrollToEnd]);
+
   return null;
 }
 
@@ -266,8 +298,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
   const projectPath = useLila((store) => store.projects.find((item) => item.id === projectId)?.path);
   const connected = useLila((store) => store.connection === "connected");
   const resourcesOpen = useLila((store) => store.resourcesOpen);
-  const gitOpen = useLila((store) => store.gitOpen);
-  const [gitChanges, setGitChanges] = React.useState<number | undefined>();
+  const gitChanges = useLila((store) => (projectId ? store.gitChangeCounts[projectId] : undefined));
   const [abortArmed, setAbortArmed] = React.useState(false);
   const state = view.state;
   const child = useLila((store) => store.sessions[sessionId]?.readOnly === true);
@@ -280,9 +311,13 @@ export function Conversation({ sessionId }: { sessionId: string }) {
   const prevGitWorkActive = React.useRef(gitWorkActive);
   const [searchOpen, setSearchOpen] = React.useState(false);
   const [searchFocus, setSearchFocus] = React.useState(0);
+  const [scrollEndSeq, setScrollEndSeq] = React.useState(0);
   const [transcriptTarget, setTranscriptTarget] = React.useState<TranscriptTarget>();
   const [history, setHistory] = React.useState<TranscriptItem[]>();
-  const [review, setReview] = React.useState<ChangeSelection>();
+  const handleReview = React.useCallback(
+    (selection: ChangeSelection) => actions.openReplyReview(sessionId, selection.changes, selection.path),
+    [sessionId],
+  );
   const latestItem = view.items.at(-1);
   const replyVisible = latestItem?.kind === "assistant" && latestItem.streaming && Boolean(latestItem.text || latestItem.thinking);
   const toolRunning = latestItem?.kind === "tool" && latestItem.status === "running";
@@ -297,26 +332,24 @@ export function Conversation({ sessionId }: { sessionId: string }) {
   const initialScrollTopRef = React.useRef<number | undefined>(actions.getScrollTop(sessionId));
   const restoredScrollRef = React.useRef(false);
 
-  const handleGitStatusLoaded = React.useCallback((status: GitStatus) => {
-    setGitChanges(status.isRepo ? status.files.length : undefined);
-  }, []);
-
   const refreshGitCount = React.useCallback(() => {
     if (!projectId || !connected) return;
     void actions
       .gitStatus(projectId)
-      .then((status) => setGitChanges(status.isRepo ? status.files.length : undefined))
+      .then((status) => actions.setGitChangeCount(projectId, status.isRepo ? status.files.length : undefined))
       .catch(() => {});
   }, [projectId, connected]);
 
   React.useEffect(() => {
-    setGitChanges(undefined);
     refreshGitCount();
   }, [refreshGitCount]);
 
   React.useEffect(() => {
     // The background agents can keep changing files after the parent Run.
-    if (prevGitWorkActive.current && !gitWorkActive) refreshGitCount();
+    if (prevGitWorkActive.current && !gitWorkActive) {
+      refreshGitCount();
+      actions.bumpWorkspaceRefresh();
+    }
     prevGitWorkActive.current = gitWorkActive;
   }, [gitWorkActive, refreshGitCount]);
 
@@ -343,7 +376,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.isComposing || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
       const store = useLila.getState();
-      if (store.paletteOpen || store.resourcesOpen || store.gitOpen) return;
+      if (store.paletteOpen || store.resourcesOpen) return;
       if (document.querySelector(BLOCKING_OVERLAY_SELECTOR)) return;
       event.preventDefault();
       if (abortArmedRef.current) {
@@ -373,12 +406,17 @@ export function Conversation({ sessionId }: { sessionId: string }) {
     }
   }, [loaded]);
 
-  // Save current scrollTop before leaving this session.
+  // Save current scrollTop before leaving this session; clear it when already at the bottom so revisiting resumes auto-scroll.
   React.useEffect(() => {
     const viewport = viewportRef;
     return () => {
-      const current = viewport.current?.scrollTop ?? scrollTopRef.current;
-      if (current !== undefined) actions.setScrollTop(sessionId, current);
+      const node = viewport.current;
+      if (node) {
+        const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight <= 24;
+        actions.setScrollTop(sessionId, atBottom ? undefined : node.scrollTop);
+      } else if (scrollTopRef.current !== undefined) {
+        actions.setScrollTop(sessionId, scrollTopRef.current);
+      }
     };
   }, [sessionId]);
 
@@ -446,7 +484,6 @@ export function Conversation({ sessionId }: { sessionId: string }) {
         <SessionToolbar
           sessionId={sessionId}
           gitChanges={gitChanges}
-          onGit={() => actions.setGitOpen(true)}
           onResources={() => actions.setResourcesOpen(true)}
           onSearch={openSearch}
           readOnly={readOnly}
@@ -455,7 +492,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
           <ConversationSearch sessionId={sessionId} connected={connected} onHit={showSearchHit} onClear={clearSearchHit} onClose={closeSearch} focusRequest={searchFocus} />
         ) : null}
         {history ? (
-          <div className="mx-auto flex w-full max-w-3xl items-center justify-between px-5 py-1 text-xs text-muted-foreground">
+          <div className="mx-auto flex w-full max-w-[46rem] items-center justify-between px-6 py-1 text-xs text-muted-foreground">
             历史消息
             <Button type="button" variant="ghost" size="xs" onClick={closeSearch}><ArrowDown />返回最新</Button>
           </div>
@@ -496,17 +533,21 @@ export function Conversation({ sessionId }: { sessionId: string }) {
             key={history ? "history" : sessionId}
             autoScroll={!transcriptTarget?.query && !history}
             defaultScrollPosition={history || initialScrollTopRef.current !== undefined ? "start" : "end"}
+            scrollEdgeThreshold={24}
             scrollPreviousItemPeek={48}
           >
-            <TranscriptNavigation viewportRef={viewportRef} target={transcriptTarget} scrollToLatest={scrollToLatest} />
+            <TranscriptNavigation viewportRef={viewportRef} target={transcriptTarget} scrollToLatest={scrollToLatest} scrollEndSeq={scrollEndSeq} />
             <MessageScroller className="@container min-h-0 flex-1">
               <MessageScrollerViewport
                 ref={viewportRef}
                 onScroll={(event) => {
-                  if (!history) scrollTopRef.current = event.currentTarget.scrollTop;
+                  if (history) return;
+                  const node = event.currentTarget;
+                  const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight <= 24;
+                  scrollTopRef.current = atBottom ? undefined : node.scrollTop;
                 }}
               >
-                <MessageScrollerContent className={cn("mx-auto w-full max-w-3xl gap-2.5 px-5 pt-4 pb-7", hasTurnRail && "ps-10 @min-[52rem]:ps-5")}>
+                <MessageScrollerContent className={cn("mx-auto w-full max-w-[46rem] gap-3 px-6 pt-5 pb-10", hasTurnRail && "ps-11 @min-[52rem]:ps-6")}>
                   {ready && !state.pending.length && !view.error && view.items.length === 0 ? (
                     <MessageScrollerItem messageId="empty">
                       <Empty className="py-24">
@@ -530,24 +571,28 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                   <TranscriptBlocks blocks={renderBlocks} sessionId={sessionId}
                     revealId={transcriptTarget?.query ? transcriptTarget.id : undefined}
                     running={!ready || running || state.compacting}
-                    onReview={setReview}
+                    onReview={handleReview}
                   />
                   {showResponseStatus ? (
                     <MessageScrollerItem messageId="response-status">
-                      <p role="status" className="flex items-center gap-2 py-1 text-sm text-muted-foreground">
-                        <Spinner aria-hidden className="size-3.5 shrink-0" />
-                        正在响应…
-                      </p>
+                      <Trace className="py-1">
+                        <TraceLine status="running" className="text-[13px]">
+                          <TraceIcon>
+                            <Spinner aria-hidden className="size-3.5" />
+                          </TraceIcon>
+                          <TraceTitle role="status">正在思考…</TraceTitle>
+                        </TraceLine>
+                      </Trace>
                     </MessageScrollerItem>
                   ) : null}
                 </MessageScrollerContent>
               </MessageScrollerViewport>
-              {hasTurnRail ? <TurnRail items={visibleItems} onJump={jumpToItem} /> : null}
+              {hasTurnRail ? <TurnRail items={visibleItems} blocks={renderBlocks} onJump={jumpToItem} /> : null}
               {!history ? <MessageScrollerButton /> : null}
             </MessageScroller>
           </MessageScrollerProvider>
         )}
-        <div className="mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-1.5 px-5 pb-4">
+        <div className="mx-auto flex w-full max-w-[46rem] shrink-0 flex-col gap-1.5 px-6 pt-1 pb-4">
           {state && !readOnly ? <ComposerStatus sessionId={sessionId} state={state} /> : null}
           {state ? <PendingPanel sessionId={sessionId} pending={state.pending} /> : null}
           {state?.access === "failed" ? (
@@ -567,7 +612,10 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                 sendDisabled={!ready || state.compacting}
                 abortArmed={abortArmed}
                 placeholder={running ? "补充说明会在当前工具结束后送达… 双击 Esc 停止" : "继续对话，/ 使用命令和技能，@ 引用文件"}
-                onSubmit={(mode) => actions.sendDraft(sessionId, mode)}
+                onSubmit={(mode) => {
+                  setScrollEndSeq((current) => current + 1);
+                  return actions.sendDraft(sessionId, mode);
+                }}
                 onAbort={canStop ? handleAbort : undefined}
                 footer={ready ? <SessionControls sessionId={sessionId} state={state} /> : null}
                 trailing={ready ? <ContextUsage sessionId={sessionId} state={state} /> : null}
@@ -576,14 +624,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
           )}
           {state ? <StatusLines lines={state.statusLines} /> : null}
         </div>
-        <ReplyChangesSheet sessionId={sessionId} selection={review} onChange={setReview} />
         <ResourcesSheet sessionId={sessionId} open={resourcesOpen} onOpenChange={actions.setResourcesOpen} />
-        <GitSheet
-          projectId={projectId}
-          open={gitOpen}
-          onOpenChange={actions.setGitOpen}
-          onStatusLoaded={handleGitStatusLoaded}
-        />
       </div>
     </MarkdownBasePathProvider>
   );

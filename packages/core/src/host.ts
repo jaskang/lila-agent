@@ -1,11 +1,11 @@
 import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai/compat";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { copyFileSync, existsSync, mkdirSync, realpathSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { open, readdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import {
   type AgentSessionServices,
@@ -18,7 +18,7 @@ import {
   type LoadExtensionsResult,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import type { ApprovalMode, GitFileDiff, GitStatus, ModelInfo, Project, SessionSummary, ThinkingLevel } from "@lila/protocol";
+import type { ApprovalMode, GitFileDiff, GitStatus, ModelInfo, Project, ProjectFileContent, SessionSummary, ThinkingLevel } from "@lila/protocol";
 import fuzzysort from "fuzzysort";
 import { UserError } from "./errors.ts";
 import { gitDiff as readGitDiff, gitStatus as readGitStatus } from "./git.ts";
@@ -31,6 +31,9 @@ const IDLE_DISPOSE_MS = 15 * 60_000;
 const SWEEP_INTERVAL_MS = 60_000;
 const SUBSESSION_REFRESH_MS = 750;
 const WALK_LIMIT = 20_000;
+const TREE_FILE_LIMIT = 3_000;
+const FILE_PREVIEW_MAX_BYTES = 512 * 1024;
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico"]);
 const WALK_SKIP: Record<string, true> = { node_modules: true, ".git": true };
 const FILE_CACHE_TTL_MS = 8_000;
 const MAX_FILE_CACHE_ENTRIES = 32;
@@ -664,6 +667,20 @@ export class SessionHost {
     return fuzzysort.go(query.trim(), files, { limit }).map((result) => result.target);
   }
 
+  async listProjectFiles(projectId: string, refresh = false): Promise<{ files: string[]; truncated: boolean }> {
+    const project = this.#project(projectId);
+    const files = await listFiles(project.path, refresh);
+    return {
+      files: files.slice(0, TREE_FILE_LIMIT),
+      truncated: files.length > TREE_FILE_LIMIT,
+    };
+  }
+
+  async readProjectFile(projectId: string, rawPath: string): Promise<ProjectFileContent> {
+    const project = this.#project(projectId);
+    return await readPreviewFile(project.path, rawPath);
+  }
+
   async gitStatus(projectId: string): Promise<GitStatus> {
     return readGitStatus(this.#project(projectId).path);
   }
@@ -673,16 +690,91 @@ export class SessionHost {
   }
 }
 
+function resolveRealOrAbs(target: string): string {
+  try {
+    return realpathSync(target);
+  } catch {
+    return resolve(target);
+  }
+}
+
+function isWithinDir(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+async function readPreviewFile(projectRoot: string, rawPath: string): Promise<ProjectFileContent> {
+  const candidate = isAbsolute(rawPath) ? resolve(rawPath) : resolve(projectRoot, rawPath);
+  if (!existsSync(candidate)) throw new UserError(`找不到文件：${rawPath}`);
+
+  let realTarget: string;
+  try {
+    realTarget = realpathSync(candidate);
+  } catch {
+    throw new UserError(`无法访问文件：${rawPath}`);
+  }
+
+  const realProject = resolveRealOrAbs(projectRoot);
+  const realAgent = resolveRealOrAbs(getAgentDir());
+  const inProject = isWithinDir(realProject, realTarget);
+  const inAgent = isWithinDir(realAgent, realTarget);
+  if (!inProject && !inAgent) {
+    throw new UserError(`不允许读取项目目录之外的文件：${rawPath}`);
+  }
+
+  const info = statSync(realTarget);
+  if (!info.isFile()) throw new UserError(`只能预览文件，无法打开目录：${rawPath}`);
+
+  const displayPath = inProject ? relative(realProject, realTarget).split(sep).join("/") : realTarget;
+  const ext = extname(realTarget).toLowerCase();
+  if (IMAGE_EXTS.has(ext)) {
+    return {
+      path: displayPath,
+      fullPath: realTarget,
+      size: info.size,
+      isBinary: true,
+      isImage: true,
+      truncated: false,
+      content: "",
+    };
+  }
+
+  const handle = await open(realTarget, "r");
+  try {
+    const readSize = Math.min(info.size, FILE_PREVIEW_MAX_BYTES);
+    const buffer = Buffer.allocUnsafe(readSize);
+    const { bytesRead } = await handle.read(buffer, 0, readSize, 0);
+    const slice = buffer.subarray(0, bytesRead);
+    const probe = slice.subarray(0, Math.min(slice.length, 8_192));
+    const isBinary = probe.includes(0);
+    return {
+      path: displayPath,
+      fullPath: realTarget,
+      size: info.size,
+      isBinary,
+      isImage: false,
+      truncated: info.size > FILE_PREVIEW_MAX_BYTES,
+      content: isBinary ? "" : slice.toString("utf8"),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
 /** Project files relative to its root: git's view when it is a repository, otherwise a bounded walk. */
-async function listFiles(root: string): Promise<string[]> {
+async function listFiles(root: string, refresh = false): Promise<string[]> {
   const now = Date.now();
-  const cached = fileListCache.get(root);
+  const cached = !refresh ? fileListCache.get(root) : undefined;
   if (cached && now < cached.expiresAt) return cached.files;
 
   let files: string[];
   try {
-    const { stdout } = await execFileAsync("git", ["ls-files", "--cached", "--others", "--exclude-standard"], { cwd: root, maxBuffer: 64 * 1024 * 1024 });
-    files = stdout.split("\n").filter(Boolean);
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-c", "core.quotepath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+      { cwd: root, maxBuffer: 64 * 1024 * 1024 },
+    );
+    files = stdout.split("\0").filter(Boolean);
   } catch {
     files = [];
     const queue = [root];

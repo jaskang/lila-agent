@@ -1,13 +1,11 @@
 import * as React from "react";
 import {
-  Bot,
   ChevronDown,
   ChevronRight,
   CircleAlert,
   FolderOpen,
   FolderPlus,
   MessageCircleQuestion,
-  Monitor,
   Moon,
   MoreHorizontal,
   Pencil,
@@ -30,15 +28,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Kbd } from "@/components/ui/kbd";
 import {
@@ -55,16 +45,12 @@ import {
   SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
-  SidebarMenuSub,
-  SidebarMenuSubButton,
-  SidebarMenuSubItem,
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
-import { cn } from "cn";
 import { actions, useLila } from "@/lib/store";
-import { type ThemeMode, useTheme } from "@/lib/theme";
+import { useTheme } from "@/lib/theme";
 
 const RELATIVE = new Intl.RelativeTimeFormat("zh-CN", { numeric: "auto" });
 const COLLAPSED_KEY = "lila.collapsedProjects";
@@ -102,68 +88,23 @@ function StatusIcon({ status }: { status: SessionSummary["status"] }) {
   return null;
 }
 
-/** Sub-agent sessions under a parent: active or selected show always; completed history shows on demand. */
-function SubSessions({
-  sessions,
-  selectedId,
-  showHistory,
-  onSelectSession,
-}: {
-  sessions: SessionSummary[];
-  selectedId: string | undefined;
-  showHistory: boolean;
-  onSelectSession: (sessionId: string) => void;
-}) {
-  const visible = showHistory ? sessions : sessions.filter((session) => session.status !== "idle" || session.id === selectedId);
-  if (!visible.length) return null;
-  return (
-    <SidebarMenuSub>
-      {visible.map((session) => (
-        <SidebarMenuSubItem key={session.id}>
-          <SidebarMenuSubButton
-            size="sm"
-            isActive={session.id === selectedId}
-            className="w-full text-start"
-            render={<button type="button" title={session.title} onClick={() => onSelectSession(session.id)} />}
-          >
-            <Bot />
-            <span className="min-w-0 flex-1 truncate">{session.title}</span>
-            <StatusIcon status={session.status} />
-          </SidebarMenuSubButton>
-        </SidebarMenuSubItem>
-      ))}
-    </SidebarMenuSub>
-  );
-}
-
 function SessionRow({
   session,
   active,
-  subSessions,
-  selectedId,
   now,
   onSelectSession,
 }: {
   session: SessionSummary;
   active: boolean;
-  subSessions?: SessionSummary[] | undefined;
-  selectedId: string | undefined;
   now: number;
   onSelectSession: (sessionId: string) => void;
 }) {
   const [editing, setEditing] = React.useState(false);
   const [confirming, setConfirming] = React.useState(false);
-  const [showHistorySubs, setShowHistorySubs] = React.useState(false);
   const [title, setTitle] = React.useState(session.title);
   const inputRef = React.useRef<HTMLInputElement>(null);
   const savingRef = React.useRef(false);
   const busy = session.status === "running" || session.status === "waiting";
-
-  const hiddenIdleCount = React.useMemo(
-    () => (subSessions ?? []).filter((sub) => sub.status === "idle" && sub.id !== selectedId).length,
-    [subSessions, selectedId],
-  );
-  const hasHistoryToggle = hiddenIdleCount > 0;
 
   const startEditing = () => {
     setTitle(session.title);
@@ -226,58 +167,45 @@ function SessionRow({
 
   return (
     <SidebarMenuItem>
-      <div
-        data-active={active || undefined}
-        className="flex min-w-0 items-center gap-1 rounded-md pe-1 hover:bg-sidebar-accent data-active:bg-sidebar-accent"
+      <SidebarMenuButton
+        isActive={active}
+        onClick={() => onSelectSession(session.id)}
+        className="h-auto py-1.5"
       >
-        <SidebarMenuButton
-          isActive={active}
-          onClick={() => onSelectSession(session.id)}
-          className="h-auto min-w-0 flex-1 py-1.5 group-has-data-[sidebar=menu-action]/menu-item:pr-2"
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate">{session.title || "新会话"}</span>
+          <span className="text-xs text-muted-foreground">{ago(session.updatedAt, now)}</span>
+        </div>
+        <StatusIcon status={session.status} />
+      </SidebarMenuButton>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <SidebarMenuAction
+              showOnHover
+              className="peer-data-[size=default]/menu-button:top-1/2 -translate-y-1/2 data-popup-open:opacity-100"
+              aria-label="更多操作"
+            />
+          }
         >
-          <div className="flex min-w-0 flex-1 flex-col">
-            <span className="truncate">{session.title || "新会话"}</span>
-            <span className="text-xs text-muted-foreground">{ago(session.updatedAt, now)}</span>
-          </div>
-          <StatusIcon status={session.status} />
-        </SidebarMenuButton>
-        {hasHistoryToggle ? (
-          <button
-            type="button"
-            aria-expanded={showHistorySubs}
-            aria-label={showHistorySubs ? "收起历史子会话" : `展开 ${subSessions?.length ?? hiddenIdleCount} 个子会话`}
-            title={showHistorySubs ? "收起历史子会话" : `展开历史子会话（共 ${subSessions?.length ?? hiddenIdleCount} 个）`}
-            onClick={() => setShowHistorySubs((current) => !current)}
-            className={cn(
-              "inline-flex h-5 shrink-0 items-center gap-0.5 rounded px-1 font-mono text-[11px] tabular-nums transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-              showHistorySubs ? "bg-sidebar-accent text-sidebar-accent-foreground" : "text-muted-foreground",
-            )}
-          >
-            <Bot className="size-3" />
-            {subSessions?.length ?? hiddenIdleCount}
-          </button>
-        ) : null}
-        <DropdownMenu>
-          <DropdownMenuTrigger render={<SidebarMenuAction showOnHover className="static shrink-0 after:hidden" aria-label="更多操作" />}>
-            <MoreHorizontal />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" side="right" className="w-36" finalFocus={false}>
-            {!session.readOnly ? (
-              <>
-                <DropdownMenuItem onClick={startEditing}>
-                  <Pencil />
-                  重命名
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-              </>
-            ) : null}
-            <DropdownMenuItem variant="destructive" disabled={busy} onClick={() => setConfirming(true)}>
-              <Trash2 />
-              删除
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
+          <MoreHorizontal />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" side="right" className="w-36" finalFocus={false}>
+          {!session.readOnly ? (
+            <>
+              <DropdownMenuItem onClick={startEditing}>
+                <Pencil />
+                重命名
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          ) : null}
+          <DropdownMenuItem variant="destructive" disabled={busy} onClick={() => setConfirming(true)}>
+            <Trash2 />
+            删除
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
       <AlertDialog open={confirming} onOpenChange={setConfirming}>
         <AlertDialogContent size="sm">
           <AlertDialogHeader>
@@ -298,14 +226,6 @@ function SessionRow({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      {subSessions?.length ? (
-        <SubSessions
-          sessions={subSessions}
-          selectedId={selectedId}
-          showHistory={showHistorySubs}
-          onSelectSession={onSelectSession}
-        />
-      ) : null}
     </SidebarMenuItem>
   );
 }
@@ -314,7 +234,6 @@ function ProjectGroup({
   project,
   list,
   allSessions,
-  childrenByParent,
   selectedId,
   isCollapsed,
   now,
@@ -325,7 +244,6 @@ function ProjectGroup({
   project: Project;
   list: SessionSummary[];
   allSessions: SessionSummary[];
-  childrenByParent: Record<string, SessionSummary[]>;
   selectedId: string | undefined;
   isCollapsed: boolean;
   now: number;
@@ -403,8 +321,6 @@ function ProjectGroup({
                 key={session.id}
                 session={session}
                 active={session.id === selectedId}
-                subSessions={childrenByParent[session.id]}
-                selectedId={selectedId}
                 now={now}
                 onSelectSession={onSelectSession}
               />
@@ -420,7 +336,6 @@ function ProjectGroup({
 export function AppSidebar() {
   const projects = useLila((state) => state.projects);
   const sessions = useLila((state) => state.sessions);
-  const childrenByParent = useLila((state) => state.childrenByParent);
   const selectedId = useLila((state) => state.selectedId);
   const { setOpenMobile } = useSidebar();
   const [collapsed, setCollapsed] = React.useState<Record<string, boolean>>(readCollapsed);
@@ -453,10 +368,9 @@ export function AppSidebar() {
     const groups: Record<string, SessionSummary[]> = {};
     const allByProject: Record<string, SessionSummary[]> = {};
     for (const session of Object.values(sessions)) {
+      if (session.parentId) continue;
       (allByProject[session.projectId] ??= []).push(session);
       if (filter && !(session.title || "新会话").toLowerCase().includes(filter)) continue;
-      // While filtering, matching sub-agent sessions show on their own.
-      if (!filter && session.parentId && sessions[session.parentId]) continue;
       (groups[session.projectId] ??= []).push(session);
     }
     for (const list of Object.values(groups)) list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -472,8 +386,8 @@ export function AppSidebar() {
 
   return (
     <Sidebar variant="inset" className="p-1.5">
-      {/* 6px outer inset + 40px header centers at y = 26px, matching the macOS traffic lights and main card toolbar. */}
-      <SidebarHeader className="mt-1.5 h-10 shrink-0 flex-row items-center gap-1 p-0 pr-1 pl-[74px] [-webkit-app-region:drag] md:mt-0">
+      {/* Matches the macOS traffic lights and main card toolbar height (h-11). */}
+      <SidebarHeader className="mt-1.5 h-11 shrink-0 flex-row items-center gap-1 p-0 pr-1 pl-[74px] [-webkit-app-region:drag] md:mt-0">
         <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" />
       </SidebarHeader>
       <SidebarContent>
@@ -530,7 +444,6 @@ export function AppSidebar() {
               project={project}
               list={list}
               allSessions={byProject.allByProject[project.id] ?? []}
-              childrenByParent={filter ? {} : childrenByParent}
               selectedId={selectedId}
               isCollapsed={isCollapsed}
               now={now}
@@ -559,53 +472,22 @@ export function AppSidebar() {
   );
 }
 
-const THEME_LABELS: Record<ThemeMode, string> = {
-  light: "浅色模式",
-  dark: "暗黑模式",
-  system: "跟随系统",
-};
-
 function ThemeSwitcher() {
-  const { theme, setTheme } = useTheme();
-  const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Monitor;
+  const { resolvedTheme, setTheme } = useTheme();
+  const isDark = resolvedTheme === "dark";
+  const label = isDark ? "切换到浅色模式" : "切换到暗黑模式";
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label={`外观：${THEME_LABELS[theme]}`}
-            title={`外观：${THEME_LABELS[theme]}`}
-            className="shrink-0 text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-          />
-        }
-      >
-        <Icon />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent side="top" align="end" className="w-36" finalFocus={false}>
-        <DropdownMenuRadioGroup
-          value={theme}
-          onValueChange={(value) => {
-            if (value === "light" || value === "dark" || value === "system") setTheme(value);
-          }}
-        >
-          <DropdownMenuRadioItem value="light">
-            <Sun />
-            浅色
-          </DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="dark">
-            <Moon />
-            暗黑
-          </DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="system">
-            <Monitor />
-            跟随系统
-          </DropdownMenuRadioItem>
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-sm"
+      aria-label={label}
+      title={label}
+      onClick={() => setTheme(isDark ? "light" : "dark")}
+      className="shrink-0 text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+    >
+      {isDark ? <Sun /> : <Moon />}
+    </Button>
   );
 }

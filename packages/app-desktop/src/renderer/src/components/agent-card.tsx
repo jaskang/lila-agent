@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Bot, CheckCircle2, ChevronDown, ChevronRight, CircleAlert, PanelRightOpen } from "lucide-react";
+import { Bot, CheckCircle2, CircleAlert, PanelRightOpen } from "lucide-react";
 import type { SessionSummary, SubagentProgress, TranscriptItem } from "@lila/protocol";
 import { Markdown } from "@/components/markdown";
 import { Badge } from "@/components/ui/badge";
@@ -149,22 +149,23 @@ export function SubSessionLink({
     : undefined);
   const previewed = useLila((state) => Boolean(subSessionId && state.previewId === subSessionId));
   if (!subSessionId) return null;
+  const label = previewed ? "关闭右侧预览" : description ? `在右侧查看：${description}` : "在右侧查看";
   return (
     <Button
       type="button"
-      size="xs"
+      size="icon-xs"
       variant="ghost"
-      aria-label={description ? `侧边查看：${description}` : "侧边查看"}
+      title={label}
+      aria-label={label}
       aria-pressed={previewed}
-      className={cn("h-6 shrink-0 px-1.5 text-muted-foreground aria-pressed:bg-accent", className)}
+      className={cn("size-6 shrink-0 text-muted-foreground/70 hover:text-foreground aria-pressed:bg-accent aria-pressed:text-foreground", className)}
       onClick={(event) => {
         event.stopPropagation();
         if (previewed) actions.closePreview();
         else actions.previewSubsession(subSessionId);
       }}
     >
-      侧边查看
-      <PanelRightOpen />
+      <PanelRightOpen className="size-3.5" />
     </Button>
   );
 }
@@ -235,9 +236,8 @@ export function SingleAgentCard({ tool, sessionId, reveal = false }: { tool: Age
 
   const status = info.active ? "running" : info.isError ? "error" : undefined;
   const meta = [
-    info.activity,
-    info.turnCount ? `${info.turnCount} 轮` : undefined,
-    info.toolUses ? `${info.toolUses} 次工具` : undefined,
+    info.type,
+    info.active ? info.activity : info.isError ? "出错" : undefined,
     info.durationText,
   ].filter(Boolean);
 
@@ -250,9 +250,9 @@ export function SingleAgentCard({ tool, sessionId, reveal = false }: { tool: Age
           setOpen(next);
         }}
       >
-        <div className="flex min-w-0 items-center gap-1.5">
-          <TraceCollapsibleTrigger>
-            <TraceLine {...(status ? { status } : {})}>
+        <div className="flex min-w-0 items-center gap-1">
+          <TraceCollapsibleTrigger className="py-0.5">
+            <TraceLine className="text-[13px]" {...(status ? { status } : {})}>
               <TraceIcon>
                 {info.active ? (
                   <Spinner />
@@ -262,9 +262,14 @@ export function SingleAgentCard({ tool, sessionId, reveal = false }: { tool: Age
                   <CheckCircle2 className="text-success-foreground" />
                 )}
               </TraceIcon>
-              <TraceTitle>子 Agent · {info.type}</TraceTitle>
-              {info.description ? <TraceDescription className="max-w-[22rem] shrink truncate font-mono text-xs">{info.description}</TraceDescription> : null}
-              {meta.length ? <TraceDescription className="truncate text-xs tabular-nums">{meta.join(" · ")}</TraceDescription> : null}
+              <TraceTitle className="max-w-[26rem] shrink truncate font-medium text-foreground">
+                {info.description || "子 Agent"}
+              </TraceTitle>
+              {meta.length ? (
+                <TraceDescription className="min-w-0 shrink truncate text-xs tabular-nums">
+                  {meta.join(" · ")}
+                </TraceDescription>
+              ) : null}
             </TraceLine>
           </TraceCollapsibleTrigger>
           <SubSessionLink sessionId={sessionId} agentId={info.agentId} description={info.description} prompt={info.prompt} />
@@ -279,73 +284,12 @@ export function SingleAgentCard({ tool, sessionId, reveal = false }: { tool: Age
   );
 }
 
-function AgentGroupRow({
-  tool,
-  sessionId,
-  live,
-  now,
-  open,
-  onToggle,
-}: {
-  tool: AgentToolItem;
-  sessionId: string;
-  live: SubagentProgress | undefined;
-  now: number;
-  open: boolean;
-  onToggle: () => void;
-}) {
-  const info = resolveAgent(tool, live, now);
-  const compactMeta = [
-    info.turnCount ? `${info.turnCount} 轮` : undefined,
-    info.toolUses ? `${info.toolUses} 次工具` : undefined,
-    info.tokensText,
-    info.durationText,
-  ].filter(Boolean);
-
-  return (
-    <div className="flex flex-col">
-      <div className="flex min-w-0 items-center gap-1 pe-3 hover:bg-muted/50">
-        <button
-          type="button"
-          aria-expanded={open}
-          onClick={onToggle}
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 ps-3 py-2 text-start text-xs focus-visible:bg-muted/50 focus-visible:outline-none"
-        >
-          <span className="shrink-0 text-muted-foreground">{open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}</span>
-          <span className="shrink-0">
-            {info.active ? (
-              <Spinner className="size-3.5 text-muted-foreground" />
-            ) : info.isError ? (
-              <CircleAlert className="size-3.5 text-destructive" />
-            ) : (
-              <CheckCircle2 className="size-3.5 text-success-foreground" />
-            )}
-          </span>
-          <Badge variant="secondary" className="h-5 shrink-0 px-1.5 font-normal">
-            {info.type}
-          </Badge>
-          <span className="min-w-0 flex-1 truncate" title={info.activity ? `${info.description ?? ""} · ${info.activity}` : info.description}>
-            <span className="font-medium text-foreground">{info.description || "子 Agent"}</span>
-            {info.activity ? <span className="ms-1.5 font-mono text-muted-foreground">· {info.activity}</span> : null}
-          </span>
-          {compactMeta.length ? <span className="hidden shrink-0 text-muted-foreground tabular-nums sm:inline">{compactMeta.join(" · ")}</span> : null}
-        </button>
-        <SubSessionLink sessionId={sessionId} agentId={info.agentId} description={info.description} prompt={info.prompt} />
-      </div>
-      {open ? (
-        <div className="border-t bg-muted/20 px-4 py-3">
-          <AgentDetailsBody info={info} sessionId={sessionId} showSubLink={false} />
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 function areAgentGroupPropsEqual(
-  prev: { tools: AgentToolItem[]; sessionId: string },
-  next: { tools: AgentToolItem[]; sessionId: string },
+  prev: { tools: AgentToolItem[]; sessionId: string; revealId?: string | undefined },
+  next: { tools: AgentToolItem[]; sessionId: string; revealId?: string | undefined },
 ): boolean {
   if (prev.sessionId !== next.sessionId) return false;
+  if (prev.revealId !== next.revealId) return false;
   if (prev.tools.length !== next.tools.length) return false;
   for (let i = 0; i < prev.tools.length; i++) {
     if (prev.tools[i] !== next.tools[i]) return false;
@@ -353,35 +297,32 @@ function areAgentGroupPropsEqual(
   return true;
 }
 
-/** Compact grouped view when multiple sub-agents are dispatched in parallel. */
-export const AgentGroup = React.memo(function AgentGroup({ tools, sessionId }: { tools: AgentToolItem[]; sessionId: string }) {
+/** Lightweight Trace timeline group when multiple sub-agents are dispatched in parallel. */
+export const AgentGroup = React.memo(function AgentGroup({
+  tools,
+  sessionId,
+  revealId,
+}: {
+  tools: AgentToolItem[];
+  sessionId: string;
+  revealId?: string | undefined;
+}) {
   const subagents = useLila((state) => state.views[sessionId]?.state?.subagents);
   const byId = React.useMemo(() => new Map((subagents ?? []).map((entry) => [entry.id, entry])), [subagents]);
-  const [expanded, setExpanded] = React.useState<Record<string, boolean>>({});
-  const [now, setNow] = React.useState(() => Date.now());
+  const [open, setOpen] = React.useState(true);
+  const hasReveal = Boolean(revealId && tools.some((tool) => tool.id === revealId));
 
-  const resolved = tools.map((tool) => {
+  let activeCount = 0;
+  let errorCount = 0;
+  let doneCount = 0;
+  for (const tool of tools) {
     const id = tool.subagent?.id;
-    return resolveAgent(tool, id ? byId.get(id) : undefined, now);
-  });
-  const activeCount = resolved.filter((info) => info.active).length;
-  const errorCount = resolved.filter((info) => info.isError).length;
-  const doneCount = resolved.length - activeCount - errorCount;
-  const totalTokens = resolved.reduce((sum, info) => sum + info.tokens, 0);
-  const totalCost = resolved.reduce((sum, info) => sum + info.cost, 0);
-
-  React.useEffect(() => {
-    if (!activeCount) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, [activeCount]);
-
-  const allExpanded = tools.every((tool) => Boolean(expanded[tool.id]));
-  const toggleAll = () => {
-    const next = !allExpanded;
-    setExpanded(Object.fromEntries(tools.map((tool) => [tool.id, next])));
-  };
+    const live = id ? byId.get(id) : undefined;
+    const status = live?.status ?? tool.subagent?.status ?? (tool.status === "running" ? "running" : tool.status === "error" ? "error" : "completed");
+    if (status === "running" || status === "queued" || tool.status === "running") activeCount++;
+    else if (isSubagentErrorStatus(status)) errorCount++;
+    else doneCount++;
+  }
 
   const summaryParts = [
     activeCount ? `${activeCount} 运行中` : undefined,
@@ -389,46 +330,47 @@ export const AgentGroup = React.memo(function AgentGroup({ tools, sessionId }: {
     errorCount ? `${errorCount} 出错` : undefined,
   ].filter(Boolean);
 
-  const metricsParts = [
-    totalTokens > 0 ? formatCompactTokens(totalTokens) : undefined,
-    totalCost > 0 ? `$${totalCost.toFixed(4)}` : undefined,
-  ].filter(Boolean);
+  const lineStatus = activeCount > 0 ? "running" : errorCount > 0 ? "error" : undefined;
 
   return (
-    <div className="overflow-hidden rounded-xl border bg-card/60">
-      <div className="flex flex-wrap items-center gap-2 border-b bg-muted/30 px-3 py-2 text-xs">
-        {activeCount > 0 ? (
-          <Spinner className="size-3.5 shrink-0 text-muted-foreground" />
-        ) : errorCount > 0 ? (
-          <CircleAlert className="size-3.5 shrink-0 text-destructive" />
-        ) : (
-          <Bot className="size-3.5 shrink-0 text-muted-foreground" />
-        )}
-        <span className="font-medium">{tools.length} 个子 Agent</span>
-        {summaryParts.length ? (
-          <span className={cn("text-muted-foreground", errorCount > 0 && !activeCount && "text-destructive")}>{summaryParts.join(" · ")}</span>
-        ) : null}
-        {metricsParts.length ? <span className="text-muted-foreground tabular-nums">· {metricsParts.join(" · ")}</span> : null}
-        <Button type="button" size="xs" variant="ghost" className="ms-auto h-6 px-2 text-muted-foreground" onClick={toggleAll}>
-          {allExpanded ? "全部收起" : "全部展开"}
-        </Button>
-      </div>
-      <div className="divide-y">
-        {tools.map((tool) => {
-          const id = tool.subagent?.id;
-          return (
-            <AgentGroupRow
-              key={tool.id}
-              tool={tool}
-              sessionId={sessionId}
-              live={id ? byId.get(id) : undefined}
-              now={now}
-              open={Boolean(expanded[tool.id])}
-              onToggle={() => setExpanded((current) => ({ ...current, [tool.id]: !current[tool.id] }))}
-            />
-          );
-        })}
-      </div>
-    </div>
+    <Trace>
+      <TraceCollapsible open={open || hasReveal} onOpenChange={setOpen}>
+        <TraceCollapsibleTrigger className="py-0.5">
+          <TraceLine className="text-[13px]" {...(lineStatus ? { status: lineStatus } : {})}>
+            <TraceIcon>
+              {activeCount > 0 ? (
+                <Spinner />
+              ) : errorCount > 0 ? (
+                <CircleAlert />
+              ) : (
+                <Bot />
+              )}
+            </TraceIcon>
+            <TraceTitle>{tools.length} 个子 Agent</TraceTitle>
+            {summaryParts.length ? (
+              <TraceDescription className={cn("text-xs", errorCount > 0 && !activeCount && "text-destructive")}>
+                {summaryParts.join(" · ")}
+              </TraceDescription>
+            ) : null}
+          </TraceLine>
+        </TraceCollapsibleTrigger>
+        <TraceCollapsibleContent>
+          <Trace className="gap-1">
+            {tools.map((tool) => {
+              const matched = tool.id === revealId;
+              return (
+                <div
+                  key={tool.id}
+                  data-transcript-item={tool.id}
+                  className={matched ? "rounded-md bg-accent/60 p-1 ring-1 ring-ring/25" : undefined}
+                >
+                  <SingleAgentCard tool={tool} sessionId={sessionId} reveal={matched} />
+                </div>
+              );
+            })}
+          </Trace>
+        </TraceCollapsibleContent>
+      </TraceCollapsible>
+    </Trace>
   );
 }, areAgentGroupPropsEqual);

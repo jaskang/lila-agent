@@ -92,17 +92,35 @@ export function Code({
   title,
   streaming = false,
   maxHeight = "20rem",
+  numbered = false,
+  highlightRange,
+  className,
 }: {
   code: string;
   language?: string | undefined;
   title?: React.ReactNode;
   streaming?: boolean;
-  maxHeight?: string;
+  maxHeight?: string | undefined;
+  numbered?: boolean;
+  highlightRange?: { start: number; end: number } | undefined;
+  className?: string;
 }) {
   const highlighted = useHighlighted(code, language, !streaming);
   const text = code.replace(/\n$/, "");
+  const rootRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    if (!highlightRange?.start) return;
+    const frame = requestAnimationFrame(() => {
+      const target = rootRef.current?.querySelector<HTMLElement>(`[data-line="${highlightRange.start}"]`);
+      target?.scrollIntoView({ block: "center", inline: "nearest" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [highlightRange?.start, highlightRange?.end, code]);
+
+  const lines = highlighted ?? text.split("\n");
   return (
-    <CodeBlock size="sm" className="not-typeset">
+    <CodeBlock ref={rootRef} size="sm" className={cn("not-typeset", className)}>
       {title ? (
         <CodeBlockHeader>
           <CodeBlockTitle>{title}</CodeBlockTitle>
@@ -115,10 +133,19 @@ export function Code({
           <CodeBlockCopyButton value={code} />
         </CodeBlockActions>
       )}
-      <CodeBlockContent style={{ maxHeight }}>
-        {highlighted
-          ? highlighted.map((line, index) => <CodeBlockLine key={index}>{line}</CodeBlockLine>)
-          : text.split("\n").map((line, index) => <CodeBlockLine key={index}>{line}</CodeBlockLine>)}
+      <CodeBlockContent lineNumbers={numbered} style={maxHeight ? { maxHeight } : undefined}>
+        {lines.map((line, index) => {
+          const lineNumber = index + 1;
+          const isHighlighted =
+            highlightRange !== undefined &&
+            lineNumber >= highlightRange.start &&
+            lineNumber <= highlightRange.end;
+          return (
+            <CodeBlockLine key={index} data-line={lineNumber} variant={isHighlighted ? "highlighted" : "default"}>
+              {line}
+            </CodeBlockLine>
+          );
+        })}
       </CodeBlockContent>
     </CodeBlock>
   );

@@ -1,10 +1,12 @@
 import * as React from "react";
-import { ExternalLink, Image as ImageIcon, ImageOff } from "lucide-react";
+import { ExternalLink, FileText, Image as ImageIcon, ImageOff } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import { Code } from "@/components/code";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { actions, useLila } from "@/lib/store";
 
 const MarkdownBasePathContext = React.createContext<string | undefined>(undefined);
 
@@ -208,26 +210,142 @@ function MarkdownImage({ src, alt, title }: { src?: string | undefined; alt?: st
   );
 }
 
+function parseLineRange(href: string | undefined): { line?: number; endLine?: number } | undefined {
+  if (!href) return undefined;
+  const hashIndex = href.indexOf("#");
+  if (hashIndex < 0) return undefined;
+  const hash = href.slice(hashIndex + 1);
+  const match = /^L(\d+)(?:-L?(\d+))?$/i.exec(hash);
+  if (!match) return undefined;
+  const line = Number(match[1]);
+  const endLine = match[2] ? Number(match[2]) : undefined;
+  if (!Number.isInteger(line) || line <= 0) return undefined;
+  return { line, ...(endLine && Number.isInteger(endLine) && endLine >= line ? { endLine } : {}) };
+}
+
+function displayLocalPath(localPath: string, projectPath: string | undefined, range?: { line?: number; endLine?: number }): string {
+  const prefix = projectPath ? `${projectPath.replace(/\/+$/, "")}/` : undefined;
+  const base = prefix && localPath.startsWith(prefix) ? localPath.slice(prefix.length) : localPath;
+  if (!range?.line) return base;
+  return range.endLine && range.endLine !== range.line ? `${base}#L${range.line}-L${range.endLine}` : `${base}#L${range.line}`;
+}
+
+const LINK_CLASS =
+  "font-medium text-info-foreground underline decoration-info-foreground/40 underline-offset-2 transition-colors hover:decoration-info-foreground focus-visible:rounded-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
+
+function pickLineRect(element: HTMLElement, pointer: { x: number; y: number } | null): DOMRect {
+  const rects = Array.from(element.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+  if (rects.length <= 1) return rects[0] ?? element.getBoundingClientRect();
+  if (!pointer) return rects[0]!;
+  for (const rect of rects) {
+    if (pointer.x >= rect.left && pointer.x <= rect.right && pointer.y >= rect.top && pointer.y <= rect.bottom) {
+      return rect;
+    }
+  }
+  let closest = rects[0]!;
+  let minDistance = Infinity;
+  for (const rect of rects) {
+    const dx = pointer.x < rect.left ? rect.left - pointer.x : pointer.x > rect.right ? pointer.x - rect.right : 0;
+    const dy = pointer.y < rect.top ? rect.top - pointer.y : pointer.y > rect.bottom ? pointer.y - rect.bottom : 0;
+    const distance = dx * dx + dy * dy;
+    if (distance < minDistance) {
+      minDistance = distance;
+      closest = rect;
+    }
+  }
+  return closest;
+}
+
 function MarkdownLink({ href, children }: { href?: string | undefined; children?: React.ReactNode }) {
   const basePath = React.useContext(MarkdownBasePathContext);
+  const activeProjectPath = useLila((state) => {
+    const projectId = state.selectedId ? state.sessions[state.selectedId]?.projectId : undefined;
+    return projectId ? state.projects.find((project) => project.id === projectId)?.path : undefined;
+  });
+  const linkRef = React.useRef<HTMLAnchorElement>(null);
+  const pointerRef = React.useRef<{ x: number; y: number } | null>(null);
+  const [anchor, setAnchor] = React.useState<{ getBoundingClientRect: () => DOMRect } | undefined>(undefined);
+
+  const syncAnchor = React.useCallback((event?: React.PointerEvent<HTMLAnchorElement>) => {
+    if (event) pointerRef.current = { x: event.clientX, y: event.clientY };
+    const element = linkRef.current;
+    if (!element) return;
+    const pointer = pointerRef.current;
+    setAnchor({
+      getBoundingClientRect: () => pickLineRect(element, pointer),
+    });
+  }, []);
+
   const localPath = resolveLocalFilePath(href, basePath);
   if (localPath) {
+    const range = parseLineRange(href);
+    const tip = displayLocalPath(localPath, activeProjectPath ?? basePath, range);
     return (
-      <a
-        href={href}
-        onClick={(event) => {
-          event.preventDefault();
-          void window.lila.openPath(localPath).catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)));
-        }}
-      >
-        {children}
-      </a>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <a
+              ref={linkRef}
+              href={href}
+              className={LINK_CLASS}
+              onPointerEnter={syncAnchor}
+              onPointerMove={syncAnchor}
+              onFocus={() => {
+                pointerRef.current = null;
+                syncAnchor();
+              }}
+              onClick={(event) => {
+                event.preventDefault();
+                if (activeProjectPath) {
+                  actions.openFilePreview(localPath, range);
+                } else {
+                  void window.lila.openPath(localPath).catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)));
+                }
+              }}
+            />
+          }
+        >
+          {children}
+        </TooltipTrigger>
+        <TooltipContent anchor={anchor} side="top" sideOffset={6} className="max-w-sm">
+          <span className="inline-flex items-center gap-1.5 font-mono text-[11px] break-all">
+            <FileText className="size-3 shrink-0 opacity-75" />
+            {tip}
+          </span>
+        </TooltipContent>
+      </Tooltip>
     );
   }
   return (
-    <a href={href} target="_blank" rel="noreferrer">
-      {children}
-    </a>
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <a
+            ref={linkRef}
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className={LINK_CLASS}
+            onPointerEnter={syncAnchor}
+            onPointerMove={syncAnchor}
+            onFocus={() => {
+              pointerRef.current = null;
+              syncAnchor();
+            }}
+          />
+        }
+      >
+        {children}
+      </TooltipTrigger>
+      {href ? (
+        <TooltipContent anchor={anchor} side="top" sideOffset={6} className="max-w-sm">
+          <span className="inline-flex items-center gap-1.5 font-mono text-[11px] break-all">
+            <ExternalLink className="size-3 shrink-0 opacity-75" />
+            {href}
+          </span>
+        </TooltipContent>
+      ) : null}
+    </Tooltip>
   );
 }
 

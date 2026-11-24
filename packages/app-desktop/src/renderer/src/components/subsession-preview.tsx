@@ -2,7 +2,7 @@ import * as React from "react";
 import { ArrowUpRight, X } from "lucide-react";
 import type { SessionState } from "@lila/protocol";
 import { MarkdownBasePathProvider } from "@/components/markdown";
-import { ReplyChangesSheet, type ChangeSelection } from "@/components/reply-changes";
+import type { ChangeSelection } from "@/components/reply-changes";
 import { TranscriptBlocks } from "@/components/transcript-blocks";
 import { Button } from "@/components/ui/button";
 import { MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerProvider, MessageScrollerViewport } from "@/components/ui/message-scroller";
@@ -41,7 +41,10 @@ export function SubsessionPreview({ sessionId }: { sessionId: string }) {
   const connected = useLila((store) => store.connection === "connected");
   const view = useLila((store) => store.views[sessionId]) ?? EMPTY_VIEW;
   const blocks = React.useMemo(() => layoutTranscript(view.items, projectPath), [view.items, projectPath]);
-  const [review, setReview] = React.useState<ChangeSelection>();
+  const handleReview = React.useCallback(
+    (selection: ChangeSelection) => actions.openReplyReview(sessionId, selection.changes, selection.path),
+    [sessionId],
+  );
   const headingId = React.useId();
   const closeButton = React.useRef<HTMLButtonElement>(null);
   const returnFocus = React.useRef<Element | null>(null);
@@ -60,22 +63,14 @@ export function SubsessionPreview({ sessionId }: { sessionId: string }) {
 
   return (
     <MarkdownBasePathProvider value={projectPath}>
-      <aside
-        aria-labelledby={headingId}
-        className="absolute inset-y-0 end-0 z-20 flex w-96 max-w-[calc(100%-3rem)] shrink-0 flex-col border-s bg-background shadow-lg lg:static lg:z-auto lg:w-[38%] lg:min-w-80 lg:max-w-md lg:shadow-none"
-        onKeyDown={(event) => {
-          if (event.key !== "Escape" || event.defaultPrevented || !event.currentTarget.contains(event.target as Node)) return;
-          event.stopPropagation();
-          close();
-        }}
-      >
-        <header className="flex h-10 shrink-0 items-center gap-1 border-b px-3">
+      <div aria-labelledby={headingId} className="flex min-h-0 flex-1 flex-col">
+        <header className="flex h-11 shrink-0 items-center gap-1 border-b border-border/60 px-3">
           <h2 id={headingId} className="min-w-0 flex-1 truncate text-sm font-medium" title={session?.title}>{session?.title ?? "子 Agent"}</h2>
           <Button type="button" size="icon-sm" variant="ghost" aria-label="在主对话区打开子会话" title="在主对话区打开" onClick={() => actions.select(sessionId)}><ArrowUpRight /></Button>
           <Button ref={closeButton} type="button" size="icon-sm" variant="ghost" aria-label="关闭子会话预览" onClick={close}><X /></Button>
         </header>
         {view.state ? (
-          <MessageScrollerProvider defaultScrollPosition="end">
+          <MessageScrollerProvider key={sessionId} autoScroll defaultScrollPosition="end" scrollEdgeThreshold={24}>
             <MessageScroller className="min-h-0 flex-1">
               <MessageScrollerViewport>
                 <MessageScrollerContent className="gap-2.5 px-3 pt-3 pb-7">
@@ -84,7 +79,7 @@ export function SubsessionPreview({ sessionId }: { sessionId: string }) {
                       {view.loadingEarlier ? "正在加载更早消息…" : "加载更早消息"}
                     </Button>
                   ) : null}
-                  <TranscriptBlocks blocks={blocks} sessionId={sessionId} running={false} onReview={setReview} />
+                  <TranscriptBlocks blocks={blocks} sessionId={sessionId} running={false} onReview={handleReview} />
                   {!blocks.length ? <p className="text-sm text-muted-foreground">还没有子任务记录。</p> : null}
                 </MessageScrollerContent>
               </MessageScrollerViewport>
@@ -104,8 +99,7 @@ export function SubsessionPreview({ sessionId }: { sessionId: string }) {
         <div className="shrink-0 p-3">
           <SubsessionActions sessionId={sessionId} state={view.state} />
         </div>
-        <ReplyChangesSheet sessionId={sessionId} selection={review} onChange={setReview} />
-      </aside>
+      </div>
     </MarkdownBasePathProvider>
   );
 }

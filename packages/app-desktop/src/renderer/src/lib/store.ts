@@ -14,6 +14,7 @@ import type {
   WatchSlot,
 } from "@lila/protocol";
 import { CoreClient, type ConnectionState, type PushMessage } from "./client.ts";
+import type { FileChange } from "./transcript-layout.ts";
 
 export type SessionView = {
   items: TranscriptItem[];
@@ -31,6 +32,9 @@ export type NewSessionOptions = { projectId?: string; modelId?: string; thinking
 export type DraftImage = ImageInput & { id: string; name: string };
 type Draft = { text: string; images: DraftImage[] };
 type DeliveryMode = "steer" | "followUp";
+
+export type RightPanelKind = "files" | "changes" | "subsession" | "review";
+export type ReplyReviewState = { sessionId: string; changes: FileChange[]; path: string };
 
 type State = {
   connection: ConnectionState;
@@ -54,7 +58,12 @@ type State = {
   sendingDrafts: Record<string, true>;
   paletteOpen: boolean;
   resourcesOpen: boolean;
-  gitOpen: boolean;
+  rightPanel?: RightPanelKind | undefined;
+  filesView: "tree" | "file";
+  activeFile?: { path: string; line?: number | undefined; endLine?: number | undefined; history: string[] } | undefined;
+  replyReview?: ReplyReviewState | undefined;
+  gitChangeCounts: Record<string, number | undefined>;
+  workspaceRefreshSeq: number;
 };
 
 export const NEW_DRAFT = "new";
@@ -125,7 +134,11 @@ export const useLila = create<State>(() => ({
   sendingDrafts: {},
   paletteOpen: false,
   resourcesOpen: false,
-  gitOpen: false,
+  rightPanel: undefined,
+  filesView: "tree",
+  activeFile: undefined,
+  gitChangeCounts: {},
+  workspaceRefreshSeq: 0,
 }));
 
 const set = useLila.setState;
@@ -267,7 +280,10 @@ function unwatchSession(slot: WatchSlot): void {
 }
 
 function closePreview(): void {
-  set({ previewId: undefined });
+  set((state) => ({
+    previewId: undefined,
+    ...(state.rightPanel === "subsession" ? { rightPanel: undefined } : {}),
+  }));
   unwatchSession("preview");
 }
 
@@ -371,7 +387,7 @@ function forget(sessionId: string): void {
       drafts,
       draftImages,
       sendingDrafts,
-      ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, gitOpen: false } : {}),
+      ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, rightPanel: undefined, activeFile: undefined } : {}),
     };
   });
   if (wasSelected) {
@@ -501,8 +517,17 @@ async function sendDraftContents(sessionId: string, draft: Draft, mode?: Deliver
 export const actions = {
   select(sessionId: string | undefined): void {
     selectionVersion++;
-    if (get().selectedId !== sessionId) closePreview();
-    set({ selectedId: sessionId, resourcesOpen: false, gitOpen: false });
+    const prev = get();
+    const prevProjectId = prev.selectedId ? prev.sessions[prev.selectedId]?.projectId : undefined;
+    const nextProjectId = sessionId ? prev.sessions[sessionId]?.projectId : undefined;
+    const sameProject = Boolean(prevProjectId && prevProjectId === nextProjectId);
+    if (prev.selectedId !== sessionId) closePreview();
+    set({
+      selectedId: sessionId,
+      resourcesOpen: false,
+      ...(prev.selectedId !== sessionId ? { replyReview: undefined, ...(prev.rightPanel === "review" ? { rightPanel: undefined } : {}) } : {}),
+      ...(!sessionId || !sameProject ? { rightPanel: undefined, filesView: "tree" as const, activeFile: undefined, replyReview: undefined } : {}),
+    });
     if (sessionId) localStorage.setItem(SELECTED_KEY, sessionId);
     else localStorage.removeItem(SELECTED_KEY);
     if (!sessionId) {
@@ -518,17 +543,92 @@ export const actions = {
     const child = sessions[sessionId];
     if (!selectedId || !child?.readOnly || child.parentId !== selectedId || sessionId === previewId) return;
     unwatchSession("preview");
-    set({ previewId: sessionId });
+    set({ previewId: sessionId, rightPanel: "subsession" });
     if (connection === "connected") void openSession(sessionId, "preview");
   },
 
   closePreview,
 
+  toggleRightPanel(kind: "files" | "changes"): void {
+    const { rightPanel } = get();
+    if (rightPanel === kind) {
+      actions.closeRightPanel();
+      return;
+    }
+    closePreview();
+    set({
+      rightPanel: kind,
+      ...(kind === "files" ? { filesView: "tree" as const } : {}),
+    });
+  },
+
+  openRightPanel(kind: "files" | "changes"): void {
+    closePreview();
+    set({
+      rightPanel: kind,
+      ...(kind === "files" ? { filesView: "tree" as const } : {}),
+    });
+  },
+
+  openFilesTree(): void {
+    closePreview();
+    set({ rightPanel: "files", filesView: "tree" });
+  },
+
+  openFilePreview(path: string, range?: { line?: number | undefined; endLine?: number | undefined }): void {
+    const { activeFile } = get();
+    const history = activeFile && activeFile.path !== path ? [...activeFile.history.slice(-19), activeFile.path] : (activeFile?.history ?? []);
+    closePreview();
+    set({
+      rightPanel: "files",
+      filesView: "file",
+      activeFile: {
+        path,
+        ...(range?.line !== undefined ? { line: range.line } : {}),
+        ...(range?.endLine !== undefined ? { endLine: range.endLine } : {}),
+        history,
+      },
+    });
+  },
+
+  backFilePreview(): void {
+    const { activeFile } = get();
+    if (!activeFile?.history.length) {
+      set({ filesView: "tree" });
+      return;
+    }
+    const previous = activeFile.history[activeFile.history.length - 1]!;
+    set({
+      filesView: "file",
+      activeFile: { path: previous, history: activeFile.history.slice(0, -1) },
+    });
+  },
+
+  openReplyReview(sessionId: string, changes: FileChange[], path: string): void {
+    closePreview();
+    set({ rightPanel: "review", replyReview: { sessionId, changes, path } });
+  },
+
+  selectReplyReviewPath(path: string): void {
+    const { replyReview } = get();
+    if (!replyReview) return;
+    set({ replyReview: { ...replyReview, path } });
+  },
+
+  closeRightPanel(): void {
+    if (get().previewId) closePreview();
+    else set({ rightPanel: undefined, replyReview: undefined });
+  },
+
   getScrollTop(sessionId: string): number | undefined {
     return scrollPositions.get(sessionId);
   },
 
-  setScrollTop(sessionId: string, scrollTop: number): void {
+  setScrollTop(sessionId: string, scrollTop: number | undefined): void {
+    if (scrollTop === undefined) {
+      scrollPositions.delete(sessionId);
+      return;
+    }
     if (!Number.isFinite(scrollTop) || scrollTop < 0) return;
     if (scrollPositions.has(sessionId)) scrollPositions.delete(sessionId);
     scrollPositions.set(sessionId, scrollTop);
@@ -560,6 +660,19 @@ export const actions = {
     set((state) => ({ drafts: { ...state.drafts, [key]: text } }));
   },
 
+  mentionFileInDraft(path: string): void {
+    const state = get();
+    const key = state.selectedId ?? NEW_DRAFT;
+    const current = state.drafts[key] ?? "";
+    const mention = `@${path}`;
+    const spacer = current && !/\s$/.test(current) ? " " : "";
+    set({ drafts: { ...state.drafts, [key]: `${current}${spacer}${mention} ` } });
+  },
+
+  bumpWorkspaceRefresh(): void {
+    set((state) => ({ workspaceRefreshSeq: state.workspaceRefreshSeq + 1 }));
+  },
+
   setDraftImages(key: string, images: DraftImage[] | ((current: DraftImage[]) => DraftImage[])): void {
     set((state) => {
       const current = state.draftImages[key] ?? [];
@@ -579,8 +692,10 @@ export const actions = {
     set({ resourcesOpen: open });
   },
 
-  setGitOpen(open: boolean): void {
-    set({ gitOpen: open });
+  setGitChangeCount(projectId: string, count: number | undefined): void {
+    set((state) => ({
+      gitChangeCounts: { ...state.gitChangeCounts, [projectId]: count },
+    }));
   },
 
   retryModels: loadModels,
@@ -640,7 +755,7 @@ export const actions = {
         draftImages,
         sendingDrafts,
         newSession: nextNewSession,
-        ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, gitOpen: false } : {}),
+        ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, rightPanel: undefined, activeFile: undefined } : {}),
       };
     });
     if (wasSelected) {
@@ -782,6 +897,14 @@ export const actions = {
     } catch {
       return [];
     }
+  },
+
+  async listFiles(projectId: string, refresh = false) {
+    return client.call({ type: "files.list", projectId, ...(refresh ? { refresh } : {}) });
+  },
+
+  async readFile(projectId: string, path: string) {
+    return (await client.call({ type: "files.read", projectId, path })).file;
   },
 
   async gitStatus(projectId: string) {

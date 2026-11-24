@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { useMessageScrollerVisibility } from "@/components/ui/message-scroller";
 import { cn } from "cn";
+import type { TranscriptBlock } from "@/lib/transcript-layout";
 
 const RAIL_SIZE = 9;
 const PREVIEW_TICK_WIDTHS = [26, 19, 13, 9];
@@ -21,11 +22,12 @@ function handleTurnKeys(event: React.KeyboardEvent<HTMLElement>): void {
   target.focus();
 }
 
-export function TurnRail({ items, onJump }: {
+export function TurnRail({ items, blocks, onJump }: {
   items: TranscriptItem[];
+  blocks: TranscriptBlock[];
   onJump: (itemId: string) => Promise<boolean>;
 }) {
-  const { currentAnchorId } = useMessageScrollerVisibility();
+  const { visibleMessageIds } = useMessageScrollerVisibility();
   const [previewOpen, setPreviewOpen] = React.useState(false);
   const [pointerStart, setPointerStart] = React.useState<number>();
   const turns = React.useMemo(() => {
@@ -41,7 +43,28 @@ export function TurnRail({ items, onJump }: {
     return result;
   }, [items]);
 
-  const active = turns.findIndex((turn) => turn.itemId === currentAnchorId);
+  const blockToTurnId = React.useMemo(() => {
+    const map = new Map<string, string>();
+    let currentTurnId: string | undefined;
+    for (const block of blocks) {
+      if (block.kind === "item" && block.item.kind === "user") {
+        currentTurnId = block.item.id;
+      }
+      if (currentTurnId) map.set(block.id, currentTurnId);
+    }
+    return map;
+  }, [blocks]);
+
+  let currentTurnId: string | undefined;
+  for (const id of visibleMessageIds) {
+    const turnId = blockToTurnId.get(id);
+    if (turnId) {
+      currentTurnId = turnId;
+      break;
+    }
+  }
+
+  const active = currentTurnId ? turns.findIndex((turn) => turn.itemId === currentTurnId) : -1;
   const center = active >= 0 ? active : turns.length - 1;
   const start = Math.max(0, Math.min(pointerStart ?? center - Math.floor(RAIL_SIZE / 2), turns.length - RAIL_SIZE));
   const visible = turns.slice(start, start + RAIL_SIZE);
@@ -59,7 +82,7 @@ export function TurnRail({ items, onJump }: {
                 onPointerLeave={() => setPointerStart(undefined)}
               >
                 {visible.map((turn, index) => {
-                  const current = turn.itemId === currentAnchorId;
+                  const current = turn.itemId === (currentTurnId ?? turns.at(-1)?.itemId);
                   const previewWidth = hovered >= 0 ? PREVIEW_TICK_WIDTHS[Math.abs(hovered - index)] : undefined;
                   return (
                     <HoverCardTrigger

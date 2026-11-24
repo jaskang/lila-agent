@@ -5,16 +5,22 @@ export type FileChange = { itemId: string; path: string } & (
   | { kind: "write"; content: string }
 );
 
+export type AgentToolItem = Extract<TranscriptItem, { kind: "tool" }>;
+
 export type TranscriptBlock =
-  | { kind: "item"; id: string; item: TranscriptItem }
+  | { kind: "item"; id: string; item: TranscriptItem; showFooter?: boolean; turnChanges?: FileChange[] }
   | { kind: "activity"; id: string; items: TranscriptItem[] }
+  | { kind: "agents"; id: string; tools: AgentToolItem[] }
   | { kind: "changes"; id: string; changes: FileChange[] };
 
+function isSubagentTool(item: TranscriptItem): item is AgentToolItem {
+  return item.kind === "tool" && Boolean(item.subagent);
+}
+
 function isRoutineActivity(item: TranscriptItem): boolean {
-  if (item.kind === "tool") return item.status !== "error" && item.name !== "ask_user";
+  if (item.kind === "tool") return item.status !== "error" && item.name !== "ask_user" && !item.subagent;
   if (item.kind === "assistant") return Boolean(item.thinking && !item.text && !item.error && !item.streaming);
-  if (item.kind !== "custom" || !item.notifications?.length) return false;
-  return item.notifications.every((entry) => entry.status === "completed" || entry.status === "steered");
+  return false;
 }
 
 function fileChange(item: TranscriptItem, projectPrefix: string | undefined): FileChange | undefined {
@@ -33,8 +39,9 @@ export function layoutTranscript(items: readonly TranscriptItem[], projectPath?:
   const projectPrefix = projectPath ? `${projectPath.replace(/\/+$/, "")}/` : undefined;
   const blocks: TranscriptBlock[] = [];
   let activity: TranscriptItem[] = [];
-  let changes: FileChange[] = [];
-  let hasReply = false;
+  let agents: AgentToolItem[] = [];
+  let turnChanges: FileChange[] = [];
+  let lastReplyBlock: Extract<TranscriptBlock, { kind: "item" }> | undefined;
 
   function flushActivity() {
     const first = activity[0];
@@ -42,29 +49,61 @@ export function layoutTranscript(items: readonly TranscriptItem[], projectPath?:
     activity = [];
   }
 
-  function flushChanges() {
-    const first = changes[0];
-    if (first && hasReply) blocks.push({ kind: "changes", id: `changes:${first.itemId}`, changes });
-    changes = [];
-    hasReply = false;
+  function flushAgents() {
+    const first = agents[0];
+    if (!first) return;
+    if (agents.length === 1) blocks.push({ kind: "item", id: first.id, item: first });
+    else blocks.push({ kind: "agents", id: `agents:${first.id}`, tools: agents });
+    agents = [];
+  }
+
+  function finalizeTurn() {
+    const completedReply = lastReplyBlock && lastReplyBlock.item.kind === "assistant" && !lastReplyBlock.item.streaming
+      ? lastReplyBlock
+      : undefined;
+    if (completedReply) {
+      completedReply.showFooter = true;
+      if (turnChanges.length) completedReply.turnChanges = turnChanges;
+    } else if (turnChanges.length && !(lastReplyBlock && lastReplyBlock.item.kind === "assistant" && lastReplyBlock.item.streaming)) {
+      const first = turnChanges[0]!;
+      blocks.push({ kind: "changes", id: `changes:${first.itemId}`, changes: turnChanges });
+    }
+    turnChanges = [];
+    lastReplyBlock = undefined;
   }
 
   for (const item of items) {
-    if (item.kind === "user" || item.kind === "run") {
+    if (item.kind === "user") {
       flushActivity();
-      flushChanges();
+      flushAgents();
+      finalizeTurn();
+    } else if (item.kind === "run") {
+      flushActivity();
+      flushAgents();
     }
-    if (isRoutineActivity(item)) {
+    if (item.kind === "run" && item.status === "completed") continue;
+    if (isSubagentTool(item)) {
+      flushActivity();
+      agents.push(item);
+    } else if (isRoutineActivity(item)) {
+      flushAgents();
       activity.push(item);
     } else {
       flushActivity();
-      blocks.push({ kind: "item", id: item.id, item });
+      flushAgents();
+      const block: Extract<TranscriptBlock, { kind: "item" }> = { kind: "item", id: item.id, item };
+      if (item.kind === "assistant" && item.text) {
+        block.showFooter = false;
+        lastReplyBlock = block;
+      }
+      blocks.push(block);
     }
     const change = fileChange(item, projectPrefix);
-    if (change) changes.push(change);
-    if (item.kind === "assistant" && item.text && !item.streaming) hasReply = true;
+    if (change) turnChanges.push(change);
   }
   flushActivity();
-  flushChanges();
+  flushAgents();
+  finalizeTurn();
+
   return blocks;
 }

@@ -155,42 +155,69 @@
 }
 
 .typeset-chat {
-  --typeset-size: 14px;
-  --typeset-leading: 1.65;
-  --typeset-flow: 0.9em;
+  --typeset-size: 14.5px;
+  --typeset-leading: 1.7;
+  --typeset-flow: 0.95em;
   font-size: var(--typeset-size);
 }
 
-/* Subtle macOS-like scrollbar with transparent track and thin pill thumb. */
-.lila-scroll::-webkit-scrollbar {
+.typeset-chat a:not([data-slot]) {
+  color: var(--info-foreground);
+  text-decoration-color: color-mix(in oklab, var(--info-foreground) 35%, transparent);
+  text-underline-offset: 2px;
+}
+
+.typeset-chat a:not([data-slot]):hover {
+  text-decoration-color: var(--info-foreground);
+}
+
+.typeset-chat :not(pre) > code:not([data-slot]) {
+  border: 1px solid var(--border);
+  padding: 0.1em 0.35em;
+}
+
+/* Subtle macOS-like scrollbar applied uniformly across native scrollable containers. */
+:not(.no-scrollbar, .scrollbar-none, [data-slot="scroll-area-viewport"])::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 
-.lila-scroll::-webkit-scrollbar-track {
+:not(.no-scrollbar, .scrollbar-none, [data-slot="scroll-area-viewport"])::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.lila-scroll::-webkit-scrollbar-thumb {
+:not(.no-scrollbar, .scrollbar-none, [data-slot="scroll-area-viewport"])::-webkit-scrollbar-thumb {
   background-color: transparent;
   background-clip: content-box;
   border: 3px solid transparent;
   border-radius: 9999px;
 }
 
-.lila-scroll:hover::-webkit-scrollbar-thumb {
+:not(
+    .no-scrollbar,
+    .scrollbar-none,
+    [data-slot="scroll-area-viewport"]
+  ):hover::-webkit-scrollbar-thumb {
   background-color: color-mix(in oklch, var(--foreground) 18%, transparent);
 }
 
-.lila-scroll::-webkit-scrollbar-thumb:hover {
+:not(
+    .no-scrollbar,
+    .scrollbar-none,
+    [data-slot="scroll-area-viewport"]
+  )::-webkit-scrollbar-thumb:hover {
   background-color: color-mix(in oklch, var(--foreground) 32%, transparent);
 }
 
-.lila-scroll::-webkit-scrollbar-thumb:active {
+:not(
+    .no-scrollbar,
+    .scrollbar-none,
+    [data-slot="scroll-area-viewport"]
+  )::-webkit-scrollbar-thumb:active {
   background-color: color-mix(in oklch, var(--foreground) 45%, transparent);
 }
 
-.lila-scroll::-webkit-scrollbar-corner {
+:not(.no-scrollbar, .scrollbar-none, [data-slot="scroll-area-viewport"])::-webkit-scrollbar-corner {
   background: transparent;
 }
 

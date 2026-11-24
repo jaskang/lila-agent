@@ -12,7 +12,7 @@ import { z } from "zod";
  * A client that reconnects simply opens the session again.
  */
 
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 export const DEFAULT_CORE_PORT = 7457;
 
 const Id = z.string().min(1);
@@ -102,7 +102,7 @@ export type SubagentNotification = {
 
 export type TranscriptItem =
   | { kind: "user"; id: string; text: string; images: ImageInput[]; canRewind: boolean }
-  | { kind: "assistant"; id: string; text: string; thinking: string; model?: string; streaming: boolean; error?: string }
+  | { kind: "assistant"; id: string; text: string; thinking: string; model?: string; timestamp?: number; streaming: boolean; error?: string }
   | {
       kind: "tool";
       /** The tool call id. */
@@ -223,6 +223,18 @@ export type GitFileDiff = {
   truncated?: boolean;
 };
 
+export type ProjectFileContent = {
+  /** Path relative to project root when inside the project, otherwise absolute path. */
+  path: string;
+  /** Real absolute path on disk (used for reveal / open in external app). */
+  fullPath: string;
+  size: number;
+  isBinary: boolean;
+  isImage: boolean;
+  truncated: boolean;
+  content: string;
+};
+
 export type SessionState = {
   status: SessionStatus;
   access: "starting" | "ready" | "read-only" | "failed";
@@ -322,6 +334,8 @@ export const ClientCommand = z.discriminatedUnion("type", [
   /** Reloads skills, prompts, extensions and MCP servers, for example after editing mcp.json. */
   z.object({ type: z.literal("session.reload"), ...SessionRef }),
   z.object({ type: z.literal("files.search"), requestId: RequestId, projectId: Id, query: z.string(), limit: z.number().int().positive().max(200) }),
+  z.object({ type: z.literal("files.list"), requestId: RequestId, projectId: Id, refresh: z.boolean().optional() }),
+  z.object({ type: z.literal("files.read"), requestId: RequestId, projectId: Id, path: z.string().min(1) }),
   z.object({ type: z.literal("git.status"), requestId: RequestId, projectId: Id }),
   z.object({ type: z.literal("git.diff"), requestId: RequestId, projectId: Id, path: z.string().min(1), staged: z.boolean().optional() }),
 ]);
@@ -356,6 +370,8 @@ export interface CommandResults {
   "session.resources": { resources: SessionResources };
   "session.reload": Empty;
   "files.search": { files: string[] };
+  "files.list": { files: string[]; truncated: boolean };
+  "files.read": { file: ProjectFileContent };
   "git.status": { status: GitStatus };
   "git.diff": { diff: GitFileDiff };
 }

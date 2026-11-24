@@ -14,7 +14,7 @@ type GitExecResult = { stdout: string; stderr: string; code: number };
 
 async function runGit(cwd: string, args: string[]): Promise<GitExecResult> {
   try {
-    const { stdout, stderr } = await execFileAsync("git", ["--literal-pathspecs", ...args], { cwd, maxBuffer: MAX_BUFFER });
+    const { stdout, stderr } = await execFileAsync("git", ["-c", "core.quotepath=false", "--literal-pathspecs", ...args], { cwd, maxBuffer: MAX_BUFFER });
     return { stdout, stderr, code: 0 };
   } catch (error) {
     const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number | string };

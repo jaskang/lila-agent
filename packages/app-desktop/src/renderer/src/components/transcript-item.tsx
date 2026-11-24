@@ -4,6 +4,7 @@ import type { ImageInput, SubagentNotification, TranscriptItem } from "@lila/pro
 import { SubSessionLink } from "@/components/agent-card";
 import { focusComposer } from "@/components/composer";
 import { Markdown } from "@/components/markdown";
+import { ReplyChanges, type ChangeSelection } from "@/components/reply-changes";
 import { ToolCall } from "@/components/tool-call";
 import {
   AlertDialog,
@@ -32,8 +33,9 @@ import {
   TraceLine,
   TraceTitle,
 } from "@/components/ui/trace";
-import { formatCompactTokens, formatDuration, isSubagentErrorStatus } from "@/lib/format";
+import { formatCompactTokens, formatDuration, formatElapsed, formatMessageTime, isSubagentErrorStatus } from "@/lib/format";
 import { actions, useLila } from "@/lib/store";
+import type { FileChange } from "@/lib/transcript-layout";
 
 const NOTICE_ICON = { info: Info, warning: TriangleAlert, error: CircleAlert } as const;
 
@@ -46,9 +48,12 @@ function IconAction({ label, disabled, onClick, children }: { label: string; dis
   );
 }
 
-function shortModelName(modelId: string): string {
-  const slash = modelId.indexOf("/");
-  return slash >= 0 ? modelId.slice(slash + 1) : modelId;
+function resolveAssistantTimestamp(item: Extract<TranscriptItem, { kind: "assistant" }>): number | undefined {
+  if (typeof item.timestamp === "number" && Number.isFinite(item.timestamp) && item.timestamp > 0) return item.timestamp;
+  const match = /^a:(\d+)(?::\d+)?$/.exec(item.id);
+  if (!match) return undefined;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function CopyAction({ text }: { text: string }) {
@@ -88,7 +93,7 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
                 type="button"
                 aria-label={`放大查看图片 ${index + 1}`}
                 onClick={() => setPreview({ image, index })}
-                className="cursor-zoom-in overflow-hidden rounded-lg border transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-focus-visible/transcript-item:outline-2 group-focus-visible/transcript-item:-outline-offset-2 group-focus-visible/transcript-item:outline-ring"
+                className="cursor-zoom-in overflow-hidden rounded-xl border transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-focus-visible/transcript-item:outline-2 group-focus-visible/transcript-item:-outline-offset-2 group-focus-visible/transcript-item:outline-ring"
               >
                 <img
                   src={`data:${image.mimeType};base64,${image.data}`}
@@ -100,14 +105,14 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
           </div>
         ) : null}
         {item.text ? (
-          <Bubble align="end" variant="muted">
-            <BubbleContent className="text-sm whitespace-pre-wrap group-focus-visible/transcript-item:inset-ring-1 group-focus-visible/transcript-item:inset-ring-ring">
+          <Bubble align="end" variant="muted" className="max-w-[82%]">
+            <BubbleContent className="rounded-[18px] px-4 py-2.5 text-[14.5px] leading-relaxed whitespace-pre-wrap group-focus-visible/transcript-item:inset-ring-1 group-focus-visible/transcript-item:inset-ring-ring">
               {item.text}
             </BubbleContent>
           </Bubble>
         ) : null}
         {item.text || item.canRewind ? (
-          <MessageFooter className="pointer-events-none gap-0.5 px-1 pb-1 opacity-0 transition-opacity group-hover/message:pointer-events-auto group-hover/message:opacity-100 group-focus-within/message:pointer-events-auto group-focus-within/message:opacity-100">
+          <MessageFooter className="gap-0.5 px-0 opacity-0 transition-opacity group-hover/message:opacity-100 group-focus-within/message:opacity-100">
             {item.text ? <CopyAction text={item.text} /> : null}
             {item.canRewind ? (
               <IconAction
@@ -161,22 +166,61 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
   );
 }
 
-function AssistantMessage({ item, reveal }: { item: Extract<TranscriptItem, { kind: "assistant" }>; reveal: boolean }) {
-  const [reasoningOpen, setReasoningOpen] = React.useState(false);
+function AssistantMessage({
+  item,
+  reveal,
+  showFooter = true,
+  turnChanges,
+  onReview,
+}: {
+  item: Extract<TranscriptItem, { kind: "assistant" }>;
+  reveal: boolean;
+  showFooter?: boolean | undefined;
+  turnChanges?: FileChange[] | undefined;
+  onReview?: ((selection: ChangeSelection) => void) | undefined;
+}) {
+  const [reasoningOpen, setReasoningOpen] = React.useState<boolean | undefined>(undefined);
   const thinkingNow = item.streaming && !item.text;
-  const showFooter = !item.streaming && Boolean(item.text);
+  const thinkingStartedAt = React.useRef<number | null>(null);
+  const [thoughtMs, setThoughtMs] = React.useState<number | undefined>(undefined);
+  const [now, setNow] = React.useState(Date.now);
+
+  React.useEffect(() => {
+    if (thinkingNow && item.thinking) {
+      if (thinkingStartedAt.current === null) {
+        thinkingStartedAt.current = Date.now();
+        setNow(thinkingStartedAt.current);
+      }
+      const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+      return () => window.clearInterval(timer);
+    }
+    if (!thinkingNow && thinkingStartedAt.current !== null && thoughtMs === undefined) {
+      setThoughtMs(Math.max(1_000, Date.now() - thinkingStartedAt.current));
+    }
+  }, [thinkingNow, item.thinking, thoughtMs]);
+
+  const thinkingLabel = thinkingNow
+    ? thinkingStartedAt.current !== null
+      ? `思考中 · ${formatElapsed(thinkingStartedAt.current, now)}`
+      : "思考中"
+    : thoughtMs !== undefined
+      ? `思考了 ${formatDuration(thoughtMs)}`
+      : "思考过程";
+
+  const renderFooter = showFooter && !item.streaming && Boolean(item.text);
+  const time = renderFooter ? formatMessageTime(resolveAssistantTimestamp(item)) : undefined;
   return (
     <Message>
       <MessageContent className="gap-1">
         {item.thinking ? (
           <Trace>
-            <TraceCollapsible open={reasoningOpen || reveal} onOpenChange={setReasoningOpen}>
+            <TraceCollapsible open={reveal || (reasoningOpen ?? thinkingNow)} onOpenChange={setReasoningOpen}>
               <TraceCollapsibleTrigger>
-                <TraceLine {...(thinkingNow ? { status: "running" as const } : {})}>
+                <TraceLine className="text-[13px]" {...(thinkingNow ? { status: "running" as const } : {})}>
                   <TraceIcon>
                     <Brain />
                   </TraceIcon>
-                  <TraceTitle>{thinkingNow ? "思考中" : "思考过程"}</TraceTitle>
+                  <TraceTitle>{thinkingLabel}</TraceTitle>
                 </TraceLine>
               </TraceCollapsibleTrigger>
               <TraceCollapsibleContent>
@@ -194,13 +238,14 @@ function AssistantMessage({ item, reveal }: { item: Extract<TranscriptItem, { ki
             <MarkerContent className="whitespace-pre-wrap">{item.error}</MarkerContent>
           </Marker>
         ) : null}
-        {showFooter ? (
-          <MessageFooter className="pointer-events-none w-fit gap-1.5 px-1 pb-1 opacity-0 transition-opacity group-hover/message:pointer-events-auto group-hover/message:opacity-100 group-focus-within/message:pointer-events-auto group-focus-within/message:opacity-100">
+        {turnChanges?.length && onReview ? <ReplyChanges changes={turnChanges} onOpen={onReview} /> : null}
+        {renderFooter ? (
+          <MessageFooter className="-ms-1 w-fit gap-1.5 px-0 pt-0.5 text-muted-foreground">
             {item.text ? <CopyAction text={item.text} /> : null}
-            {item.model ? (
-              <span className="truncate font-mono text-[11px] text-muted-foreground" title={item.model}>
-                {shortModelName(item.model)}
-              </span>
+            {time ? (
+              <time className="text-xs font-normal tabular-nums" dateTime={time.iso} title={time.title}>
+                {time.label}
+              </time>
             ) : null}
           </MessageFooter>
         ) : null}
@@ -236,34 +281,27 @@ function SubagentNotificationCard({
   }
 
   const single = entries.length === 1 ? entries[0] : undefined;
-  const totalTokens = entries.reduce((sum, entry) => sum + (entry.totalTokens ?? 0), 0);
-  const totalCost = entries.reduce((sum, entry) => sum + (entry.totalCost ?? 0), 0);
   const headerMeta = single
-    ? [
-        single.toolUses ? `${single.toolUses} 次工具` : undefined,
-        single.totalTokens ? formatCompactTokens(single.totalTokens) : undefined,
-        formatDuration(single.durationMs),
-      ].filter(Boolean)
-    : [
-        totalTokens > 0 ? formatCompactTokens(totalTokens) : undefined,
-        totalCost > 0 ? `$${totalCost.toFixed(4)}` : undefined,
-      ].filter(Boolean);
+    ? [hasError ? "出错" : "已完成", formatDuration(single.durationMs)].filter(Boolean)
+    : [];
 
   return (
     <Trace>
       <TraceCollapsible open={open || reveal} onOpenChange={setOpen}>
-        <TraceCollapsibleTrigger>
-          <TraceLine {...(hasError ? { status: "error" as const } : {})}>
-            <TraceIcon>
-              {hasError ? <CircleAlert /> : <CheckCircle2 className="text-success-foreground" />}
-            </TraceIcon>
-            <TraceTitle>
-              {single ? (hasError ? "子 Agent 出错" : "子 Agent 完成") : `${entries.length} 个子 Agent 完成`}
-            </TraceTitle>
-            {single ? <TraceDescription className="max-w-[22rem] shrink truncate">{single.description}</TraceDescription> : null}
-            {headerMeta.length ? <TraceDescription className="text-xs tabular-nums">{headerMeta.join(" · ")}</TraceDescription> : null}
-          </TraceLine>
-        </TraceCollapsibleTrigger>
+        <div className="flex min-w-0 items-center gap-1">
+          <TraceCollapsibleTrigger className="py-0.5">
+            <TraceLine className="text-[13px]" {...(hasError ? { status: "error" as const } : {})}>
+              <TraceIcon>
+                {hasError ? <CircleAlert /> : <CheckCircle2 className="text-success-foreground" />}
+              </TraceIcon>
+              <TraceTitle className="max-w-[26rem] shrink truncate font-medium text-foreground">
+                {single ? single.description || (hasError ? "子 Agent 出错" : "子 Agent 已完成") : `${entries.length} 个子 Agent 已完成`}
+              </TraceTitle>
+              {headerMeta.length ? <TraceDescription className="text-xs tabular-nums">{headerMeta.join(" · ")}</TraceDescription> : null}
+            </TraceLine>
+          </TraceCollapsibleTrigger>
+          {single ? <SubSessionLink sessionId={sessionId} agentId={single.id} description={single.description} /> : null}
+        </div>
         <TraceCollapsibleContent>
           <div className="flex flex-col gap-2 text-foreground">
             {entries.map((entry, index) => {
@@ -281,7 +319,7 @@ function SubagentNotificationCard({
                     <Badge variant={err ? "destructive" : "secondary"}>{err ? "出错" : "已完成"}</Badge>
                     <span className="font-medium">{entry.description}</span>
                     {meta.length ? <span className="text-muted-foreground tabular-nums">· {meta.join(" · ")}</span> : null}
-                    <NotificationSubLink sessionId={sessionId} entry={entry} />
+                    {single ? null : <NotificationSubLink sessionId={sessionId} entry={entry} />}
                   </div>
                   {entry.error ? <p className="text-sm text-destructive">{entry.error}</p> : null}
                   {entry.preview ? <Markdown text={entry.preview} /> : null}
@@ -300,17 +338,23 @@ export const TranscriptEntry = React.memo(function TranscriptEntry({
   sessionId,
   running,
   reveal = false,
+  showFooter = true,
+  turnChanges,
+  onReview,
 }: {
   item: TranscriptItem;
   sessionId: string;
   running: boolean;
   reveal?: boolean;
+  showFooter?: boolean | undefined;
+  turnChanges?: FileChange[] | undefined;
+  onReview?: ((selection: ChangeSelection) => void) | undefined;
 }) {
   switch (item.kind) {
     case "user":
       return <UserMessage item={item} sessionId={sessionId} running={running} />;
     case "assistant":
-      return <AssistantMessage item={item} reveal={reveal} />;
+      return <AssistantMessage item={item} reveal={reveal} showFooter={showFooter} turnChanges={turnChanges} onReview={onReview} />;
     case "tool":
       return <ToolCall tool={item} sessionId={sessionId} reveal={reveal} />;
     case "custom":
@@ -325,8 +369,9 @@ export const TranscriptEntry = React.memo(function TranscriptEntry({
         </div>
       );
     case "run": {
-      const Icon = item.status === "completed" ? CheckCircle2 : item.status === "aborted" ? CircleStop : CircleAlert;
-      const label = { completed: "本轮已完成", aborted: "本轮已停止", error: "本轮出错", incomplete: "本轮未完成" }[item.status];
+      if (item.status === "completed") return null;
+      const Icon = item.status === "aborted" ? CircleStop : CircleAlert;
+      const label = { aborted: "本轮已停止", error: "本轮出错", incomplete: "本轮未完成" }[item.status];
       const duration = formatDuration(item.durationMs);
       return (
         <div data-run-status={item.status} className="flex items-center gap-1.5 text-xs text-muted-foreground">

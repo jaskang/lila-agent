@@ -307,8 +307,8 @@ export function Composer({
   return (
     <InputGroup
       className={cn(
-        "rounded-2xl bg-background shadow-xs has-disabled:bg-background has-disabled:opacity-100 dark:bg-background dark:has-disabled:bg-background",
-        dragging && "border-primary ring-3 ring-primary/20",
+        "rounded-[22px] border-border bg-card shadow-[0_2px_12px_-3px_rgb(0_0_0/0.07)] transition-[border-color,box-shadow] has-disabled:bg-card has-disabled:opacity-100 has-[[data-slot=input-group-control]:focus-visible]:border-foreground/20 has-[[data-slot=input-group-control]:focus-visible]:ring-2 has-[[data-slot=input-group-control]:focus-visible]:ring-ring/15 dark:bg-card dark:shadow-[0_4px_18px_-4px_rgb(0_0_0/0.4)] dark:has-disabled:bg-card",
+        dragging && "border-primary/60 ring-2 ring-primary/20",
       )}
       onDragOver={(event) => {
         if (!event.dataTransfer.types.includes("Files")) return;
@@ -370,8 +370,17 @@ export function Composer({
           </Command>
         </div>
       ) : null}
+      {dragging ? (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center gap-2 rounded-[22px] bg-card/90 text-sm font-medium text-foreground backdrop-blur-xs"
+        >
+          <Paperclip className="size-4 text-muted-foreground" />
+          松开以添加图片或文件
+        </div>
+      ) : null}
       {images.length ? (
-        <InputGroupAddon align="block-start" className="px-3 pt-2 pb-0">
+        <InputGroupAddon align="block-start" className="px-3.5 pt-3 pb-0">
           <AttachmentGroup>
             {images.map((image) => (
               <Attachment key={image.id} size="xs" orientation="vertical" className="w-16" title={image.name}>
@@ -412,9 +421,9 @@ export function Composer({
           event.preventDefault();
           void addFiles(pasted);
         }}
-        className="max-h-72 min-h-11 w-full flex-none px-3 pt-2.5 pb-1.5 text-sm"
+        className="max-h-72 min-h-12 w-full flex-none px-4 pt-3.5 pb-2 text-[14.5px] leading-relaxed"
       />
-      <InputGroupAddon align="block-end" className="flex-wrap gap-1 px-2 py-1.5">
+      <InputGroupAddon align="block-end" className="flex-wrap gap-1 px-2.5 pt-1 pb-2">
         <InputGroupButton
           type="button"
           size="icon-sm"

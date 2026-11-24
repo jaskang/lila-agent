@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Blocks, Check, CircleAlert, FolderPlus, GitBranch, MessageCircleQuestion, MessageSquare, Minimize2, Monitor, Moon, PanelLeft, RotateCw, Square, SquarePen, Sun } from "lucide-react";
+import { Blocks, Check, CircleAlert, FolderPlus, FolderTree, GitBranch, MessageCircleQuestion, MessageSquare, Minimize2, Monitor, Moon, PanelLeft, RotateCw, Square, SquarePen, Sun } from "lucide-react";
 import { CommandDialog, Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from "@/components/ui/command";
 import { useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
@@ -32,9 +32,15 @@ export function CommandPalette() {
           <CommandEmpty>没有匹配的结果</CommandEmpty>
           {selectedId ? (
             <CommandGroup heading="当前会话">
-              <CommandItem value="session-git 改动 diff git 工作区" onSelect={() => run(() => actions.setGitOpen(true))}>
+              <CommandItem value="session-files 文件 目录树 浏览 files" onSelect={() => run(() => actions.openRightPanel("files"))}>
+                <FolderTree />
+                浏览项目文件
+                <CommandShortcut>⌘E</CommandShortcut>
+              </CommandItem>
+              <CommandItem value="session-git 改动 diff git 工作区" onSelect={() => run(() => actions.openRightPanel("changes"))}>
                 <GitBranch />
                 查看工作区 Git 改动
+                <CommandShortcut>⇧⌘G</CommandShortcut>
               </CommandItem>
               {ready ? (
                 <CommandItem value="session-resources 能力 技能 MCP 扩展" onSelect={() => run(() => actions.setResourcesOpen(true))}>

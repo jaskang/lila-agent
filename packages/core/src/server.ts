@@ -129,6 +129,10 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         return {};
       case "files.search":
         return { files: await host.searchFiles(command.projectId, command.query, command.limit) };
+      case "files.list":
+        return await host.listProjectFiles(command.projectId, command.refresh);
+      case "files.read":
+        return { file: await host.readProjectFile(command.projectId, command.path) };
       case "git.status":
         return { status: await host.gitStatus(command.projectId) };
       case "git.diff":

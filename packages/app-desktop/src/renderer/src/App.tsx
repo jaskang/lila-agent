@@ -1,9 +1,13 @@
 import * as React from "react";
 import { RotateCw, WifiOff } from "lucide-react";
 import { AppSidebar } from "@/components/app-sidebar";
+import { ChangesPanel } from "@/components/changes-panel";
 import { CommandPalette } from "@/components/command-palette";
 import { Conversation } from "@/components/conversation";
+import { FilesPanel } from "@/components/files-panel";
 import { NewSession } from "@/components/new-session";
+import { ReplyChangesPanel } from "@/components/reply-changes";
+import { RightPanelShell } from "@/components/right-panel";
 import { SubsessionPreview } from "@/components/subsession-preview";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -61,8 +65,12 @@ function ConnectionBanner() {
 
 export function App() {
   const selectedId = useLila((state) => state.selectedId);
+  const selectedProjectId = useLila((state) => (state.selectedId ? state.sessions[state.selectedId]?.projectId : undefined));
   const previewId = useLila((state) => state.previewId);
+  const rightPanel = useLila((state) => state.rightPanel);
+  const replyReview = useLila((state) => state.replyReview);
   const [sidebarOpen, setSidebarOpen] = React.useState(readSidebarOpen);
+  const workspaceRef = React.useRef<HTMLDivElement>(null);
 
   const handleSidebarOpenChange = React.useCallback((open: boolean) => {
     setSidebarOpen(open);
@@ -77,14 +85,22 @@ export function App() {
     client.start();
     if (typeof Notification !== "undefined" && Notification.permission === "default") void Notification.requestPermission();
     const onKey = (event: KeyboardEvent) => {
-      if (!event.metaKey || event.shiftKey || event.altKey) return;
+      if (!event.metaKey || event.altKey) return;
       const key = event.key.toLowerCase();
-      if (key === "n") {
+      if (!event.shiftKey) {
+        if (key === "n") {
+          event.preventDefault();
+          actions.startNew();
+        } else if (key === "k") {
+          event.preventDefault();
+          actions.setPaletteOpen(!useLila.getState().paletteOpen);
+        } else if (key === "e" && useLila.getState().selectedId) {
+          event.preventDefault();
+          actions.toggleRightPanel("files");
+        }
+      } else if (key === "g" && useLila.getState().selectedId) {
         event.preventDefault();
-        actions.startNew();
-      } else if (key === "k") {
-        event.preventDefault();
-        actions.setPaletteOpen(!useLila.getState().paletteOpen);
+        actions.toggleRightPanel("changes");
       }
     };
     window.addEventListener("keydown", onKey);
@@ -94,18 +110,36 @@ export function App() {
     };
   }, []);
 
+  const rightPanelContent =
+    selectedId && rightPanel === "subsession" && previewId
+      ? { label: "子会话预览", node: <SubsessionPreview key={previewId} sessionId={previewId} /> }
+      : selectedId && rightPanel === "review" && replyReview
+        ? { label: "本轮文件改动", node: <ReplyChangesPanel review={replyReview} /> }
+        : selectedId && rightPanel === "files" && selectedProjectId
+          ? { label: "项目文件与预览", node: <FilesPanel projectId={selectedProjectId} /> }
+          : selectedId && rightPanel === "changes" && selectedProjectId
+            ? { label: "工作区改动", node: <ChangesPanel projectId={selectedProjectId} /> }
+            : undefined;
+
   return (
     <TooltipProvider>
       <SidebarProvider open={sidebarOpen} onOpenChange={handleSidebarOpenChange} className="h-svh min-h-0">
         <AppSidebar />
-        <SidebarInset className="relative m-1.5 min-h-0 overflow-hidden rounded-xl bg-background shadow-sm ring-1 ring-border/60 md:peer-data-[variant=inset]:m-1.5 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-1.5">
-          <ConnectionBanner />
-          {selectedId ? (
-            <div className="relative flex min-h-0 flex-1">
-              <Conversation key={selectedId} sessionId={selectedId} />
-              {previewId ? <SubsessionPreview key={previewId} sessionId={previewId} /> : null}
+        <SidebarInset className="relative m-1.5 min-h-0 flex-row overflow-visible bg-transparent shadow-none md:peer-data-[variant=inset]:m-1.5 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-none md:peer-data-[variant=inset]:shadow-none md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-1.5">
+          <div ref={workspaceRef} className="relative flex min-h-0 min-w-0 flex-1">
+            <div className="@container relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl bg-background shadow-sm ring-1 ring-border/60">
+              <ConnectionBanner />
+              {selectedId ? <Conversation key={selectedId} sessionId={selectedId} /> : <NewSession />}
             </div>
-          ) : <NewSession />}
+            <RightPanelShell
+              open={Boolean(rightPanelContent)}
+              label={rightPanelContent?.label}
+              containerRef={workspaceRef}
+              onClose={() => actions.closeRightPanel()}
+            >
+              {rightPanelContent?.node}
+            </RightPanelShell>
+          </div>
         </SidebarInset>
         <CommandPalette />
       </SidebarProvider>

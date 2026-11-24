@@ -74,6 +74,7 @@ export function assistantItem(message: AssistantMessage, streaming: boolean): As
     text,
     thinking,
     model: `${message.provider}/${message.model}`,
+    ...(typeof message.timestamp === "number" && Number.isFinite(message.timestamp) ? { timestamp: message.timestamp } : {}),
     streaming,
     ...(error ? { error } : {}),
   };

@@ -48,7 +48,7 @@ test("projects a branch into transcript items", () => {
   const items = projectBranch(branch);
   expect(items).toEqual([
     { kind: "user", id: "u:1", text: "Fix a.ts", images: [], canRewind: true },
-    { kind: "assistant", id: "a:2", text: "Editing.", thinking: "Need to edit.", model: "anthropic/claude", streaming: false },
+    { kind: "assistant", id: "a:2", text: "Editing.", thinking: "Need to edit.", model: "anthropic/claude", timestamp: 2, streaming: false },
     {
       kind: "tool",
       id: "call-1",

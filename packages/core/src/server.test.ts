@@ -264,3 +264,29 @@ test("searches beyond the open page and returns a window around a folded tool re
     client.ws.close();
   }
 });
+
+test("lists project files and reads in-project markdown while blocking out-of-project paths", async () => {
+  const client = await connect();
+  const projectDir = mkdtempSync(join(tmpdir(), "lila-files-"));
+  const outsideFile = join(mkdtempSync(join(tmpdir(), "lila-outside-")), "secret.txt");
+  writeFileSync(outsideFile, "top secret");
+  mkdirSync(join(projectDir, "docs", "设计参考"), { recursive: true });
+  writeFileSync(join(projectDir, "docs", "plan.md"), "# Plan\n\nHello Lila\n");
+  writeFileSync(join(projectDir, "docs", "设计参考", "规范.md"), "# Spec\n");
+
+  try {
+    const { project } = await client.call({ type: "projects.add", requestId: "files-add", path: projectDir });
+    const listed = await client.call({ type: "files.list", requestId: "files-list", projectId: project.id });
+    expect(listed.files).toContain("docs/plan.md");
+    expect(listed.files).toContain("docs/设计参考/规范.md");
+
+    const { file } = await client.call({ type: "files.read", requestId: "files-read", projectId: project.id, path: "docs/plan.md" });
+    expect(file).toMatchObject({ path: "docs/plan.md", isBinary: false, isImage: false, truncated: false, content: "# Plan\n\nHello Lila\n" });
+
+    await expect(
+      client.call({ type: "files.read", requestId: "files-outside", projectId: project.id, path: outsideFile }),
+    ).rejects.toThrow("不允许读取项目目录之外的文件");
+  } finally {
+    client.ws.close();
+  }
+});
