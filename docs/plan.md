@@ -2,7 +2,7 @@
 
 架构见 [architecture.md](architecture.md)，内核选择见 [ADR 0001](adr/0001-pi-sdk-kernel.md)。
 
-本地运行：`bun install` 后 `bun run dev`。原生客户端会自行启动或复用 core。core 日志在 `~/Library/Application Support/Lila/core.log`。模型、认证、MCP、技能都读 `~/.pi/agent`，先用 `pi` 命令行配好（`/login`、`pi mcp add`、`pi install`）。
+本地运行：`bun install` 后 `bun run dev`（同时启动 core 和 Electron）。core 日志在 `~/Library/Application Support/Lila/core.log`。模型、认证、MCP、技能都读 `~/.pi/agent`，先用 `pi` 命令行配好（`/login`、`pi mcp add`、`pi install`）。
 
 ## 下一个任务
 
@@ -12,9 +12,9 @@
 
 响应速度按架构文档三条标准实测；长会话用一个几百条消息的 Pi 会话文件打开试。
 
-### 2. 原生客户端发布
+### 2. 发布打包
 
-- 确定 macOS 应用包中的 core、依赖和 Node 运行时如何分发。当前从仓库根目录执行 `bun run dev` 或 `bun run build`。
+- electron-builder 把 `packages/core`（含 `node_modules`）放进 `resources/core`，主进程已经按 `ELECTRON_RUN_AS_NODE=1 <app> resources/core/src/main.ts` 启动它，不需要编译。
 - 签名与公证。
 - 视使用情况决定是否把 core 改成 launchd 用户级常驻服务。
 
@@ -26,12 +26,9 @@
 
 ### 4. 体验待补
 
-- 为 Rust 客户端接入会话内查找、轮次目录、子会话侧边预览和项目 Git 改动。
 - 会话树导航（Pi 的 `/tree`）和从任意消息分叉成新会话。
 
 ## 已完成
-
-以下条目涵盖原生迁移前的 Electron 工作。原生客户端当前能力见 [架构](architecture.md)和 [原生客户端说明](../packages/app-native/README.md)。
 
 - **内核换成 pi-coding-agent SDK。** 会话是 Pi 的 JSONL 文件，与 `pi` 命令行共用配置；MCP、codemode、tool_search、技能、提示模板、AGENTS.md、用户扩展和 Pi 包都生效；子 Agent 用 pi-subagents。
 - **core 改在 Node 上运行**（Electron 自带 Node 24），WebSocket 用 `ws`，token 鉴权、拒绝网页来源。

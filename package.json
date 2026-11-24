@@ -7,8 +7,8 @@
   "type": "module",
   "scripts": {
     "build:protocol": "bun run --filter @lila/protocol build",
-    "build": "bun run build:protocol && cargo build --manifest-path packages/app-native/Cargo.toml",
-    "dev": "bun run build:protocol && cargo run --manifest-path packages/app-native/Cargo.toml",
+    "build": "bun run build:protocol && bun run --filter @lila/desktop build",
+    "dev": "bun run build:protocol && bun run --filter @lila/core --filter @lila/desktop dev",
     "lint": "oxlint",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
