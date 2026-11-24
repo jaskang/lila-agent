@@ -440,7 +440,7 @@ export function Composer({
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-0.5">{footer}</div>
         <div className="ms-auto flex shrink-0 items-center gap-1">
           {abortArmed ? (
-            <span className="shrink-0 px-1 text-xs text-amber-600 dark:text-amber-400">
+            <span className="shrink-0 px-1 text-xs text-warning-foreground">
               再按一次 <Kbd>Esc</Kbd> 停止
             </span>
           ) : null}

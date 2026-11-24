@@ -7,11 +7,14 @@ import {
   FolderOpen,
   FolderPlus,
   MessageCircleQuestion,
+  Monitor,
+  Moon,
   MoreHorizontal,
   Pencil,
   Plus,
   Search,
   SquarePen,
+  Sun,
   Trash2,
   X,
 } from "lucide-react";
@@ -26,7 +29,16 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Kbd } from "@/components/ui/kbd";
 import {
@@ -52,6 +64,7 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "cn";
 import { actions, useLila } from "@/lib/store";
+import { type ThemeMode, useTheme } from "@/lib/theme";
 
 const RELATIVE = new Intl.RelativeTimeFormat("zh-CN", { numeric: "auto" });
 const COLLAPSED_KEY = "lila.collapsedProjects";
@@ -84,7 +97,7 @@ function ago(iso: string, now: number): string {
 
 function StatusIcon({ status }: { status: SessionSummary["status"] }) {
   if (status === "running") return <Spinner className="text-muted-foreground" />;
-  if (status === "waiting") return <MessageCircleQuestion className="text-amber-600 dark:text-amber-400" />;
+  if (status === "waiting") return <MessageCircleQuestion className="text-warning-foreground" />;
   if (status === "error") return <CircleAlert className="text-destructive" />;
   return null;
 }
@@ -530,15 +543,69 @@ export function AppSidebar() {
         {filter && !Object.keys(byProject.groups).length ? <p className="px-4 py-2 text-xs text-muted-foreground">没有匹配的会话</p> : null}
       </SidebarContent>
       <SidebarFooter>
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton onClick={() => void actions.addProject()}>
-              <FolderPlus />
-              添加项目
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
+        <div className="flex items-center gap-1">
+          <SidebarMenu className="min-w-0 flex-1">
+            <SidebarMenuItem>
+              <SidebarMenuButton onClick={() => void actions.addProject()}>
+                <FolderPlus />
+                添加项目
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </SidebarMenu>
+          <ThemeSwitcher />
+        </div>
       </SidebarFooter>
     </Sidebar>
+  );
+}
+
+const THEME_LABELS: Record<ThemeMode, string> = {
+  light: "浅色模式",
+  dark: "暗黑模式",
+  system: "跟随系统",
+};
+
+function ThemeSwitcher() {
+  const { theme, setTheme } = useTheme();
+  const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Monitor;
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`外观：${THEME_LABELS[theme]}`}
+            title={`外观：${THEME_LABELS[theme]}`}
+            className="shrink-0 text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+          />
+        }
+      >
+        <Icon />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent side="top" align="end" className="w-36" finalFocus={false}>
+        <DropdownMenuRadioGroup
+          value={theme}
+          onValueChange={(value) => {
+            if (value === "light" || value === "dark" || value === "system") setTheme(value);
+          }}
+        >
+          <DropdownMenuRadioItem value="light">
+            <Sun />
+            浅色
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="dark">
+            <Moon />
+            暗黑
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="system">
+            <Monitor />
+            跟随系统
+          </DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

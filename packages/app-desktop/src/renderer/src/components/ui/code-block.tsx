@@ -187,8 +187,8 @@ const codeBlockLineVariants = cva(
       variant: {
         default: "",
         added:
-          "bg-emerald-500/12 after:text-emerald-600 after:content-['+'] dark:bg-emerald-500/15 dark:after:text-emerald-400",
-        removed: "bg-destructive/10 after:text-destructive after:content-['−']",
+          "bg-success/12 after:text-success-foreground after:content-['+'] dark:bg-success/15",
+        removed: "bg-destructive/10 after:text-destructive-foreground after:content-['−']",
         highlighted: "border-y border-border/60 bg-muted/60 text-muted-foreground",
       },
     },

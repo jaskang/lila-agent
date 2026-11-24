@@ -255,7 +255,7 @@ function SubagentNotificationCard({
         <TraceCollapsibleTrigger>
           <TraceLine {...(hasError ? { status: "error" as const } : {})}>
             <TraceIcon>
-              {hasError ? <CircleAlert /> : <CheckCircle2 className="text-emerald-600 dark:text-emerald-400" />}
+              {hasError ? <CircleAlert /> : <CheckCircle2 className="text-success-foreground" />}
             </TraceIcon>
             <TraceTitle>
               {single ? (hasError ? "子 Agent 出错" : "子 Agent 完成") : `${entries.length} 个子 Agent 完成`}
@@ -339,7 +339,7 @@ export const TranscriptEntry = React.memo(function TranscriptEntry({
     case "notice": {
       const Icon = NOTICE_ICON[item.tone];
       return (
-        <Marker className={item.tone === "error" ? "text-destructive" : item.tone === "warning" ? "text-amber-700 dark:text-amber-400" : undefined}>
+        <Marker className={item.tone === "error" ? "text-destructive-foreground" : item.tone === "warning" ? "text-warning-foreground" : undefined}>
           <MarkerIcon>
             <Icon />
           </MarkerIcon>

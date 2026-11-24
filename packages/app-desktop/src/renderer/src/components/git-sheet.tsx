@@ -17,13 +17,13 @@ import { actions, useLila } from "@/lib/store";
 type Scope = "all" | "staged" | "unstaged";
 
 const STATUS_BADGE: Record<GitFileStatus, { letter: string; label: string; className: string }> = {
-  modified: { letter: "M", label: "已修改", className: "text-amber-600 dark:text-amber-400" },
-  added: { letter: "A", label: "新增", className: "text-emerald-600 dark:text-emerald-400" },
-  deleted: { letter: "D", label: "删除", className: "text-destructive" },
-  renamed: { letter: "R", label: "重命名", className: "text-sky-600 dark:text-sky-400" },
-  copied: { letter: "C", label: "复制", className: "text-sky-600 dark:text-sky-400" },
-  untracked: { letter: "?", label: "未跟踪", className: "text-emerald-600 dark:text-emerald-400" },
-  unmerged: { letter: "U", label: "冲突", className: "text-destructive" },
+  modified: { letter: "M", label: "已修改", className: "text-warning-foreground" },
+  added: { letter: "A", label: "新增", className: "text-success-foreground" },
+  deleted: { letter: "D", label: "删除", className: "text-destructive-foreground" },
+  renamed: { letter: "R", label: "重命名", className: "text-info-foreground" },
+  copied: { letter: "C", label: "复制", className: "text-info-foreground" },
+  untracked: { letter: "?", label: "未跟踪", className: "text-success-foreground" },
+  unmerged: { letter: "U", label: "冲突", className: "text-destructive-foreground" },
 };
 
 function splitPath(path: string): { name: string; dir: string } {
@@ -252,9 +252,9 @@ export function GitSheet({
                         </div>
                         {file.added !== undefined || file.removed !== undefined ? (
                           <span className="shrink-0 font-mono text-[11px] tabular-nums">
-                            {file.added ? <span className="text-emerald-600 dark:text-emerald-400">+{file.added}</span> : null}
+                            {file.added ? <span className="text-success-foreground">+{file.added}</span> : null}
                             {file.added && file.removed ? " " : null}
-                            {file.removed ? <span className="text-destructive">−{file.removed}</span> : null}
+                            {file.removed ? <span className="text-destructive-foreground">−{file.removed}</span> : null}
                           </span>
                         ) : null}
                       </button>

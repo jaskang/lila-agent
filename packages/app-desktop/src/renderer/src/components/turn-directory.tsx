@@ -84,7 +84,7 @@ export function TurnRail({ items, onJump }: {
                         aria-hidden
                         className={cn(
                           "h-0.5 rounded-full bg-muted-foreground/45 transition-[width,background-color] duration-150 motion-reduce:transition-none",
-                          current && "bg-sky-600 dark:bg-sky-400",
+                          current && "bg-info",
                           hovered === index && "bg-foreground",
                         )}
                         style={{ width: Math.max(current ? 13 : 7, previewWidth ?? 0) }}

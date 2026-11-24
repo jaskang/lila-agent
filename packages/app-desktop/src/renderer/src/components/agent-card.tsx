@@ -259,7 +259,7 @@ export function SingleAgentCard({ tool, sessionId, reveal = false }: { tool: Age
                 ) : info.isError ? (
                   <CircleAlert />
                 ) : (
-                  <CheckCircle2 className="text-emerald-600 dark:text-emerald-400" />
+                  <CheckCircle2 className="text-success-foreground" />
                 )}
               </TraceIcon>
               <TraceTitle>子 Agent · {info.type}</TraceTitle>
@@ -318,7 +318,7 @@ function AgentGroupRow({
             ) : info.isError ? (
               <CircleAlert className="size-3.5 text-destructive" />
             ) : (
-              <CheckCircle2 className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+              <CheckCircle2 className="size-3.5 text-success-foreground" />
             )}
           </span>
           <Badge variant="secondary" className="h-5 shrink-0 px-1.5 font-normal">

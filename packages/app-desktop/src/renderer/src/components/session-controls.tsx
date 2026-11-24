@@ -207,7 +207,7 @@ export function ContextUsage({ sessionId, state }: { sessionId: string; state: S
   const percent = context.percent ?? (context.tokens !== null && context.window ? (context.tokens / context.window) * 100 : null);
   const filled = Math.min(100, Math.max(0, percent ?? 0));
   const busy = state.access !== "ready" || state.runActive || state.compacting;
-  const tone = filled >= 80 ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground";
+  const tone = filled >= 80 ? "text-warning-foreground" : "text-muted-foreground";
   return (
     <HoverCard>
       <HoverCardTrigger render={<Button variant="ghost" size="icon-sm" className={tone} aria-label={`上下文已用 ${Math.round(filled)}%`} />}>

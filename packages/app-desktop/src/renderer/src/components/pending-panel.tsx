@@ -51,8 +51,8 @@ function Shell({
   children: React.ReactNode;
 }) {
   return (
-    <Item variant="outline" size="sm" role="region" aria-label={title} className="items-start gap-2 border-amber-500/40 bg-amber-50/80 dark:bg-amber-950/30">
-      <ItemMedia variant="icon" className="mt-0.5 text-amber-600 dark:text-amber-400">{icon}</ItemMedia>
+    <Item variant="outline" size="sm" role="region" aria-label={title} className="items-start gap-2 border-warning/35 bg-warning/8 dark:bg-warning/10">
+      <ItemMedia variant="icon" className="mt-0.5 text-warning-foreground">{icon}</ItemMedia>
       <ItemContent className="min-w-0 gap-2">
         <div className="flex items-center gap-2">
           <ItemTitle className="min-w-0 flex-1">{title}</ItemTitle>

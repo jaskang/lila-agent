@@ -1,9 +1,10 @@
 import * as React from "react";
-import { Blocks, CircleAlert, FolderPlus, GitBranch, MessageCircleQuestion, MessageSquare, Minimize2, PanelLeft, RotateCw, Square, SquarePen } from "lucide-react";
+import { Blocks, Check, CircleAlert, FolderPlus, GitBranch, MessageCircleQuestion, MessageSquare, Minimize2, Monitor, Moon, PanelLeft, RotateCw, Square, SquarePen, Sun } from "lucide-react";
 import { CommandDialog, Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from "@/components/ui/command";
 import { useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { actions, useLila } from "@/lib/store";
+import { useTheme } from "@/lib/theme";
 
 export function CommandPalette() {
   const open = useLila((state) => state.paletteOpen);
@@ -12,6 +13,7 @@ export function CommandPalette() {
   const selectedId = useLila((state) => state.selectedId);
   const activeState = useLila((state) => (state.selectedId ? state.views[state.selectedId]?.state : undefined));
   const { toggleSidebar } = useSidebar();
+  const { theme, setTheme } = useTheme();
   const projectName = React.useMemo(() => new Map(projects.map((project) => [project.id, project.name])), [projects]);
   const sorted = React.useMemo(() => Object.values(sessions).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)), [sessions]);
   const ready = activeState?.access === "ready";
@@ -80,6 +82,21 @@ export function CommandPalette() {
               <FolderPlus />
               添加项目…
             </CommandItem>
+            <CommandItem value="theme-light 浅色模式 外观 主题 light" onSelect={() => run(() => setTheme("light"))}>
+              <Sun />
+              切换到浅色模式
+              {theme === "light" ? <Check className="ms-auto size-4 text-muted-foreground" /> : null}
+            </CommandItem>
+            <CommandItem value="theme-dark 暗黑模式 深色模式 外观 主题 dark" onSelect={() => run(() => setTheme("dark"))}>
+              <Moon />
+              切换到暗黑模式
+              {theme === "dark" ? <Check className="ms-auto size-4 text-muted-foreground" /> : null}
+            </CommandItem>
+            <CommandItem value="theme-system 跟随系统 外观 主题 system" onSelect={() => run(() => setTheme("system"))}>
+              <Monitor />
+              外观跟随系统
+              {theme === "system" ? <Check className="ms-auto size-4 text-muted-foreground" /> : null}
+            </CommandItem>
           </CommandGroup>
           {sorted.length ? (
             <CommandGroup heading="会话">
@@ -92,7 +109,7 @@ export function CommandPalette() {
                   {session.status === "running" ? (
                     <Spinner />
                   ) : session.status === "waiting" ? (
-                    <MessageCircleQuestion className="text-amber-600 dark:text-amber-400" />
+                    <MessageCircleQuestion className="text-warning-foreground" />
                   ) : session.status === "error" ? (
                     <CircleAlert className="text-destructive" />
                   ) : (

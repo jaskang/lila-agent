@@ -267,8 +267,8 @@ export function DiffView({ patch, path, maxHeight = "24rem" }: { patch: string; 
                 {file.path}
               </CodeBlockTitle>
               <span className="ms-auto shrink-0 font-mono text-xs tabular-nums">
-                <span className="text-emerald-600 dark:text-emerald-400">+{file.added}</span>{" "}
-                <span className="text-destructive">−{file.removed}</span>
+                <span className="text-success-foreground">+{file.added}</span>{" "}
+                <span className="text-destructive-foreground">−{file.removed}</span>
               </span>
             </CodeBlockHeader>
             <CodeBlockContent style={{ maxHeight }}>

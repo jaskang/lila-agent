@@ -53,6 +53,40 @@ let window: BrowserWindow | undefined;
 let quitting = false;
 let ensuring: Promise<void> | undefined;
 
+type ThemeMode = "system" | "light" | "dark";
+
+function isThemeMode(value: unknown): value is ThemeMode {
+  return value === "system" || value === "light" || value === "dark";
+}
+
+function windowBackgroundColor(): string {
+  return nativeTheme.shouldUseDarkColors ? "#171717" : "#ffffff";
+}
+
+function readSavedTheme(): ThemeMode {
+  try {
+    const raw = readFileSync(join(dataDir, "theme"), "utf8").trim();
+    if (isThemeMode(raw)) return raw;
+  } catch {
+    // Missing or unreadable theme preference defaults to system.
+  }
+  return "system";
+}
+
+function applyTheme(mode: ThemeMode, persist: boolean): void {
+  nativeTheme.themeSource = mode;
+  if (window && !window.isDestroyed()) {
+    window.setBackgroundColor(windowBackgroundColor());
+  }
+  if (!persist) return;
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(join(dataDir, "theme"), `${mode}\n`);
+  } catch {
+    // Best-effort theme persistence.
+  }
+}
+
 type Health = { ok: boolean; app?: string; protocolVersion?: number; pid?: number };
 
 async function health(): Promise<Health | undefined> {
@@ -284,7 +318,7 @@ function createWindow(): void {
     minWidth: 760,
     minHeight: 520,
     show: false,
-    backgroundColor: nativeTheme.shouldUseDarkColors ? "#171717" : "#ffffff",
+    backgroundColor: windowBackgroundColor(),
     title: "Lila",
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 18, y: 20 },
@@ -367,6 +401,10 @@ ipcMain.on("lila:reveal-path", (_event, path: string) => {
 
 ipcMain.on("lila:focus", () => showWindow());
 
+ipcMain.on("lila:set-theme", (_event, mode: unknown) => {
+  if (isThemeMode(mode)) applyTheme(mode, true);
+});
+
 function resolveAllowedMedia(rawPath: string, rawBase: string | null): { path: string; mime: string } | undefined {
   const candidates: string[] = [];
   if (isAbsolute(rawPath)) {
@@ -433,6 +471,10 @@ app.on("before-quit", () => {
 });
 
 void app.whenReady().then(() => {
+  applyTheme(readSavedTheme(), false);
+  nativeTheme.on("updated", () => {
+    if (window && !window.isDestroyed()) window.setBackgroundColor(windowBackgroundColor());
+  });
   registerMediaProtocol();
   createWindow();
   app.on("activate", showWindow);
