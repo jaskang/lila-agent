@@ -111,6 +111,8 @@ export async function startCore(options: CoreOptions): Promise<Core> {
 
   async function execute(ws: WebSocket, command: ClientCommand): Promise<CommandResults[CommandType]> {
     switch (command.type) {
+      case "ping":
+        return { ok: true };
       case "projects.list":
         return { projects: [...host.store.projects] };
       case "projects.add":
@@ -119,7 +121,88 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         await host.removeProject(command.projectId);
         return {};
       case "models.list":
-        return await host.listModels();
+        return await host.listModels(command.refresh ?? false);
+      case "provider.models.set":
+        return await host.setProviderModels(command.providerId, command.modelIds);
+      case "settings.get":
+        return { settings: await host.getSettings() };
+      case "settings.update":
+        return {
+          settings: await host.updateSettings({
+            defaultModelId: command.defaultModelId,
+            defaultThinkingLevel: command.defaultThinkingLevel,
+            autoCompaction: command.autoCompaction,
+            autoRetry: command.autoRetry,
+          }),
+        };
+      case "providers.list":
+        return { providers: await host.listProviders() };
+      case "auth.login.start": {
+        let loginId = "";
+        loginId = await host.startProviderLogin(ws, command.providerId, command.method, (event) => {
+          send(ws, { type: "auth.login", loginId, providerId: command.providerId, event });
+        });
+        return { loginId };
+      }
+      case "auth.login.respond":
+        host.respondProviderLogin(command.loginId, command.promptId, command.value);
+        return {};
+      case "auth.login.cancel":
+        host.cancelProviderLogin(command.loginId);
+        return {};
+      case "auth.logout":
+        await host.logoutProvider(command.providerId);
+        return {};
+      case "mcp.list":
+        return { config: host.listMcp(command.projectId) };
+      case "mcp.upsert":
+        return { config: await host.upsertMcp(command.scope, command.name, command.config, command.projectId) };
+      case "mcp.toggle":
+        return {
+          config: await host.toggleMcp(
+            command.scope,
+            command.name,
+            { enabled: command.enabled, exposure: command.exposure },
+            command.projectId,
+          ),
+        };
+      case "mcp.remove":
+        return { config: await host.removeMcp(command.scope, command.name, command.projectId) };
+      case "capabilities.get":
+        return { capabilities: await host.getCapabilities(command.projectId, command.sessionId) };
+      case "memory.get":
+        return { memory: await host.getMemory(command.projectId, command.sessionId) };
+      case "memory.add":
+        return { memory: await host.addMemory(command.target, command.content) };
+      case "memory.replace":
+        return { memory: await host.replaceMemory(command.target, command.oldText, command.newContent) };
+      case "memory.remove":
+        return { memory: await host.removeMemory(command.target, command.oldText) };
+      case "memory.config.update":
+        return {
+          memory: await host.updateMemorySettings({
+            enabled: command.enabled,
+            memoryCharLimit: command.memoryCharLimit,
+            userCharLimit: command.userCharLimit,
+            dreamingEnabled: command.dreamingEnabled,
+            dreamingMinHours: command.dreamingMinHours,
+            dreamingMinTurns: command.dreamingMinTurns,
+            dreamingModelId: command.dreamingModelId,
+          }),
+        };
+      case "packages.install":
+        return { capabilities: await host.installPackage(command.source, command.scope, command.projectId) };
+      case "packages.remove":
+        return { capabilities: await host.removePackage(command.source, command.scope, command.projectId) };
+      case "packages.update":
+        return { capabilities: await host.updatePackages(command.source, command.projectId) };
+      case "workspace.reload":
+        await host.reloadWorkspace(command.projectId, command.sessionId);
+        return {};
+      case "usage.summary":
+        return { summary: await host.getUsageSummary(command.range, command.onlyConfigured ?? true) };
+      case "quotas.list":
+        return { quotas: await host.listQuotas(command.refresh ?? false) };
       case "sessions.list":
         return { sessions: await host.listSessions() };
       case "session.create":
@@ -143,7 +226,10 @@ export async function startCore(options: CoreOptions): Promise<Core> {
       case "commands.list":
         return { commands: await host.commands(command.projectId, command.sessionId) };
       case "session.fork":
-        return { session: await host.forkSubsession(command.sessionId) };
+        return { session: await host.forkSession(command.sessionId, command.itemId) };
+      case "session.retry":
+        await host.retrySession(command.sessionId);
+        return {};
       case "session.open": {
         const slot = command.slot ?? "main";
         const seq = nextWatchSeq(ws, slot);
@@ -184,8 +270,8 @@ export async function startCore(options: CoreOptions): Promise<Core> {
       case "session.respond":
         live.respond(command.pendingId, command.answer);
         return {};
-      case "session.resources":
-        return { resources: live.resources() };
+      case "session.queue.update":
+        return { state: await live.updateQueue(command.action, command.kind, command.index) };
       case "session.reload":
         await live.reload();
         return {};
@@ -264,6 +350,7 @@ export async function startCore(options: CoreOptions): Promise<Core> {
       ws.on("close", () => {
         unwatch(ws, "main");
         unwatch(ws, "preview");
+        host.cancelLoginsForOwner(ws);
       });
       send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, coreVersion: pkg.version });
     });

@@ -3,7 +3,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync,
 import { readFile, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, protocol, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, protocol, screen, shell } from "electron";
 import { DEFAULT_CORE_PORT, PROTOCOL_VERSION } from "@lila/protocol";
 
 protocol.registerSchemesAsPrivileged([
@@ -60,7 +60,65 @@ function isThemeMode(value: unknown): value is ThemeMode {
 }
 
 function windowBackgroundColor(): string {
-  return nativeTheme.shouldUseDarkColors ? "#171717" : "#ffffff";
+  return nativeTheme.shouldUseDarkColors ? "#121212" : "#fafafa";
+}
+
+type WindowState = {
+  x?: number;
+  y?: number;
+  width: number;
+  height: number;
+  maximized?: boolean;
+};
+
+const DEFAULT_WINDOW_STATE: WindowState = { width: 1200, height: 800 };
+
+function readWindowState(): WindowState {
+  try {
+    const raw = JSON.parse(readFileSync(join(dataDir, "window-state.json"), "utf8")) as Partial<WindowState>;
+    const width = typeof raw.width === "number" && Number.isFinite(raw.width) && raw.width >= 760 ? Math.round(raw.width) : DEFAULT_WINDOW_STATE.width;
+    const height = typeof raw.height === "number" && Number.isFinite(raw.height) && raw.height >= 520 ? Math.round(raw.height) : DEFAULT_WINDOW_STATE.height;
+    const state: WindowState = { width, height, maximized: Boolean(raw.maximized) };
+    if (typeof raw.x === "number" && Number.isFinite(raw.x) && typeof raw.y === "number" && Number.isFinite(raw.y)) {
+      const bounds = { x: Math.round(raw.x), y: Math.round(raw.y), width, height };
+      const visible = screen.getAllDisplays().some((display) => {
+        const area = display.workArea;
+        const overlapX = Math.min(bounds.x + bounds.width, area.x + area.width) - Math.max(bounds.x, area.x);
+        const overlapY = Math.min(bounds.y + bounds.height, area.y + area.height) - Math.max(bounds.y, area.y);
+        return overlapX >= 120 && overlapY >= 120;
+      });
+      if (visible) {
+        state.x = bounds.x;
+        state.y = bounds.y;
+      }
+    }
+    return state;
+  } catch {
+    return DEFAULT_WINDOW_STATE;
+  }
+}
+
+function saveWindowState(win: BrowserWindow): void {
+  if (win.isDestroyed()) return;
+  try {
+    const maximized = win.isMaximized();
+    const bounds = maximized ? win.getNormalBounds() : win.getBounds();
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(
+      join(dataDir, "window-state.json"),
+      JSON.stringify({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, maximized }, null, 2) + "\n",
+    );
+  } catch {
+    // Best-effort window state persistence.
+  }
+}
+
+function openExternalSafe(rawUrl: string): Promise<void> {
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:" && parsed.protocol !== "mailto:") {
+    throw new Error(`不支持打开该协议的链接：${parsed.protocol}`);
+  }
+  return shell.openExternal(parsed.toString());
 }
 
 function readSavedTheme(): ThemeMode {
@@ -167,13 +225,15 @@ async function withCoreLock<T>(run: () => Promise<T>): Promise<T> {
 }
 
 /** Connects to a running core, or starts one that outlives this app. */
-async function ensureCore(): Promise<void> {
-  const initial = await health();
-  if (initial?.protocolVersion === PROTOCOL_VERSION) return;
+async function ensureCore(forceRestart = false): Promise<void> {
+  if (!forceRestart) {
+    const initial = await health();
+    if (initial?.protocolVersion === PROTOCOL_VERSION) return;
+  }
 
   await withCoreLock(async () => {
     const current = await health();
-    if (current?.protocolVersion === PROTOCOL_VERSION) return;
+    if (!forceRestart && current?.protocolVersion === PROTOCOL_VERSION) return;
     if (current?.pid) {
       if (!isOwnedCore(current)) {
         throw new Error(`端口 ${port} 已被其他进程占用（pid ${current.pid}），无法启动 Lila core`);
@@ -301,6 +361,110 @@ function isAllowedMcpConfigPath(realTarget: string): boolean {
   return registeredProjectPaths().some((projectPath) => realTarget === resolveRealPath(join(projectPath, ".pi", "mcp.json")));
 }
 
+function isAllowedSettingsConfigPath(realTarget: string): boolean {
+  return (
+    realTarget === resolveRealPath(join(agentDir(), "settings.json")) ||
+    realTarget === resolveRealPath(join(agentDir(), "models.json"))
+  );
+}
+
+function isAllowedAppNavigation(targetUrl: string): boolean {
+  const devUrl = process.env.ELECTRON_RENDERER_URL;
+  if (!app.isPackaged && devUrl) {
+    try {
+      return new URL(targetUrl).origin === new URL(devUrl).origin;
+    } catch {
+      return false;
+    }
+  }
+  const indexPath = resolve(import.meta.dirname, "../renderer/index.html");
+  try {
+    const parsed = new URL(targetUrl);
+    return parsed.protocol === "file:" && resolve(decodeURIComponent(parsed.pathname)) === indexPath;
+  } catch {
+    return false;
+  }
+}
+
+function installApplicationMenu(): void {
+  const isMac = process.platform === "darwin";
+  const sendMenu = (action: "new-session" | "settings") => {
+    showWindow();
+    if (window && !window.isDestroyed()) {
+      window.webContents.send("lila:menu-action", action);
+    }
+  };
+  const template: Electron.MenuItemConstructorOptions[] = [
+    ...(isMac
+      ? [
+          {
+            label: app.name,
+            submenu: [
+              { role: "about" as const, label: "关于 Lila" },
+              { type: "separator" as const },
+              { label: "设置…", accelerator: "CmdOrCtrl+,", click: () => sendMenu("settings") },
+              { type: "separator" as const },
+              { role: "services" as const, label: "服务" },
+              { type: "separator" as const },
+              { role: "hide" as const, label: "隐藏 Lila" },
+              { role: "hideOthers" as const, label: "隐藏其他" },
+              { role: "unhide" as const, label: "全部显示" },
+              { type: "separator" as const },
+              { role: "quit" as const, label: "退出 Lila" },
+            ],
+          },
+        ]
+      : []),
+    {
+      label: "文件",
+      submenu: [
+        { label: "新建会话", accelerator: "CmdOrCtrl+N", click: () => sendMenu("new-session") },
+        ...(isMac ? [] : [{ label: "设置…", accelerator: "CmdOrCtrl+,", click: () => sendMenu("settings") }]),
+        { type: "separator" as const },
+        isMac ? { role: "close" as const, label: "关闭窗口" } : { role: "quit" as const, label: "退出" },
+      ],
+    },
+    {
+      label: "编辑",
+      submenu: [
+        { role: "undo" as const, label: "撤销" },
+        { role: "redo" as const, label: "重做" },
+        { type: "separator" as const },
+        { role: "cut" as const, label: "剪切" },
+        { role: "copy" as const, label: "复制" },
+        { role: "paste" as const, label: "粘贴" },
+        { role: "selectAll" as const, label: "全选" },
+      ],
+    },
+    {
+      label: "视图",
+      submenu: [
+        { role: "resetZoom" as const, label: "实际大小" },
+        { role: "zoomIn" as const, label: "放大" },
+        { role: "zoomOut" as const, label: "缩小" },
+        { type: "separator" as const },
+        { role: "togglefullscreen" as const, label: "切换全屏" },
+        ...(!app.isPackaged
+          ? [
+              { type: "separator" as const },
+              { role: "reload" as const, label: "重新加载" },
+              { role: "toggleDevTools" as const, label: "开发者工具" },
+            ]
+          : []),
+      ],
+    },
+    {
+      label: "窗口",
+      submenu: [
+        { role: "minimize" as const, label: "最小化" },
+        { role: "zoom" as const, label: "缩放" },
+        ...(isMac ? [{ type: "separator" as const }, { role: "front" as const, label: "前置全部窗口" }] : []),
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
 function showWindow(): void {
   if (!window || window.isDestroyed()) {
     createWindow();
@@ -312,9 +476,11 @@ function showWindow(): void {
 }
 
 function createWindow(): void {
+  const initialState = readWindowState();
   const win = new BrowserWindow({
-    width: 1200,
-    height: 800,
+    ...(initialState.x !== undefined && initialState.y !== undefined ? { x: initialState.x, y: initialState.y } : {}),
+    width: initialState.width,
+    height: initialState.height,
     minWidth: 760,
     minHeight: 520,
     show: false,
@@ -331,23 +497,76 @@ function createWindow(): void {
   });
   window = win;
 
-  win.once("ready-to-show", () => win.show());
+  let persistTimer: ReturnType<typeof setTimeout> | undefined;
+  const schedulePersist = () => {
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => saveWindowState(win), 300);
+  };
+  win.on("resize", schedulePersist);
+  win.on("move", schedulePersist);
+  win.on("maximize", schedulePersist);
+  win.on("unmaximize", schedulePersist);
+
+  win.once("ready-to-show", () => {
+    if (initialState.maximized) win.maximize();
+    win.show();
+  });
   // Closing only hides the window so reopening is instant; the app keeps running in the Dock.
   win.on("close", (event) => {
+    clearTimeout(persistTimer);
+    saveWindowState(win);
     if (quitting || process.platform !== "darwin") return;
     event.preventDefault();
     win.hide();
   });
   win.webContents.setWindowOpenHandler(({ url }) => {
     try {
-      const parsed = new URL(url);
-      if (parsed.protocol === "https:" || parsed.protocol === "http:" || parsed.protocol === "mailto:") {
-        void shell.openExternal(parsed.toString());
-      }
+      void openExternalSafe(url);
     } catch {
-      // Ignore malformed URLs.
+      // Ignore malformed or disallowed URLs.
     }
     return { action: "deny" };
+  });
+  win.webContents.on("will-navigate", (event, url) => {
+    if (isAllowedAppNavigation(url)) return;
+    event.preventDefault();
+    try {
+      void openExternalSafe(url);
+    } catch {
+      // Ignore malformed or disallowed URLs.
+    }
+  });
+  win.webContents.on("context-menu", (_event, params) => {
+    const items: Electron.MenuItemConstructorOptions[] = [];
+    if (params.linkURL) {
+      items.push(
+        {
+          label: "在浏览器中打开链接",
+          click: () => {
+            try {
+              void openExternalSafe(params.linkURL);
+            } catch {
+              // Ignore disallowed URL.
+            }
+          },
+        },
+        { label: "复制链接地址", click: () => clipboard.writeText(params.linkURL) },
+        { type: "separator" },
+      );
+    }
+    if (params.isEditable) {
+      items.push(
+        { role: "cut", label: "剪切", enabled: params.editFlags.canCut },
+        { role: "copy", label: "复制", enabled: params.editFlags.canCopy },
+        { role: "paste", label: "粘贴", enabled: params.editFlags.canPaste },
+        { type: "separator" },
+        { role: "selectAll", label: "全选", enabled: params.editFlags.canSelectAll },
+      );
+    } else if (params.selectionText.trim()) {
+      items.push({ role: "copy", label: "复制" });
+    }
+    if (!items.length) return;
+    Menu.buildFromTemplate(items).popup({ window: win });
   });
 
   const devUrl = process.env.ELECTRON_RENDERER_URL;
@@ -388,15 +607,44 @@ ipcMain.handle("lila:open-path", async (_event, path: string) => {
     // Pi reads MCP servers from mcp.json; give the user an empty one to fill in.
     mkdirSync(dirname(realTarget), { recursive: true });
     writeFileSync(realTarget, '{"mcpServers":{}}\n');
+  } else if (isAllowedSettingsConfigPath(realTarget)) {
+    mkdirSync(dirname(realTarget), { recursive: true });
+    writeFileSync(realTarget, "{}\n");
   }
   const error = await shell.openPath(realTarget);
   if (error) throw new Error(error);
 });
 
-ipcMain.on("lila:reveal-path", (_event, path: string) => {
+ipcMain.handle("lila:reveal-path", async (_event, path: string): Promise<{ ok: boolean; error?: string }> => {
   const realTarget = resolveRealPath(path);
-  if (!isAllowedPath(realTarget, true)) return;
+  if (!isAllowedPath(realTarget, true)) return { ok: false, error: `不允许定位该路径：${path}` };
+  if (!existsSync(realTarget)) return { ok: false, error: "文件尚未创建" };
   shell.showItemInFolder(realTarget);
+  return { ok: true };
+});
+
+ipcMain.handle("lila:open-external", async (_event, url: string) => {
+  await openExternalSafe(url);
+});
+
+ipcMain.handle("lila:restart-core", async () => {
+  ensuring = ensureCore(true).finally(() => {
+    ensuring = undefined;
+  });
+  await ensuring;
+});
+
+ipcMain.handle("lila:app-info", () => ({
+  appVersion: app.getVersion(),
+  electronVersion: process.versions.electron,
+  platform: process.platform,
+  arch: process.arch,
+}));
+
+ipcMain.on("lila:set-badge", (_event, count: unknown) => {
+  if (process.platform !== "darwin" || !app.dock) return;
+  const num = typeof count === "number" && Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+  app.dock.setBadge(num > 0 ? String(num) : "");
 });
 
 ipcMain.on("lila:focus", () => showWindow());
@@ -470,15 +718,23 @@ app.on("before-quit", () => {
   quitting = true;
 });
 
-void app.whenReady().then(() => {
-  applyTheme(readSavedTheme(), false);
-  nativeTheme.on("updated", () => {
-    if (window && !window.isDestroyed()) window.setBackgroundColor(windowBackgroundColor());
+const singleInstanceLock = app.requestSingleInstanceLock();
+if (!singleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => showWindow());
+
+  void app.whenReady().then(() => {
+    applyTheme(readSavedTheme(), false);
+    nativeTheme.on("updated", () => {
+      if (window && !window.isDestroyed()) window.setBackgroundColor(windowBackgroundColor());
+    });
+    installApplicationMenu();
+    registerMediaProtocol();
+    createWindow();
+    app.on("activate", showWindow);
   });
-  registerMediaProtocol();
-  createWindow();
-  app.on("activate", showWindow);
-});
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

@@ -1,8 +1,10 @@
 import * as React from "react";
-import { Brain, Check, CheckCircle2, CircleAlert, CircleStop, Copy, Info, PencilLine, Puzzle, TriangleAlert } from "lucide-react";
+import { Brain, Check, CheckCircle2, CircleAlert, CircleStop, Copy, GitFork, Info, PencilLine, Puzzle, RotateCw, TriangleAlert } from "lucide-react";
+import { toast } from "sonner";
 import type { ImageInput, SubagentNotification, TranscriptItem } from "@lila/protocol";
 import { SubSessionLink } from "@/components/agent-card";
 import { focusComposer } from "@/components/composer";
+import { IconButton } from "@/components/icon-button";
 import { Markdown } from "@/components/markdown";
 import { ReplyChanges, type ChangeSelection } from "@/components/reply-changes";
 import { ToolCall } from "@/components/tool-call";
@@ -22,7 +24,6 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import { Message, MessageContent, MessageFooter } from "@/components/ui/message";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Trace,
   TraceCollapsible,
@@ -41,10 +42,9 @@ const NOTICE_ICON = { info: Info, warning: TriangleAlert, error: CircleAlert } a
 
 function IconAction({ label, disabled, onClick, children }: { label: string; disabled?: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
-    <Tooltip>
-      <TooltipTrigger render={<Button size="icon-xs" variant="ghost" aria-label={label} disabled={disabled} onClick={onClick} />}>{children}</TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
+    <IconButton size="icon-xs" label={label} disabled={disabled} onClick={onClick}>
+      {children}
+    </IconButton>
   );
 }
 
@@ -58,14 +58,20 @@ function resolveAssistantTimestamp(item: Extract<TranscriptItem, { kind: "assist
 
 function CopyAction({ text }: { text: string }) {
   const [copied, setCopied] = React.useState(false);
+  const timerRef = React.useRef<number | undefined>(undefined);
+  React.useEffect(() => () => window.clearTimeout(timerRef.current), []);
   return (
     <IconAction
       label={copied ? "已复制" : "复制"}
       onClick={() => {
-        void navigator.clipboard.writeText(text).then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1_500);
-        });
+        void navigator.clipboard
+          .writeText(text)
+          .then(() => {
+            setCopied(true);
+            window.clearTimeout(timerRef.current);
+            timerRef.current = window.setTimeout(() => setCopied(false), 1_500);
+          })
+          .catch(() => toast.error("复制失败"));
       }}
     >
       {copied ? <Check /> : <Copy />}
@@ -112,16 +118,24 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
           </Bubble>
         ) : null}
         {item.text || item.canRewind ? (
-          <MessageFooter className="gap-0.5 px-0 opacity-0 transition-opacity group-hover/message:opacity-100 group-focus-within/message:opacity-100">
+          <MessageFooter className="pointer-events-none gap-0.5 px-0 opacity-0 transition-opacity group-hover/message:pointer-events-auto group-hover/message:opacity-100 group-focus-within/message:pointer-events-auto group-focus-within/message:opacity-100">
             {item.text ? <CopyAction text={item.text} /> : null}
             {item.canRewind ? (
-              <IconAction
-                label={running ? "任务进行中，不能编辑重发" : "编辑重发"}
-                disabled={running}
-                onClick={() => setConfirmRewind(true)}
-              >
-                <PencilLine />
-              </IconAction>
+              <>
+                <IconAction
+                  label="从此处分叉为新会话"
+                  onClick={() => void actions.forkFromMessage(sessionId, item.id)}
+                >
+                  <GitFork />
+                </IconAction>
+                <IconAction
+                  label={running ? "任务进行中，不能编辑重发" : "编辑重发"}
+                  disabled={running}
+                  onClick={() => setConfirmRewind(true)}
+                >
+                  <PencilLine />
+                </IconAction>
+              </>
             ) : null}
           </MessageFooter>
         ) : null}
@@ -179,11 +193,15 @@ function AssistantMessage({
   turnChanges?: FileChange[] | undefined;
   onReview?: ((selection: ChangeSelection) => void) | undefined;
 }) {
-  const [reasoningOpen, setReasoningOpen] = React.useState<boolean | undefined>(undefined);
+  const [reasoningOpen, setReasoningOpen] = React.useState<boolean | undefined>(reveal ? true : undefined);
   const thinkingNow = item.streaming && !item.text;
   const thinkingStartedAt = React.useRef<number | null>(null);
   const [thoughtMs, setThoughtMs] = React.useState<number | undefined>(undefined);
   const [now, setNow] = React.useState(Date.now);
+
+  React.useEffect(() => {
+    if (reveal) setReasoningOpen(true);
+  }, [reveal]);
 
   React.useEffect(() => {
     if (thinkingNow && item.thinking) {
@@ -214,7 +232,7 @@ function AssistantMessage({
       <MessageContent className="gap-1">
         {item.thinking ? (
           <Trace>
-            <TraceCollapsible open={reveal || (reasoningOpen ?? thinkingNow)} onOpenChange={setReasoningOpen}>
+            <TraceCollapsible open={reasoningOpen ?? thinkingNow} onOpenChange={setReasoningOpen}>
               <TraceCollapsibleTrigger>
                 <TraceLine className="text-[13px]" {...(thinkingNow ? { status: "running" as const } : {})}>
                   <TraceIcon>
@@ -231,7 +249,7 @@ function AssistantMessage({
         ) : null}
         {item.text ? <Markdown text={item.text} streaming={item.streaming} /> : null}
         {item.error ? (
-          <Marker className="text-destructive">
+          <Marker className="text-destructive-foreground">
             <MarkerIcon>
               <CircleAlert />
             </MarkerIcon>
@@ -255,7 +273,7 @@ function AssistantMessage({
 }
 
 function NotificationSubLink({ sessionId, entry }: { sessionId: string; entry: SubagentNotification }) {
-  return <SubSessionLink sessionId={sessionId} agentId={entry.id} description={entry.description} className="ms-auto" />;
+  return <SubSessionLink sessionId={sessionId} agentId={entry.id} description={entry.description} showLabel className="ms-auto" />;
 }
 
 function SubagentNotificationCard({
@@ -269,7 +287,10 @@ function SubagentNotificationCard({
 }) {
   const entries = item.notifications ?? [];
   const hasError = entries.some((entry) => isSubagentErrorStatus(entry.status));
-  const [open, setOpen] = React.useState(hasError);
+  const [open, setOpen] = React.useState(hasError || reveal);
+  React.useEffect(() => {
+    if (reveal) setOpen(true);
+  }, [reveal]);
 
   if (!entries.length) {
     if (!item.text) return null;
@@ -287,21 +308,18 @@ function SubagentNotificationCard({
 
   return (
     <Trace>
-      <TraceCollapsible open={open || reveal} onOpenChange={setOpen}>
-        <div className="flex min-w-0 items-center gap-1">
-          <TraceCollapsibleTrigger className="py-0.5">
-            <TraceLine className="text-[13px]" {...(hasError ? { status: "error" as const } : {})}>
-              <TraceIcon>
-                {hasError ? <CircleAlert /> : <CheckCircle2 className="text-success-foreground" />}
-              </TraceIcon>
-              <TraceTitle className="max-w-[26rem] shrink truncate font-medium text-foreground">
-                {single ? single.description || (hasError ? "子 Agent 出错" : "子 Agent 已完成") : `${entries.length} 个子 Agent 已完成`}
-              </TraceTitle>
-              {headerMeta.length ? <TraceDescription className="text-xs tabular-nums">{headerMeta.join(" · ")}</TraceDescription> : null}
-            </TraceLine>
-          </TraceCollapsibleTrigger>
-          {single ? <SubSessionLink sessionId={sessionId} agentId={single.id} description={single.description} /> : null}
-        </div>
+      <TraceCollapsible open={open} onOpenChange={setOpen}>
+        <TraceCollapsibleTrigger className="py-0.5">
+          <TraceLine className="text-[13px]" {...(hasError ? { status: "error" as const } : {})}>
+            <TraceIcon>
+              {hasError ? <CircleAlert /> : <CheckCircle2 className="text-success-foreground" />}
+            </TraceIcon>
+            <TraceTitle className="max-w-[26rem] shrink truncate font-medium text-foreground">
+              {single ? single.description || (hasError ? "子 Agent 出错" : "子 Agent 已完成") : `${entries.length} 个子 Agent 已完成`}
+            </TraceTitle>
+            {headerMeta.length ? <TraceDescription className="text-xs tabular-nums">{headerMeta.join(" · ")}</TraceDescription> : null}
+          </TraceLine>
+        </TraceCollapsibleTrigger>
         <TraceCollapsibleContent>
           <div className="flex flex-col gap-2 text-foreground">
             {entries.map((entry, index) => {
@@ -319,9 +337,9 @@ function SubagentNotificationCard({
                     <Badge variant={err ? "destructive" : "secondary"}>{err ? "出错" : "已完成"}</Badge>
                     <span className="font-medium">{entry.description}</span>
                     {meta.length ? <span className="text-muted-foreground tabular-nums">· {meta.join(" · ")}</span> : null}
-                    {single ? null : <NotificationSubLink sessionId={sessionId} entry={entry} />}
+                    <NotificationSubLink sessionId={sessionId} entry={entry} />
                   </div>
-                  {entry.error ? <p className="text-sm text-destructive">{entry.error}</p> : null}
+                  {entry.error ? <p className="text-sm text-destructive-foreground">{entry.error}</p> : null}
                   {entry.preview ? <Markdown text={entry.preview} /> : null}
                 </div>
               );
@@ -374,10 +392,22 @@ export const TranscriptEntry = React.memo(function TranscriptEntry({
       const label = { aborted: "本轮已停止", error: "本轮出错", incomplete: "本轮未完成" }[item.status];
       const duration = formatDuration(item.durationMs);
       return (
-        <div data-run-status={item.status} className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <div data-run-status={item.status} className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
           <Icon aria-hidden className="size-3.5 shrink-0" />
           <span>{label}</span>
           {duration ? <span className="tabular-nums">· 用时 {duration}</span> : null}
+          {!running ? (
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              className="ms-1 h-5 px-1.5 text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => void actions.prompt(sessionId, "请继续完成刚才未完成的任务。")}
+            >
+              <RotateCw className="size-3" />
+              继续
+            </Button>
+          ) : null}
         </div>
       );
     }

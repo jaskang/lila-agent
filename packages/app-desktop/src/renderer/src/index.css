@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+@import "katex/dist/katex.min.css";
 @import "./typeset.css";
 
 @custom-variant dark (&:where(.dark, .dark *));
@@ -144,11 +145,14 @@
     -webkit-user-select: none;
     user-select: none;
   }
-  /* The window chrome is not selectable; conversation content is. */
+  /* The window chrome is not selectable; conversation, settings, errors and code are. */
   [data-slot="message-scroller-content"],
+  [data-slot="dialog-content"],
+  [data-slot="alert"],
   textarea,
   input,
-  pre {
+  pre,
+  code {
     -webkit-user-select: text;
     user-select: text;
   }
@@ -187,7 +191,7 @@
 }
 
 :not(.no-scrollbar, .scrollbar-none, [data-slot="scroll-area-viewport"])::-webkit-scrollbar-thumb {
-  background-color: transparent;
+  background-color: color-mix(in oklch, var(--foreground) 10%, transparent);
   background-clip: content-box;
   border: 3px solid transparent;
   border-radius: 9999px;

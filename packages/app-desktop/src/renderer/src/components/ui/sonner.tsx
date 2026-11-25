@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom"
 import { Toaster as Sonner, type ToasterProps } from "sonner"
 import { CircleCheckIcon, InfoIcon, TriangleAlertIcon, OctagonXIcon, Loader2Icon } from "lucide-react"
 import { useTheme } from "@/lib/theme"
@@ -5,7 +6,7 @@ import { useTheme } from "@/lib/theme"
 const Toaster = ({ ...props }: ToasterProps) => {
   const { resolvedTheme } = useTheme()
 
-  return (
+  const toaster = (
     <Sonner
       theme={resolvedTheme}
       className="toaster group"
@@ -36,12 +37,14 @@ const Toaster = ({ ...props }: ToasterProps) => {
       }
       toastOptions={{
         classNames: {
-          toast: "cn-toast",
+          toast: "cn-toast pointer-events-auto",
         },
       }}
       {...props}
     />
   )
+
+  return typeof document !== "undefined" ? createPortal(toaster, document.body) : toaster
 }
 
 export { Toaster }

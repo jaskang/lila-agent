@@ -6,7 +6,7 @@ import { FileActions } from "@/components/tool-call";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "cn";
-import { actions, type ReplyReviewState } from "@/lib/store";
+import { actions, useLila, type ReplyReviewState } from "@/lib/store";
 import type { FileChange } from "@/lib/transcript-layout";
 
 export type ChangeSelection = { changes: FileChange[]; path: string };
@@ -66,7 +66,7 @@ function DiffStat({ added, removed, className }: { added: number; removed: numbe
   return (
     <span className={cn("inline-flex shrink-0 items-center gap-1.5 font-mono text-xs tabular-nums", className)}>
       {added > 0 ? <span className="text-success-foreground">+{added}</span> : null}
-      {removed > 0 ? <span className="text-destructive">-{removed}</span> : null}
+      {removed > 0 ? <span className="text-destructive-foreground">-{removed}</span> : null}
     </span>
   );
 }
@@ -142,6 +142,7 @@ export function ReplyChangesPanel({ review }: { review: ReplyReviewState }) {
     setNarrowView("diff");
   }, [review.path, review.changes]);
 
+  const returnToPreviewId = useLila((state) => state.returnToPreviewId);
   const selectFile = (path: string) => {
     actions.selectReplyReviewPath(path);
     setNarrowView("diff");
@@ -150,7 +151,18 @@ export function ReplyChangesPanel({ review }: { review: ReplyReviewState }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border/60 px-3">
-        {files.length > 1 && narrowView === "diff" ? (
+        {returnToPreviewId ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            className="-ms-1 text-muted-foreground hover:text-foreground"
+            onClick={() => actions.returnToSubsession()}
+          >
+            <ArrowLeft />
+            返回子会话
+          </Button>
+        ) : files.length > 1 && narrowView === "diff" ? (
           <Button
             type="button"
             variant="ghost"
@@ -198,7 +210,7 @@ export function ReplyChangesPanel({ review }: { review: ReplyReviewState }) {
           title="查看完整 Git 改动"
           aria-label="查看完整 Git 改动"
           className="text-muted-foreground"
-          onClick={() => actions.openRightPanel("changes")}
+          onClick={() => (selected ? actions.openChangesForFile(selected.path) : actions.openRightPanel("changes"))}
         >
           <GitBranch />
         </Button>

@@ -30,6 +30,10 @@ export type ParsedStackTrace = {
 
 const FRAME_WITH_FN = /^at\s+(.+?)\s+\((.+?):(\d+):(\d+)\)$/;
 const FRAME_BARE = /^at\s+(.+?):(\d+):(\d+)$/;
+const FRAME_PYTHON = /^File\s+"(.+?)",\s+line\s+(\d+)(?:,\s+in\s+(.+))?$/;
+const FRAME_TSC = /^(.+?)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s+(.+)$/;
+const FRAME_GO = /^([^\s]+\.go):(\d+)(?:\s+\+0x[0-9a-f]+)?$/;
+const FRAME_RUST = /^at\s+([^\s]+\.rs):(\d+):(\d+)$/;
 
 function isInternalFrame(raw: string, file: string | undefined): boolean {
   const target = file ?? raw;
@@ -38,6 +42,9 @@ function isInternalFrame(raw: string, file: string | undefined): boolean {
     target.startsWith("node:") ||
     target.startsWith("bun:") ||
     target.startsWith("internal/") ||
+    target.includes("/site-packages/") ||
+    target.includes("/lib/python") ||
+    target.includes("/usr/local/go/src/") ||
     target.includes("<anonymous>") ||
     raw.includes("(native)")
   );
@@ -71,13 +78,57 @@ function parseFrameLine(trimmed: string): StackFrame | undefined {
       internal: isInternalFrame(trimmed, file),
     };
   }
+  const py = FRAME_PYTHON.exec(trimmed);
+  if (py) {
+    const file = cleanFilePath(py[1]!);
+    return {
+      raw: trimmed,
+      name: py[3],
+      file,
+      line: py[2],
+      internal: isInternalFrame(trimmed, file),
+    };
+  }
+  const tsc = FRAME_TSC.exec(trimmed);
+  if (tsc) {
+    const file = cleanFilePath(tsc[1]!);
+    return {
+      raw: trimmed,
+      name: `${tsc[4]}: ${tsc[5]}`,
+      file,
+      line: tsc[2],
+      column: tsc[3],
+      internal: isInternalFrame(trimmed, file),
+    };
+  }
+  const go = FRAME_GO.exec(trimmed);
+  if (go) {
+    const file = cleanFilePath(go[1]!);
+    return {
+      raw: trimmed,
+      file,
+      line: go[2],
+      internal: isInternalFrame(trimmed, file),
+    };
+  }
+  const rust = FRAME_RUST.exec(trimmed);
+  if (rust) {
+    const file = cleanFilePath(rust[1]!);
+    return {
+      raw: trimmed,
+      file,
+      line: rust[2],
+      column: rust[3],
+      internal: isInternalFrame(trimmed, file),
+    };
+  }
   if (trimmed.startsWith("at ")) {
     return { raw: trimmed, internal: isInternalFrame(trimmed, undefined) };
   }
   return undefined;
 }
 
-/** Detects a JS/Node/Bun stack trace inside tool output and splits app frames from framework internals. */
+/** Detects JS/Node/Bun, Python, TypeScript, Go, or Rust stack traces / compiler errors inside tool output. */
 export function parseStackTrace(output: string): ParsedStackTrace | undefined {
   const lines = output.split(/\r?\n/);
   let firstFrameIndex = -1;
@@ -89,21 +140,35 @@ export function parseStackTrace(output: string): ParsedStackTrace | undefined {
     if (frame) {
       if (firstFrameIndex === -1) firstFrameIndex = i;
       frames.push(frame);
-    } else if (firstFrameIndex !== -1 && frames.length >= 2) {
+    } else if (firstFrameIndex !== -1 && frames.length >= 2 && trimmed === "") {
       break;
     }
   }
 
-  if (frames.length < 2 || firstFrameIndex <= 0) return undefined;
+  if (frames.length < 1 || (frames.length === 1 && !frames[0]?.file)) return undefined;
 
-  let errorLine = "";
-  for (let i = firstFrameIndex - 1; i >= 0; i--) {
-    const candidate = lines[i]!.trim();
-    if (candidate) {
-      errorLine = candidate;
-      break;
+  const headerLines: string[] = [];
+  if (firstFrameIndex > 0) {
+    for (let i = firstFrameIndex - 1; i >= 0 && headerLines.length < 4; i--) {
+      const candidate = lines[i]!.trim();
+      if (!candidate) {
+        if (headerLines.length > 0) break;
+        continue;
+      }
+      headerLines.unshift(candidate);
     }
   }
+  // Python tracebacks put the exception message at the bottom.
+  if (headerLines.length === 1 && headerLines[0]!.startsWith("Traceback")) {
+    for (let i = lines.length - 1; i > firstFrameIndex; i--) {
+      const tail = lines[i]!.trim();
+      if (tail) {
+        headerLines.push(tail);
+        break;
+      }
+    }
+  }
+  const errorLine = headerLines.join("\n") || frames[0]?.name || frames[0]?.raw || "";
   if (!errorLine) return undefined;
 
   const appFrames = frames.filter((frame) => !frame.internal);
@@ -142,7 +207,7 @@ export function StackTraceView({
 
   return (
     <div className="flex min-w-0 flex-col gap-2">
-      <p className="rounded-lg border border-destructive/25 bg-destructive/8 px-3 py-2 font-mono text-xs break-words text-destructive-foreground">
+      <p className="rounded-lg border border-destructive/25 bg-destructive/8 px-3 py-2 font-mono text-xs whitespace-pre-wrap break-words text-destructive-foreground">
         {parsed.errorLine}
       </p>
       <Trace className="gap-1.5">

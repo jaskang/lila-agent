@@ -53,7 +53,8 @@ export function ConversationSearch({
         (data) => {
           if (cancelled) return;
           setResult({ ...data, query, offset });
-          if (offset && offset >= data.total) setIndex(Math.max(0, data.total - 1));
+          if (data.total > 0 && index >= data.total) setIndex(data.total - 1);
+          else if (data.total === 0 && index !== 0) setIndex(0);
         },
         () => { if (!cancelled) setFailed(true); },
       );
@@ -81,7 +82,7 @@ export function ConversationSearch({
     total === undefined ? "查找中…" : total ? `${index + 1} / ${total}` : "没有匹配";
 
   return (
-    <div role="search" aria-label="查找会话内容" className="mx-auto w-full max-w-3xl px-5 pt-2">
+    <div role="search" aria-label="查找会话内容" className="mx-auto w-full max-w-[46rem] px-6 pt-2">
       <InputGroup className="min-h-8 bg-background has-disabled:bg-background has-disabled:opacity-100 dark:has-disabled:bg-background">
         <InputGroupAddon><Search aria-hidden /></InputGroupAddon>
         <InputGroupInput
@@ -98,7 +99,7 @@ export function ConversationSearch({
             setText(event.target.value);
           }}
           onKeyDown={(event) => {
-            if (event.nativeEvent.isComposing) return;
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
             if (event.key === "Enter") {
               event.preventDefault();
               if (failed) {
@@ -111,14 +112,33 @@ export function ConversationSearch({
           }}
         />
         <InputGroupAddon align="inline-end" className="gap-1">
+          {text ? (
+            <InputGroupButton
+              aria-label="清空搜索词"
+              title="清空"
+              size="icon-xs"
+              onClick={() => {
+                onClear();
+                setMissing(false);
+                setFailed(false);
+                setIndex(0);
+                setText("");
+                input.current?.focus();
+              }}
+            >
+              <X className="size-3" />
+            </InputGroupButton>
+          ) : null}
           <span role="status" className="whitespace-nowrap text-xs tabular-nums">{count}</span>
           <InputGroupButton aria-label="上一条匹配" title="上一条（Shift+Enter）" size="icon-xs" disabled={!total} onClick={() => move(-1)}><ChevronUp /></InputGroupButton>
           <InputGroupButton aria-label="下一条匹配" title="下一条（Enter）" size="icon-xs" disabled={!total} onClick={() => move(1)}><ChevronDown /></InputGroupButton>
           <InputGroupButton aria-label="关闭会话查找" title="关闭（Esc）" size="icon-xs" onClick={onClose}><X /></InputGroupButton>
         </InputGroupAddon>
       </InputGroup>
-      {missing ? <p role="status" className="px-2 py-1 text-xs text-muted-foreground">这条记录已变更。请重新搜索。</p> :
-        hit ? <p className="truncate px-2 py-1 text-xs text-muted-foreground" title={hit.excerpt}>{MATCH_LABEL[hit.kind]} · {hit.excerpt}</p> : null}
+      <div className="min-h-5">
+        {missing ? <p role="status" className="px-2 py-0.5 text-xs text-muted-foreground">这条记录已变更。请重新搜索。</p> :
+          hit ? <p className="truncate px-2 py-0.5 text-xs text-muted-foreground" title={hit.excerpt}>{MATCH_LABEL[hit.kind]} · {hit.excerpt}</p> : null}
+      </div>
     </div>
   );
 }

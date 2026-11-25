@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowDown, ArrowLeft, Blocks, ChevronUp, FolderTree, GitBranch, RotateCw, Search } from "lucide-react";
+import { ArrowDown, ArrowLeft, ChevronUp, FolderTree, GitBranch, RotateCw, Search } from "lucide-react";
 import type { SessionState, TranscriptItem, TranscriptSearchMatch } from "@lila/protocol";
 import { ComposerStatus } from "@/components/composer-status";
 import { ConversationSearch } from "@/components/conversation-search";
@@ -7,12 +7,10 @@ import type { ChangeSelection } from "@/components/reply-changes";
 import { Composer } from "@/components/composer";
 import { MarkdownBasePathProvider } from "@/components/markdown";
 import { PendingPanel } from "@/components/pending-panel";
-import { ResourcesSheet } from "@/components/resources-sheet";
 import { ApprovalSelect, ContextUsage, ModelPicker, ModelSetup } from "@/components/session-controls";
 import { SubsessionActions } from "@/components/subsession-preview";
 import { TranscriptBlocks } from "@/components/transcript-blocks";
 import { TurnRail } from "@/components/turn-directory";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
@@ -47,13 +45,11 @@ const BLOCKING_OVERLAY_SELECTOR = [
 function SessionToolbar({
   sessionId,
   gitChanges,
-  onResources,
   onSearch,
   readOnly,
 }: {
   sessionId: string;
   gitChanges?: number | undefined;
-  onResources: () => void;
   onSearch: () => void;
   readOnly: boolean;
 }) {
@@ -181,19 +177,9 @@ function SessionToolbar({
           >
             <GitBranch />
             <span className="hidden @min-[30rem]:inline">改动</span>
-            {gitChanges ? (
-              <Badge variant="secondary" className="h-4 min-w-4 px-1 font-mono text-[11px] tabular-nums">
-                {gitChanges}
-              </Badge>
-            ) : null}
+            {gitChanges ? <span className="font-mono text-xs text-muted-foreground tabular-nums">{gitChanges}</span> : null}
           </Button>
         </>
-      ) : null}
-      {!readOnly ? (
-        <Button variant="ghost" size="sm" aria-label="能力面板" title="能力面板（技能 / MCP / 扩展）" className="font-normal text-muted-foreground [-webkit-app-region:no-drag]" onClick={onResources}>
-          <Blocks />
-          <span className="hidden @min-[30rem]:inline">能力</span>
-        </Button>
       ) : null}
     </header>
   );
@@ -297,7 +283,6 @@ export function Conversation({ sessionId }: { sessionId: string }) {
   const projectId = useLila((store) => store.sessions[sessionId]?.projectId);
   const projectPath = useLila((store) => store.projects.find((item) => item.id === projectId)?.path);
   const connected = useLila((store) => store.connection === "connected");
-  const resourcesOpen = useLila((store) => store.resourcesOpen);
   const gitChanges = useLila((store) => (projectId ? store.gitChangeCounts[projectId] : undefined));
   const [abortArmed, setAbortArmed] = React.useState(false);
   const state = view.state;
@@ -370,14 +355,16 @@ export function Conversation({ sessionId }: { sessionId: string }) {
     return () => window.clearTimeout(abortTimerRef.current);
   }, [canStop, disarmAbort]);
 
-  // Global double-Escape to abort when no overlay, command palette, or completion menu is open.
+  const hasPending = Boolean(state?.pending.length);
+
+  // Global double-Escape to abort when no overlay, command palette, pending card, or completion menu is open.
   React.useEffect(() => {
-    if (!canStop || searchOpen) return;
+    if (!canStop || searchOpen || hasPending) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.isComposing || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
       const store = useLila.getState();
-      if (store.paletteOpen || store.resourcesOpen) return;
-      if (document.querySelector(BLOCKING_OVERLAY_SELECTOR)) return;
+      if (store.paletteOpen || store.settingsOpen) return;
+      if (document.querySelector(BLOCKING_OVERLAY_SELECTOR) || document.querySelector("[data-pending-panel]")) return;
       event.preventDefault();
       if (abortArmedRef.current) {
         handleAbort();
@@ -393,7 +380,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [canStop, handleAbort, searchOpen]);
+  }, [canStop, handleAbort, searchOpen, hasPending]);
 
   // Restore saved scrollTop synchronously after MessageScrollerProvider's layout effects and before paint.
   React.useLayoutEffect(() => {
@@ -431,6 +418,11 @@ export function Conversation({ sessionId }: { sessionId: string }) {
   }, []);
 
   const closeSearch = React.useCallback(() => {
+    clearSearchHit();
+    setSearchOpen(false);
+  }, [clearSearchHit]);
+
+  const returnToLatest = React.useCallback(() => {
     clearSearchHit();
     scrollToLatest.current = Boolean(history);
     setHistory(undefined);
@@ -471,11 +463,21 @@ export function Conversation({ sessionId }: { sessionId: string }) {
       }
     };
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("lila:open-search", openSearch);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("lila:open-search", openSearch);
+    };
   }, [openSearch, closeSearch, searchOpen]);
 
   const visibleItems = history ?? view.items;
-  const hasTurnRail = visibleItems.some((item) => item.kind === "user");
+  const hasTurnRail = React.useMemo(() => {
+    let count = 0;
+    for (const item of visibleItems) {
+      if (item.kind === "user" && ++count >= 4) return true;
+    }
+    return false;
+  }, [visibleItems]);
   const renderBlocks = React.useMemo(() => layoutTranscript(visibleItems, projectPath), [visibleItems, projectPath]);
 
   return (
@@ -484,7 +486,6 @@ export function Conversation({ sessionId }: { sessionId: string }) {
         <SessionToolbar
           sessionId={sessionId}
           gitChanges={gitChanges}
-          onResources={() => actions.setResourcesOpen(true)}
           onSearch={openSearch}
           readOnly={readOnly}
         />
@@ -493,8 +494,8 @@ export function Conversation({ sessionId }: { sessionId: string }) {
         ) : null}
         {history ? (
           <div className="mx-auto flex w-full max-w-[46rem] items-center justify-between px-6 py-1 text-xs text-muted-foreground">
-            历史消息
-            <Button type="button" variant="ghost" size="xs" onClick={closeSearch}><ArrowDown />返回最新</Button>
+            <span>正在查看历史消息片段</span>
+            <Button type="button" variant="ghost" size="xs" onClick={returnToLatest}><ArrowDown />返回最新</Button>
           </div>
         ) : null}
         {!loaded ? (
@@ -513,16 +514,14 @@ export function Conversation({ sessionId }: { sessionId: string }) {
             ) : !connected ? (
               <Empty className="py-24">
                 <EmptyHeader>
-                  <EmptyTitle>等待重连后加载会话…</EmptyTitle>
-                  <EmptyDescription>与 core 重新连接后会自动恢复消息和任务状态。</EmptyDescription>
+                  <EmptyTitle>等待重连…</EmptyTitle>
                 </EmptyHeader>
                 <Spinner />
               </Empty>
             ) : (
               <Empty className="py-24">
                 <EmptyHeader>
-                  <EmptyTitle>正在打开会话</EmptyTitle>
-                  <EmptyDescription>正在读取消息和任务状态。</EmptyDescription>
+                  <EmptyTitle>正在加载…</EmptyTitle>
                 </EmptyHeader>
                 <Spinner />
               </Empty>
@@ -548,16 +547,6 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                 }}
               >
                 <MessageScrollerContent className={cn("mx-auto w-full max-w-[46rem] gap-3 px-6 pt-5 pb-10", hasTurnRail && "ps-11 @min-[52rem]:ps-6")}>
-                  {ready && !state.pending.length && !view.error && view.items.length === 0 ? (
-                    <MessageScrollerItem messageId="empty">
-                      <Empty className="py-24">
-                        <EmptyHeader>
-                          <EmptyTitle>要做点什么？</EmptyTitle>
-                          <EmptyDescription>Agent 会在项目目录里读代码、改文件、跑命令，过程都会显示在这里。</EmptyDescription>
-                        </EmptyHeader>
-                      </Empty>
-                    </MessageScrollerItem>
-                  ) : null}
                   {!history && view.hasEarlier ? (
                     <MessageScrollerItem messageId="load-earlier">
                       <div className="flex justify-center py-1">
@@ -595,10 +584,18 @@ export function Conversation({ sessionId }: { sessionId: string }) {
         <div className="mx-auto flex w-full max-w-[46rem] shrink-0 flex-col gap-1.5 px-6 pt-1 pb-4">
           {state && !readOnly ? <ComposerStatus sessionId={sessionId} state={state} /> : null}
           {state ? <PendingPanel sessionId={sessionId} pending={state.pending} /> : null}
-          {state?.access === "failed" ? (
-            <p role="alert" className="break-words px-1 text-sm text-destructive">会话初始化失败：{state.startupError}</p>
+          {loaded && view.error ? (
+            <p role="alert" className="break-words px-1 text-xs text-destructive-foreground">{view.error}</p>
           ) : null}
-          {readOnly ? (
+          {state?.access === "failed" ? (
+            <div role="alert" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-destructive/30 bg-destructive/8 px-3.5 py-2.5 text-xs text-destructive-foreground">
+              <span className="min-w-0 flex-1 break-words">会话初始化失败：{state.startupError ?? "未知错误"}</span>
+              <Button type="button" size="xs" variant="outline" onClick={() => void actions.retrySession(sessionId)}>
+                <RotateCw />
+                重试初始化
+              </Button>
+            </div>
+          ) : readOnly ? (
             <SubsessionActions sessionId={sessionId} state={state} />
           ) : (
             <>
@@ -611,8 +608,13 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                 disabled={!loaded}
                 sendDisabled={!ready || state.compacting}
                 abortArmed={abortArmed}
-                placeholder={running ? "补充说明会在当前工具结束后送达… 双击 Esc 停止" : "继续对话，/ 使用命令和技能，@ 引用文件"}
+                placeholder={running ? "运行中，输入可插话…" : "输入消息…"}
                 onSubmit={(mode) => {
+                  if (history) {
+                    clearSearchHit();
+                    scrollToLatest.current = true;
+                    setHistory(undefined);
+                  }
                   setScrollEndSeq((current) => current + 1);
                   return actions.sendDraft(sessionId, mode);
                 }}
@@ -624,7 +626,6 @@ export function Conversation({ sessionId }: { sessionId: string }) {
           )}
           {state ? <StatusLines lines={state.statusLines} /> : null}
         </div>
-        <ResourcesSheet sessionId={sessionId} open={resourcesOpen} onOpenChange={actions.setResourcesOpen} />
       </div>
     </MarkdownBasePathProvider>
   );

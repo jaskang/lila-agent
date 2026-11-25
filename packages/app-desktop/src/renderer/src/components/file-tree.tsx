@@ -89,10 +89,15 @@ function TreeNodeView({
 }) {
   const isAncestor = node.kind === "folder" && Boolean(selectedPath && selectedPath.startsWith(`${node.path}/`));
   const [open, setOpen] = React.useState(() => defaultOpen || expandAll || isAncestor);
+  const prevExpandAllRef = React.useRef(expandAll);
 
   React.useEffect(() => {
-    if (expandAll || isAncestor) setOpen(true);
-    else if (!defaultOpen) setOpen(false);
+    if (expandAll || isAncestor) {
+      setOpen(true);
+    } else if (prevExpandAllRef.current && !expandAll && !defaultOpen) {
+      setOpen(false);
+    }
+    prevExpandAllRef.current = expandAll;
   }, [expandAll, isAncestor, defaultOpen]);
 
   if (node.kind === "folder") {

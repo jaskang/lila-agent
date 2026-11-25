@@ -14,7 +14,7 @@ core（Node，独立常驻进程）←────┘←── 以后的手机�
   ├─ server.ts：鉴权、命令分发、按会话推送
   ├─ 会话宿主：每个 Lila 管理的可写会话一个 Pi AgentSession（pi-coding-agent SDK）
   │    ├─ Pi 资源加载：AGENTS.md、技能、提示模板、用户扩展、Pi 包
-  │    ├─ 内置扩展：MCP、codemode、tool_search、子 Agent（pi-subagents）
+  │    ├─ 内置扩展：MCP、codemode、tool_search、子 Agent（pi-subagents）、长期记忆（pi-memory）
   │    └─ Lila 扩展：工具审批、ask_user 提问
   ├─ 界面桥：Pi 扩展的 select/confirm/input/editor → 待处理项
   └─ transcript 投影：Pi 会话条目 → 界面条目
@@ -44,6 +44,7 @@ core（Node，独立常驻进程）←────┘←── 以后的手机�
 | codemode、工具搜索 | Pi 内置扩展，MCP 服务器连上后自动启用 |
 | 技能、提示模板、斜杠命令 | Pi 资源加载（`~/.pi/agent/skills`、`~/.agents/skills`、项目 `.agents/skills` 等） |
 | 子 Agent（前台/后台、并行、工作流、定时） | [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents)，用户自己 `pi install` 过就用用户的那份 |
+| 长期记忆（MEMORY.md / USER.md、后台整理） | [`@amaster.ai/pi-memory`](https://www.npmjs.com/package/@amaster.ai/pi-memory)，存在 `~/.pi/agent/memories/`，支持设置页可视化管理，用户自装记忆扩展时自动让位 |
 | AGENTS.md / CLAUDE.md | Pi 上下文文件 |
 | 压缩、自动重试、插话与追加消息 | Pi `AgentSession` |
 | 工具审批、`ask_user` 提问 | Lila 内置 Pi 扩展 |

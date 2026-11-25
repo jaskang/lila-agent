@@ -1,41 +1,60 @@
 import * as React from "react";
 import { Radio } from "@base-ui/react/radio";
 import { RadioGroup } from "@base-ui/react/radio-group";
-import { Check, ChevronDown, Minimize2, RotateCw, ShieldAlert, ShieldCheck, ShieldQuestion } from "lucide-react";
+import {
+  BarChart3,
+  Check,
+  ChevronDown,
+  KeyRound,
+  Minimize2,
+  RotateCw,
+  Settings2,
+  ShieldAlert,
+  ShieldCheck,
+  ShieldQuestion,
+} from "lucide-react";
 import type { ApprovalMode, ModelInfo, SessionState, ThinkingLevel } from "@lila/protocol";
+import { SearchInput } from "@/components/search-input";
 import { Button } from "@/components/ui/button";
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
-import { Slider } from "@/components/ui/slider";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
-import { actions, APPROVAL_HINT, APPROVAL_LABEL, useLila } from "@/lib/store";
+import { actions, APPROVAL_LABEL, useLila } from "@/lib/store";
 
 export function ModelSetup() {
   const connected = useLila((state) => state.connection === "connected");
   const loading = useLila((state) => state.modelsLoading);
   const error = useLila((state) => state.modelsError);
   const hasModels = useLila((state) => state.models.length > 0);
-  const guidance = <>没有可用模型。请在终端运行 <code>pi</code>，在 Pi 中输入 <code>/login</code>，然后回来刷新。</>;
-  const status = loading ? "正在读取模型…" : error ? "读取模型失败，请刷新后重试。" : hasModels ? "请选择一个可用模型。" : guidance;
+  const status = loading ? "正在读取模型…" : error ? "读取模型失败" : hasModels ? "请选择模型" : "尚未配置模型";
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-muted/30 px-3 py-2 text-sm">
-      <p role="status" className="min-w-0 flex-1">{status}</p>
-      <Button type="button" size="sm" variant="outline" disabled={!connected || loading} onClick={() => void actions.retryModels()}>
-        <RotateCw />
-        刷新模型
-      </Button>
+      <p role="status" className="min-w-0 flex-1 text-muted-foreground">
+        {status}
+      </p>
+      <div className="flex items-center gap-1.5">
+        {!hasModels ? (
+          <Button type="button" size="sm" disabled={!connected} onClick={() => actions.openSettings("providers")}>
+            <KeyRound />
+            配置模型
+          </Button>
+        ) : null}
+        <Button type="button" size="sm" variant="outline" disabled={!connected || loading} onClick={() => void actions.retryModels()}>
+          <RotateCw />
+          刷新
+        </Button>
+      </div>
     </div>
   );
 }
 
 /** The quiet chip look shared by every control in the composer's bottom bar. */
-const CHIP =
+export const COMPOSER_CHIP =
   "h-7 gap-1 rounded-md border-transparent bg-transparent px-2 text-xs font-normal text-muted-foreground shadow-none hover:bg-muted hover:text-foreground dark:bg-transparent dark:hover:bg-muted aria-expanded:bg-muted aria-expanded:text-foreground [&_svg]:size-3.5 [&>svg:last-child]:size-3 [&>svg:last-child]:opacity-60";
 
-/** The Model Selector and its effort control share one focused Base UI popover. */
+/** Provider-grouped Model Selector with instant selection and live reasoning-effort control. */
 export function ModelPicker({
   models,
   modelId,
@@ -50,88 +69,151 @@ export function ModelPicker({
   onApply: (modelId: string, thinkingLevel: ThinkingLevel) => boolean | Promise<boolean>;
 }) {
   const [open, setOpen] = React.useState(false);
-  const [selection, setSelection] = React.useState(modelId);
-  const [effort, setEffort] = React.useState(thinkingLevel);
+  const [query, setQuery] = React.useState("");
+  const [draftEffort, setDraftEffort] = React.useState<ThinkingLevel | undefined>(thinkingLevel);
   const [saving, setSaving] = React.useState(false);
 
-  const current = models.find((model) => model.id === modelId);
-  const selected = models.find((model) => model.id === selection);
-  const levels = (selection && selection === modelId ? currentLevels : undefined) ?? selected?.thinkingLevels ?? [];
-  const chosenEffort = effort && levels.includes(effort) ? effort : selected?.defaultThinkingLevel ?? levels[0];
-  const currentEffort = thinkingLevel ?? current?.defaultThinkingLevel;
-  const sliderIndex = Math.max(0, levels.indexOf(chosenEffort ?? "off"));
+  React.useEffect(() => {
+    setDraftEffort(thinkingLevel);
+  }, [thinkingLevel, modelId]);
 
-  async function apply(): Promise<void> {
-    if (!selection || !chosenEffort || saving) return;
+  const visibleModels = React.useMemo(() => {
+    const enabled = models.filter((item) => item.enabled || item.id === modelId);
+    return enabled.length ? enabled : models;
+  }, [models, modelId]);
+
+  const filteredModels = React.useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return visibleModels;
+    return visibleModels.filter(
+      (model) =>
+        model.label.toLowerCase().includes(needle) ||
+        model.id.toLowerCase().includes(needle) ||
+        model.providerName.toLowerCase().includes(needle),
+    );
+  }, [visibleModels, query]);
+
+  const groups = React.useMemo(() => {
+    const map = new Map<string, { providerName: string; items: ModelInfo[] }>();
+    for (const model of filteredModels) {
+      let group = map.get(model.provider);
+      if (!group) {
+        group = { providerName: model.providerName || model.provider, items: [] };
+        map.set(model.provider, group);
+      }
+      group.items.push(model);
+    }
+    return [...map.entries()];
+  }, [filteredModels]);
+
+  const current = models.find((model) => model.id === modelId);
+  const levels = currentLevels ?? current?.thinkingLevels ?? [];
+  const currentEffort = draftEffort && levels.includes(draftEffort) ? draftEffort : current?.defaultThinkingLevel ?? levels[0];
+  const showSearch = visibleModels.length > 8;
+
+  async function selectModel(nextId: string): Promise<void> {
+    if (!nextId || saving) return;
+    if (nextId === modelId) {
+      setOpen(false);
+      return;
+    }
+    const target = models.find((item) => item.id === nextId);
+    const targetLevels = target?.thinkingLevels ?? [];
+    const nextEffort =
+      thinkingLevel && targetLevels.includes(thinkingLevel)
+        ? thinkingLevel
+        : target?.defaultThinkingLevel ?? targetLevels[0] ?? "off";
     setSaving(true);
     try {
-      if (await onApply(selection, chosenEffort)) setOpen(false);
+      if (await onApply(nextId, nextEffort)) setOpen(false);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function selectEffort(nextEffort: ThinkingLevel): Promise<void> {
+    const targetId = modelId ?? visibleModels[0]?.id;
+    if (!targetId || saving || nextEffort === thinkingLevel) return;
+    const prev = draftEffort;
+    setDraftEffort(nextEffort);
+    setSaving(true);
+    try {
+      const ok = await onApply(targetId, nextEffort);
+      if (!ok) setDraftEffort(prev);
     } finally {
       setSaving(false);
     }
   }
 
   return (
-    <Popover open={open} onOpenChange={(next) => {
-      if (next) {
-        setSelection(modelId ?? models[0]?.id);
-        setEffort(thinkingLevel);
-      }
-      setOpen(next);
-    }}>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (next) {
+          setQuery("");
+          setDraftEffort(thinkingLevel);
+        }
+      }}
+    >
       <PopoverTrigger
-        render={<Button type="button" variant="ghost" size="sm" className={cn(CHIP, "max-w-full sm:max-w-[19rem]")} />}
-        disabled={!modelId && !models.length}
+        render={<Button type="button" variant="ghost" size="sm" className={cn(COMPOSER_CHIP, "max-w-full sm:max-w-[19rem]")} />}
+        disabled={!modelId && !visibleModels.length}
         aria-label="模型与推理等级"
       >
-        <span className="truncate">{current?.label ?? modelId ?? (models.length ? "选择模型" : "没有可用模型")}</span>
+        <span className="truncate">{current?.label ?? modelId ?? (visibleModels.length ? "选择模型" : "无可用模型")}</span>
         {currentEffort && currentEffort !== "off" ? (
           <span className="shrink-0 text-muted-foreground">· {currentEffort}</span>
         ) : null}
         <ChevronDown />
       </PopoverTrigger>
-      <PopoverContent side="top" align="start" className="w-[min(21rem,calc(100vw-2rem))] gap-0 overflow-hidden p-0">
+      <PopoverContent side="top" align="start" className="w-[min(22rem,calc(100vw-2rem))] gap-0 overflow-hidden p-0">
         <PopoverTitle className="sr-only">模型与推理等级</PopoverTitle>
+        {showSearch ? (
+          <div className="border-b border-border/60 p-2">
+            <SearchInput autoFocus value={query} onChange={setQuery} placeholder="搜索模型" ariaLabel="搜索模型" inputClassName="h-7" />
+          </div>
+        ) : null}
+
         <RadioGroup
           aria-label="模型"
-          value={selection ?? ""}
+          value={modelId ?? ""}
           disabled={saving}
-          onValueChange={(next) => {
-            setSelection(next);
-            setEffort(next === modelId ? thinkingLevel : undefined);
-          }}
-          className="flex max-h-[min(15rem,35vh)] flex-col overflow-y-auto p-1"
+          onValueChange={(next) => void selectModel(next)}
+          className="flex max-h-[min(18rem,40vh)] flex-col gap-1.5 overflow-y-auto p-1.5"
         >
-          {models.map((model) => (
-            <Radio.Root
-              key={model.id}
-              value={model.id}
-              nativeButton
-              render={<Button type="button" variant="ghost" />}
-              className="w-full justify-start gap-2 px-2 font-normal data-checked:bg-accent data-checked:text-accent-foreground"
-            >
-              <Radio.Indicator keepMounted className="shrink-0 data-unchecked:invisible">
-                <Check aria-hidden />
-              </Radio.Indicator>
-              <span className="min-w-0 flex-1 truncate text-start" title={model.label}>{model.label}</span>
-              <span className="max-w-[35%] truncate text-xs text-muted-foreground" title={model.provider}>{model.provider}</span>
-            </Radio.Root>
-          ))}
+          {groups.length ? (
+            groups.map(([providerId, group]) => (
+              <div key={providerId} className="flex flex-col gap-0.5">
+                <div className="px-2 pt-1 pb-0.5 text-[11px] font-medium text-muted-foreground">{group.providerName}</div>
+                {group.items.map((model) => (
+                  <Radio.Root
+                    key={model.id}
+                    value={model.id}
+                    nativeButton
+                    render={<Button type="button" variant="ghost" size="sm" />}
+                    className="h-7.5 w-full justify-start gap-2 px-2 font-normal data-checked:bg-accent data-checked:font-medium data-checked:text-accent-foreground"
+                  >
+                    <Radio.Indicator keepMounted className="shrink-0 data-unchecked:invisible">
+                      <Check aria-hidden className="size-3.5" />
+                    </Radio.Indicator>
+                    <span className="min-w-0 flex-1 truncate text-start text-xs" title={model.id}>
+                      {model.label}
+                    </span>
+                  </Radio.Root>
+                ))}
+              </div>
+            ))
+          ) : (
+            <p className="px-3 py-5 text-center text-xs text-muted-foreground">无匹配模型</p>
+          )}
         </RadioGroup>
-        <div className="flex flex-col gap-1 border-t px-2.5 py-2">
+
+        <div className="flex flex-col gap-2 border-t border-border/60 px-2.5 py-2">
           {levels.length > 1 ? (
-            <>
-              <Slider
-                value={[sliderIndex]}
-                max={levels.length - 1}
-                step={1}
-                disabled={saving}
-                thumbLabel="推理等级"
-                getAriaValueText={(_formatted, value) => levels[value] ?? "off"}
-                onValueChange={(value) => setEffort(levels[typeof value === "number" ? value : value[0] ?? 0])}
-                className="py-1"
-              />
-              <div className="flex flex-wrap justify-between gap-0.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="shrink-0 text-[11px] text-muted-foreground">推理</span>
+              <div className="inline-flex flex-wrap justify-end gap-0.5 rounded-md bg-muted/50 p-0.5">
                 {levels.map((level) => (
                   <Button
                     key={level}
@@ -139,23 +221,37 @@ export function ModelPicker({
                     size="xs"
                     variant="ghost"
                     disabled={saving}
-                    aria-pressed={chosenEffort === level}
-                    className="px-1 text-xs font-normal text-muted-foreground aria-pressed:bg-accent aria-pressed:font-medium aria-pressed:text-foreground"
-                    onClick={() => setEffort(level)}
+                    aria-pressed={currentEffort === level}
+                    className="h-6 px-1.5 text-[11px] font-normal text-muted-foreground aria-pressed:bg-background aria-pressed:font-medium aria-pressed:text-foreground aria-pressed:shadow-2xs"
+                    onClick={() => void selectEffort(level)}
                   >
                     {level}
                   </Button>
                 ))}
               </div>
-            </>
+            </div>
           ) : null}
-          <div className="flex items-center justify-end gap-2">
-            {levels.length === 1 ? (
-              <span className="me-auto text-xs text-muted-foreground"><span className="sr-only">推理等级 </span>{chosenEffort}</span>
-            ) : null}
-            <Button type="button" size="sm" disabled={!selection || !chosenEffort || saving} onClick={() => void apply()}>
-              {saving ? <Spinner /> : null}
-              应用
+          <div className="flex items-center justify-between gap-2">
+            {saving ? (
+              <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                <Spinner className="size-3" />
+                切换中…
+              </span>
+            ) : (
+              <span />
+            )}
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              className="h-6 px-1.5 text-[11px] font-normal text-muted-foreground hover:text-foreground"
+              onClick={() => {
+                setOpen(false);
+                actions.openSettings("providers");
+              }}
+            >
+              <Settings2 className="size-3" />
+              管理模型
             </Button>
           </div>
         </div>
@@ -179,17 +275,14 @@ export function ApprovalSelect({ value, disabled, onChange }: { value: ApprovalM
       }}
       items={APPROVAL_MODES.map((mode) => ({ value: mode, label: APPROVAL_SHORT[mode] }))}
     >
-      <SelectTrigger size="sm" className={CHIP} aria-label="审批方式" title={APPROVAL_LABEL[value]}>
+      <SelectTrigger size="sm" className={COMPOSER_CHIP} aria-label="审批方式" title={APPROVAL_LABEL[value]}>
         <Icon />
         <SelectValue />
       </SelectTrigger>
-      <SelectContent alignItemWithTrigger={false} align="start" side="top" className="w-72">
+      <SelectContent alignItemWithTrigger={false} align="start" side="top">
         {APPROVAL_MODES.map((mode) => (
-          <SelectItem key={mode} value={mode} className="[&>*:first-child]:min-w-0 [&>*:first-child]:shrink [&>*:first-child]:whitespace-normal">
-            <div className="flex flex-col whitespace-normal">
-              <span>{APPROVAL_LABEL[mode]}</span>
-              <span className="text-xs text-muted-foreground">{APPROVAL_HINT[mode]}</span>
-            </div>
+          <SelectItem key={mode} value={mode}>
+            {APPROVAL_LABEL[mode]}
           </SelectItem>
         ))}
       </SelectContent>
@@ -200,8 +293,9 @@ export function ApprovalSelect({ value, disabled, onChange }: { value: ApprovalM
 const TOKENS = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 const RING = 2 * Math.PI * 7;
 
-/** Context window use as a small ring next to the send button; details and compaction on hover. */
+/** Context window use as a small ring next to the send button; details, compaction and usage shortcut on click. */
 export function ContextUsage({ sessionId, state }: { sessionId: string; state: SessionState }) {
+  const [open, setOpen] = React.useState(false);
   const context = state.context;
   if (!context) return null;
   const percent = context.percent ?? (context.tokens !== null && context.window ? (context.tokens / context.window) * 100 : null);
@@ -209,8 +303,19 @@ export function ContextUsage({ sessionId, state }: { sessionId: string; state: S
   const busy = state.access !== "ready" || state.runActive || state.compacting;
   const tone = filled >= 80 ? "text-warning-foreground" : "text-muted-foreground";
   return (
-    <HoverCard>
-      <HoverCardTrigger render={<Button variant="ghost" size="icon-sm" className={tone} aria-label={`上下文已用 ${Math.round(filled)}%`} />}>
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            className={tone}
+            title={`上下文已用 ${Math.round(filled)}%`}
+            aria-label={`上下文已用 ${Math.round(filled)}%`}
+          />
+        }
+      >
         <svg viewBox="0 0 18 18" className="size-4 -rotate-90" aria-hidden>
           <circle cx="9" cy="9" r="7" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.2" />
           <circle
@@ -225,8 +330,9 @@ export function ContextUsage({ sessionId, state }: { sessionId: string; state: S
             strokeDashoffset={RING * (1 - filled / 100)}
           />
         </svg>
-      </HoverCardTrigger>
-      <HoverCardContent align="end" side="top" className="flex w-64 flex-col gap-3">
+      </PopoverTrigger>
+      <PopoverContent align="end" side="top" className="flex w-64 flex-col gap-3">
+        <PopoverTitle className="sr-only">上下文与用量</PopoverTitle>
         <div className="flex flex-col gap-1.5">
           <div className="flex items-baseline justify-between text-xs">
             <span className="font-medium">上下文 {percent === null ? "" : `${Math.round(percent)}%`}</span>
@@ -236,15 +342,40 @@ export function ContextUsage({ sessionId, state }: { sessionId: string; state: S
           </div>
           <Progress value={filled} />
         </div>
-        <div className="flex items-baseline justify-between text-xs">
+        <div className="flex items-center justify-between text-xs">
           <span className="font-medium">花费</span>
           <span className="text-muted-foreground tabular-nums">${state.cost.toFixed(4)}</span>
         </div>
-        <Button size="sm" variant="outline" disabled={busy} onClick={() => void actions.compact(sessionId)}>
-          {state.compacting ? <Spinner /> : <Minimize2 />}
-          {state.compacting ? "正在压缩…" : "压缩上下文"}
-        </Button>
-      </HoverCardContent>
-    </HoverCard>
+        <div className="flex items-center gap-1.5">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="flex-1"
+            disabled={busy}
+            onClick={() => {
+              setOpen(false);
+              void actions.compact(sessionId);
+            }}
+          >
+            {state.compacting ? <Spinner /> : <Minimize2 />}
+            {state.compacting ? "压缩中…" : "压缩上下文"}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+            onClick={() => {
+              setOpen(false);
+              actions.openSettings("usage");
+            }}
+          >
+            <BarChart3 />
+            用量
+          </Button>
+        </div>
+      </PopoverContent>
+    </Popover>
   );
 }

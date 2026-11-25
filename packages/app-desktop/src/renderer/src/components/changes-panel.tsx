@@ -1,18 +1,17 @@
 import * as React from "react";
-import { ArrowDown, ArrowLeft, ArrowUp, AtSign, ExternalLink, FileCode, FolderOpen, FolderTree, GitBranch, List, RotateCw, TriangleAlert, X } from "lucide-react";
+import { ArrowLeft, AtSign, ExternalLink, FileCode, FolderOpen, FolderTree, GitBranch, List, RotateCw, TriangleAlert, X } from "lucide-react";
 import { toast } from "sonner";
 import type { GitFileChange, GitFileDiff, GitFileStatus, GitStatus } from "@lila/protocol";
 import { DiffView } from "@/components/code";
 import { focusComposer } from "@/components/composer";
 import { FileTree } from "@/components/file-tree";
+import { IconButton } from "@/components/icon-button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "cn";
 import { actions, useLila } from "@/lib/store";
 
@@ -48,27 +47,6 @@ function joinPath(root: string, rel: string): string {
   return `${root.replace(/\/+$/, "")}/${rel.replace(/^\.\//, "")}`;
 }
 
-function HeaderIconButton({
-  label,
-  disabled,
-  onClick,
-  children,
-}: {
-  label: string;
-  disabled?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger render={<Button type="button" size="icon-sm" variant="ghost" aria-label={label} disabled={disabled} className="text-muted-foreground hover:text-foreground" onClick={onClick} />}>
-        {children}
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
-  );
-}
-
 /**
  * Workspace Git changes panel inside the unified right card.
  * Uses @container queries to show a clean single-column drill-down at default width
@@ -78,6 +56,8 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
   const project = useLila((state) => state.projects.find((item) => item.id === projectId));
   const connected = useLila((state) => state.connection === "connected");
   const refreshSeq = useLila((state) => state.workspaceRefreshSeq);
+  const activeChangePath = useLila((state) => state.activeChangePath);
+  const returnToPreviewId = useLila((state) => state.returnToPreviewId);
   const [status, setStatus] = React.useState<GitStatus>();
   const [error, setError] = React.useState<string>();
   const [loading, setLoading] = React.useState(false);
@@ -151,10 +131,16 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
       setShowDiff(false);
       return;
     }
+    if (activeChangePath && files.some((file) => file.path === activeChangePath)) {
+      setSelectedPath(activeChangePath);
+      setShowDiff(true);
+      actions.setActiveChangePath(undefined);
+      return;
+    }
     if (!selectedPath || !files.some((file) => file.path === selectedPath)) {
       setSelectedPath(files[0]!.path);
     }
-  }, [files, selectedPath]);
+  }, [files, selectedPath, activeChangePath]);
 
   const selectedFile: GitFileChange | undefined = files.find((file) => file.path === selectedPath);
   const effectiveStaged = scope === "staged" ? true : scope === "unstaged" ? false : undefined;
@@ -196,43 +182,44 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="flex h-11 shrink-0 items-center gap-1 border-b border-border/60 px-2.5">
-        {showDiff && selectedFile ? (
+        {returnToPreviewId ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            className="text-muted-foreground hover:text-foreground"
+            onClick={() => actions.returnToSubsession()}
+          >
+            <ArrowLeft />
+            返回子会话
+          </Button>
+        ) : showDiff && selectedFile ? (
           <span className="@min-[42rem]:hidden">
-            <HeaderIconButton label="返回改动列表" onClick={() => setShowDiff(false)}>
+            <IconButton label="返回改动列表" onClick={() => setShowDiff(false)}>
               <ArrowLeft />
-            </HeaderIconButton>
+            </IconButton>
           </span>
         ) : null}
-        <div className="flex min-w-0 flex-1 items-center gap-1.5 px-1">
-          <GitBranch className="size-4 shrink-0 text-muted-foreground" />
+        <div className="flex min-w-0 flex-1 items-baseline gap-2 px-1">
+          <GitBranch className="size-4 shrink-0 self-center text-muted-foreground" />
           <h2 className="truncate text-sm font-medium">工作区改动</h2>
           {status?.isRepo && status.branch ? (
-            <Badge variant="secondary" className="hidden gap-1 font-mono text-[11px] font-normal @min-[24rem]:inline-flex">
+            <span className="hidden truncate font-mono text-xs text-muted-foreground @min-[24rem]:inline">
               {status.branch}
-            </Badge>
-          ) : null}
-          {status?.ahead ? (
-            <Badge variant="outline" className="hidden gap-0.5 font-mono text-[11px] tabular-nums @min-[28rem]:inline-flex">
-              <ArrowUp className="size-3" />
-              {status.ahead}
-            </Badge>
-          ) : null}
-          {status?.behind ? (
-            <Badge variant="outline" className="hidden gap-0.5 font-mono text-[11px] tabular-nums @min-[28rem]:inline-flex">
-              <ArrowDown className="size-3" />
-              {status.behind}
-            </Badge>
+              {status.ahead ? ` ↑${status.ahead}` : ""}
+              {status.behind ? ` ↓${status.behind}` : ""}
+            </span>
           ) : null}
         </div>
-        <HeaderIconButton label={viewMode === "tree" ? "切换为列表视图" : "切换为目录树视图"} onClick={toggleViewMode}>
+        <IconButton label={viewMode === "tree" ? "切换为列表视图" : "切换为目录树视图"} onClick={toggleViewMode}>
           {viewMode === "tree" ? <List /> : <FolderTree />}
-        </HeaderIconButton>
-        <HeaderIconButton label="刷新改动" disabled={loading} onClick={() => void loadStatus()}>
+        </IconButton>
+        <IconButton label="刷新改动" disabled={loading} onClick={() => void loadStatus()}>
           {loading ? <Spinner /> : <RotateCw />}
-        </HeaderIconButton>
-        <HeaderIconButton label="关闭改动面板" onClick={() => actions.closeRightPanel()}>
+        </IconButton>
+        <IconButton label="关闭改动面板" onClick={() => actions.closeRightPanel()}>
           <X />
-        </HeaderIconButton>
+        </IconButton>
       </header>
 
       {!status ? (
@@ -253,15 +240,13 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
       ) : !status.isRepo ? (
         <Empty className="flex-1">
           <EmptyHeader>
-            <EmptyTitle>当前目录不是 Git 仓库</EmptyTitle>
-            <EmptyDescription>在 Git 仓库里工作时，可以在这里随时查看未提交的改动和差异。</EmptyDescription>
+            <EmptyTitle>非 Git 仓库</EmptyTitle>
           </EmptyHeader>
         </Empty>
       ) : status.files.length === 0 ? (
         <Empty className="flex-1">
           <EmptyHeader>
-            <EmptyTitle>工作区很干净</EmptyTitle>
-            <EmptyDescription>当前没有未提交的文件改动。</EmptyDescription>
+            <EmptyTitle>无未提交改动</EmptyTitle>
           </EmptyHeader>
         </Empty>
       ) : (
@@ -304,6 +289,7 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
                     };
                   })}
                   selectedPath={selectedPath}
+                  defaultOpen={files.length <= 20}
                   onSelect={handleSelectFile}
                 />
               ) : (
@@ -353,13 +339,11 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
                         {selectedFile.path}
                       </span>
                       {selectedFile.from ? (
-                        <Badge variant="outline" className="font-mono text-[11px] font-normal">
-                          ← {selectedFile.from}
-                        </Badge>
+                        <span className="truncate font-mono text-[11px] text-muted-foreground">← {selectedFile.from}</span>
                       ) : null}
                       {fullPath && selectedFile.status !== "deleted" ? (
                         <div className="flex items-center gap-0.5">
-                          <HeaderIconButton
+                          <IconButton
                             label="引用到对话"
                             onClick={() => {
                               actions.mentionFileInDraft(selectedFile.path);
@@ -367,21 +351,21 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
                             }}
                           >
                             <AtSign />
-                          </HeaderIconButton>
-                          <HeaderIconButton label="在文件面板预览" onClick={() => actions.openFilePreview(fullPath)}>
+                          </IconButton>
+                          <IconButton label="在文件面板预览" onClick={() => actions.openFilePreview(fullPath)}>
                             <FileCode />
-                          </HeaderIconButton>
-                          <HeaderIconButton
+                          </IconButton>
+                          <IconButton
                             label="用默认应用打开"
                             onClick={() =>
                               void window.lila.openPath(fullPath).catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)))
                             }
                           >
                             <ExternalLink />
-                          </HeaderIconButton>
-                          <HeaderIconButton label="在访达中显示" onClick={() => window.lila.revealPath(fullPath)}>
+                          </IconButton>
+                          <IconButton label="在文件夹中显示" onClick={() => void actions.revealPath(fullPath)}>
                             <FolderOpen />
-                          </HeaderIconButton>
+                          </IconButton>
                         </div>
                       ) : null}
                     </div>
@@ -401,21 +385,19 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
                       <Empty className="py-12">
                         <EmptyHeader>
                           <EmptyTitle>二进制文件</EmptyTitle>
-                          <EmptyDescription>无法以文本形式展示此文件的差异。</EmptyDescription>
                         </EmptyHeader>
                       </Empty>
                     ) : diff?.patch ? (
                       <>
                         {diff.truncated ? (
-                          <p className="text-xs text-muted-foreground">差异内容过长，仅展示前一部分。</p>
+                          <p className="text-xs text-muted-foreground">差异已截断</p>
                         ) : null}
                         <DiffView patch={diff.patch} path={selectedFile.path} maxHeight="none" />
                       </>
                     ) : (
                       <Empty className="py-12">
                         <EmptyHeader>
-                          <EmptyTitle>没有可显示的文本差异</EmptyTitle>
-                          <EmptyDescription>该文件可能仅有权限改动或为空文件。</EmptyDescription>
+                          <EmptyTitle>无文本差异</EmptyTitle>
                         </EmptyHeader>
                       </Empty>
                     )}

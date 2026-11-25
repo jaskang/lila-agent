@@ -136,29 +136,38 @@ export function SubSessionLink({
   agentId,
   description,
   prompt,
+  showLabel = false,
   className,
 }: {
   sessionId: string;
   agentId?: string | undefined;
   description?: string | undefined;
   prompt?: string | undefined;
+  showLabel?: boolean;
   className?: string | undefined;
 }) {
-  const subSessionId = useLila((state) => state.selectedId === sessionId
-    ? findMatchingSubSession(state.childrenByParent[sessionId], { agentId, description, prompt })
-    : undefined);
+  const subSessionId = useLila((state) =>
+    state.selectedId === sessionId || state.previewId === sessionId
+      ? findMatchingSubSession(state.childrenByParent[sessionId], { agentId, description, prompt })
+      : undefined,
+  );
   const previewed = useLila((state) => Boolean(subSessionId && state.previewId === subSessionId));
   if (!subSessionId) return null;
-  const label = previewed ? "关闭右侧预览" : description ? `在右侧查看：${description}` : "在右侧查看";
+  const label = previewed ? "关闭侧栏预览" : description ? `在侧栏打开：${description}` : "在侧栏打开";
   return (
     <Button
       type="button"
-      size="icon-xs"
-      variant="ghost"
+      size={showLabel ? "xs" : "icon-xs"}
+      variant={showLabel ? "outline" : "ghost"}
       title={label}
       aria-label={label}
       aria-pressed={previewed}
-      className={cn("size-6 shrink-0 text-muted-foreground/70 hover:text-foreground aria-pressed:bg-accent aria-pressed:text-foreground", className)}
+      className={cn(
+        showLabel
+          ? "h-6 shrink-0 gap-1 px-2 text-[11px] font-normal text-muted-foreground hover:text-foreground aria-pressed:bg-accent aria-pressed:text-foreground"
+          : "size-6 shrink-0 text-muted-foreground/70 hover:text-foreground aria-pressed:bg-accent aria-pressed:text-foreground",
+        className,
+      )}
       onClick={(event) => {
         event.stopPropagation();
         if (previewed) actions.closePreview();
@@ -166,6 +175,7 @@ export function SubSessionLink({
       }}
     >
       <PanelRightOpen className="size-3.5" />
+      {showLabel ? (previewed ? "关闭侧栏" : "侧栏打开") : null}
     </Button>
   );
 }
@@ -191,7 +201,16 @@ function AgentDetailsBody({ info, sessionId, showSubLink = true }: { info: Resol
             {stat}
           </span>
         ))}
-        {showSubLink ? <SubSessionLink sessionId={sessionId} agentId={info.agentId} description={info.description} prompt={info.prompt} className="ms-auto" /> : null}
+        {showSubLink ? (
+          <SubSessionLink
+            sessionId={sessionId}
+            agentId={info.agentId}
+            description={info.description}
+            prompt={info.prompt}
+            showLabel
+            className="ms-auto"
+          />
+        ) : null}
       </div>
       {info.active && info.activity ? (
         <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground">
@@ -204,7 +223,7 @@ function AgentDetailsBody({ info, sessionId, showSubLink = true }: { info: Resol
           {info.prompt}
         </div>
       ) : null}
-      {info.error ? <p className="text-sm text-destructive">{info.error}</p> : null}
+      {info.error ? <p className="text-sm text-destructive-foreground">{info.error}</p> : null}
       {info.output ? (
         <div className="rounded-lg border bg-card px-3 py-2 text-foreground">
           <Markdown text={info.output} streaming={info.active} />
@@ -214,7 +233,17 @@ function AgentDetailsBody({ info, sessionId, showSubLink = true }: { info: Resol
   );
 }
 
-export function SingleAgentCard({ tool, sessionId, reveal = false }: { tool: AgentToolItem; sessionId: string; reveal?: boolean }) {
+export function SingleAgentCard({
+  tool,
+  sessionId,
+  reveal = false,
+  nested = false,
+}: {
+  tool: AgentToolItem;
+  sessionId: string;
+  reveal?: boolean;
+  nested?: boolean;
+}) {
   const agentId = tool.subagent?.id;
   const live = useLila<SubagentProgress | undefined>((state) =>
     agentId ? state.views[sessionId]?.state?.subagents?.find((entry) => entry.id === agentId) : undefined,
@@ -228,11 +257,16 @@ export function SingleAgentCard({ tool, sessionId, reveal = false }: { tool: Age
     return () => window.clearInterval(timer);
   }, [info.active, info.startedAt]);
 
-  const [open, setOpen] = React.useState(info.isError);
+  // Top-level sub-agent tasks expand by default while running; nested ones inside AgentGroup stay collapsed as the 2nd level.
+  const shouldAutoOpen = info.isError || (!nested && info.active);
+  const [open, setOpen] = React.useState(() => shouldAutoOpen || reveal);
   const [touched, setTouched] = React.useState(false);
   React.useEffect(() => {
-    if (!touched && info.isError) setOpen(true);
-  }, [info.isError, touched]);
+    if (reveal) setOpen(true);
+  }, [reveal]);
+  React.useEffect(() => {
+    if (!touched && shouldAutoOpen) setOpen(true);
+  }, [shouldAutoOpen, touched]);
 
   const status = info.active ? "running" : info.isError ? "error" : undefined;
   const meta = [
@@ -244,39 +278,36 @@ export function SingleAgentCard({ tool, sessionId, reveal = false }: { tool: Age
   return (
     <Trace>
       <TraceCollapsible
-        open={open || reveal}
+        open={open}
         onOpenChange={(next) => {
           setTouched(true);
           setOpen(next);
         }}
       >
-        <div className="flex min-w-0 items-center gap-1">
-          <TraceCollapsibleTrigger className="py-0.5">
-            <TraceLine className="text-[13px]" {...(status ? { status } : {})}>
-              <TraceIcon>
-                {info.active ? (
-                  <Spinner />
-                ) : info.isError ? (
-                  <CircleAlert />
-                ) : (
-                  <CheckCircle2 className="text-success-foreground" />
-                )}
-              </TraceIcon>
-              <TraceTitle className="max-w-[26rem] shrink truncate font-medium text-foreground">
-                {info.description || "子 Agent"}
-              </TraceTitle>
-              {meta.length ? (
-                <TraceDescription className="min-w-0 shrink truncate text-xs tabular-nums">
-                  {meta.join(" · ")}
-                </TraceDescription>
-              ) : null}
-            </TraceLine>
-          </TraceCollapsibleTrigger>
-          <SubSessionLink sessionId={sessionId} agentId={info.agentId} description={info.description} prompt={info.prompt} />
-        </div>
+        <TraceCollapsibleTrigger className="py-0.5">
+          <TraceLine className="text-[13px]" {...(status ? { status } : {})}>
+            <TraceIcon>
+              {info.active ? (
+                <Spinner />
+              ) : info.isError ? (
+                <CircleAlert />
+              ) : (
+                <CheckCircle2 className="text-success-foreground" />
+              )}
+            </TraceIcon>
+            <TraceTitle className="max-w-[26rem] shrink truncate font-medium text-foreground">
+              {info.description || "子 Agent"}
+            </TraceTitle>
+            {meta.length ? (
+              <TraceDescription className="min-w-0 shrink truncate text-xs tabular-nums">
+                {meta.join(" · ")}
+              </TraceDescription>
+            ) : null}
+          </TraceLine>
+        </TraceCollapsibleTrigger>
         <TraceCollapsibleContent>
           <div className="flex flex-col gap-2 text-foreground">
-            <AgentDetailsBody info={info} sessionId={sessionId} showSubLink={false} />
+            <AgentDetailsBody info={info} sessionId={sessionId} showSubLink />
           </div>
         </TraceCollapsibleContent>
       </TraceCollapsible>
@@ -309,12 +340,13 @@ export const AgentGroup = React.memo(function AgentGroup({
 }) {
   const subagents = useLila((state) => state.views[sessionId]?.state?.subagents);
   const byId = React.useMemo(() => new Map((subagents ?? []).map((entry) => [entry.id, entry])), [subagents]);
-  const [open, setOpen] = React.useState(true);
   const hasReveal = Boolean(revealId && tools.some((tool) => tool.id === revealId));
 
   let activeCount = 0;
   let errorCount = 0;
   let doneCount = 0;
+  let totalTokens = 0;
+  let totalCost = 0;
   for (const tool of tools) {
     const id = tool.subagent?.id;
     const live = id ? byId.get(id) : undefined;
@@ -322,19 +354,39 @@ export const AgentGroup = React.memo(function AgentGroup({
     if (status === "running" || status === "queued" || tool.status === "running") activeCount++;
     else if (isSubagentErrorStatus(status)) errorCount++;
     else doneCount++;
+    totalTokens += live?.tokens ?? tool.subagent?.tokens ?? 0;
+    totalCost += live?.cost ?? tool.subagent?.cost ?? 0;
   }
+
+  const shouldAutoOpen = activeCount > 0 || errorCount > 0;
+  const [open, setOpen] = React.useState(() => shouldAutoOpen || hasReveal);
+  const [touched, setTouched] = React.useState(false);
+  React.useEffect(() => {
+    if (hasReveal) setOpen(true);
+  }, [hasReveal]);
+  React.useEffect(() => {
+    if (!touched && shouldAutoOpen) setOpen(true);
+  }, [shouldAutoOpen, touched]);
 
   const summaryParts = [
     activeCount ? `${activeCount} 运行中` : undefined,
     doneCount ? `${doneCount} 已完成` : undefined,
     errorCount ? `${errorCount} 出错` : undefined,
+    totalTokens > 0 ? formatCompactTokens(totalTokens) : undefined,
+    totalCost > 0 ? `$${totalCost.toFixed(4)}` : undefined,
   ].filter(Boolean);
 
   const lineStatus = activeCount > 0 ? "running" : errorCount > 0 ? "error" : undefined;
 
   return (
     <Trace>
-      <TraceCollapsible open={open || hasReveal} onOpenChange={setOpen}>
+      <TraceCollapsible
+        open={open}
+        onOpenChange={(next) => {
+          setTouched(true);
+          setOpen(next);
+        }}
+      >
         <TraceCollapsibleTrigger className="py-0.5">
           <TraceLine className="text-[13px]" {...(lineStatus ? { status: lineStatus } : {})}>
             <TraceIcon>
@@ -348,7 +400,7 @@ export const AgentGroup = React.memo(function AgentGroup({
             </TraceIcon>
             <TraceTitle>{tools.length} 个子 Agent</TraceTitle>
             {summaryParts.length ? (
-              <TraceDescription className={cn("text-xs", errorCount > 0 && !activeCount && "text-destructive")}>
+              <TraceDescription className={cn("text-xs tabular-nums", errorCount > 0 && !activeCount && "text-destructive-foreground")}>
                 {summaryParts.join(" · ")}
               </TraceDescription>
             ) : null}
@@ -364,7 +416,7 @@ export const AgentGroup = React.memo(function AgentGroup({
                   data-transcript-item={tool.id}
                   className={matched ? "rounded-md bg-accent/60 p-1 ring-1 ring-ring/25" : undefined}
                 >
-                  <SingleAgentCard tool={tool} sessionId={sessionId} reveal={matched} />
+                  <SingleAgentCard tool={tool} sessionId={sessionId} reveal={matched} nested />
                 </div>
               );
             })}

@@ -4,11 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch src/main.ts",
+    "dev": "LILA_CORE_REPLACE=1 node --watch src/main.ts",
     "start": "node src/main.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
+    "@amaster.ai/pi-memory": "0.1.40",
     "@earendil-works/pi-ai": "1.5.2",
     "@earendil-works/pi-coding-agent": "1.5.2",
     "@lila/protocol": "workspace:*",

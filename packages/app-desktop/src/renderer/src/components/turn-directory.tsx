@@ -6,10 +6,9 @@ import { useMessageScrollerVisibility } from "@/components/ui/message-scroller";
 import { cn } from "cn";
 import type { TranscriptBlock } from "@/lib/transcript-layout";
 
-const RAIL_SIZE = 9;
 const PREVIEW_TICK_WIDTHS = [26, 19, 13, 9];
 
-type TurnPreview = { itemId: string; prompt: string; reply?: string };
+type TurnPreview = { itemId: string; number: number; prompt: string; reply?: string };
 
 function handleTurnKeys(event: React.KeyboardEvent<HTMLElement>): void {
   if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
@@ -29,12 +28,16 @@ export function TurnRail({ items, blocks, onJump }: {
 }) {
   const { visibleMessageIds } = useMessageScrollerVisibility();
   const [previewOpen, setPreviewOpen] = React.useState(false);
-  const [pointerStart, setPointerStart] = React.useState<number>();
+  const railRef = React.useRef<HTMLDivElement>(null);
   const turns = React.useMemo(() => {
     const result: TurnPreview[] = [];
     for (const item of items) {
       if (item.kind === "user") {
-        result.push({ itemId: item.id, prompt: item.text.trim().slice(0, 280) || (item.images.length ? "图片消息" : "空消息") });
+        result.push({
+          itemId: item.id,
+          number: result.length + 1,
+          prompt: item.text.trim().slice(0, 280) || (item.images.length ? "图片消息" : "空消息"),
+        });
       } else if (item.kind === "assistant" && !item.streaming && item.text) {
         const turn = result.at(-1);
         if (turn) turn.reply = item.text.trim().slice(0, 280);
@@ -64,25 +67,28 @@ export function TurnRail({ items, blocks, onJump }: {
     }
   }
 
-  const active = currentTurnId ? turns.findIndex((turn) => turn.itemId === currentTurnId) : -1;
-  const center = active >= 0 ? active : turns.length - 1;
-  const start = Math.max(0, Math.min(pointerStart ?? center - Math.floor(RAIL_SIZE / 2), turns.length - RAIL_SIZE));
-  const visible = turns.slice(start, start + RAIL_SIZE);
+  const effectiveTurnId = currentTurnId ?? turns.at(-1)?.itemId;
+
+  React.useEffect(() => {
+    if (!effectiveTurnId || previewOpen) return;
+    const activeButton = railRef.current?.querySelector<HTMLElement>(`[data-turn-anchor="${CSS.escape(effectiveTurnId)}"]`);
+    activeButton?.scrollIntoView({ block: "nearest" });
+  }, [effectiveTurnId, previewOpen]);
+
   return (
     <nav aria-label="轮次导航" className="pointer-events-none absolute inset-y-0 start-2 z-10 flex w-8 items-center">
       <HoverCard<TurnPreview> onOpenChange={setPreviewOpen}>
         {({ payload }) => {
-          const hovered = previewOpen ? visible.findIndex((turn) => turn.itemId === payload?.itemId) : -1;
+          const hovered = previewOpen ? turns.findIndex((turn) => turn.itemId === payload?.itemId) : -1;
           return (
             <>
               <div
-                className="pointer-events-auto flex max-h-[calc(100%_-_1rem)] flex-col overflow-y-auto [scrollbar-width:none]"
+                ref={railRef}
+                className="pointer-events-auto flex max-h-[min(18rem,55%)] flex-col overflow-y-auto py-1 [scrollbar-width:none]"
                 onKeyDown={handleTurnKeys}
-                onPointerEnter={() => setPointerStart(start)}
-                onPointerLeave={() => setPointerStart(undefined)}
               >
-                {visible.map((turn, index) => {
-                  const current = turn.itemId === (currentTurnId ?? turns.at(-1)?.itemId);
+                {turns.map((turn, index) => {
+                  const current = turn.itemId === effectiveTurnId;
                   const previewWidth = hovered >= 0 ? PREVIEW_TICK_WIDTHS[Math.abs(hovered - index)] : undefined;
                   return (
                     <HoverCardTrigger
@@ -95,9 +101,9 @@ export function TurnRail({ items, blocks, onJump }: {
                           type="button"
                           size="icon-xs"
                           variant="ghost"
-                          className="h-3.5 w-8 justify-start rounded px-0.5 hover:bg-transparent focus-visible:ring-0 focus-visible:inset-ring-1 focus-visible:inset-ring-ring/60"
+                          className="h-3.5 w-8 shrink-0 justify-start rounded px-0.5 hover:bg-transparent focus-visible:ring-0 focus-visible:inset-ring-1 focus-visible:inset-ring-ring/60"
                           data-turn-anchor={turn.itemId}
-                          aria-label={`跳转到消息：${turn.prompt.replace(/\s+/g, " ")}`}
+                          aria-label={`第 ${turn.number} 轮：${turn.prompt.replace(/\s+/g, " ")}`}
                           aria-current={current ? "location" : undefined}
                           onClick={() => void onJump(turn.itemId)}
                         />
@@ -118,6 +124,10 @@ export function TurnRail({ items, blocks, onJump }: {
               </div>
               {payload ? (
                 <HoverCardContent side="right" alignOffset={0} sideOffset={5} className="w-[min(18rem,calc(100vw-4rem))] space-y-1">
+                  <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground tabular-nums">
+                    <span>第 {payload.number} 轮</span>
+                    <span>共 {turns.length} 轮</span>
+                  </div>
                   <p className="truncate text-xs font-semibold">{payload.prompt}</p>
                   {payload.reply ? <p className="line-clamp-3 wrap-anywhere text-xs leading-relaxed text-muted-foreground">{payload.reply}</p> : null}
                 </HoverCardContent>

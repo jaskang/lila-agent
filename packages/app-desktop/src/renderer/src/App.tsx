@@ -4,10 +4,11 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { ChangesPanel } from "@/components/changes-panel";
 import { CommandPalette } from "@/components/command-palette";
 import { Conversation } from "@/components/conversation";
-import { FilesPanel } from "@/components/files-panel";
+import { FilesPanel } from "@/components/files";
 import { NewSession } from "@/components/new-session";
 import { ReplyChangesPanel } from "@/components/reply-changes";
 import { RightPanelShell } from "@/components/right-panel";
+import { SettingsDialog } from "@/components/settings";
 import { SubsessionPreview } from "@/components/subsession-preview";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -33,30 +34,38 @@ function readSidebarOpen(): boolean {
 function ConnectionBanner() {
   const connection = useLila((state) => state.connection);
   const detail = useLila((state) => state.connectionDetail);
-  // A short reconnect should not flash a banner.
+  const disconnected = connection !== "connected";
+  // A short reconnect should not flash a banner, and reconnect attempts must not reset this timer.
   const [visible, setVisible] = React.useState(false);
   React.useEffect(() => {
-    if (connection === "connected") {
+    if (!disconnected) {
       setVisible(false);
       return;
     }
     const timer = setTimeout(() => setVisible(true), 800);
     return () => clearTimeout(timer);
-  }, [connection]);
-  if (!visible || connection === "connected") return null;
+  }, [disconnected]);
+  if (!visible || !disconnected) return null;
   return (
     <div className="absolute inset-x-0 top-12 z-20 mx-auto w-fit max-w-lg px-4">
       <Alert variant={connection === "incompatible" ? "destructive" : "default"} className="shadow-md">
         {connection === "connecting" ? <Spinner /> : <WifiOff />}
         <AlertTitle>{connection === "incompatible" ? "core 版本不匹配" : connection === "connecting" ? "正在连接 core…" : "与 core 的连接断开了"}</AlertTitle>
         <AlertDescription>
-          {detail ?? "正在自动重连，任务不会因为窗口断线而中断。"}
-          {connection === "incompatible" ? (
-            <Button size="sm" variant="outline" className="mt-2" onClick={() => window.location.reload()}>
-              <RotateCw />
-              重新连接
-            </Button>
-          ) : null}
+          <span>{detail ?? "正在自动重连，任务不会因为窗口断线而中断。"}</span>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {connection === "incompatible" ? (
+              <Button size="sm" variant="outline" onClick={() => window.location.reload()}>
+                <RotateCw />
+                重新加载界面
+              </Button>
+            ) : (
+              <Button size="sm" variant="outline" onClick={() => actions.reconnectNow()}>
+                <RotateCw />
+                立即重连
+              </Button>
+            )}
+          </div>
         </AlertDescription>
       </Alert>
     </div>
@@ -85,26 +94,45 @@ export function App() {
     client.start();
     if (typeof Notification !== "undefined" && Notification.permission === "default") void Notification.requestPermission();
     const onKey = (event: KeyboardEvent) => {
-      if (!event.metaKey || event.altKey) return;
+      const mod = (event.metaKey || event.ctrlKey) && !event.altKey;
+      if (!mod) return;
       const key = event.key.toLowerCase();
+      const state = useLila.getState();
       if (!event.shiftKey) {
+        if (key === "k") {
+          event.preventDefault();
+          actions.setPaletteOpen(!state.paletteOpen);
+          return;
+        }
+        if (key === ",") {
+          event.preventDefault();
+          actions.setSettingsOpen(!state.settingsOpen);
+          return;
+        }
+        if (state.settingsOpen || state.paletteOpen) return;
         if (key === "n") {
           event.preventDefault();
           actions.startNew();
-        } else if (key === "k") {
-          event.preventDefault();
-          actions.setPaletteOpen(!useLila.getState().paletteOpen);
-        } else if (key === "e" && useLila.getState().selectedId) {
+        } else if (key === "e" && state.selectedId) {
           event.preventDefault();
           actions.toggleRightPanel("files");
         }
-      } else if (key === "g" && useLila.getState().selectedId) {
+      } else if (!state.settingsOpen && !state.paletteOpen && key === "g" && state.selectedId) {
         event.preventDefault();
         actions.toggleRightPanel("changes");
       }
     };
+    const offMenu = window.lila.onMenuAction((action) => {
+      if (action === "settings") actions.openSettings();
+      else if (action === "new-session") {
+        actions.setSettingsOpen(false);
+        actions.setPaletteOpen(false);
+        actions.startNew();
+      }
+    });
     window.addEventListener("keydown", onKey);
     return () => {
+      offMenu();
       window.removeEventListener("keydown", onKey);
       client.dispose();
     };
@@ -142,6 +170,7 @@ export function App() {
           </div>
         </SidebarInset>
         <CommandPalette />
+        <SettingsDialog />
       </SidebarProvider>
       <Toaster position="bottom-right" richColors closeButton />
     </TooltipProvider>

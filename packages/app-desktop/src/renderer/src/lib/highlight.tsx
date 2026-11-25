@@ -1,7 +1,7 @@
 import * as React from "react";
 import type { HighlightRequest, HighlightResponse } from "./highlight.worker.ts";
 
-const MAX_CHARS = 20_000;
+export const HIGHLIGHT_MAX_CHARS = 80_000;
 const CACHE_LIMIT = 200;
 
 type PendingTask = {
@@ -72,7 +72,7 @@ export function useHighlighted(code: string, language: string | undefined, enabl
   const [result, setResult] = React.useState<{ key: string; lines: React.ReactNode[] } | null>(null);
   const key = `${language}\u0000${code}`;
   React.useEffect(() => {
-    if (!enabled || !language || code.length > MAX_CHARS) return;
+    if (!enabled || !language || code.length > HIGHLIGHT_MAX_CHARS) return;
     let cancelled = false;
     void highlight(code, language)
       .then((lines) => {

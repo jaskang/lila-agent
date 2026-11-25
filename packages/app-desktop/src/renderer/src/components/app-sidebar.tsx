@@ -10,13 +10,13 @@ import {
   MoreHorizontal,
   Pencil,
   Plus,
-  Search,
+  Settings,
   SquarePen,
   Sun,
   Trash2,
-  X,
 } from "lucide-react";
 import type { Project, SessionSummary } from "@lila/protocol";
+import { SearchInput } from "@/components/search-input";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -30,7 +30,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { Kbd } from "@/components/ui/kbd";
 import {
   Sidebar,
   SidebarContent,
@@ -40,7 +39,6 @@ import {
   SidebarGroupContent,
   SidebarGroupLabel,
   SidebarHeader,
-  SidebarInput,
   SidebarMenu,
   SidebarMenuAction,
   SidebarMenuButton,
@@ -54,6 +52,7 @@ import { useTheme } from "@/lib/theme";
 
 const RELATIVE = new Intl.RelativeTimeFormat("zh-CN", { numeric: "auto" });
 const COLLAPSED_KEY = "lila.collapsedProjects";
+const PROJECT_PREVIEW_LIMIT = 5;
 
 function readCollapsed(): Record<string, boolean> {
   try {
@@ -73,7 +72,9 @@ function projectStatus(sessions: SessionSummary[]): SessionSummary["status"] {
 }
 
 function ago(iso: string, now: number): string {
-  const minutes = Math.round((Date.parse(iso) - now) / 60_000);
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return "";
+  const minutes = Math.round((ts - now) / 60_000);
   if (Math.abs(minutes) < 1) return "刚刚";
   if (Math.abs(minutes) < 60) return RELATIVE.format(minutes, "minute");
   const hours = Math.round(minutes / 60);
@@ -84,7 +85,7 @@ function ago(iso: string, now: number): string {
 function StatusIcon({ status }: { status: SessionSummary["status"] }) {
   if (status === "running") return <Spinner className="text-muted-foreground" />;
   if (status === "waiting") return <MessageCircleQuestion className="text-warning-foreground" />;
-  if (status === "error") return <CircleAlert className="text-destructive" />;
+  if (status === "error") return <CircleAlert className="text-destructive-foreground" />;
   return null;
 }
 
@@ -167,13 +168,11 @@ function SessionRow({
 
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton
-        isActive={active}
-        onClick={() => onSelectSession(session.id)}
-        className="h-auto py-1.5"
-      >
+      <SidebarMenuButton isActive={active} onClick={() => onSelectSession(session.id)} className="h-auto py-1.5">
         <div className="flex min-w-0 flex-1 flex-col">
-          <span className="truncate">{session.title || "新会话"}</span>
+          <span className="truncate" title={session.title || "新会话"}>
+            {session.title || "新会话"}
+          </span>
           <span className="text-xs text-muted-foreground">{ago(session.updatedAt, now)}</span>
         </div>
         <StatusIcon status={session.status} />
@@ -210,7 +209,7 @@ function SessionRow({
         <AlertDialogContent size="sm">
           <AlertDialogHeader>
             <AlertDialogTitle>删除会话？</AlertDialogTitle>
-            <AlertDialogDescription>“{session.title || "新会话"}”的会话文件会被删除，pi 命令行里也会看不到它。</AlertDialogDescription>
+            <AlertDialogDescription>将删除「{session.title || "新会话"}」对应的会话文件。</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>
@@ -252,8 +251,20 @@ function ProjectGroup({
   onStartNew: (projectId: string) => void;
 }) {
   const [removing, setRemoving] = React.useState(false);
+  const [showAll, setShowAll] = React.useState(false);
   const status = projectStatus(allSessions);
   const busy = status === "running" || status === "waiting";
+  const visibleList = React.useMemo(() => {
+    if (showAll || list.length <= PROJECT_PREVIEW_LIMIT) return list;
+    const head = list.slice(0, PROJECT_PREVIEW_LIMIT);
+    if (selectedId && !head.some((s) => s.id === selectedId)) {
+      const activeSession = list.find((s) => s.id === selectedId);
+      if (activeSession) return [...head, activeSession];
+    }
+    return head;
+  }, [list, showAll, selectedId]);
+  const hiddenCount = Math.max(0, list.length - visibleList.length);
+
   return (
     <SidebarGroup className="group/project">
       <SidebarGroupLabel
@@ -278,7 +289,7 @@ function ProjectGroup({
           <MoreHorizontal />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" side="right" className="w-40" finalFocus={false}>
-          <DropdownMenuItem onClick={() => window.lila.revealPath(project.path)}>
+          <DropdownMenuItem onClick={() => void actions.revealPath(project.path)}>
             <FolderOpen />
             在访达中显示
           </DropdownMenuItem>
@@ -297,7 +308,7 @@ function ProjectGroup({
         <AlertDialogContent size="sm">
           <AlertDialogHeader>
             <AlertDialogTitle>移除项目？</AlertDialogTitle>
-            <AlertDialogDescription>只会将“{project.name}”从 Lila 列表移除，不会删除本地目录或历史会话文件。</AlertDialogDescription>
+            <AlertDialogDescription>仅从列表移除「{project.name}」，保留本地文件。</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>
@@ -313,10 +324,10 @@ function ProjectGroup({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      {isCollapsed ? null : (
+      {isCollapsed || !list.length ? null : (
         <SidebarGroupContent>
           <SidebarMenu>
-            {list.map((session) => (
+            {visibleList.map((session) => (
               <SessionRow
                 key={session.id}
                 session={session}
@@ -325,7 +336,31 @@ function ProjectGroup({
                 onSelectSession={onSelectSession}
               />
             ))}
-            {!list.length ? <p className="px-2 py-1 text-xs text-muted-foreground">还没有会话</p> : null}
+            {hiddenCount > 0 ? (
+              <SidebarMenuItem>
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  className="h-7 w-full justify-start px-2 text-xs font-normal text-muted-foreground hover:text-foreground"
+                  onClick={() => setShowAll(true)}
+                >
+                  展开其余 {hiddenCount} 条
+                </Button>
+              </SidebarMenuItem>
+            ) : showAll && list.length > PROJECT_PREVIEW_LIMIT ? (
+              <SidebarMenuItem>
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  className="h-7 w-full justify-start px-2 text-xs font-normal text-muted-foreground hover:text-foreground"
+                  onClick={() => setShowAll(false)}
+                >
+                  收起
+                </Button>
+              </SidebarMenuItem>
+            ) : null}
           </SidebarMenu>
         </SidebarGroupContent>
       )}
@@ -364,29 +399,40 @@ export function AppSidebar() {
     [setOpenMobile],
   );
 
-  const byProject = React.useMemo(() => {
+  const projectNames = React.useMemo(() => new Map(projects.map((p) => [p.id, p.name.toLowerCase()])), [projects]);
+
+  const { groups, allByProject } = React.useMemo(() => {
     const groups: Record<string, SessionSummary[]> = {};
     const allByProject: Record<string, SessionSummary[]> = {};
     for (const session of Object.values(sessions)) {
       if (session.parentId) continue;
       (allByProject[session.projectId] ??= []).push(session);
-      if (filter && !(session.title || "新会话").toLowerCase().includes(filter)) continue;
+      if (filter) {
+        const titleMatch = (session.title || "新会话").toLowerCase().includes(filter);
+        const projMatch = projectNames.get(session.projectId)?.includes(filter) ?? false;
+        if (!titleMatch && !projMatch) continue;
+      }
       (groups[session.projectId] ??= []).push(session);
     }
     for (const list of Object.values(groups)) list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return { groups, allByProject };
-  }, [sessions, filter]);
+  }, [sessions, filter, projectNames]);
+
+  const filtering = Boolean(filter);
 
   const toggle = (projectId: string) =>
     setCollapsed((current) => {
       const next = { ...current, [projectId]: !current[projectId] };
-      localStorage.setItem(COLLAPSED_KEY, JSON.stringify(next));
+      try {
+        localStorage.setItem(COLLAPSED_KEY, JSON.stringify(next));
+      } catch {
+        // Ignore storage errors.
+      }
       return next;
     });
 
   return (
     <Sidebar variant="inset" className="p-1.5">
-      {/* Matches the macOS traffic lights and main card toolbar height (h-11). */}
       <SidebarHeader className="mt-1.5 h-11 shrink-0 flex-row items-center gap-1 p-0 pr-1 pl-[74px] [-webkit-app-region:drag] md:mt-0">
         <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" />
       </SidebarHeader>
@@ -394,56 +440,25 @@ export function AppSidebar() {
         <SidebarGroup className="gap-2">
           <SidebarMenu>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={() => handleStartNew()}>
+              <SidebarMenuButton title="新会话（⌘N）" onClick={() => handleStartNew()}>
                 <SquarePen />
                 新会话
-                <Kbd className="ms-auto">⌘N</Kbd>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-            <SidebarMenuItem>
-              <SidebarMenuButton onClick={() => actions.setPaletteOpen(true)}>
-                <Search />
-                搜索
-                <Kbd className="ms-auto">⌘K</Kbd>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
-          <div className="relative">
-            <SidebarInput
-              value={query}
-              placeholder="筛选会话…"
-              aria-label="筛选会话"
-              className={query ? "pr-7" : undefined}
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Escape" && query) {
-                  event.preventDefault();
-                  setQuery("");
-                }
-              }}
-            />
-            {query ? (
-              <button
-                type="button"
-                aria-label="清空筛选"
-                onClick={() => setQuery("")}
-                className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-sm p-0.5 text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
-              >
-                <X className="size-3.5" />
-              </button>
-            ) : null}
-          </div>
+          <SearchInput variant="sidebar" value={query} onChange={setQuery} placeholder="搜索" ariaLabel="搜索项目或会话" />
         </SidebarGroup>
         {projects.map((project) => {
-          const list = byProject.groups[project.id] ?? [];
-          if (filter && !list.length) return null;
-          const isCollapsed = Boolean(collapsed[project.id]) && !filter;
+          const list = groups[project.id] ?? [];
+          const projectMatched = filtering && project.name.toLowerCase().includes(filter);
+          if (filtering && !list.length && !projectMatched) return null;
+          const isCollapsed = Boolean(collapsed[project.id]) && !filtering;
           return (
             <ProjectGroup
               key={project.id}
               project={project}
               list={list}
-              allSessions={byProject.allByProject[project.id] ?? []}
+              allSessions={allByProject[project.id] ?? []}
               selectedId={selectedId}
               isCollapsed={isCollapsed}
               now={now}
@@ -453,7 +468,6 @@ export function AppSidebar() {
             />
           );
         })}
-        {filter && !Object.keys(byProject.groups).length ? <p className="px-4 py-2 text-xs text-muted-foreground">没有匹配的会话</p> : null}
       </SidebarContent>
       <SidebarFooter>
         <div className="flex items-center gap-1">
@@ -466,6 +480,17 @@ export function AppSidebar() {
             </SidebarMenuItem>
           </SidebarMenu>
           <ThemeSwitcher />
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="设置"
+            title="设置（⌘,）"
+            onClick={() => actions.openSettings()}
+            className="shrink-0 text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+          >
+            <Settings />
+          </Button>
         </div>
       </SidebarFooter>
     </Sidebar>

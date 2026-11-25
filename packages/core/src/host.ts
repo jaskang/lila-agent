@@ -1,90 +1,48 @@
-import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai/compat";
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, realpathSync, renameSync, statSync, unlinkSync } from "node:fs";
-import { open, readdir } from "node:fs/promises";
-import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
-import {
-  type AgentSessionServices,
-  createAgentSessionFromServices,
-  createAgentSessionServices,
-  createCodemodeExtension,
-  createMcpExtension,
-  createToolSearchExtension,
-  getAgentDir,
-  type LoadExtensionsResult,
-  SessionManager,
-} from "@earendil-works/pi-coding-agent";
-import type { ApprovalMode, GitFileDiff, GitStatus, ModelInfo, Project, ProjectFileContent, SessionSummary, ThinkingLevel } from "@lila/protocol";
-import fuzzysort from "fuzzysort";
+import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
+import { type AgentSessionServices, createAgentSessionFromServices, SessionManager } from "@earendil-works/pi-coding-agent";
+import type {
+  ApprovalMode,
+  AuthLoginEvent,
+  AuthMethod,
+  CapabilitiesSnapshot,
+  CoreSettings,
+  GitFileDiff,
+  GitStatus,
+  McpConfigSnapshot,
+  McpExposure,
+  McpScope,
+  McpServerInput,
+  MemorySnapshot,
+  MemoryTarget,
+  ModelInfo,
+  PackageScope,
+  Project,
+  ProjectFileContent,
+  ProviderAuthInfo,
+  ProviderQuotaItem,
+  SessionSummary,
+  ThinkingLevel,
+  UsageRange,
+  UsageSummary,
+} from "@lila/protocol";
 import { UserError } from "./errors.ts";
+import { createServices, ExtensionsService } from "./extensions-service.ts";
 import { gitDiff as readGitDiff, gitStatus as readGitStatus } from "./git.ts";
-import { createLilaExtension } from "./lila-extension.ts";
 import { type Clients, findModel, LiveSession, parseAutoSubagentName, sessionTitle, slashCommands } from "./live-session.ts";
+import type { MemoryConfigPatch } from "./memory.ts";
+import { SettingsService, settleServices } from "./settings-service.ts";
 import { Store } from "./store.ts";
 import { readSubsessionView, recordedSubagentIds } from "./subsession-view.ts";
+import { invalidateFileCache, listTreeFiles, readPreviewFile, searchProjectFiles } from "./workspace-service.ts";
 
 const IDLE_DISPOSE_MS = 15 * 60_000;
 const SWEEP_INTERVAL_MS = 60_000;
 const SUBSESSION_REFRESH_MS = 750;
-const WALK_LIMIT = 20_000;
-const TREE_FILE_LIMIT = 3_000;
-const FILE_PREVIEW_MAX_BYTES = 512 * 1024;
-const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico"]);
-const WALK_SKIP: Record<string, true> = { node_modules: true, ".git": true };
-const FILE_CACHE_TTL_MS = 8_000;
-const MAX_FILE_CACHE_ENTRIES = 32;
-const execFileAsync = promisify(execFile);
-const fileListCache = new Map<string, { files: string[]; expiresAt: number }>();
-
-/** pi-subagents' extension entry, loaded unless the user installed the package into Pi themselves. */
-const SUBAGENTS_ENTRY = join(dirname(createRequire(import.meta.url).resolve("@tintinweb/pi-subagents/package.json")), "src", "index.ts");
-
-function withoutDuplicateSubagents(result: LoadExtensionsResult): LoadExtensionsResult {
-  const userCopy = result.extensions.some((extension) => extension.path !== SUBAGENTS_ENTRY && extension.path.includes("pi-subagents"));
-  if (!userCopy) return result;
-  return {
-    ...result,
-    extensions: result.extensions.filter((extension) => extension.path !== SUBAGENTS_ENTRY),
-    errors: result.errors.filter((error) => error.path !== SUBAGENTS_ENTRY && !error.error.includes(SUBAGENTS_ENTRY)),
-  };
-}
-
-/** Pi services for a project: its skills, prompts, AGENTS.md, the user's extensions, and Lila's built-ins. */
-function createServices(cwd: string, live?: LiveSession): Promise<AgentSessionServices> {
-  return createAgentSessionServices({
-    cwd,
-    agentDir: getAgentDir(),
-    resourceLoaderOptions: {
-      additionalExtensionPaths: [SUBAGENTS_ENTRY],
-      // The pi CLI's built-in extensions; SDK sessions do not load them on their own.
-      extensionFactories: [
-        { name: "codemode", factory: createCodemodeExtension(), replaceable: true, builtin: true },
-        { name: "tool-search", factory: createToolSearchExtension(), replaceable: true, builtin: true },
-        { name: "mcp", factory: createMcpExtension(), replaceable: true, builtin: true },
-        ...(live ? [{ name: "lila", factory: createLilaExtension(live), hidden: true }] : []),
-      ],
-      extensionsOverride: withoutDuplicateSubagents,
-    },
-    // A project the user added to Lila is trusted.
-    resourceLoaderReloadOptions: { resolveProjectTrust: async () => true },
-  });
-}
 
 type IndexedSession = { id: string; projectId: string; path: string; summary: SessionSummary };
 type CachedServices = { promise: Promise<AgentSessionServices>; lastActivity: number };
-
-async function settleServices(promise: Promise<AgentSessionServices>): Promise<void> {
-  try {
-    const services = await promise;
-    await services.modelRuntime.settleCredentialWrites();
-  } catch {
-    // Creation already failed or credentials could not be flushed during teardown.
-  }
-}
 
 function moveToTrash(source: string, destination: string): void {
   try {
@@ -107,19 +65,26 @@ export class SessionHost {
   readonly #deletingSessions = new Set<string>();
   readonly #removingProjects = new Set<string>();
   #index = new Map<string, IndexedSession>();
-  #modelServices: Promise<AgentSessionServices> | undefined;
-  /** Services of projects without a live session, for the slash menu of a session not created yet. */
   readonly #projectServices = new Map<string, CachedServices>();
   readonly #subsessionSyncTimers = new Map<string, { projectId: string; timer: NodeJS.Timeout }>();
   readonly #sweeper: NodeJS.Timeout;
   readonly #subsessionRefresh: NodeJS.Timeout;
   readonly #watchedSubsessions = new Map<string, string>();
+  readonly #settings: SettingsService;
+  readonly #extensions: ExtensionsService;
   #sweeping = false;
 
   constructor(dataDir: string, clients: Clients) {
     this.#dataDir = dataDir;
     this.#clients = clients;
     this.store = new Store(dataDir);
+    this.#settings = new SettingsService(dataDir, () => this.#syncLiveRuntime());
+    this.#extensions = new ExtensionsService({
+      project: (projectId) => this.#project(projectId),
+      servicesForCapabilities: (projectId, sessionId) => this.#servicesForCapabilities(projectId, sessionId),
+      invalidateProjectServices: (projectId) => this.#invalidateProjectServices(projectId),
+      reloadIdleSessions: (projectId, sessionId) => this.#reloadIdleSessions(projectId, sessionId),
+    });
     this.#sweeper = setInterval(() => void this.#sweep(), SWEEP_INTERVAL_MS);
     this.#sweeper.unref();
     this.#subsessionRefresh = setInterval(() => this.#refreshSubsessionViews(), SUBSESSION_REFRESH_MS).unref();
@@ -153,9 +118,7 @@ export class SessionHost {
       const pendingOpens: Array<Promise<unknown>> = [];
       for (const [sessionId, promise] of this.#opening) {
         const openProjectId = this.#openingProjects.get(sessionId) ?? this.#index.get(sessionId)?.projectId;
-        if (!openProjectId || openProjectId === projectId) {
-          pendingOpens.push(promise.catch(() => undefined));
-        }
+        if (!openProjectId || openProjectId === projectId) pendingOpens.push(promise.catch(() => undefined));
       }
       if (pendingOpens.length) await Promise.all(pendingOpens);
 
@@ -168,7 +131,7 @@ export class SessionHost {
       for (const [id, entry] of Array.from(this.#index.entries())) {
         if (entry.projectId === projectId) this.#index.delete(id);
       }
-      if (project) fileListCache.delete(project.path);
+      if (project) invalidateFileCache(project.path);
       this.store.removeProject(projectId);
       this.#clients.broadcast({ type: "projects", projects: [...this.store.projects] });
     } finally {
@@ -183,22 +146,10 @@ export class SessionHost {
   }
 
   // -------------------------------------------------------------------------
-  // Models
-
-  /** One services instance for the user's agentDir, so models registered by user extensions are listed too. */
-  #models(): { promise: Promise<AgentSessionServices>; cached: boolean } {
-    const cached = this.#modelServices !== undefined;
-    this.#modelServices ??= createAgentSessionServices({ cwd: homedir(), agentDir: getAgentDir() }).catch((error: unknown) => {
-      this.#modelServices = undefined;
-      throw error;
-    });
-    return { promise: this.#modelServices, cached };
-  }
+  // Service caches & delegations
 
   #invalidateCaches(projectId?: string): void {
-    const models = this.#modelServices;
-    this.#modelServices = undefined;
-    if (models) void settleServices(models);
+    this.#settings.invalidate();
     if (projectId) {
       const cached = this.#projectServices.get(projectId);
       if (cached) {
@@ -208,29 +159,150 @@ export class SessionHost {
     }
   }
 
-  async listModels(): Promise<{ models: ModelInfo[]; defaultModelId?: string }> {
-    const { promise, cached } = this.#models();
-    const services = await promise;
-    if (cached) {
-      // Pick up credentials or default model changes made via the `pi` CLI without restarting core.
-      await services.settingsManager.reload();
-      await services.modelRuntime.refresh({ allowNetwork: false });
+  #invalidateProjectServices(projectId?: string): void {
+    if (projectId) {
+      this.#invalidateCaches(projectId);
+      return;
     }
-    const models = services.modelRuntime.getAvailableSnapshot().map(
-      (model): ModelInfo => ({
-        id: `${model.provider}/${model.id}`,
-        provider: model.provider,
-        label: model.name,
-        reasoning: model.reasoning,
-        thinkingLevels: getSupportedThinkingLevels(model),
-        defaultThinkingLevel: clampThinkingLevel(model, services.settingsManager.getModelThinkingLevel(model.provider, model.id) ?? services.settingsManager.getDefaultThinkingLevel() ?? "medium"),
-        images: model.input.includes("image"),
-        contextWindow: model.contextWindow,
-      }),
-    );
-    const provider = services.settingsManager.getDefaultProvider();
-    const modelId = services.settingsManager.getDefaultModel();
-    return { models, ...(provider && modelId ? { defaultModelId: `${provider}/${modelId}` } : {}) };
+    this.#invalidateCaches();
+    for (const [id, cached] of Array.from(this.#projectServices.entries())) {
+      this.#projectServices.delete(id);
+      void settleServices(cached.promise);
+    }
+  }
+
+  async #reloadIdleSessions(projectId?: string, sessionId?: string): Promise<void> {
+    this.#invalidateProjectServices(projectId);
+    const targets = sessionId
+      ? [this.#live.get(sessionId)].filter((live): live is LiveSession => Boolean(live))
+      : Array.from(this.#live.values()).filter((live) => !projectId || live.projectId === projectId);
+    await Promise.all(targets.map((live) => live.reloadIfIdle().catch(() => false)));
+  }
+
+  async #syncLiveRuntime(): Promise<void> {
+    await Promise.all(Array.from(this.#live.values(), (live) => live.refreshSettingsAndAuth()));
+  }
+
+  async #servicesForCapabilities(projectId?: string, sessionId?: string): Promise<{ services: AgentSessionServices; cwd?: string }> {
+    if (sessionId) {
+      const live = this.#live.get(sessionId);
+      if (live) return { services: live.services, cwd: live.services.cwd };
+    }
+    if (projectId) {
+      const project = this.#project(projectId);
+      const existingLive = Array.from(this.#live.values()).find((live) => live.projectId === project.id);
+      if (existingLive) return { services: existingLive.services, cwd: project.path };
+      let entry = this.#projectServices.get(project.id);
+      if (!entry) {
+        const promise = createServices(project.path);
+        promise.catch(() => {
+          if (this.#projectServices.get(project.id)?.promise === promise) this.#projectServices.delete(project.id);
+        });
+        entry = { promise, lastActivity: Date.now() };
+        this.#projectServices.set(project.id, entry);
+      } else {
+        entry.lastActivity = Date.now();
+      }
+      return { services: await entry.promise, cwd: project.path };
+    }
+    return { services: await this.#settings.getModelServices().promise };
+  }
+
+  listModels(forceRefresh = false): Promise<{ models: ModelInfo[]; defaultModelId?: string }> {
+    return this.#settings.listModels(forceRefresh);
+  }
+  setProviderModels(providerId: string, modelIds: string[] | null): Promise<{ models: ModelInfo[]; defaultModelId?: string }> {
+    return this.#settings.setProviderModels(providerId, modelIds);
+  }
+  getSettings(): Promise<CoreSettings> {
+    return this.#settings.getSettings();
+  }
+  updateSettings(patch: {
+    defaultModelId?: string | undefined;
+    defaultThinkingLevel?: ThinkingLevel | undefined;
+    autoCompaction?: boolean | undefined;
+    autoRetry?: boolean | undefined;
+  }): Promise<CoreSettings> {
+    return this.#settings.updateSettings(patch);
+  }
+  listProviders(): Promise<ProviderAuthInfo[]> {
+    return this.#settings.listProviders();
+  }
+  startProviderLogin(owner: unknown, providerId: string, method: AuthMethod, emit: (event: AuthLoginEvent) => void): Promise<string> {
+    return this.#settings.startProviderLogin(owner, providerId, method, emit);
+  }
+  respondProviderLogin(loginId: string, promptId: string, value: string): void {
+    this.#settings.respondProviderLogin(loginId, promptId, value);
+  }
+  cancelProviderLogin(loginId: string): void {
+    this.#settings.cancelProviderLogin(loginId);
+  }
+  cancelLoginsForOwner(owner: unknown): void {
+    this.#settings.cancelLoginsForOwner(owner);
+  }
+  logoutProvider(providerId: string): Promise<void> {
+    return this.#settings.logoutProvider(providerId);
+  }
+  getUsageSummary(range: UsageRange, onlyConfigured = true): Promise<UsageSummary> {
+    return this.#settings.getUsageSummary(range, onlyConfigured);
+  }
+  listQuotas(refresh = false): Promise<ProviderQuotaItem[]> {
+    return this.#settings.listQuotas(refresh);
+  }
+
+  listMcp(projectId?: string): McpConfigSnapshot {
+    return this.#extensions.listMcp(projectId);
+  }
+  upsertMcp(scope: McpScope, name: string, config: McpServerInput, projectId?: string): Promise<McpConfigSnapshot> {
+    return this.#extensions.upsertMcp(scope, name, config, projectId);
+  }
+  toggleMcp(
+    scope: McpScope,
+    name: string,
+    patch: { enabled?: boolean | undefined; exposure?: McpExposure | undefined },
+    projectId?: string,
+  ): Promise<McpConfigSnapshot> {
+    return this.#extensions.toggleMcp(scope, name, patch, projectId);
+  }
+  removeMcp(scope: McpScope, name: string, projectId?: string): Promise<McpConfigSnapshot> {
+    return this.#extensions.removeMcp(scope, name, projectId);
+  }
+  getCapabilities(projectId?: string, sessionId?: string): Promise<CapabilitiesSnapshot> {
+    return this.#extensions.getCapabilities(projectId, sessionId);
+  }
+  installPackage(source: string, scope: PackageScope, projectId?: string): Promise<CapabilitiesSnapshot> {
+    return this.#extensions.installPackage(source, scope, projectId);
+  }
+  removePackage(source: string, scope: PackageScope, projectId?: string): Promise<CapabilitiesSnapshot> {
+    return this.#extensions.removePackage(source, scope, projectId);
+  }
+  updatePackages(source?: string, projectId?: string): Promise<CapabilitiesSnapshot> {
+    return this.#extensions.updatePackages(source, projectId);
+  }
+  async reloadWorkspace(projectId?: string, sessionId?: string): Promise<void> {
+    if (sessionId) {
+      const live = this.#live.get(sessionId);
+      if (live) {
+        await live.reload();
+        return;
+      }
+    }
+    await this.#reloadIdleSessions(projectId);
+  }
+  getMemory(projectId?: string, sessionId?: string): Promise<MemorySnapshot> {
+    return this.#extensions.getMemory(projectId, sessionId);
+  }
+  addMemory(target: MemoryTarget, content: string): Promise<MemorySnapshot> {
+    return this.#extensions.addMemory(target, content);
+  }
+  replaceMemory(target: MemoryTarget, oldText: string, newContent: string): Promise<MemorySnapshot> {
+    return this.#extensions.replaceMemory(target, oldText, newContent);
+  }
+  removeMemory(target: MemoryTarget, oldText: string): Promise<MemorySnapshot> {
+    return this.#extensions.removeMemory(target, oldText);
+  }
+  updateMemorySettings(patch: MemoryConfigPatch): Promise<MemorySnapshot> {
+    return this.#extensions.updateMemorySettings(patch);
   }
 
   // -------------------------------------------------------------------------
@@ -282,7 +354,6 @@ export class SessionHost {
         }
       }),
     );
-    // Merge conservatively so concurrent sub-session syncs are not dropped and deleted sessions/projects do not resurrect.
     const nextIndex = new Map<string, IndexedSession>();
     for (const [id, entry] of scanned) {
       if (this.#deletingSessions.has(id) || this.#removingProjects.has(entry.projectId) || !this.store.project(entry.projectId)) continue;
@@ -293,7 +364,6 @@ export class SessionHost {
       if (this.#deletingSessions.has(id) || this.#removingProjects.has(prev.projectId) || !this.store.project(prev.projectId)) continue;
       if (this.#live.has(id) || existsSync(prev.path)) nextIndex.set(id, prev);
     }
-    // Pi records who spawned a session (pi-subagents does for every sub-agent); nest those under their parent.
     const idByPath = new Map(Array.from(nextIndex.values(), (entry) => [entry.path, entry.id]));
     const recordedByParent = new Map<string, Map<string, string>>();
     for (const [id, meta] of parents) {
@@ -312,7 +382,6 @@ export class SessionHost {
     }
     this.#index = nextIndex;
     const summaries = new Map(Array.from(nextIndex.values(), (entry) => [entry.id, entry.summary]));
-    // A live session knows its status, pending requests and newest activity better than its file.
     for (const live of this.#live.values()) {
       if (this.#deletingSessions.has(live.id) || this.#removingProjects.has(live.projectId)) continue;
       summaries.set(live.id, live.summary());
@@ -320,24 +389,10 @@ export class SessionHost {
     return Array.from(summaries.values()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  /** Slash commands of a session, or of its project before the session exists. */
   async commands(projectId: string, sessionId?: string) {
     if (sessionId) return (await this.live(sessionId)).commands();
-    const project = this.#project(projectId);
-    const existingLive = Array.from(this.#live.values()).find((live) => live.projectId === project.id);
-    if (existingLive) return existingLive.commands();
-    let entry = this.#projectServices.get(project.id);
-    if (!entry) {
-      const promise = createServices(project.path);
-      promise.catch(() => {
-        if (this.#projectServices.get(project.id)?.promise === promise) this.#projectServices.delete(project.id);
-      });
-      entry = { promise, lastActivity: Date.now() };
-      this.#projectServices.set(project.id, entry);
-    } else {
-      entry.lastActivity = Date.now();
-    }
-    const loader = (await entry.promise).resourceLoader;
+    const { services } = await this.#servicesForCapabilities(projectId);
+    const loader = services.resourceLoader;
     const extensionCommands = loader.getExtensions().extensions.flatMap((extension) => Array.from(extension.commands.values()));
     return slashCommands(extensionCommands, loader.getPrompts().prompts, loader.getSkills().skills);
   }
@@ -360,7 +415,6 @@ export class SessionHost {
     }
   }
 
-  /** The live session, opening the Pi session file when needed. */
   async live(sessionId: string): Promise<LiveSession> {
     if (this.#deletingSessions.has(sessionId)) throw new UserError("会话正在删除");
     const live = this.#live.get(sessionId);
@@ -415,13 +469,48 @@ export class SessionHost {
     return readSubsessionView(entry.path, project.path, status, this.store.approvalMode(sessionId));
   }
 
+  async forkSession(sessionId: string, itemId?: string): Promise<SessionSummary> {
+    const entry = await this.#entry(sessionId);
+    if (!itemId) return await this.forkSubsession(sessionId);
+    if (entry.summary.readOnly) throw new UserError("子 Agent 会话请直接使用「继续为新会话」");
+    const live = await this.live(sessionId);
+    const entryId = live.findUserEntryId(itemId);
+    if (!entryId) throw new UserError("找不到这条消息，无法从此处分叉");
+    const branchPath = live.session.sessionManager.createBranchedSession(entryId);
+    if (!branchPath) throw new UserError("无法创建分叉会话文件");
+    const manager = SessionManager.open(branchPath);
+    const title = `分叉：${entry.summary.title}`;
+    manager.appendSessionInfo(title);
+    const summary: SessionSummary = {
+      id: manager.getSessionId(),
+      projectId: entry.projectId,
+      title,
+      updatedAt: new Date().toISOString(),
+      status: "idle",
+      pendingCount: 0,
+    };
+    this.store.setApprovalMode(summary.id, this.store.approvalMode(sessionId));
+    this.#index.set(summary.id, { id: summary.id, projectId: entry.projectId, path: branchPath, summary });
+    this.#clients.broadcast({ type: "session", session: summary });
+    return summary;
+  }
+
+  async retrySession(sessionId: string): Promise<void> {
+    const existing = this.#live.get(sessionId);
+    if (existing) {
+      if (existing.access !== "failed") return;
+      await this.#dispose(existing, false);
+    }
+    await this.live(sessionId);
+    this.#clients.toWatchers(sessionId, { type: "reset", sessionId });
+  }
+
   async forkSubsession(sessionId: string): Promise<SessionSummary> {
     const entry = await this.#entry(sessionId);
     if (!entry.summary.readOnly) throw new UserError("只有子 Agent 会话可以用此方式继续");
     if (this.#subsessionStatus(entry) === "running") throw new UserError("请等子 Agent 结束后再继续");
     const project = this.#project(entry.projectId);
     const manager = SessionManager.forkFrom(entry.path, project.path);
-    // The fork has its own id and name. The agent keeps ownership of the source.
     const title = `继续：${entry.summary.title}`;
     manager.appendSessionInfo(title);
     const summary: SessionSummary = {
@@ -465,6 +554,7 @@ export class SessionHost {
       clients: this.#clients,
       onReload: () => this.#invalidateCaches(project.id),
       onSubsessionsChanged: () => this.#scheduleSubsessionSync(project, sessionId),
+      onProviderResponse: (providerId, _status, headers) => this.#settings.recordResponseHeaders(providerId, headers),
     });
     const services = await createServices(project.path, live);
     try {
@@ -473,7 +563,6 @@ export class SessionHost {
         model = findModel(services, options.modelId);
         if (!model) throw new UserError(`找不到模型 ${options.modelId}，或它还没有配置凭据`);
       }
-      // Pi clamps a thinking level the model does not support to the nearest one it does.
       const { session } = await createAgentSessionFromServices({
         services,
         sessionManager,
@@ -495,7 +584,6 @@ export class SessionHost {
 
   async deleteSession(sessionId: string): Promise<void> {
     if (this.#deletingSessions.has(sessionId)) throw new UserError("会话正在删除");
-    // An agent can start before the scheduled index sync discovers its child file.
     if (!this.#index.has(sessionId) && !this.#live.has(sessionId) && this.#live.size > 0) {
       await this.listSessions();
       if (this.#deletingSessions.has(sessionId)) throw new UserError("会话正在删除");
@@ -543,7 +631,6 @@ export class SessionHost {
   async #dispose(live: LiveSession, announce = true): Promise<void> {
     this.#live.delete(live.id);
     await live.dispose();
-    // A session that never got a message has no file, so it leaves the list with its live session.
     const file = live.session.sessionFile;
     if (announce && !(file && existsSync(file))) {
       this.store.forgetSession(live.id);
@@ -646,160 +733,31 @@ export class SessionHost {
     clearInterval(this.#subsessionRefresh);
     for (const entry of this.#subsessionSyncTimers.values()) clearTimeout(entry.timer);
     this.#subsessionSyncTimers.clear();
-    const modelServices = this.#modelServices;
-    this.#modelServices = undefined;
     const projectServices = Array.from(this.#projectServices.values(), (entry) => entry.promise);
     this.#projectServices.clear();
     await Promise.all([
       ...Array.from(this.#live.values()).map((live) => this.#dispose(live, false)),
       ...projectServices.map(settleServices),
-      ...(modelServices ? [settleServices(modelServices)] : []),
+      this.#settings.dispose(),
     ]);
   }
 
   // -------------------------------------------------------------------------
   // Files & Git
 
-  async searchFiles(projectId: string, query: string, limit: number): Promise<string[]> {
-    const project = this.#project(projectId);
-    const files = await listFiles(project.path);
-    if (!query.trim()) return files.slice(0, limit);
-    return fuzzysort.go(query.trim(), files, { limit }).map((result) => result.target);
+  searchFiles(projectId: string, query: string, limit: number): Promise<string[]> {
+    return searchProjectFiles(this.#project(projectId).path, query, limit);
   }
-
-  async listProjectFiles(projectId: string, refresh = false): Promise<{ files: string[]; truncated: boolean }> {
-    const project = this.#project(projectId);
-    const files = await listFiles(project.path, refresh);
-    return {
-      files: files.slice(0, TREE_FILE_LIMIT),
-      truncated: files.length > TREE_FILE_LIMIT,
-    };
+  listProjectFiles(projectId: string, refresh = false): Promise<{ files: string[]; truncated: boolean }> {
+    return listTreeFiles(this.#project(projectId).path, refresh);
   }
-
-  async readProjectFile(projectId: string, rawPath: string): Promise<ProjectFileContent> {
-    const project = this.#project(projectId);
-    return await readPreviewFile(project.path, rawPath);
+  readProjectFile(projectId: string, rawPath: string): Promise<ProjectFileContent> {
+    return readPreviewFile(this.#project(projectId).path, rawPath);
   }
-
-  async gitStatus(projectId: string): Promise<GitStatus> {
+  gitStatus(projectId: string): Promise<GitStatus> {
     return readGitStatus(this.#project(projectId).path);
   }
-
-  async gitDiff(projectId: string, path: string, staged?: boolean): Promise<GitFileDiff> {
+  gitDiff(projectId: string, path: string, staged?: boolean): Promise<GitFileDiff> {
     return readGitDiff(this.#project(projectId).path, path, staged);
   }
-}
-
-function resolveRealOrAbs(target: string): string {
-  try {
-    return realpathSync(target);
-  } catch {
-    return resolve(target);
-  }
-}
-
-function isWithinDir(root: string, target: string): boolean {
-  const rel = relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
-async function readPreviewFile(projectRoot: string, rawPath: string): Promise<ProjectFileContent> {
-  const candidate = isAbsolute(rawPath) ? resolve(rawPath) : resolve(projectRoot, rawPath);
-  if (!existsSync(candidate)) throw new UserError(`找不到文件：${rawPath}`);
-
-  let realTarget: string;
-  try {
-    realTarget = realpathSync(candidate);
-  } catch {
-    throw new UserError(`无法访问文件：${rawPath}`);
-  }
-
-  const realProject = resolveRealOrAbs(projectRoot);
-  const realAgent = resolveRealOrAbs(getAgentDir());
-  const inProject = isWithinDir(realProject, realTarget);
-  const inAgent = isWithinDir(realAgent, realTarget);
-  if (!inProject && !inAgent) {
-    throw new UserError(`不允许读取项目目录之外的文件：${rawPath}`);
-  }
-
-  const info = statSync(realTarget);
-  if (!info.isFile()) throw new UserError(`只能预览文件，无法打开目录：${rawPath}`);
-
-  const displayPath = inProject ? relative(realProject, realTarget).split(sep).join("/") : realTarget;
-  const ext = extname(realTarget).toLowerCase();
-  if (IMAGE_EXTS.has(ext)) {
-    return {
-      path: displayPath,
-      fullPath: realTarget,
-      size: info.size,
-      isBinary: true,
-      isImage: true,
-      truncated: false,
-      content: "",
-    };
-  }
-
-  const handle = await open(realTarget, "r");
-  try {
-    const readSize = Math.min(info.size, FILE_PREVIEW_MAX_BYTES);
-    const buffer = Buffer.allocUnsafe(readSize);
-    const { bytesRead } = await handle.read(buffer, 0, readSize, 0);
-    const slice = buffer.subarray(0, bytesRead);
-    const probe = slice.subarray(0, Math.min(slice.length, 8_192));
-    const isBinary = probe.includes(0);
-    return {
-      path: displayPath,
-      fullPath: realTarget,
-      size: info.size,
-      isBinary,
-      isImage: false,
-      truncated: info.size > FILE_PREVIEW_MAX_BYTES,
-      content: isBinary ? "" : slice.toString("utf8"),
-    };
-  } finally {
-    await handle.close();
-  }
-}
-
-/** Project files relative to its root: git's view when it is a repository, otherwise a bounded walk. */
-async function listFiles(root: string, refresh = false): Promise<string[]> {
-  const now = Date.now();
-  const cached = !refresh ? fileListCache.get(root) : undefined;
-  if (cached && now < cached.expiresAt) return cached.files;
-
-  let files: string[];
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["-c", "core.quotepath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-      { cwd: root, maxBuffer: 64 * 1024 * 1024 },
-    );
-    files = stdout.split("\0").filter(Boolean);
-  } catch {
-    files = [];
-    const queue = [root];
-    while (queue.length > 0 && files.length < WALK_LIMIT) {
-      const dir = queue.shift() as string;
-      const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-      for (const entry of entries) {
-        if (WALK_SKIP[entry.name]) continue;
-        const path = join(dir, entry.name);
-        if (entry.isDirectory()) queue.push(path);
-        else if (entry.isFile()) files.push(relative(root, path));
-        if (files.length >= WALK_LIMIT) break;
-      }
-    }
-  }
-
-  if (fileListCache.size >= MAX_FILE_CACHE_ENTRIES) {
-    for (const [key, entry] of fileListCache) {
-      if (now >= entry.expiresAt) fileListCache.delete(key);
-    }
-    if (fileListCache.size >= MAX_FILE_CACHE_ENTRIES) {
-      const oldest = fileListCache.keys().next().value;
-      if (oldest !== undefined) fileListCache.delete(oldest);
-    }
-  }
-  fileListCache.set(root, { files, expiresAt: now + FILE_CACHE_TTL_MS });
-  return files;
 }

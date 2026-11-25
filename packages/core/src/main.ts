@@ -16,6 +16,49 @@ const hostname = process.env.LILA_CORE_HOST || "127.0.0.1";
 const dataDir = process.env.LILA_DATA_DIR || defaultDataDir();
 const tokenPath = join(dataDir, "core-token");
 const pidPath = join(dataDir, "core.pid");
+const replaceExisting = process.env.LILA_CORE_REPLACE === "1";
+
+async function readHealth(url: string): Promise<{ app?: string; pid?: number } | undefined> {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(500) });
+    return response.ok ? ((await response.json()) as { app?: string; pid?: number }) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function waitUntilGone(url: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await readHealth(url))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+/** In dev mode, replace any stale detached core holding the port so `bun run dev` always runs latest code. */
+async function stopExistingCoreIfNeeded(): Promise<void> {
+  if (!replaceExisting) return;
+  const urlHost = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname;
+  const healthUrl = `http://${urlHost}:${port}/health`;
+  const current = await readHealth(healthUrl);
+  if (!current || current.app !== "lila-core" || !current.pid || current.pid === process.pid) return;
+  console.log(`[core] replacing existing core (pid ${current.pid}) on port ${port}`);
+  try {
+    process.kill(current.pid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+    throw error;
+  }
+  if (await waitUntilGone(healthUrl, 3_000)) return;
+  try {
+    process.kill(current.pid, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+    throw error;
+  }
+  await waitUntilGone(healthUrl, 1_500);
+}
 
 /** Shared secret for local clients; readable only by the current user. */
 function loadToken(): string {
@@ -42,6 +85,7 @@ function clearPid(): void {
   }
 }
 
+await stopExistingCoreIfNeeded();
 const core = await startCore({ port, hostname, dataDir, token: loadToken() });
 writePid();
 console.log(`[core] listening on ${core.url} (data ${dataDir}, pid ${process.pid})`);

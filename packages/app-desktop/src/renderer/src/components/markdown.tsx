@@ -1,12 +1,16 @@
 import * as React from "react";
-import { ExternalLink, FileText, Image as ImageIcon, ImageOff } from "lucide-react";
+import { Check, Code2, Copy, ExternalLink, Eye, FileText, Image as ImageIcon, ImageOff } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { toast } from "sonner";
 import { Code } from "@/components/code";
+import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { actions, useLila } from "@/lib/store";
+import { useTheme } from "@/lib/theme";
 
 const MarkdownBasePathContext = React.createContext<string | undefined>(undefined);
 
@@ -47,6 +51,19 @@ function normalizePosixPath(path: string): string {
   return `/${out.join("/")}`;
 }
 
+const COLON_LINE_SUFFIX_RE = /:(\d+)(?::(\d+))?(?:-(\d+))?$/;
+
+function splitColonLineSuffix(path: string): { path: string; line?: number; endLine?: number } {
+  const match = COLON_LINE_SUFFIX_RE.exec(path);
+  if (!match) return { path };
+  const base = path.slice(0, match.index);
+  if (!base || base.endsWith("/")) return { path };
+  const line = Number(match[1]);
+  const endLine = match[3] ? Number(match[3]) : undefined;
+  if (!Number.isInteger(line) || line <= 0) return { path };
+  return { path: base, line, ...(endLine && Number.isInteger(endLine) && endLine >= line ? { endLine } : {}) };
+}
+
 export function resolveLocalFilePath(raw: string | undefined, basePath?: string): string | undefined {
   if (!raw) return undefined;
   const trimmed = raw.trim();
@@ -55,20 +72,21 @@ export function resolveLocalFilePath(raw: string | undefined, basePath?: string)
   if (/^file:/i.test(trimmed)) {
     try {
       const parsed = new URL(trimmed);
-      if (parsed.pathname) return normalizePosixPath(decodeSafe(parsed.pathname));
+      if (parsed.pathname) return normalizePosixPath(splitColonLineSuffix(decodeSafe(parsed.pathname)).path);
     } catch {
       return undefined;
     }
     return undefined;
   }
 
-  if (SCHEME_RE.test(trimmed)) return undefined;
-
-  const clean = decodeSafe(stripQueryAndHash(trimmed));
-  if (!clean) return undefined;
-  if (clean.startsWith("/")) return normalizePosixPath(clean);
+  // Strip optional `:line[:col]` before checking scheme so `src/a.ts:42` is not mistaken for a URI scheme.
+  const withoutQueryHash = decodeSafe(stripQueryAndHash(trimmed));
+  const stripped = splitColonLineSuffix(withoutQueryHash).path;
+  if (SCHEME_RE.test(stripped)) return undefined;
+  if (!stripped) return undefined;
+  if (stripped.startsWith("/")) return normalizePosixPath(stripped);
   if (!basePath) return undefined;
-  return normalizePosixPath(`${basePath.replace(/\/+$/, "")}/${clean}`);
+  return normalizePosixPath(`${basePath.replace(/\/+$/, "")}/${stripped}`);
 }
 
 function toMediaUrl(localPath: string, basePath?: string): string {
@@ -213,14 +231,20 @@ function MarkdownImage({ src, alt, title }: { src?: string | undefined; alt?: st
 function parseLineRange(href: string | undefined): { line?: number; endLine?: number } | undefined {
   if (!href) return undefined;
   const hashIndex = href.indexOf("#");
-  if (hashIndex < 0) return undefined;
-  const hash = href.slice(hashIndex + 1);
-  const match = /^L(\d+)(?:-L?(\d+))?$/i.exec(hash);
-  if (!match) return undefined;
-  const line = Number(match[1]);
-  const endLine = match[2] ? Number(match[2]) : undefined;
-  if (!Number.isInteger(line) || line <= 0) return undefined;
-  return { line, ...(endLine && Number.isInteger(endLine) && endLine >= line ? { endLine } : {}) };
+  if (hashIndex >= 0) {
+    const hash = href.slice(hashIndex + 1);
+    const match = /^L(\d+)(?:-L?(\d+))?$/i.exec(hash);
+    if (match) {
+      const line = Number(match[1]);
+      const endLine = match[2] ? Number(match[2]) : undefined;
+      if (Number.isInteger(line) && line > 0) {
+        return { line, ...(endLine && Number.isInteger(endLine) && endLine >= line ? { endLine } : {}) };
+      }
+    }
+  }
+  const colon = splitColonLineSuffix(decodeSafe(stripQueryAndHash(href.trim())));
+  if (colon.line) return { line: colon.line, ...(colon.endLine ? { endLine: colon.endLine } : {}) };
+  return undefined;
 }
 
 function displayLocalPath(localPath: string, projectPath: string | undefined, range?: { line?: number; endLine?: number }): string {
@@ -289,7 +313,6 @@ function MarkdownLink({ href, children }: { href?: string | undefined; children?
               href={href}
               className={LINK_CLASS}
               onPointerEnter={syncAnchor}
-              onPointerMove={syncAnchor}
               onFocus={() => {
                 pointerRef.current = null;
                 syncAnchor();
@@ -349,34 +372,197 @@ function MarkdownLink({ href, children }: { href?: string | undefined; children?
   );
 }
 
+const FencedCodeContext = React.createContext(false);
+
+let mermaidRenderSeq = 0;
+
+function MermaidBlock({ code, streaming }: { code: string; streaming: boolean }) {
+  const { resolvedTheme } = useTheme();
+  const [svg, setSvg] = React.useState<string>();
+  const [error, setError] = React.useState<string>();
+  const [showSource, setShowSource] = React.useState(false);
+  const [copied, setCopied] = React.useState(false);
+
+  React.useEffect(() => {
+    if (streaming || showSource) return;
+    let cancelled = false;
+    const renderId = `lila-mermaid-${++mermaidRenderSeq}`;
+    void import("mermaid")
+      .then(async (mod) => {
+        const mermaid = mod.default;
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "strict",
+          theme: resolvedTheme === "dark" ? "dark" : "default",
+          fontFamily: "var(--font-sans)",
+        });
+        const result = await mermaid.render(renderId, code.trim());
+        if (!cancelled) {
+          setSvg(result.svg);
+          setError(undefined);
+        }
+      })
+      .catch((failure: unknown) => {
+        if (!cancelled) {
+          setSvg(undefined);
+          setError(failure instanceof Error ? failure.message : String(failure));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [code, streaming, showSource, resolvedTheme]);
+
+  if (streaming || showSource || error) {
+    return (
+      <div className="not-typeset my-2 flex flex-col gap-1.5">
+        <Code
+          code={code}
+          language="mermaid"
+          streaming={streaming}
+          title={
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-muted-foreground">mermaid</span>
+              {!streaming && !error ? (
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  className="h-5 px-1.5 text-[11px]"
+                  onClick={() => setShowSource(false)}
+                >
+                  <Eye className="size-3" />
+                  查看图表
+                </Button>
+              ) : null}
+            </div>
+          }
+        />
+        {error ? <p className="px-1 text-[11px] text-muted-foreground">图表渲染失败，已回退为源码显示。</p> : null}
+      </div>
+    );
+  }
+
+  return (
+    <div data-not-typeset className="not-typeset my-2 overflow-hidden rounded-xl border border-border/70 bg-card/50">
+      <div className="flex items-center justify-between gap-2 border-b border-border/60 bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">
+        <span className="font-mono">mermaid</span>
+        <div className="flex items-center gap-1">
+          <Button type="button" size="xs" variant="ghost" className="h-6 px-1.5 text-[11px]" onClick={() => setShowSource(true)}>
+            <Code2 className="size-3" />
+            源码
+          </Button>
+          <Button
+            type="button"
+            size="xs"
+            variant="ghost"
+            className="h-6 px-1.5 text-[11px]"
+            onClick={() => {
+              void navigator.clipboard
+                .writeText(code)
+                .then(() => {
+                  setCopied(true);
+                  window.setTimeout(() => setCopied(false), 1_500);
+                })
+                .catch(() => toast.error("复制失败"));
+            }}
+          >
+            {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+            {copied ? "已复制" : "复制"}
+          </Button>
+        </div>
+      </div>
+      <div className="overflow-x-auto p-4 [&_svg]:mx-auto [&_svg]:max-w-full">
+        {svg ? (
+          <div dangerouslySetInnerHTML={{ __html: svg }} />
+        ) : (
+          <div className="py-6 text-center text-xs text-muted-foreground">正在渲染图表…</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MarkdownTable({ children }: { children?: React.ReactNode }) {
+  const tableRef = React.useRef<HTMLTableElement>(null);
+  const [copied, setCopied] = React.useState(false);
+
+  const copyTable = () => {
+    const table = tableRef.current;
+    if (!table) return;
+    const rows = Array.from(table.querySelectorAll("tr")).map((tr) =>
+      Array.from(tr.querySelectorAll("th, td"))
+        .map((cell) => (cell.textContent ?? "").replace(/\s+/g, " ").trim())
+        .join("\t"),
+    );
+    void navigator.clipboard
+      .writeText(rows.join("\n"))
+      .then(() => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1_500);
+      })
+      .catch(() => toast.error("复制失败"));
+  };
+
+  return (
+    <div className="group/table relative">
+      <div className="typeset-scroll">
+        <table ref={tableRef}>{children}</table>
+      </div>
+      <Button
+        type="button"
+        size="icon-xs"
+        variant="secondary"
+        aria-label="复制表格"
+        title="复制表格（制表符分隔）"
+        onClick={copyTable}
+        className="absolute top-1 right-1 size-6 opacity-0 transition-opacity group-hover/table:opacity-100 focus-visible:opacity-100"
+      >
+        {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+      </Button>
+    </div>
+  );
+}
+
+function MarkdownCode({
+  className,
+  children,
+  streaming,
+}: {
+  className?: string | undefined;
+  children?: React.ReactNode;
+  streaming: boolean;
+}) {
+  const isFenced = React.useContext(FencedCodeContext);
+  const language = /language-([^\s]+)/.exec(className ?? "")?.[1];
+  const value = String(children);
+  if (!isFenced && !language && !value.includes("\n")) return <code>{children}</code>;
+  if (language?.toLowerCase() === "mermaid") {
+    return <MermaidBlock code={value} streaming={streaming} />;
+  }
+  return (
+    <Code
+      code={value}
+      {...(language ? { language, title: <span className="font-mono text-muted-foreground">{language}</span> } : {})}
+      streaming={streaming}
+    />
+  );
+}
+
 function components(streaming: boolean): Components {
   return {
-    pre: ({ children }) => <>{children}</>,
-    code: ({ className, children }) => {
-      const language = /language-([^\s]+)/.exec(className ?? "")?.[1];
-      const value = String(children);
-      if (!language && !value.includes("\n")) return <code>{children}</code>;
-      return (
-        <Code
-          code={value}
-          {...(language ? { language, title: <span className="font-mono text-muted-foreground">{language}</span> } : {})}
-          streaming={streaming}
-        />
-      );
-    },
+    pre: ({ children }) => <FencedCodeContext.Provider value={true}>{children}</FencedCodeContext.Provider>,
+    code: ({ className, children }) => <MarkdownCode className={className} streaming={streaming}>{children}</MarkdownCode>,
     a: ({ href, children }) => <MarkdownLink href={href}>{children}</MarkdownLink>,
     img: ({ src, alt, title }) => <MarkdownImage src={src} alt={alt} title={title} />,
-    table: ({ children }) => (
-      <div className="typeset-scroll">
-        <table>{children}</table>
-      </div>
-    ),
+    table: ({ children }) => <MarkdownTable>{children}</MarkdownTable>,
   };
 }
 
 const streamingComponents = components(true);
 const settledComponents = components(false);
-const plugins = [remarkGfm];
+const remarkPlugins = [remarkGfm, remarkMath];
+const rehypePlugins = [[rehypeKatex, { strict: false, throwOnError: false }] as [typeof rehypeKatex, { strict: boolean; throwOnError: boolean }]];
 
 const LIST_ITEM_RE = /^\s*(?:[-*+]|\d+[.)])\s+/;
 const BLOCKQUOTE_RE = /^\s*>/;
@@ -443,7 +629,12 @@ function splitStreamingBlocks(text: string): { settled: string[]; active: string
 
 const MarkdownBlock = React.memo(function MarkdownBlock({ text, streaming }: { text: string; streaming: boolean }) {
   return (
-    <ReactMarkdown remarkPlugins={plugins} urlTransform={markdownUrlTransform} components={streaming ? streamingComponents : settledComponents}>
+    <ReactMarkdown
+      remarkPlugins={remarkPlugins}
+      rehypePlugins={rehypePlugins}
+      urlTransform={markdownUrlTransform}
+      components={streaming ? streamingComponents : settledComponents}
+    >
       {text}
     </ReactMarkdown>
   );

@@ -17,26 +17,40 @@ function summarize(items: TranscriptItem[]) {
   const readPaths = new Set<string>();
   const changedPaths = new Set<string>();
   let commands = 0;
+  let searches = 0;
+  let mcpCalls = 0;
   let other = 0;
   let active = false;
   for (const item of items) {
     if (item.kind !== "tool") continue;
     active ||= item.status === "running";
-    if (item.name === "read" && typeof item.args.path === "string") {
-      readPaths.add(item.args.path);
-    } else if ((item.name === "edit" || item.name === "write") && item.status === "done" && typeof item.args.path === "string") {
-      changedPaths.add(item.args.path);
+    const filePath =
+      typeof item.args.path === "string"
+        ? item.args.path
+        : typeof item.args.file_path === "string"
+          ? item.args.file_path
+          : undefined;
+    if (item.name === "read" && filePath) {
+      readPaths.add(filePath);
+    } else if ((item.name === "edit" || item.name === "write") && item.status === "done" && filePath) {
+      changedPaths.add(filePath);
     } else if (item.name === "bash") {
       commands++;
+    } else if (item.name === "grep" || item.name === "find" || item.name === "ls") {
+      searches++;
+    } else if (item.name.startsWith("mcp__") || item.name === "codemode") {
+      mcpCalls++;
     } else {
       other++;
     }
   }
   const details = [
     readPaths.size ? `读取 ${readPaths.size} 个文件` : undefined,
+    searches ? `检索 ${searches} 次` : undefined,
     commands ? `运行 ${commands} 条命令` : undefined,
     changedPaths.size ? `修改 ${changedPaths.size} 个文件` : undefined,
-    other ? `${other} 次工具调用` : undefined,
+    mcpCalls ? `调用 ${mcpCalls} 次工具/MCP` : undefined,
+    other ? `${other} 次其他操作` : undefined,
   ].filter(Boolean);
   return { title: details.join(" · ") || "思考过程", active };
 }
@@ -51,13 +65,19 @@ export const TranscriptActivity = React.memo(function TranscriptActivity({
   sessionId: string;
   revealId: string | undefined;
 }) {
-  const [open, setOpen] = React.useState(false);
-  const [viewed, setViewed] = React.useState(false);
   const reveal = items.some((item) => item.id === revealId);
+  const [open, setOpen] = React.useState(reveal);
+  const [viewed, setViewed] = React.useState(reveal);
+  React.useEffect(() => {
+    if (reveal) {
+      setViewed(true);
+      setOpen(true);
+    }
+  }, [reveal]);
   const { title, active } = summarize(items);
 
   const rows: React.ReactNode[] = [];
-  for (let index = 0; (viewed || open || reveal) && index < items.length; index++) {
+  for (let index = 0; (viewed || open) && index < items.length; index++) {
     const item = items[index]!;
     const matched = item.id === revealId;
     rows.push(
@@ -69,7 +89,7 @@ export const TranscriptActivity = React.memo(function TranscriptActivity({
 
   return (
     <Trace>
-      <TraceCollapsible open={open || reveal} onOpenChange={(next) => {
+      <TraceCollapsible open={open} onOpenChange={(next) => {
         if (next) setViewed(true);
         setOpen(next);
       }}>

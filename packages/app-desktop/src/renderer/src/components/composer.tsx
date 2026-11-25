@@ -4,7 +4,6 @@ import { toast } from "sonner";
 import type { SlashCommand } from "@lila/protocol";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentGroup, AttachmentMedia } from "@/components/ui/attachment";
 import { Command, CommandEmpty, CommandGroup, CommandItem, CommandList } from "@/components/ui/command";
-import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } from "@/components/ui/input-group";
 import { cn } from "cn";
@@ -59,11 +58,18 @@ function fenced(name: string, content: string): string {
 /** The `/command` or `@path` token right before the caret, if any. */
 function findSuggest(text: string, caret: number, slash: boolean, files: boolean): Suggest | null {
   const before = text.slice(0, caret);
-  const match = /(^|\s)([/@])([^\s]*)$/.exec(before);
-  if (!match) return null;
-  const start = before.length - (match[3]?.length ?? 0) - 1;
-  if (match[2] === "/" && slash && start === 0) return { kind: "slash", start, query: match[3] ?? "" };
-  if (match[2] === "@" && files) return { kind: "file", start, query: match[3] ?? "" };
+  if (slash) {
+    const slashMatch = /^\/([^\s]*)$/.exec(before);
+    if (slashMatch) return { kind: "slash", start: 0, query: slashMatch[1] ?? "" };
+  }
+  if (files) {
+    // Allow `@` at start, after whitespace, or after CJK/punctuation, while avoiding email addresses like user@domain.
+    const atMatch = /(^|[^A-Za-z0-9_.-])@([^\s]*)$/.exec(before);
+    if (atMatch) {
+      const query = atMatch[2] ?? "";
+      return { kind: "file", start: before.length - query.length - 1, query };
+    }
+  }
   return null;
 }
 
@@ -106,6 +112,7 @@ export function Composer({
   const images = useLila((state) => state.draftImages[draftKey] ?? EMPTY_IMAGES);
   const connected = useLila((state) => state.connection === "connected");
   const sending = useLila((state) => Boolean(state.sendingDrafts[draftKey]));
+  const commandsRefreshSeq = useLila((state) => state.commandsRefreshSeq);
   const [dragging, setDragging] = React.useState(false);
   const [suggest, setSuggest] = React.useState<Suggest | null>(null);
   const [highlight, setHighlight] = React.useState(0);
@@ -114,6 +121,7 @@ export function Composer({
   const ref = React.useRef<HTMLTextAreaElement>(null);
   const fileInput = React.useRef<HTMLInputElement>(null);
   const listRef = React.useRef<HTMLDivElement>(null);
+  const composingRef = React.useRef(false);
 
   React.useEffect(() => {
     ref.current?.focus();
@@ -122,12 +130,18 @@ export function Composer({
     setSuggest(null);
   }, [draftKey, sessionId, projectId]);
 
+  React.useEffect(() => {
+    setCommands(null);
+  }, [commandsRefreshSeq]);
+
   // Slash commands are fetched when the menu first opens for this session or project.
   React.useEffect(() => {
-    if (suggest?.kind !== "slash" || !projectId || commands) return;
+    if (suggest?.kind !== "slash" || !projectId || commands !== null) return;
     let cancelled = false;
     void actions.commands(projectId, sessionId).then((list) => {
-      if (!cancelled) setCommands(sessionId ? list : list.filter((command) => command.source !== "builtin"));
+      if (!cancelled && list !== undefined) {
+        setCommands(sessionId ? list : list.filter((command) => command.source !== "builtin"));
+      }
     });
     return () => {
       cancelled = true;
@@ -149,6 +163,9 @@ export function Composer({
       clearTimeout(timer);
     };
   }, [fileQuery, projectId]);
+
+  const filesStale = suggest?.kind === "file" && (files === null || files.query !== suggest.query);
+  const suggestLoading = (suggest?.kind === "slash" && commands === null) || filesStale;
 
   // Group in fixed display order first, then flatten so keyboard navigation matches visual order 1:1.
   const { groups, flatOptions } = React.useMemo<{ groups: Array<[string, Option[]]>; flatOptions: Option[] }>(() => {
@@ -178,6 +195,7 @@ export function Composer({
       }
       return { groups: ordered, flatOptions: ordered.flatMap(([, items]) => items) };
     }
+    if (filesStale) return { groups: [], flatOptions: [] };
     const fileItems: Option[] = (files?.files ?? []).map((path) => ({
       value: path,
       label: path,
@@ -186,7 +204,7 @@ export function Composer({
     }));
     const ordered: Array<[string, Option[]]> = fileItems.length ? [["file", fileItems]] : [];
     return { groups: ordered, flatOptions: fileItems };
-  }, [suggest, commands, files]);
+  }, [suggest, commands, files, filesStale]);
 
   React.useEffect(() => setHighlight(0), [flatOptions]);
 
@@ -202,6 +220,7 @@ export function Composer({
   const canSend = connected && !disabled && !sendDisabled && !sending && (running ? hasText : hasText || images.length > 0);
 
   function syncSuggest(value: string, caret: number): void {
+    if (composingRef.current) return;
     setSuggest(findSuggest(value, caret, Boolean(projectId), Boolean(projectId)));
   }
 
@@ -209,7 +228,10 @@ export function Composer({
     const textarea = ref.current;
     if (!textarea || !suggest) return;
     const caret = textarea.selectionStart;
-    const next = text.slice(0, suggest.start) + option.insert + text.slice(caret);
+    // Extend end to the end of the current non-whitespace token so editing mid-token replaces cleanly.
+    let end = caret;
+    while (end < text.length && !/\s/.test(text[end]!)) end += 1;
+    const next = text.slice(0, suggest.start) + option.insert + text.slice(end);
     actions.setDraft(draftKey, next);
     setSuggest(null);
     const position = suggest.start + option.insert.length;
@@ -273,7 +295,7 @@ export function Composer({
   }
 
   function onKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>): void {
-    if (event.nativeEvent.isComposing) return;
+    if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (menuOpen) {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -293,12 +315,15 @@ export function Composer({
           if (option) choose(option);
           return;
         }
+      } else if (suggestLoading && (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey))) {
+        // Avoid sending a half-typed `@query` while debounced file search is still loading.
+        event.preventDefault();
+        return;
       }
     }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      if (event.altKey && !running) return;
-      void submit(event.altKey ? "followUp" : "steer");
+      void submit(running && event.altKey ? "followUp" : "steer");
     }
   }
 
@@ -408,6 +433,13 @@ export function Composer({
         value={text}
         disabled={disabled}
         placeholder={placeholder}
+        onCompositionStart={() => {
+          composingRef.current = true;
+        }}
+        onCompositionEnd={(event) => {
+          composingRef.current = false;
+          syncSuggest(event.currentTarget.value, event.currentTarget.selectionStart);
+        }}
         onChange={(event) => {
           actions.setDraft(draftKey, event.target.value);
           syncSuggest(event.target.value, event.target.selectionStart);
@@ -448,11 +480,7 @@ export function Composer({
         />
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-0.5">{footer}</div>
         <div className="ms-auto flex shrink-0 items-center gap-1">
-          {abortArmed ? (
-            <span className="shrink-0 px-1 text-xs text-warning-foreground">
-              再按一次 <Kbd>Esc</Kbd> 停止
-            </span>
-          ) : null}
+          {abortArmed ? <span className="shrink-0 px-1 text-xs text-warning-foreground">再按一次 Esc 停止</span> : null}
           {running ? (
             <InputGroupButton
               size="xs"
@@ -489,11 +517,13 @@ export function Composer({
               disabled={!canSend}
               aria-label={running ? "插话" : "发送"}
               title={
-                running
-                  ? hasText
-                    ? "插话：当前工具结束后送达（↵），⌥↵ 排到这一轮之后"
-                    : "运行中插话请先输入文字"
-                  : "发送（↵），⇧↵ 换行"
+                sendDisabled
+                  ? "会话正在准备中…"
+                  : running
+                    ? hasText
+                      ? "插话：当前工具结束后送达（↵），⌥↵ 排到这一轮之后"
+                      : "运行中插话请先输入文字"
+                    : "发送（↵），⇧↵ 换行"
               }
               onClick={() => void submit("steer")}
             >

@@ -30,6 +30,7 @@ export interface LilaBridge {
   readonly allowedTools: Set<string>;
   request(request: Omit<PendingRequest, "id">, options?: { signal?: AbortSignal; timeout?: number }): Promise<PendingAnswer | undefined>;
   onSubagentEvent?(event: SubagentBusEvent): void;
+  onProviderResponse?(providerId: string | undefined, status: number, headers: Record<string, string>): void;
 }
 
 const READ_ONLY_TOOLS: Record<string, true> = {
@@ -43,13 +44,28 @@ const READ_ONLY_TOOLS: Record<string, true> = {
   tool_search: true,
   get_subagent_result: true,
   ask_user: true,
+  memory_read: true,
 };
-const FILE_TOOLS: Record<string, true> = { edit: true, write: true };
+const FILE_TOOLS: Record<string, true> = {
+  edit: true,
+  write: true,
+  memory_add: true,
+  memory_replace: true,
+  memory_remove: true,
+};
 const SUMMARY_LIMIT = 4_000;
 
 function summarize(toolName: string, input: Record<string, unknown>): string {
   if (toolName === "bash" && typeof input.command === "string") return input.command;
-  if (FILE_TOOLS[toolName] && typeof input.path === "string") return input.path;
+  if ((toolName === "edit" || toolName === "write") && typeof input.path === "string") return input.path;
+  if (toolName === "memory_add" || toolName === "memory_replace" || toolName === "memory_remove") {
+    const target = input.target === "user" ? "用户画像 (USER.md)" : "Agent 笔记 (MEMORY.md)";
+    const parts = [`目标：${target}`];
+    if (typeof input.oldText === "string" && input.oldText) parts.push(`匹配：${input.oldText}`);
+    if (typeof input.content === "string" && input.content) parts.push(`内容：${input.content}`);
+    if (typeof input.newContent === "string" && input.newContent) parts.push(`替换为：${input.newContent}`);
+    return parts.join("\n");
+  }
   const json = JSON.stringify(input, null, 2) ?? "";
   return json.length > SUMMARY_LIMIT ? `${json.slice(0, SUMMARY_LIMIT)}\n…` : json;
 }
@@ -202,6 +218,13 @@ export function createLilaExtension(bridge: LilaBridge): ExtensionFactory {
       });
     }
 
+    if (bridge.onProviderResponse) {
+      const onResponse = bridge.onProviderResponse.bind(bridge);
+      pi.on("after_provider_response", (event, ctx) => {
+        onResponse(ctx.model?.provider, event.status, event.headers);
+      });
+    }
+
     pi.on("tool_call", async (event, ctx) => {
       // Calls a tool makes (codemode scripts) follow the decision about the calling tool.
       if (event.parentToolCallId) return;
@@ -227,7 +250,14 @@ export function createLilaExtension(bridge: LilaBridge): ExtensionFactory {
         bridge.allowedTools.add(name);
         return;
       }
-      return { block: true, reason: answer?.type === "option" ? "用户拒绝了这次工具调用。" : "用户取消了这次工具调用。" };
+      if (answer?.type === "option") {
+        const note = answer.note?.trim();
+        return {
+          block: true,
+          reason: note ? `用户拒绝了这次工具调用，并补充说明：${note}` : "用户拒绝了这次工具调用。",
+        };
+      }
+      return { block: true, reason: "用户取消了这次工具调用。" };
     });
 
     pi.registerTool({

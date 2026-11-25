@@ -3,121 +3,62 @@ import { toast } from "sonner";
 import type {
   ApprovalMode,
   ImageInput,
-  ModelInfo,
   PendingAnswer,
   Project,
-  SessionState,
   SessionSummary,
   SlashCommand,
   ThinkingLevel,
-  TranscriptItem,
   WatchSlot,
 } from "@lila/protocol";
-import { CoreClient, type ConnectionState, type PushMessage } from "./client.ts";
-import type { FileChange } from "./transcript-layout.ts";
+import { CoreClient, type PushMessage } from "../client.ts";
+import type { FileChange } from "../transcript-layout.ts";
+import { createSettingsActions } from "./settings-actions.ts";
+import {
+  attempt,
+  message,
+  persistDrafts,
+  readNewSession,
+  readNotificationsEnabled,
+  readSavedDrafts,
+  report,
+  safeLocalGet,
+  safeLocalRemove,
+  safeLocalSet,
+  toDraftImages,
+  withSessions,
+} from "./storage.ts";
+import { applyFrameBatch, createViewCache, indexOf, type SessionFrame } from "./transcript.ts";
+import {
+  type DeliveryMode,
+  type Draft,
+  type DraftImage,
+  EARLIER_LIMIT,
+  EMPTY_DRAFT,
+  emptyView,
+  type FileHistoryEntry,
+  NEW_DRAFT,
+  NEW_SESSION_KEY,
+  type NewSessionOptions,
+  OPEN_LIMIT,
+  SELECTED_KEY,
+  type SessionView,
+  type State,
+} from "./types.ts";
 
-export type SessionView = {
-  items: TranscriptItem[];
-  /** Item id → index in `items`. */
-  index: Record<string, number>;
-  hasEarlier: boolean;
-  loadingEarlier: boolean;
-  state?: SessionState;
-  loading: boolean;
-  error?: string;
-};
-
-/** Settings for a session that does not exist yet; remembered between new sessions. */
-export type NewSessionOptions = { projectId?: string; modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode: ApprovalMode };
-export type DraftImage = ImageInput & { id: string; name: string };
-type Draft = { text: string; images: DraftImage[] };
-type DeliveryMode = "steer" | "followUp";
-
-export type RightPanelKind = "files" | "changes" | "subsession" | "review";
-export type ReplyReviewState = { sessionId: string; changes: FileChange[]; path: string };
-
-type State = {
-  connection: ConnectionState;
-  connectionDetail?: string;
-  projects: Project[];
-  models: ModelInfo[];
-  defaultModelId?: string;
-  modelsError?: string;
-  modelsLoading: boolean;
-  sessions: Record<string, SessionSummary>;
-  /** Parent session id → child sub-agent sessions, sorted by newest first. */
-  childrenByParent: Record<string, SessionSummary[]>;
-  views: Record<string, SessionView>;
-  selectedId?: string;
-  previewId?: string;
-  newSession: NewSessionOptions;
-  /** Composer text per session; `new` is the new-session composer. */
-  drafts: Record<string, string>;
-  /** Pending image attachments per session; preserved across session switches. */
-  draftImages: Record<string, DraftImage[]>;
-  sendingDrafts: Record<string, true>;
-  paletteOpen: boolean;
-  resourcesOpen: boolean;
-  rightPanel?: RightPanelKind | undefined;
-  filesView: "tree" | "file";
-  activeFile?: { path: string; line?: number | undefined; endLine?: number | undefined; history: string[] } | undefined;
-  replyReview?: ReplyReviewState | undefined;
-  gitChangeCounts: Record<string, number | undefined>;
-  workspaceRefreshSeq: number;
-};
-
-export const NEW_DRAFT = "new";
-const SELECTED_KEY = "lila.selectedSession";
-const NEW_SESSION_KEY = "lila.newSession";
-const OPEN_LIMIT = 300;
-const EARLIER_LIMIT = 200;
-const MAX_CACHED_VIEWS = 10;
-const MAX_SCROLL_POSITIONS = 50;
-
-export const APPROVAL_LABEL: Record<ApprovalMode, string> = {
-  auto: "自动执行",
-  "ask-exec": "执行命令前询问",
-  "ask-all": "修改和执行都询问",
-};
-
-export const APPROVAL_HINT: Record<ApprovalMode, string> = {
-  auto: "所有工具直接执行，适合你信任的项目。",
-  "ask-exec": "改文件不问，运行命令、MCP 和子 Agent 前先问你。",
-  "ask-all": "改文件和运行命令前都先问你。",
-};
-
-export const EMPTY_VIEW: SessionView = Object.freeze({
-  items: [],
-  index: {},
-  hasEarlier: false,
-  loadingEarlier: false,
-  loading: false,
-});
-
-export const emptyView = (): SessionView => ({ items: [], index: {}, hasEarlier: false, loadingEarlier: false, loading: false });
-
-function buildChildrenByParent(sessions: Record<string, SessionSummary>): Record<string, SessionSummary[]> {
-  const children: Record<string, SessionSummary[]> = {};
-  for (const session of Object.values(sessions)) {
-    if (session.parentId) (children[session.parentId] ??= []).push(session);
-  }
-  for (const list of Object.values(children)) list.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  return children;
-}
-
-function withSessions(sessions: Record<string, SessionSummary>): Pick<State, "sessions" | "childrenByParent"> {
-  return { sessions, childrenByParent: buildChildrenByParent(sessions) };
-}
-
-function readNewSession(): NewSessionOptions {
-  try {
-    const saved = JSON.parse(localStorage.getItem(NEW_SESSION_KEY) ?? "null") as Partial<NewSessionOptions> | null;
-    if (saved && typeof saved === "object") return { ...saved, approvalMode: saved.approvalMode ?? "auto" };
-  } catch {
-    // A broken entry falls back to the defaults.
-  }
-  return { approvalMode: "auto" };
-}
+export {
+  APPROVAL_LABEL,
+  EMPTY_VIEW,
+  NEW_DRAFT,
+  emptyView,
+  type AuthLoginFlowState,
+  type DraftImage,
+  type FileHistoryEntry,
+  type NewSessionOptions,
+  type ReplyReviewState,
+  type RightPanelKind,
+  type SessionView,
+  type SettingsTab,
+} from "./types.ts";
 
 export const useLila = create<State>(() => ({
   connection: "connecting",
@@ -127,108 +68,40 @@ export const useLila = create<State>(() => ({
   sessions: {},
   childrenByParent: {},
   views: {},
-  selectedId: localStorage.getItem(SELECTED_KEY) ?? undefined,
+  selectedId: safeLocalGet(SELECTED_KEY) ?? undefined,
   newSession: readNewSession(),
-  drafts: {},
+  drafts: readSavedDrafts(),
   draftImages: {},
   sendingDrafts: {},
   paletteOpen: false,
-  resourcesOpen: false,
+  settingsOpen: false,
+  settingsTab: "general",
+  settingsDirty: { mcp: false, memory: false, capabilities: false },
+  notificationsEnabled: readNotificationsEnabled(),
+  authLogin: undefined,
   rightPanel: undefined,
-  filesView: "tree",
   activeFile: undefined,
+  activeChangePath: undefined,
   gitChangeCounts: {},
   workspaceRefreshSeq: 0,
+  commandsRefreshSeq: 0,
 }));
 
 const set = useLila.setState;
 const get = useLila.getState;
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function report(error: unknown): void {
-  toast.error(message(error));
-}
-
-function indexOf(items: TranscriptItem[]): Record<string, number> {
-  const index: Record<string, number> = {};
-  items.forEach((item, at) => {
-    index[item.id] = at;
-  });
-  return index;
-}
-
-/** Most-recently-opened sessions, used to cap in-memory transcript views. */
-const recentViews: string[] = [];
-/** Per-session scrollTop cache, kept in memory so revisiting a session restores its reading position. */
-const scrollPositions = new Map<string, number>();
-
-function recordViewAccess(sessionId: string): void {
-  const existing = recentViews.indexOf(sessionId);
-  if (existing >= 0) recentViews.splice(existing, 1);
-  recentViews.push(sessionId);
-}
-
-function pruneViews(): void {
-  if (recentViews.length <= MAX_CACHED_VIEWS) return;
-  const { selectedId, previewId } = get();
-  const keep = new Set([selectedId, previewId, watching.main, watching.preview]);
-  const drop: string[] = [];
-  for (let i = 0; i < recentViews.length && recentViews.length - drop.length > MAX_CACHED_VIEWS; i++) {
-    const candidate = recentViews[i]!;
-    if (!keep.has(candidate)) drop.push(candidate);
-  }
-  if (!drop.length) return;
-  const dropped = new Set(drop);
-  for (let i = recentViews.length - 1; i >= 0; i--) {
-    if (dropped.has(recentViews[i]!)) recentViews.splice(i, 1);
-  }
-  set((state) => {
-    const views = { ...state.views };
-    for (const id of dropped) delete views[id];
-    return { views };
-  });
-}
+const viewCache = createViewCache();
 
 function setView(sessionId: string, update: (view: SessionView) => SessionView): void {
   set((state) => ({ views: { ...state.views, [sessionId]: update(state.views[sessionId] ?? emptyView()) } }));
 }
 
-// ---------------------------------------------------------------------------
-// Live frames, merged per animation frame so a fast model cannot flood React with renders.
-
-type SessionFrame = Extract<PushMessage, { type: "item" | "delta" | "state" }>;
-
-function applyFrame(view: SessionView, frame: SessionFrame, items: TranscriptItem[], index: Record<string, number>): SessionView {
-  if (frame.type === "state") return { ...view, state: frame.state };
-  if (frame.type === "item") {
-    const at = index[frame.item.id];
-    if (at === undefined) {
-      index[frame.item.id] = items.length;
-      items.push(frame.item);
-    } else {
-      items[at] = frame.item;
-    }
-    return view;
-  }
-  const at = index[frame.itemId];
-  const current = at === undefined ? undefined : items[at];
-  if (current && current.kind !== "assistant") return view;
-  const base = current ?? { kind: "assistant" as const, id: frame.itemId, text: "", thinking: "", streaming: true };
-  const next = { ...base, [frame.channel]: base[frame.channel] + frame.delta };
-  if (at === undefined) {
-    index[frame.itemId] = items.length;
-    items.push(next);
-  } else {
-    items[at] = next;
-  }
-  return view;
-}
-
 let buffer: SessionFrame[] = [];
 let frameHandle: number | undefined;
+const watching: Partial<Record<WatchSlot, string>> = {};
+const opening = new Map<string, number>();
+let openCounter = 0;
+let selectionVersion = 0;
+let newDraftTarget = { key: NEW_DRAFT };
 
 function flush(): void {
   if (frameHandle !== undefined) cancelAnimationFrame(frameHandle);
@@ -236,34 +109,19 @@ function flush(): void {
   if (!buffer.length) return;
   const frames = buffer;
   buffer = [];
+  set((state) => ({ views: applyFrameBatch(state.views, frames) }));
+}
+
+function pruneViews(): void {
+  const { selectedId, previewId } = get();
+  const drop = viewCache.collectPrunable(new Set([selectedId, previewId, watching.main, watching.preview]));
+  if (!drop.length) return;
   set((state) => {
     const views = { ...state.views };
-    const touched = new Map<string, { items: TranscriptItem[]; index: Record<string, number> }>();
-    for (const frame of frames) {
-      let view = views[frame.sessionId];
-      if (!view) continue;
-      let work = touched.get(frame.sessionId);
-      if (!work) {
-        work = { items: view.items.slice(), index: { ...view.index } };
-        touched.set(frame.sessionId, work);
-      }
-      view = applyFrame(view, frame, work.items, work.index);
-      views[frame.sessionId] = view;
-    }
-    for (const [sessionId, work] of touched) {
-      const view = views[sessionId];
-      if (view) views[sessionId] = { ...view, items: work.items, index: work.index };
-    }
+    for (const id of drop) delete views[id];
     return { views };
   });
 }
-
-/** Independent watches for the conversation and the read-only preview. */
-const watching: Partial<Record<WatchSlot, string>> = {};
-const opening = new Map<string, number>();
-let openCounter = 0;
-let selectionVersion = 0;
-let newDraftTarget = { key: NEW_DRAFT };
 
 function unwatchSession(slot: WatchSlot): void {
   const id = watching[slot];
@@ -291,7 +149,7 @@ async function openSession(sessionId: string, slot: WatchSlot = "main"): Promise
   const token = ++openCounter;
   opening.set(sessionId, token);
   watching[slot] = sessionId;
-  recordViewAccess(sessionId);
+  viewCache.recordAccess(sessionId);
   flush();
   setView(sessionId, (view) => ({ ...view, loading: true, error: undefined }));
   try {
@@ -299,7 +157,6 @@ async function openSession(sessionId: string, slot: WatchSlot = "main"): Promise
     const limit = current?.state?.access === "read-only" ? Math.min(1_000, Math.max(OPEN_LIMIT, current.items.length)) : OPEN_LIMIT;
     const { items, hasEarlier, state } = await client.call({ type: "session.open", sessionId, limit, slot });
     if (opening.get(sessionId) !== token || watching[slot] !== sessionId) return;
-    // Frames queued before the snapshot are already part of it.
     buffer = buffer.filter((frame) => frame.sessionId !== sessionId);
     setView(sessionId, () => ({ items, index: indexOf(items), hasEarlier, loadingEarlier: false, state, loading: false }));
     pruneViews();
@@ -311,24 +168,84 @@ async function openSession(sessionId: string, slot: WatchSlot = "main"): Promise
   }
 }
 
-// ---------------------------------------------------------------------------
-// System notifications while the window is in the background.
-
 function notify(title: string, body: string, sessionId?: string): void {
-  if (document.hasFocus() || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  if (!get().notificationsEnabled || document.hasFocus() || typeof Notification === "undefined" || Notification.permission !== "granted") return;
   const notification = new Notification(title, { body });
   notification.onclick = () => {
-    if (sessionId && get().sessions[sessionId]) actions.select(sessionId);
+    set({ settingsOpen: false, paletteOpen: false });
+    const target = sessionId ? get().sessions[sessionId] : undefined;
+    if (target) {
+      if (target.readOnly && target.parentId && get().sessions[target.parentId]) {
+        actions.select(target.parentId);
+        actions.previewSubsession(target.id);
+      } else if (!target.readOnly) {
+        actions.select(target.id);
+      }
+    }
     window.lila.focus();
   };
 }
 
 function notifyTransition(previous: SessionSummary | undefined, next: SessionSummary): void {
-  if (!previous) return;
+  if (!previous || next.parentId || next.readOnly) return;
   const title = next.title || "新会话";
   if (next.pendingCount > previous.pendingCount) notify("需要你处理", title, next.id);
   else if (previous.status === "running" && next.status === "idle") notify("任务完成", title, next.id);
   else if (previous.status !== "error" && next.status === "error") notify("任务出错", title, next.id);
+}
+
+function forget(sessionId: string): void {
+  const wasSelected = get().selectedId === sessionId;
+  if (wasSelected || get().previewId === sessionId) closePreview();
+  viewCache.remove(sessionId);
+  set((state) => {
+    const sessions = { ...state.sessions };
+    delete sessions[sessionId];
+    const views = { ...state.views };
+    delete views[sessionId];
+    const drafts = { ...state.drafts };
+    delete drafts[sessionId];
+    const draftImages = { ...state.draftImages };
+    delete draftImages[sessionId];
+    const sendingDrafts = { ...state.sendingDrafts };
+    delete sendingDrafts[sessionId];
+    return {
+      ...withSessions(sessions),
+      views,
+      drafts,
+      draftImages,
+      sendingDrafts,
+      ...(wasSelected ? { selectedId: undefined, rightPanel: undefined, activeFile: undefined } : {}),
+    };
+  });
+  if (wasSelected) {
+    safeLocalRemove(SELECTED_KEY);
+    unwatchSession("main");
+  }
+  persistDrafts(get().drafts);
+}
+
+let queuedModelsLoad: { refresh: boolean } | undefined;
+
+async function loadModels(refresh = false): Promise<void> {
+  if (get().modelsLoading) {
+    queuedModelsLoad = { refresh: Boolean(queuedModelsLoad?.refresh || refresh) };
+    return;
+  }
+  set({ modelsLoading: true });
+  try {
+    const { models, defaultModelId } = await client.call({ type: "models.list", ...(refresh ? { refresh: true } : {}) });
+    set({ models, defaultModelId, modelsError: undefined });
+  } catch (error) {
+    set({ modelsError: message(error) });
+  } finally {
+    set({ modelsLoading: false });
+    if (queuedModelsLoad) {
+      const next = queuedModelsLoad;
+      queuedModelsLoad = undefined;
+      void loadModels(next.refresh);
+    }
+  }
 }
 
 function handlePush(frame: PushMessage): void {
@@ -356,56 +273,44 @@ function handlePush(frame: PushMessage): void {
     case "session.removed":
       forget(frame.sessionId);
       return;
+    case "auth.login": {
+      const current = get().authLogin;
+      if (!current || current.loginId !== frame.loginId) return;
+      const event = frame.event;
+      switch (event.type) {
+        case "auth_url":
+          set({ authLogin: { ...current, authUrl: { url: event.url, ...(event.instructions ? { instructions: event.instructions } : {}) }, deviceCode: undefined } });
+          return;
+        case "device_code":
+          set({ authLogin: { ...current, deviceCode: { userCode: event.userCode, verificationUri: event.verificationUri }, authUrl: undefined } });
+          return;
+        case "info":
+          set({ authLogin: { ...current, info: { message: event.message, ...(event.links ? { links: event.links } : {}) } } });
+          return;
+        case "progress":
+          set({ authLogin: { ...current, progress: event.message } });
+          return;
+        case "prompt":
+          set({ authLogin: { ...current, prompt: event.prompt } });
+          return;
+        case "prompt_cleared":
+          if (current.prompt?.promptId === event.promptId) set({ authLogin: { ...current, prompt: undefined } });
+          return;
+        case "done":
+          set({ authLogin: { ...current, status: "done", prompt: undefined, progress: undefined, error: undefined } });
+          void loadModels();
+          return;
+        case "error":
+          set({ authLogin: { ...current, status: "error", prompt: undefined, progress: undefined, error: event.message } });
+          return;
+      }
+      return;
+    }
     case "notify": {
       const show = frame.level === "error" ? toast.error : frame.level === "warning" ? toast.warning : toast.info;
       const title = frame.sessionId ? get().sessions[frame.sessionId]?.title : undefined;
       show(frame.message, title ? { description: title } : undefined);
     }
-  }
-}
-
-function forget(sessionId: string): void {
-  const wasSelected = get().selectedId === sessionId;
-  if (wasSelected || get().previewId === sessionId) closePreview();
-  const idx = recentViews.indexOf(sessionId);
-  if (idx >= 0) recentViews.splice(idx, 1);
-  scrollPositions.delete(sessionId);
-  set((state) => {
-    const sessions = { ...state.sessions };
-    delete sessions[sessionId];
-    const views = { ...state.views };
-    delete views[sessionId];
-    const drafts = { ...state.drafts };
-    delete drafts[sessionId];
-    const draftImages = { ...state.draftImages };
-    delete draftImages[sessionId];
-    const sendingDrafts = { ...state.sendingDrafts };
-    delete sendingDrafts[sessionId];
-    return {
-      ...withSessions(sessions),
-      views,
-      drafts,
-      draftImages,
-      sendingDrafts,
-      ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, rightPanel: undefined, activeFile: undefined } : {}),
-    };
-  });
-  if (wasSelected) {
-    localStorage.removeItem(SELECTED_KEY);
-    unwatchSession("main");
-  }
-}
-
-async function loadModels(): Promise<void> {
-  if (get().modelsLoading) return;
-  set({ modelsLoading: true });
-  try {
-    const { models, defaultModelId } = await client.call({ type: "models.list" });
-    set({ models, defaultModelId, modelsError: undefined });
-  } catch (error) {
-    set({ modelsError: message(error) });
-  } finally {
-    set({ modelsLoading: false });
   }
 }
 
@@ -421,7 +326,7 @@ async function onReady(): Promise<void> {
     const missing = selectedId !== undefined && !byId[selectedId];
     set({ projects, ...withSessions(byId), ...(missing ? { selectedId: undefined } : {}) });
     if (missing) {
-      localStorage.removeItem(SELECTED_KEY);
+      safeLocalRemove(SELECTED_KEY);
       unwatchSession("main");
     }
     const { selectedId: current, previewId } = get();
@@ -443,28 +348,6 @@ export const client = new CoreClient({
   onPush: handlePush,
 });
 
-// ---------------------------------------------------------------------------
-// Actions.
-
-async function attempt<T>(run: () => Promise<T>): Promise<T | undefined> {
-  try {
-    return await run();
-  } catch (error) {
-    report(error);
-    return undefined;
-  }
-}
-
-function toDraftImages(images: ImageInput[]): DraftImage[] {
-  return images.map((image, index) => ({
-    ...image,
-    id: crypto.randomUUID(),
-    name: `图片 ${index + 1}`,
-  }));
-}
-
-const EMPTY_DRAFT: Draft = { text: "", images: [] };
-
 function readDraft(key: string, state = get()): Draft {
   return { text: state.drafts[key] ?? "", images: state.draftImages[key] ?? [] };
 }
@@ -479,7 +362,6 @@ function writeDraft(state: State, key: string, draft: Draft): Pick<State, "draft
   return { drafts, draftImages };
 }
 
-/** Reserving a submission immediately leaves a fresh draft for anything typed while awaiting core. */
 function beginDraftSubmission(key: string): Draft | undefined {
   const state = get();
   const draft = readDraft(key, state);
@@ -508,13 +390,28 @@ function finishDraftSubmission(key: string, unsent?: Draft): void {
 async function sendDraftContents(sessionId: string, draft: Draft, mode?: DeliveryMode): Promise<void> {
   let accepted = false;
   try {
-    accepted = await actions.prompt(sessionId, draft.text.trim(), draft.images.map(({ mimeType, data }) => ({ mimeType, data })), mode);
+    accepted = await actions.prompt(
+      sessionId,
+      draft.text.trim(),
+      draft.images.map(({ mimeType, data }) => ({ mimeType, data })),
+      mode,
+    );
   } finally {
     finishDraftSubmission(sessionId, accepted ? undefined : draft);
   }
 }
 
+function setNewSession(patch: Partial<NewSessionOptions>): void {
+  const next = { ...get().newSession, ...patch };
+  set({ newSession: next });
+  safeLocalSet(NEW_SESSION_KEY, JSON.stringify(next));
+}
+
+const settingsActions = createSettingsActions({ client, get, set, loadModels, setNewSession });
+
 export const actions = {
+  ...settingsActions,
+
   select(sessionId: string | undefined): void {
     selectionVersion++;
     const prev = get();
@@ -524,12 +421,11 @@ export const actions = {
     if (prev.selectedId !== sessionId) closePreview();
     set({
       selectedId: sessionId,
-      resourcesOpen: false,
       ...(prev.selectedId !== sessionId ? { replyReview: undefined, ...(prev.rightPanel === "review" ? { rightPanel: undefined } : {}) } : {}),
-      ...(!sessionId || !sameProject ? { rightPanel: undefined, filesView: "tree" as const, activeFile: undefined, replyReview: undefined } : {}),
+      ...(!sessionId || !sameProject ? { rightPanel: undefined, activeFile: undefined, replyReview: undefined } : {}),
     });
-    if (sessionId) localStorage.setItem(SELECTED_KEY, sessionId);
-    else localStorage.removeItem(SELECTED_KEY);
+    if (sessionId) safeLocalSet(SELECTED_KEY, sessionId);
+    else safeLocalRemove(SELECTED_KEY);
     if (!sessionId) {
       unwatchSession("main");
       return;
@@ -550,38 +446,46 @@ export const actions = {
   closePreview,
 
   toggleRightPanel(kind: "files" | "changes"): void {
-    const { rightPanel } = get();
-    if (rightPanel === kind) {
+    if (get().rightPanel === kind) {
       actions.closeRightPanel();
       return;
     }
     closePreview();
-    set({
-      rightPanel: kind,
-      ...(kind === "files" ? { filesView: "tree" as const } : {}),
-    });
+    set({ rightPanel: kind });
   },
 
   openRightPanel(kind: "files" | "changes"): void {
     closePreview();
-    set({
-      rightPanel: kind,
-      ...(kind === "files" ? { filesView: "tree" as const } : {}),
-    });
+    set({ rightPanel: kind, returnToPreviewId: undefined });
   },
 
-  openFilesTree(): void {
+  openChangesForFile(path: string): void {
+    const prevPreview = get().rightPanel === "subsession" ? get().previewId : get().returnToPreviewId;
     closePreview();
-    set({ rightPanel: "files", filesView: "tree" });
+    set({ rightPanel: "changes", activeChangePath: path, returnToPreviewId: prevPreview });
+  },
+
+  setActiveChangePath(path: string | undefined): void {
+    set({ activeChangePath: path });
   },
 
   openFilePreview(path: string, range?: { line?: number | undefined; endLine?: number | undefined }): void {
-    const { activeFile } = get();
-    const history = activeFile && activeFile.path !== path ? [...activeFile.history.slice(-19), activeFile.path] : (activeFile?.history ?? []);
+    const { activeFile, rightPanel, previewId, returnToPreviewId } = get();
+    const prevEntry: FileHistoryEntry | undefined =
+      activeFile && activeFile.path !== path
+        ? {
+            path: activeFile.path,
+            ...(activeFile.line !== undefined ? { line: activeFile.line } : {}),
+            ...(activeFile.endLine !== undefined ? { endLine: activeFile.endLine } : {}),
+            ...(activeFile.scrollTop !== undefined ? { scrollTop: activeFile.scrollTop } : {}),
+          }
+        : undefined;
+    const history = prevEntry ? [...activeFile!.history.slice(-19), prevEntry] : (activeFile?.history ?? []);
+    const nextReturnPreview = rightPanel === "subsession" ? previewId : returnToPreviewId;
     closePreview();
     set({
       rightPanel: "files",
-      filesView: "file",
+      returnToPreviewId: nextReturnPreview,
       activeFile: {
         path,
         ...(range?.line !== undefined ? { line: range.line } : {}),
@@ -591,22 +495,42 @@ export const actions = {
     });
   },
 
+  setActiveFileScrollTop(scrollTop: number): void {
+    const { activeFile } = get();
+    if (!activeFile) return;
+    set({ activeFile: { ...activeFile, scrollTop } });
+  },
+
   backFilePreview(): void {
     const { activeFile } = get();
-    if (!activeFile?.history.length) {
-      set({ filesView: "tree" });
-      return;
-    }
+    if (!activeFile?.history.length) return;
     const previous = activeFile.history[activeFile.history.length - 1]!;
     set({
-      filesView: "file",
-      activeFile: { path: previous, history: activeFile.history.slice(0, -1) },
+      activeFile: {
+        path: previous.path,
+        ...(previous.line !== undefined ? { line: previous.line } : {}),
+        ...(previous.endLine !== undefined ? { endLine: previous.endLine } : {}),
+        ...(previous.scrollTop !== undefined ? { scrollTop: previous.scrollTop } : {}),
+        history: activeFile.history.slice(0, -1),
+      },
     });
   },
 
   openReplyReview(sessionId: string, changes: FileChange[], path: string): void {
+    const { rightPanel, previewId, returnToPreviewId } = get();
+    const nextReturnPreview = rightPanel === "subsession" ? previewId : returnToPreviewId;
     closePreview();
-    set({ rightPanel: "review", replyReview: { sessionId, changes, path } });
+    set({ rightPanel: "review", replyReview: { sessionId, changes, path }, returnToPreviewId: nextReturnPreview });
+  },
+
+  returnToSubsession(): void {
+    const target = get().returnToPreviewId;
+    if (!target || !get().sessions[target]) {
+      set({ returnToPreviewId: undefined });
+      return;
+    }
+    set({ returnToPreviewId: undefined });
+    actions.previewSubsession(target);
   },
 
   selectReplyReviewPath(path: string): void {
@@ -617,56 +541,38 @@ export const actions = {
 
   closeRightPanel(): void {
     if (get().previewId) closePreview();
-    else set({ rightPanel: undefined, replyReview: undefined });
+    else set({ rightPanel: undefined, replyReview: undefined, returnToPreviewId: undefined });
   },
 
-  getScrollTop(sessionId: string): number | undefined {
-    return scrollPositions.get(sessionId);
-  },
+  getScrollTop: (sessionId: string) => viewCache.getScrollTop(sessionId),
+  setScrollTop: (sessionId: string, scrollTop: number | undefined) => viewCache.setScrollTop(sessionId, scrollTop),
 
-  setScrollTop(sessionId: string, scrollTop: number | undefined): void {
-    if (scrollTop === undefined) {
-      scrollPositions.delete(sessionId);
-      return;
-    }
-    if (!Number.isFinite(scrollTop) || scrollTop < 0) return;
-    if (scrollPositions.has(sessionId)) scrollPositions.delete(sessionId);
-    scrollPositions.set(sessionId, scrollTop);
-    if (scrollPositions.size > MAX_SCROLL_POSITIONS) {
-      const oldest = scrollPositions.keys().next().value;
-      if (oldest !== undefined) scrollPositions.delete(oldest);
-    }
-  },
-
-  /** Shows the new-session composer, optionally for one project. */
   startNew(projectId?: string): void {
-    if (projectId) actions.setNewSession({ projectId });
+    if (projectId) setNewSession({ projectId });
     actions.select(undefined);
   },
 
-  setNewSession(patch: Partial<NewSessionOptions>): void {
-    const next = { ...get().newSession, ...patch };
-    set({ newSession: next });
-    localStorage.setItem(NEW_SESSION_KEY, JSON.stringify(next));
-  },
+  setNewSession,
 
-  /** An attachment read can finish after the composer moved into the created session. */
   captureDraftTarget(key: string): () => string {
     const target = key === NEW_DRAFT ? newDraftTarget : { key };
     return () => target.key;
   },
 
   setDraft(key: string, text: string): void {
-    set((state) => ({ drafts: { ...state.drafts, [key]: text } }));
+    const drafts = { ...get().drafts, [key]: text };
+    set({ drafts });
+    persistDrafts(drafts);
   },
 
   mentionFileInDraft(path: string): void {
     const state = get();
     const key = state.selectedId ?? NEW_DRAFT;
     const current = state.drafts[key] ?? "";
-    const mention = `@${path}`;
     const spacer = current && !/\s$/.test(current) ? " " : "";
-    set({ drafts: { ...state.drafts, [key]: `${current}${spacer}${mention} ` } });
+    const drafts = { ...state.drafts, [key]: `${current}${spacer}@${path} ` };
+    set({ drafts });
+    persistDrafts(drafts);
   },
 
   bumpWorkspaceRefresh(): void {
@@ -685,22 +591,28 @@ export const actions = {
   },
 
   setPaletteOpen(open: boolean): void {
-    set({ paletteOpen: open });
-  },
-
-  setResourcesOpen(open: boolean): void {
-    set({ resourcesOpen: open });
-  },
-
-  setGitChangeCount(projectId: string, count: number | undefined): void {
     set((state) => ({
-      gitChangeCounts: { ...state.gitChangeCounts, [projectId]: count },
+      paletteOpen: open,
+      ...(open && state.settingsOpen ? { settingsOpen: false } : {}),
     }));
   },
 
-  retryModels: loadModels,
+  reconnectNow(): void {
+    client.reconnectNow();
+  },
 
-  retrySession(sessionId: string): void {
+  setGitChangeCount(projectId: string, count: number | undefined): void {
+    set((state) => ({ gitChangeCounts: { ...state.gitChangeCounts, [projectId]: count } }));
+  },
+
+  retryModels: () => loadModels(true),
+
+  async retrySession(sessionId: string): Promise<void> {
+    if (get().views[sessionId]?.state?.access === "failed") {
+      const ok = await attempt(() => client.call({ type: "session.retry", sessionId }));
+      if (ok) toast.success("正在重新初始化会话");
+      return;
+    }
     if (get().previewId === sessionId) void openSession(sessionId, "preview");
     else if (get().selectedId === sessionId) void openSession(sessionId);
   },
@@ -726,10 +638,7 @@ export const actions = {
         .filter((session) => session.projectId === projectId)
         .map((session) => session.id),
     );
-    for (let i = recentViews.length - 1; i >= 0; i--) {
-      if (removedSessionIds.has(recentViews[i]!)) recentViews.splice(i, 1);
-    }
-    for (const id of removedSessionIds) scrollPositions.delete(id);
+    viewCache.removeMany(removedSessionIds);
     const wasSelected = state.selectedId !== undefined && removedSessionIds.has(state.selectedId);
     const remainingProjects = state.projects.filter((project) => project.id !== projectId);
     const nextNewSession =
@@ -755,19 +664,19 @@ export const actions = {
         draftImages,
         sendingDrafts,
         newSession: nextNewSession,
-        ...(wasSelected ? { selectedId: undefined, resourcesOpen: false, rightPanel: undefined, activeFile: undefined } : {}),
+        ...(wasSelected ? { selectedId: undefined, rightPanel: undefined, activeFile: undefined } : {}),
       };
     });
     if (wasSelected) {
-      localStorage.removeItem(SELECTED_KEY);
+      safeLocalRemove(SELECTED_KEY);
       closePreview();
       unwatchSession("main");
     }
-    if (nextNewSession !== state.newSession) localStorage.setItem(NEW_SESSION_KEY, JSON.stringify(nextNewSession));
+    if (nextNewSession !== state.newSession) safeLocalSet(NEW_SESSION_KEY, JSON.stringify(nextNewSession));
+    persistDrafts(get().drafts);
     return true;
   },
 
-  /** Creates a session, then hands the next draft to it while the submitted one waits for acceptance. */
   async createAndPrompt(projectId: string, modelId: string, thinkingLevel?: ThinkingLevel): Promise<void> {
     const { approvalMode } = get().newSession;
     const submitted = beginDraftSubmission(NEW_DRAFT);
@@ -801,15 +710,19 @@ export const actions = {
       };
     });
     if (followSession) {
-      localStorage.setItem(SELECTED_KEY, session.id);
+      safeLocalSet(SELECTED_KEY, session.id);
       if (get().connection === "connected") await openSession(session.id);
     }
+    persistDrafts(get().drafts);
     await sendDraftContents(session.id, submitted);
   },
 
   async sendDraft(sessionId: string, mode?: DeliveryMode): Promise<void> {
     const draft = beginDraftSubmission(sessionId);
-    if (draft) await sendDraftContents(sessionId, draft, mode);
+    if (draft) {
+      persistDrafts(get().drafts);
+      await sendDraftContents(sessionId, draft, mode);
+    }
   },
 
   async continueSubsession(sessionId: string): Promise<void> {
@@ -819,6 +732,37 @@ export const actions = {
     const { session } = result;
     set((state) => withSessions({ ...state.sessions, [session.id]: session }));
     if (selectionVersion === version) actions.select(session.id);
+  },
+
+  async forkFromMessage(sessionId: string, itemId: string): Promise<boolean> {
+    const version = selectionVersion;
+    const result = await attempt(() => client.call({ type: "session.fork", sessionId, itemId }));
+    if (!result) return false;
+    const { session } = result;
+    set((state) => withSessions({ ...state.sessions, [session.id]: session }));
+    if (selectionVersion === version) actions.select(session.id);
+    toast.success("已分叉出新会话");
+    return true;
+  },
+
+  async updateQueue(
+    sessionId: string,
+    action: "remove" | "promote" | "clear",
+    kind?: "steering" | "followUp",
+    index?: number,
+  ): Promise<boolean> {
+    const result = await attempt(() =>
+      client.call({
+        type: "session.queue.update",
+        sessionId,
+        action,
+        ...(kind ? { kind } : {}),
+        ...(index !== undefined ? { index } : {}),
+      }),
+    );
+    if (!result) return false;
+    setView(sessionId, (view) => ({ ...view, state: result.state }));
+    return true;
   },
 
   async prompt(sessionId: string, text: string, images: ImageInput[] = [], mode?: "steer" | "followUp"): Promise<boolean> {
@@ -862,11 +806,13 @@ export const actions = {
 
   async reload(sessionId: string): Promise<boolean> {
     const done = (await attempt(() => client.call({ type: "session.reload", sessionId }))) !== undefined;
-    if (done) toast.success("已重新加载技能、扩展和 MCP");
+    if (done) {
+      set((state) => ({ commandsRefreshSeq: state.commandsRefreshSeq + 1, settingsDirty: { mcp: false, memory: false, capabilities: false } }));
+      toast.success("已重新加载技能、扩展和 MCP");
+    }
     return done;
   },
 
-  /** Moves the session back to before a user message; its text and images go back into the composer. */
   async rewind(sessionId: string, itemId: string, images: ImageInput[] = []): Promise<boolean> {
     const result = await attempt(() => client.call({ type: "session.rewind", sessionId, itemId }));
     if (!result) return false;
@@ -879,16 +825,12 @@ export const actions = {
     await attempt(() => client.call({ type: "session.respond", sessionId, pendingId, answer }));
   },
 
-  async commands(projectId: string, sessionId?: string): Promise<SlashCommand[]> {
+  async commands(projectId: string, sessionId?: string): Promise<SlashCommand[] | undefined> {
     try {
       return (await client.call({ type: "commands.list", projectId, ...(sessionId ? { sessionId } : {}) })).commands;
     } catch {
-      return [];
+      return undefined;
     }
-  },
-
-  async resources(sessionId: string) {
-    return (await client.call({ type: "session.resources", sessionId })).resources;
   },
 
   async searchFiles(projectId: string, query: string): Promise<string[]> {

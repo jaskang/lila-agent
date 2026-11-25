@@ -11,6 +11,7 @@ let core: Core;
 beforeAll(async () => {
   // Keep the user's Pi configuration and sessions out of the test.
   process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "lila-agent-dir-"));
+  process.env.PI_OFFLINE = "1";
   core = await startCore({ port: 0, dataDir: mkdtempSync(join(tmpdir(), "lila-core-")), token: "secret" });
 });
 
@@ -290,3 +291,209 @@ test("lists project files and reads in-project markdown while blocking out-of-pr
     client.ws.close();
   }
 });
+
+test("reads and updates Pi settings and runs interactive API key login/logout", async () => {
+  const client = await connect();
+  try {
+    const initial = await client.call({ type: "settings.get", requestId: "s-get-1" });
+    expect(initial.settings.paths.agentDir).toBe(process.env.PI_CODING_AGENT_DIR);
+
+    const updated = await client.call({
+      type: "settings.update",
+      requestId: "s-upd",
+      defaultThinkingLevel: "high",
+      autoCompaction: false,
+      autoRetry: false,
+    });
+    expect(updated.settings).toMatchObject({ defaultThinkingLevel: "high", autoCompaction: false, autoRetry: false });
+
+    const { providers } = await client.call({ type: "providers.list", requestId: "p-list-1" });
+    const apiKeyProvider = providers.find((provider) => provider.id === "anthropic" && provider.supportsApiKey) ?? providers.find((provider) => provider.supportsApiKey);
+    expect(apiKeyProvider).toBeDefined();
+
+    const { loginId } = await client.call({
+      type: "auth.login.start",
+      requestId: "auth-start",
+      providerId: apiKeyProvider!.id,
+      method: "api_key",
+    });
+
+    const promptFrame = await client.until((message) => message.type === "auth.login" && message.loginId === loginId && message.event.type === "prompt");
+    expect(promptFrame.type === "auth.login" && promptFrame.event.type === "prompt").toBe(true);
+    if (promptFrame.type !== "auth.login" || promptFrame.event.type !== "prompt") throw new Error("unreachable");
+
+    await client.call({
+      type: "auth.login.respond",
+      requestId: "auth-resp",
+      loginId,
+      promptId: promptFrame.event.prompt.promptId,
+      value: "test-api-key-12345",
+    });
+
+    const doneFrame = await client.until((message) => message.type === "auth.login" && message.loginId === loginId && (message.event.type === "done" || message.event.type === "error"));
+    expect(doneFrame.type === "auth.login" && doneFrame.event.type).toBe("done");
+
+    const afterLogin = await client.call({ type: "providers.list", requestId: "p-list-2" });
+    const loggedIn = afterLogin.providers.find((provider) => provider.id === apiKeyProvider!.id);
+    expect(loggedIn?.configured).toBe(true);
+    expect(loggedIn?.storedType).toBe("api_key");
+
+    const listedModels = await client.call({ type: "models.list", requestId: "m-list-1" });
+    const providerModels = listedModels.models.filter((item) => item.provider === apiKeyProvider!.id);
+    expect(providerModels.length).toBeGreaterThan(1);
+    const picked = providerModels[0]!;
+    const filtered = await client.call({
+      type: "provider.models.set",
+      requestId: "p-models-set-1",
+      providerId: apiKeyProvider!.id,
+      modelIds: [picked.id],
+    });
+    const filteredProviderModels = filtered.models.filter((item) => item.provider === apiKeyProvider!.id);
+    expect(filteredProviderModels.filter((item) => item.enabled).map((item) => item.id)).toEqual([picked.id]);
+
+    const restored = await client.call({
+      type: "provider.models.set",
+      requestId: "p-models-set-2",
+      providerId: apiKeyProvider!.id,
+      modelIds: null,
+    });
+    const restoredProviderModels = restored.models.filter((item) => item.provider === apiKeyProvider!.id);
+    expect(restoredProviderModels.every((item) => item.enabled)).toBe(true);
+
+    await client.call({ type: "auth.logout", requestId: "auth-logout", providerId: apiKeyProvider!.id });
+    const afterLogout = await client.call({ type: "providers.list", requestId: "p-list-3" });
+    const loggedOut = afterLogout.providers.find((provider) => provider.id === apiKeyProvider!.id);
+    expect(loggedOut?.storedType).toBeUndefined();
+  } finally {
+    client.ws.close();
+  }
+}, 30_000);
+
+test("manages global and project MCP servers and reads capabilities snapshot", async () => {
+  const client = await connect();
+  const projectDir = mkdtempSync(join(tmpdir(), "lila-mcp-proj-"));
+  writeFileSync(join(projectDir, "AGENTS.md"), "# Project context\n");
+  try {
+    const { project } = await client.call({ type: "projects.add", requestId: "mcp-proj", path: projectDir });
+
+    const addedGlobal = await client.call({
+      type: "mcp.upsert",
+      requestId: "mcp-add-1",
+      scope: "global",
+      projectId: project.id,
+      name: "docs",
+      config: { transport: "http", url: "https://example.com/mcp", description: "文档服务" },
+    });
+    expect(addedGlobal.config.servers).toContainEqual(
+      expect.objectContaining({ name: "docs", scope: "global", transport: "http", url: "https://example.com/mcp", enabled: true, exposure: "codemode" }),
+    );
+
+    const addedProject = await client.call({
+      type: "mcp.upsert",
+      requestId: "mcp-add-2",
+      scope: "project",
+      projectId: project.id,
+      name: "fs",
+      config: { transport: "stdio", command: "npx", args: ["-y", "demo-mcp"], exposure: "direct" },
+    });
+    expect(addedProject.config.servers).toContainEqual(
+      expect.objectContaining({ name: "fs", scope: "project", transport: "stdio", command: "npx", args: ["-y", "demo-mcp"], exposure: "direct" }),
+    );
+
+    const toggled = await client.call({
+      type: "mcp.toggle",
+      requestId: "mcp-toggle",
+      scope: "global",
+      projectId: project.id,
+      name: "docs",
+      enabled: false,
+      exposure: "deferred",
+    });
+    expect(toggled.config.servers.find((item) => item.name === "docs")).toMatchObject({ enabled: false, exposure: "deferred" });
+
+    const removed = await client.call({
+      type: "mcp.remove",
+      requestId: "mcp-remove",
+      scope: "global",
+      projectId: project.id,
+      name: "docs",
+    });
+    expect(removed.config.servers.some((item) => item.name === "docs")).toBe(false);
+
+    const { capabilities } = await client.call({ type: "capabilities.get", requestId: "cap-get", projectId: project.id });
+    expect(capabilities.agentDir).toBe(process.env.PI_CODING_AGENT_DIR);
+    expect(capabilities.contextFiles.some((file) => file.endsWith("AGENTS.md"))).toBe(true);
+  } finally {
+    client.ws.close();
+  }
+}, 30_000);
+
+test("manages persistent memory entries, config, and registers built-in pi-memory extension", async () => {
+  const client = await connect();
+  const projectDir = mkdtempSync(join(tmpdir(), "lila-memory-proj-"));
+  try {
+    const { project } = await client.call({ type: "projects.add", requestId: "mem-proj", path: projectDir });
+
+    const initial = await client.call({ type: "memory.get", requestId: "mem-get-1", projectId: project.id });
+    expect(initial.memory.enabled).toBe(true);
+    expect(initial.memory.dir).toBe(join(process.env.PI_CODING_AGENT_DIR!, "memories"));
+    expect(initial.memory.memory.entries).toEqual([]);
+    expect(initial.memory.user.entries).toEqual([]);
+
+    const added = await client.call({
+      type: "memory.add",
+      requestId: "mem-add-1",
+      target: "user",
+      content: "使用中文回复并优先使用 Bun",
+    });
+    expect(added.memory.user.entries).toEqual(["使用中文回复并优先使用 Bun"]);
+    expect(added.memory.user.charCount).toBeGreaterThan(0);
+
+    const replaced = await client.call({
+      type: "memory.replace",
+      requestId: "mem-rep-1",
+      target: "user",
+      oldText: "优先使用 Bun",
+      newContent: "始终使用中文回复，包管理统一用 Bun",
+    });
+    expect(replaced.memory.user.entries).toEqual(["始终使用中文回复，包管理统一用 Bun"]);
+
+    const updatedCfg = await client.call({
+      type: "memory.config.update",
+      requestId: "mem-cfg-1",
+      memoryCharLimit: 3200,
+      userCharLimit: 1800,
+      dreamingEnabled: false,
+      dreamingMinHours: 12,
+      dreamingMinTurns: 8,
+    });
+    expect(updatedCfg.memory.memory.charLimit).toBe(3200);
+    expect(updatedCfg.memory.user.charLimit).toBe(1800);
+    expect(updatedCfg.memory.dreaming).toMatchObject({
+      enabled: false,
+      minHoursSinceLastRun: 12,
+      minTurnsSinceLastRun: 8,
+    });
+
+    const { commands } = await client.call({ type: "commands.list", requestId: "mem-cmds", projectId: project.id });
+    expect(commands.some((cmd) => cmd.name === "memory")).toBe(true);
+
+    // Open a real session to verify the built-in pi-memory extension loads the saved USER.md snapshot on startup.
+    const { session } = await client.call({ type: "session.create", requestId: "mem-sess", projectId: project.id });
+    await client.call({ type: "session.open", requestId: "mem-open", sessionId: session.id });
+    const readyState = await client.until(
+      (message) => message.type === "state" && message.sessionId === session.id && message.state.access === "ready",
+    );
+    expect(readyState.type === "state" && readyState.state.statusLines["pi-memory"]).toBe("memory: loaded");
+
+    const removed = await client.call({
+      type: "memory.remove",
+      requestId: "mem-rm-1",
+      target: "user",
+      oldText: "统一用 Bun",
+    });
+    expect(removed.memory.user.entries).toEqual([]);
+  } finally {
+    client.ws.close();
+  }
+}, 30_000);

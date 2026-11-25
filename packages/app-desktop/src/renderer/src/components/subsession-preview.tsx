@@ -1,6 +1,7 @@
 import * as React from "react";
 import { ArrowUpRight, X } from "lucide-react";
 import type { SessionState } from "@lila/protocol";
+import { IconButton } from "@/components/icon-button";
 import { MarkdownBasePathProvider } from "@/components/markdown";
 import type { ChangeSelection } from "@/components/reply-changes";
 import { TranscriptBlocks } from "@/components/transcript-blocks";
@@ -13,16 +14,17 @@ import { layoutTranscript } from "@/lib/transcript-layout";
 export function SubsessionActions({ sessionId, state }: { sessionId: string; state: SessionState | undefined }) {
   const connected = useLila((store) => store.connection === "connected");
   const [forking, setForking] = React.useState(false);
+  const running = state?.status === "running";
   return (
-    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-muted/30 px-3 py-2 text-sm">
-      <p role="status" className="text-muted-foreground">
-        {state?.status === "running" ? "子 Agent 正在运行，记录会自动更新。" : "这是子 Agent 的只读记录。"}
-      </p>
+    <div className="flex items-center justify-between gap-2 border-t border-border/60 pt-2.5 text-xs">
+      <span role="status" className="text-muted-foreground">
+        {running ? "运行中…" : ""}
+      </span>
       <Button
         type="button"
         size="sm"
         variant="outline"
-        disabled={!connected || state?.access !== "read-only" || state.status === "running" || forking}
+        disabled={!connected || state?.access !== "read-only" || running || forking}
         onClick={() => {
           setForking(true);
           void actions.continueSubsession(sessionId).finally(() => setForking(false));
@@ -61,13 +63,33 @@ export function SubsessionPreview({ sessionId }: { sessionId: string }) {
     }
   }
 
+  const modelShort = view.state?.modelId?.split("/").at(-1);
+  const statusText =
+    view.state?.status === "running"
+      ? "运行中"
+      : view.state?.status === "error"
+        ? "出错"
+        : view.state?.status === "waiting"
+          ? "待处理"
+          : undefined;
+  const meta = [statusText, modelShort, view.state?.cost ? `$${view.state.cost.toFixed(4)}` : undefined].filter(Boolean).join(" · ");
+
   return (
     <MarkdownBasePathProvider value={projectPath}>
       <div aria-labelledby={headingId} className="flex min-h-0 flex-1 flex-col">
-        <header className="flex h-11 shrink-0 items-center gap-1 border-b border-border/60 px-3">
-          <h2 id={headingId} className="min-w-0 flex-1 truncate text-sm font-medium" title={session?.title}>{session?.title ?? "子 Agent"}</h2>
-          <Button type="button" size="icon-sm" variant="ghost" aria-label="在主对话区打开子会话" title="在主对话区打开" onClick={() => actions.select(sessionId)}><ArrowUpRight /></Button>
-          <Button ref={closeButton} type="button" size="icon-sm" variant="ghost" aria-label="关闭子会话预览" onClick={close}><X /></Button>
+        <header className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border/60 px-3">
+          <div className="flex min-w-0 flex-1 flex-col">
+            <h2 id={headingId} className="truncate text-sm font-medium" title={session?.title}>
+              {session?.title ?? "子 Agent"}
+            </h2>
+            {meta ? <span className="truncate font-mono text-[10px] text-muted-foreground tabular-nums">{meta}</span> : null}
+          </div>
+          <IconButton label="在主对话区打开" onClick={() => actions.select(sessionId)}>
+            <ArrowUpRight />
+          </IconButton>
+          <IconButton buttonRef={closeButton} label="关闭预览" onClick={close}>
+            <X />
+          </IconButton>
         </header>
         {view.state ? (
           <MessageScrollerProvider key={sessionId} autoScroll defaultScrollPosition="end" scrollEdgeThreshold={24}>
@@ -76,11 +98,11 @@ export function SubsessionPreview({ sessionId }: { sessionId: string }) {
                 <MessageScrollerContent className="gap-2.5 px-3 pt-3 pb-7">
                   {view.hasEarlier ? (
                     <Button type="button" variant="ghost" size="sm" className="self-center" disabled={view.loadingEarlier} onClick={() => void actions.loadEarlier(sessionId)}>
-                      {view.loadingEarlier ? "正在加载更早消息…" : "加载更早消息"}
+                      {view.loadingEarlier ? "正在加载…" : "加载更早消息"}
                     </Button>
                   ) : null}
                   <TranscriptBlocks blocks={blocks} sessionId={sessionId} running={false} onReview={handleReview} />
-                  {!blocks.length ? <p className="text-sm text-muted-foreground">还没有子任务记录。</p> : null}
+                  {!blocks.length ? <p className="text-sm text-muted-foreground">暂无记录</p> : null}
                 </MessageScrollerContent>
               </MessageScrollerViewport>
               <MessageScrollerButton />
@@ -91,12 +113,19 @@ export function SubsessionPreview({ sessionId }: { sessionId: string }) {
             {view.error && !view.loading ? (
               <>
                 <p className="break-words">{view.error}</p>
-                <Button type="button" variant="outline" size="sm" disabled={!connected} onClick={() => actions.retrySession(sessionId)}>重试</Button>
+                <Button type="button" variant="outline" size="sm" disabled={!connected} onClick={() => actions.retrySession(sessionId)}>
+                  重试
+                </Button>
               </>
-            ) : <><Spinner aria-hidden />{connected ? "正在打开子会话…" : "等待重新连接…"}</>}
+            ) : (
+              <>
+                <Spinner aria-hidden />
+                {connected ? "正在加载…" : "等待重连…"}
+              </>
+            )}
           </div>
         )}
-        <div className="shrink-0 p-3">
+        <div className="shrink-0 px-3 pb-3">
           <SubsessionActions sessionId={sessionId} state={view.state} />
         </div>
       </div>

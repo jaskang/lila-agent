@@ -1,10 +1,8 @@
-import { join } from "node:path";
 import type {
   AgentSession,
   AgentSessionEvent,
   AgentSessionServices,
   ExtensionUIDialogOptions,
-  ToolInfo,
 } from "@earendil-works/pi-coding-agent";
 import type {
   ClientCommand,
@@ -12,7 +10,6 @@ import type {
   PendingRequest,
   RunStatus,
   ServerMessage,
-  SessionResources,
   SessionState,
   SessionStatus,
   SessionSummary,
@@ -130,6 +127,7 @@ export class LiveSession implements LilaBridge {
   readonly #store: Store;
   readonly #clients: Clients;
   readonly #onReload?: () => void;
+  readonly #onProviderResponse?: (providerId: string | undefined, status: number, headers: Record<string, string>) => void;
   readonly #pending: PendingBridge;
   readonly #subagents: SubagentTracker;
   #session!: AgentSession;
@@ -161,12 +159,14 @@ export class LiveSession implements LilaBridge {
     clients: Clients;
     onReload?: () => void;
     onSubsessionsChanged?: () => void;
+    onProviderResponse?: (providerId: string | undefined, status: number, headers: Record<string, string>) => void;
   }) {
     this.id = options.id;
     this.projectId = options.projectId;
     this.#store = options.store;
     this.#clients = options.clients;
     this.#onReload = options.onReload;
+    this.#onProviderResponse = options.onProviderResponse;
     this.#pending = new PendingBridge({
       onPendingChanged: () => {
         this.touch();
@@ -195,6 +195,10 @@ export class LiveSession implements LilaBridge {
 
   get services(): AgentSessionServices {
     return this.#services;
+  }
+
+  get access(): SessionState["access"] {
+    return this.#access;
   }
 
   get approvalMode() {
@@ -433,18 +437,23 @@ export class LiveSession implements LilaBridge {
     this.#session.compact().catch((error: unknown) => this.#notify("error", `压缩失败：${errorMessage(error)}`));
   }
 
+  findUserEntryId(itemId: string): string | undefined {
+    const parsed = parseUserItemId(itemId);
+    if (!parsed) return undefined;
+    let seen = 0;
+    const entry = this.#session.sessionManager.getBranch().find((candidate) => {
+      if (candidate.type !== "message" || candidate.message.role !== "user" || candidate.message.timestamp !== parsed.timestamp) return false;
+      return ++seen === parsed.occurrence;
+    });
+    return entry?.type === "message" ? entry.id : undefined;
+  }
+
   async rewind(itemId: string): Promise<string> {
     this.#requireReady();
     const session = this.#session;
     if (session.isStreaming || session.isCompacting) throw new UserError("请先停止当前回复再回退");
-    const parsed = parseUserItemId(itemId);
-    let seen = 0;
-    const entry = parsed
-      ? session.sessionManager.getBranch().find((candidate) => {
-          if (candidate.type !== "message" || candidate.message.role !== "user" || candidate.message.timestamp !== parsed.timestamp) return false;
-          return ++seen === parsed.occurrence;
-        })
-      : undefined;
+    const entryId = this.findUserEntryId(itemId);
+    const entry = entryId ? session.sessionManager.getBranch().find((candidate) => candidate.id === entryId) : undefined;
     if (!entry || entry.type !== "message") throw new UserError("找不到这条消息，可能已经不在当前分支上");
     const result = await session.navigateTree(entry.id);
     if (result.cancelled) throw new UserError("回退被扩展取消了");
@@ -452,6 +461,35 @@ export class LiveSession implements LilaBridge {
     this.#clients.toWatchers(this.id, { type: "reset", sessionId: this.id });
     this.#pushState();
     return displayUserText(result.editorText ?? contentText((entry.message as UserMessage).content));
+  }
+
+  async updateQueue(action: "remove" | "promote" | "clear", kind?: "steering" | "followUp", index?: number): Promise<SessionState> {
+    this.#requireReady();
+    this.touch();
+    const session = this.#session;
+    const cleared = session.clearQueue();
+    let steering = [...cleared.steering];
+    let followUp = [...cleared.followUp];
+
+    if (action === "clear") {
+      if (kind === "steering") steering = [];
+      else if (kind === "followUp") followUp = [];
+      else {
+        steering = [];
+        followUp = [];
+      }
+    } else if (action === "remove" && kind && index !== undefined) {
+      if (kind === "steering" && index >= 0 && index < steering.length) steering.splice(index, 1);
+      if (kind === "followUp" && index >= 0 && index < followUp.length) followUp.splice(index, 1);
+    } else if (action === "promote" && index !== undefined && index >= 0 && index < followUp.length) {
+      const [promoted] = followUp.splice(index, 1);
+      if (promoted !== undefined) steering.push(promoted);
+    }
+
+    for (const text of steering) await session.steer(text);
+    for (const text of followUp) await session.followUp(text);
+    this.#pushState();
+    return this.state();
   }
 
   respond(pendingId: string, answer: PendingAnswer): void {
@@ -464,40 +502,26 @@ export class LiveSession implements LilaBridge {
     return slashCommands(extensionCommands, session.promptTemplates, session.resourceLoader.getSkills().skills);
   }
 
-  resources(): SessionResources {
-    const session = this.#session;
-    const loader = session.resourceLoader;
-    const { cwd, agentDir } = this.#services;
-    const extensions = loader.getExtensions();
-    const skills = loader.getSkills();
-    const prompts = loader.getPrompts();
-    const active = new Set(session.getActiveToolNames());
-    return {
-      cwd,
-      agentDir,
-      mcpConfigPaths: [join(agentDir, "mcp.json"), join(cwd, ".pi", "mcp.json")],
-      skills: skills.skills.map((skill) => ({ name: skill.name, description: skill.description, path: skill.filePath, scope: skill.sourceInfo.scope })),
-      prompts: prompts.prompts.map((prompt) => ({ name: prompt.name, description: prompt.description, path: prompt.filePath })),
-      extensions: extensions.extensions
-        .filter((extension) => !extension.hidden)
-        .map((extension) => ({ path: extension.path, tools: [...extension.tools.keys()], commands: [...extension.commands.keys()] })),
-      tools: session.getAllTools().map((tool) => ({ name: tool.name, description: tool.description, source: toolSource(tool), active: active.has(tool.name) })),
-      contextFiles: loader.getAgentsFiles().agentsFiles.map((file) => file.path),
-      diagnostics: [
-        ...this.#services.diagnostics.map((diagnostic) => diagnostic.message),
-        ...extensions.errors.map((error) => `${error.path}: ${error.error}`),
-        ...skills.diagnostics.map((diagnostic) => diagnostic.message),
-        ...prompts.diagnostics.map((diagnostic) => diagnostic.message),
-      ],
-    };
-  }
-
   async reload(): Promise<void> {
     this.#requireReady();
     if (this.#session.isStreaming || this.#session.isCompacting) throw new UserError("请等当前回复结束后再重新加载");
     await this.#session.reload();
     this.#onReload?.();
     this.#pushState();
+  }
+
+  async reloadIfIdle(): Promise<boolean> {
+    if (this.#disposed || this.#access !== "ready" || this.#session.isStreaming || this.#session.isCompacting) return false;
+    await this.#session.reload();
+    this.#onReload?.();
+    this.#pushState();
+    return true;
+  }
+
+  async refreshSettingsAndAuth(): Promise<void> {
+    if (this.#disposed) return;
+    await this.#services.settingsManager.reload().catch(() => undefined);
+    await this.#services.modelRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
   }
 
   async dispose(): Promise<void> {
@@ -530,6 +554,10 @@ export class LiveSession implements LilaBridge {
   onSubagentEvent(event: SubagentBusEvent): void {
     this.touch();
     this.#subagents.onEvent(event);
+  }
+
+  onProviderResponse(providerId: string | undefined, status: number, headers: Record<string, string>): void {
+    this.#onProviderResponse?.(providerId, status, headers);
   }
 
   // -------------------------------------------------------------------------
@@ -786,9 +814,4 @@ export class LiveSession implements LilaBridge {
         break;
     }
   }
-}
-
-function toolSource(tool: ToolInfo): string {
-  const mcp = tool.namespace?.name.replace(/^mcp__/, "") ?? /^mcp__(.+?)__/.exec(tool.name)?.[1];
-  return mcp ?? tool.sourceInfo.source;
 }

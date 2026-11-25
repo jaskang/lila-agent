@@ -4,7 +4,7 @@ import { cn } from "cn";
 const WIDTH_STORAGE_KEY = "lila.rightPanelWidth";
 const DEFAULT_WIDTH_PCT = 44;
 const MIN_WIDTH_PCT = 26;
-const MAX_WIDTH_PCT = 64;
+const MAX_WIDTH_PCT = 70;
 const TRANSITION_MS = 220;
 
 function readWidthPct(): number {
@@ -179,7 +179,7 @@ export function RightPanelShell({
           )}
           onKeyDown={(event) => {
             if (event.key !== "Escape" || event.defaultPrevented || !event.currentTarget.contains(event.target as Node)) return;
-            if (event.target instanceof HTMLInputElement && event.target.value) return;
+            if ((event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) && event.target.value) return;
             event.stopPropagation();
             onClose();
           }}
