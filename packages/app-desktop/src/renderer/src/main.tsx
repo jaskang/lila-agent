@@ -5,6 +5,10 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App.tsx";
 import { initTheme } from "./lib/theme.ts";
 
+if (window.lila?.windowMaterial === "vibrant") {
+  document.documentElement.dataset.windowMaterial = "vibrant";
+}
+
 initTheme();
 
 const root = document.getElementById("root");

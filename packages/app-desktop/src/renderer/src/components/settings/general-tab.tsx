@@ -1,12 +1,13 @@
 import * as React from "react";
 import { KeyRound, Monitor, Moon, Sun } from "lucide-react";
-import type { ApprovalMode, CoreSettings, ThinkingLevel } from "@lila/protocol";
+import type { CoreSettings, ThinkingLevel } from "@lila/protocol";
+import { ApprovalSelect } from "@/components/session-controls";
 import { SettingsRow, SettingsSection, useGroupedModels } from "@/components/settings/shared";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "cn";
-import { actions, APPROVAL_LABEL, useLila } from "@/lib/store";
+import { actions, useLila } from "@/lib/store";
 import { type ThemeMode, useTheme } from "@/lib/theme";
 
 const THINKING_LEVEL_OPTIONS: Array<{ value: ThinkingLevel; label: string }> = [
@@ -24,8 +25,6 @@ const THEME_OPTIONS: Array<{ value: ThemeMode; label: string; icon: React.Compon
   { value: "light", label: "浅色", icon: Sun },
   { value: "dark", label: "深色", icon: Moon },
 ];
-
-const APPROVAL_MODES = Object.keys(APPROVAL_LABEL) as ApprovalMode[];
 
 export function GeneralTab({
   settings,
@@ -47,6 +46,7 @@ export function GeneralTab({
   const { theme, setTheme } = useTheme();
   const notificationsEnabled = useLila((state) => state.notificationsEnabled);
   const newSession = useLila((state) => state.newSession);
+  const defaultApprovalMode = useLila((state) => state.defaultApprovalMode);
   const models = useLila((state) => state.models);
   const connected = useLila((state) => state.connection === "connected");
 
@@ -113,25 +113,8 @@ export function GeneralTab({
       </SettingsSection>
 
       <SettingsSection title="新会话默认">
-        <SettingsRow title="默认审批">
-          <Select
-            value={newSession.approvalMode}
-            onValueChange={(value) => {
-              if (value) actions.setNewSession({ approvalMode: value as ApprovalMode });
-            }}
-            items={APPROVAL_MODES.map((mode) => ({ value: mode, label: APPROVAL_LABEL[mode] }))}
-          >
-            <SelectTrigger size="sm" className="w-44">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent align="end">
-              {APPROVAL_MODES.map((mode) => (
-                <SelectItem key={mode} value={mode}>
-                  {APPROVAL_LABEL[mode]}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+        <SettingsRow title="默认审批" detail="工具获准后按运行进程的系统权限执行">
+          <ApprovalSelect value={defaultApprovalMode} onChange={actions.setDefaultApprovalMode} label="默认审批" inSettings />
         </SettingsRow>
 
         <SettingsRow title="默认模型">

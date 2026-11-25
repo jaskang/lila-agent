@@ -125,9 +125,10 @@ export function App() {
     const offMenu = window.lila.onMenuAction((action) => {
       if (action === "settings") actions.openSettings();
       else if (action === "new-session") {
-        actions.setSettingsOpen(false);
-        actions.setPaletteOpen(false);
-        actions.startNew();
+        actions.closeSettingsThen(() => {
+          actions.setPaletteOpen(false);
+          actions.startNew();
+        });
       }
     });
     window.addEventListener("keydown", onKey);
@@ -155,7 +156,7 @@ export function App() {
         <AppSidebar />
         <SidebarInset className="relative m-1.5 min-h-0 flex-row overflow-visible bg-transparent shadow-none md:peer-data-[variant=inset]:m-1.5 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-none md:peer-data-[variant=inset]:shadow-none md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-1.5">
           <div ref={workspaceRef} className="relative flex min-h-0 min-w-0 flex-1">
-            <div className="@container relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl bg-background shadow-sm ring-1 ring-border/60">
+            <div data-surface="panel" className="@container relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl bg-workspace-surface shadow-[var(--panel-shadow)] ring-1 ring-[var(--panel-border)]">
               <ConnectionBanner />
               {selectedId ? <Conversation key={selectedId} sessionId={selectedId} /> : <NewSession />}
             </div>

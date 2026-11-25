@@ -1,16 +1,16 @@
 import * as React from "react";
 import { ExternalLink, FileJson, Globe, Pencil, Plus, RotateCw, Terminal, Trash2, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
-import type { McpConfigSnapshot, McpExposure, McpScope, McpServerInput, McpServerItem } from "@lila/protocol";
+import type { McpConfigSnapshot, McpExposure, McpScope, McpServerItem } from "@lila/protocol";
 import { IconButton } from "@/components/icon-button";
 import { McpImportForm, McpServerForm } from "@/components/settings/mcp-form";
 import {
   emptyMcpForm,
   EXPOSURE_OPTIONS,
   mcpFormFromItem,
+  type McpFormErrors,
   type McpFormState,
-  parseArgs,
-  parseKeyValues,
+  parseMcpForm,
   parseMcpJsonImport,
 } from "@/components/settings/mcp-parse";
 import { SettingsSection } from "@/components/settings/shared";
@@ -49,9 +49,11 @@ export function McpSettingsTab({
   const [error, setError] = React.useState<string>();
   const [form, setForm] = React.useState<McpFormState>();
   const [initialFormSnapshot, setInitialFormSnapshot] = React.useState("");
-  const [discardOpen, setDiscardOpen] = React.useState(false);
+  const [formErrors, setFormErrors] = React.useState<McpFormErrors>({});
+  const [formError, setFormError] = React.useState<string>();
   const [importMode, setImportMode] = React.useState(false);
   const [importJson, setImportJson] = React.useState("");
+  const [importError, setImportError] = React.useState<string>();
   const [importScope, setImportScope] = React.useState<McpScope>("global");
   const [importing, setImporting] = React.useState(false);
   const [confirmRemove, setConfirmRemove] = React.useState<McpServerItem>();
@@ -80,17 +82,25 @@ export function McpSettingsTab({
     if (!projectId && importScope === "project") setImportScope("global");
   }, [projectId, importScope]);
 
+  const hasDraft = Boolean(form && JSON.stringify(form) !== initialFormSnapshot) || Boolean(importMode && importJson);
+  const draftStatus = saving || importing ? "saving" : hasDraft ? "dirty" : undefined;
+  React.useLayoutEffect(() => {
+    actions.setSettingsDraftStatus(draftStatus);
+    return () => actions.setSettingsDraftStatus(undefined);
+  }, [draftStatus]);
+
   const openForm = (next: McpFormState) => {
     setForm(next);
     setInitialFormSnapshot(JSON.stringify(next));
+    setFormError(undefined);
+    setFormErrors({});
   };
 
-  const requestCloseForm = () => {
-    if (form && JSON.stringify(form) !== initialFormSnapshot) {
-      setDiscardOpen(true);
-      return;
-    }
-    setForm(undefined);
+  const closeImport = () => {
+    setImportMode(false);
+    setImportJson("");
+    setImportError(undefined);
+    setImportScope("global");
   };
 
   const openFile = (path: string) => {
@@ -102,65 +112,22 @@ export function McpSettingsTab({
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!form || saving) return;
-    const name = form.name.trim();
-    if (!name) {
-      toast.error("请输入名称");
+    setFormError(undefined);
+    const parsed = parseMcpForm(form);
+    if ("errors" in parsed) {
+      setFormErrors(parsed.errors);
       return;
     }
-
-    let input: McpServerInput;
-    if (form.transport === "http") {
-      const url = form.url.trim();
-      if (!url) {
-        toast.error("请输入 URL");
-        return;
-      }
-      const parsedHeaders = parseKeyValues(form.headersText, ":");
-      if (parsedHeaders.invalidLines.length) {
-        toast.error(`请求头第 ${parsedHeaders.invalidLines.join("、")} 行格式有误`);
-        return;
-      }
-      input = {
-        transport: "http",
-        url,
-        ...(parsedHeaders.data ? { headers: parsedHeaders.data } : {}),
-        ...(form.description.trim() ? { description: form.description.trim() } : {}),
-        exposure: form.exposure,
-        enabled: form.enabled,
-      };
-    } else {
-      const command = form.command.trim();
-      if (!command) {
-        toast.error("请输入命令");
-        return;
-      }
-      const args = parseArgs(form.argsText);
-      const parsedEnv = parseKeyValues(form.envText, "=");
-      if (parsedEnv.invalidLines.length) {
-        toast.error(`环境变量第 ${parsedEnv.invalidLines.join("、")} 行格式有误`);
-        return;
-      }
-      input = {
-        transport: "stdio",
-        command,
-        ...(args.length ? { args } : {}),
-        ...(parsedEnv.data ? { env: parsedEnv.data } : {}),
-        ...(form.cwd.trim() ? { cwd: form.cwd.trim() } : {}),
-        ...(form.description.trim() ? { description: form.description.trim() } : {}),
-        exposure: form.exposure,
-        enabled: form.enabled,
-      };
-    }
-
+    setFormErrors({});
     setSaving(true);
+    const { name, config: input } = parsed.entry;
     try {
-      const next = await actions.upsertMcp(form.scope, name, input, projectId);
-      if (next) {
-        setConfig(next);
-        setForm(undefined);
-        actions.setSettingsDirty("mcp", true);
-        toast.success(form.editingKey ? `已更新 ${name}` : `已添加 ${name}`);
-      }
+      setConfig(await actions.upsertMcp(form.scope, name, input, projectId));
+      setForm(undefined);
+      actions.setSettingsDirty("mcp", true);
+      toast.success(form.editingKey ? `已更新 ${name}` : `已添加 ${name}`);
+    } catch (failure) {
+      setFormError(failure instanceof Error ? failure.message : String(failure));
     } finally {
       setSaving(false);
     }
@@ -169,26 +136,16 @@ export function McpSettingsTab({
   const handleImportJson = async (event: React.FormEvent) => {
     event.preventDefault();
     if (importing || !importJson.trim()) return;
-    let items: Array<{ name: string; input: McpServerInput }>;
-    try {
-      items = parseMcpJsonImport(importJson);
-    } catch (failure) {
-      toast.error(failure instanceof Error ? failure.message : String(failure));
-      return;
-    }
+    setImportError(undefined);
     setImporting(true);
     try {
-      let latest: McpConfigSnapshot | undefined;
-      for (const item of items) {
-        latest = await actions.upsertMcp(importScope, item.name, item.input, projectId);
-      }
-      if (latest) {
-        setConfig(latest);
-        actions.setSettingsDirty("mcp", true);
-        setImportMode(false);
-        setImportJson("");
-        toast.success(`已导入 ${items.length} 个服务器`);
-      }
+      const entries = parseMcpJsonImport(importJson);
+      setConfig(await actions.importMcp(importScope, entries, projectId));
+      actions.setSettingsDirty("mcp", true);
+      closeImport();
+      toast.success(`已导入 ${entries.length} 个服务器`);
+    } catch (failure) {
+      setImportError(failure instanceof Error ? failure.message : String(failure));
     } finally {
       setImporting(false);
     }
@@ -242,9 +199,13 @@ export function McpSettingsTab({
         projectId={projectId}
         projectName={projectName}
         importing={importing}
+        error={importError}
         onScopeChange={setImportScope}
-        onJsonChange={setImportJson}
-        onCancel={() => setImportMode(false)}
+        onJsonChange={(value) => {
+          setImportJson(value);
+          setImportError(undefined);
+        }}
+        onCancel={() => actions.requestSettingsNavigation(closeImport)}
         onSubmit={(event) => void handleImportJson(event)}
       />
     );
@@ -252,37 +213,27 @@ export function McpSettingsTab({
 
   if (form) {
     return (
-      <>
-        <McpServerForm
-          form={form}
-          projectId={projectId}
-          projectName={projectName}
-          saving={saving}
-          onChange={setForm}
-          onCancel={requestCloseForm}
-          onSubmit={(event) => void handleSubmit(event)}
-        />
-        <AlertDialog open={discardOpen} onOpenChange={setDiscardOpen}>
-          <AlertDialogContent size="sm">
-            <AlertDialogHeader>
-              <AlertDialogTitle>放弃未保存的更改？</AlertDialogTitle>
-              <AlertDialogDescription>返回后将丢失当前表单内容。</AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>继续编辑</AlertDialogCancel>
-              <AlertDialogAction
-                variant="destructive"
-                onClick={() => {
-                  setDiscardOpen(false);
-                  setForm(undefined);
-                }}
-              >
-                放弃
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
-      </>
+      <McpServerForm
+        form={form}
+        projectId={projectId}
+        projectName={projectName}
+        saving={saving}
+        errors={formErrors}
+        error={formError}
+        onChange={(next) => {
+          setForm(next);
+          setFormError(undefined);
+          setFormErrors((errors) => {
+            const active = { ...errors };
+            for (const field of Object.keys(active) as Array<keyof McpFormErrors>) {
+              if (next[field] !== form[field]) delete active[field];
+            }
+            return active;
+          });
+        }}
+        onCancel={() => actions.requestSettingsNavigation(() => setForm(undefined))}
+        onSubmit={(event) => void handleSubmit(event)}
+      />
     );
   }
 

@@ -1,7 +1,13 @@
 import * as React from "react";
 import { ArrowUp, Clock3, FileText, Paperclip, Puzzle, Sparkles, Square, SquareSlash, X } from "lucide-react";
 import { toast } from "sonner";
-import type { SlashCommand } from "@lila/protocol";
+import {
+  MAX_PROMPT_IMAGE_BASE64_BYTES,
+  MAX_PROMPT_IMAGE_BYTES,
+  MAX_PROMPT_IMAGES,
+  promptImageBytes,
+  type SlashCommand,
+} from "@lila/protocol";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentGroup, AttachmentMedia } from "@/components/ui/attachment";
 import { Command, CommandEmpty, CommandGroup, CommandItem, CommandList } from "@/components/ui/command";
 import { Spinner } from "@/components/ui/spinner";
@@ -9,8 +15,6 @@ import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } fro
 import { cn } from "cn";
 import { actions, type DraftImage, useLila } from "@/lib/store";
 
-const MAX_IMAGES = 10;
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TEXT_BYTES = 200 * 1024;
 const EMPTY_IMAGES: DraftImage[] = [];
 const TEXT_EXTENSIONS =
@@ -74,7 +78,13 @@ function findSuggest(text: string, caret: number, slash: boolean, files: boolean
 }
 
 export function focusComposer(): void {
-  document.querySelector<HTMLTextAreaElement>("textarea[data-composer]")?.focus();
+  const focus = () => document.querySelector<HTMLTextAreaElement>("textarea[data-composer]")?.focus();
+  if (document.querySelector("[data-workspace-sheet][data-open]")) {
+    actions.closeRightPanel();
+    requestAnimationFrame(focus);
+  } else {
+    focus();
+  }
 }
 
 export function Composer({
@@ -241,16 +251,37 @@ export function Composer({
     });
   }
 
+  function imageLimit(usedCount: number, usedBytes: number, size: number): string | undefined {
+    if (usedCount >= MAX_PROMPT_IMAGES) return `单条消息最多添加 ${MAX_PROMPT_IMAGES} 张图片`;
+    const remaining = MAX_PROMPT_IMAGE_BASE64_BYTES - usedBytes;
+    if (size > remaining) {
+      const remainingMiB = Math.max(0, Math.floor(remaining * 0.75 / (1024 * 1024) * 10) / 10);
+      return `图片超出单条消息的附件上限，当前还可添加约 ${remainingMiB} MB`;
+    }
+    return undefined;
+  }
+
   async function addFiles(list: FileList | File[]): Promise<void> {
     const draftTarget = actions.captureDraftTarget(draftKey);
     const incoming = Array.from(list);
     const added: DraftImage[] = [];
     const blocks: string[] = [];
+    const existingImages = () => {
+      const key = draftTarget();
+      const state = useLila.getState();
+      return [...(state.sendingDrafts[key]?.images ?? []), ...(state.draftImages[key] ?? [])];
+    };
     for (const file of incoming) {
       try {
         if (file.type.startsWith("image/")) {
-          if (file.size > MAX_IMAGE_BYTES) {
+          if (file.size > MAX_PROMPT_IMAGE_BYTES) {
             toast.warning(`${file.name} 超过 10 MB，没有添加`);
+            continue;
+          }
+          const existing = existingImages();
+          const limit = imageLimit(existing.length + added.length, promptImageBytes(existing) + promptImageBytes(added), Math.ceil(file.size / 3) * 4);
+          if (limit) {
+            toast.warning(`${file.name || "图片"}：${limit}`);
             continue;
           }
           const url = await readAs(file, "dataURL");
@@ -276,9 +307,19 @@ export function Composer({
     const target = draftTarget();
     if (added.length) {
       actions.setDraftImages(target, (current) => {
-        const room = MAX_IMAGES - current.length;
-        if (added.length > room) toast.warning(`最多添加 ${MAX_IMAGES} 张图片`);
-        return [...current, ...added.slice(0, Math.max(room, 0))];
+        const pending = useLila.getState().sendingDrafts[target]?.images ?? [];
+        const next = [...current];
+        let usedBytes = promptImageBytes(pending) + promptImageBytes(current);
+        for (const image of added) {
+          const limit = imageLimit(pending.length + next.length, usedBytes, image.data.length);
+          if (limit) {
+            toast.warning(`${image.name}：${limit}`);
+            continue;
+          }
+          next.push(image);
+          usedBytes += image.data.length;
+        }
+        return next;
       });
     }
     if (blocks.length) {

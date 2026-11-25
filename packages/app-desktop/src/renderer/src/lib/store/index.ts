@@ -12,6 +12,7 @@ import type {
 } from "@lila/protocol";
 import { CoreClient, type PushMessage } from "../client.ts";
 import type { FileChange } from "../transcript-layout.ts";
+import { readDraftImages, saveDraftImages } from "./draft-images.ts";
 import { createSettingsActions } from "./settings-actions.ts";
 import {
   attempt,
@@ -29,6 +30,7 @@ import {
 } from "./storage.ts";
 import { applyFrameBatch, createViewCache, indexOf, type SessionFrame } from "./transcript.ts";
 import {
+  DEFAULT_APPROVAL_KEY,
   type DeliveryMode,
   type Draft,
   type DraftImage,
@@ -60,6 +62,8 @@ export {
   type SettingsTab,
 } from "./types.ts";
 
+const savedDraftImages = await readDraftImages();
+
 export const useLila = create<State>(() => ({
   connection: "connecting",
   projects: [],
@@ -69,13 +73,14 @@ export const useLila = create<State>(() => ({
   childrenByParent: {},
   views: {},
   selectedId: safeLocalGet(SELECTED_KEY) ?? undefined,
-  newSession: readNewSession(),
+  ...readNewSession(),
   drafts: readSavedDrafts(),
-  draftImages: {},
+  draftImages: savedDraftImages,
   sendingDrafts: {},
   paletteOpen: false,
   settingsOpen: false,
   settingsTab: "general",
+  confirmSettingsDiscard: false,
   settingsDirty: { mcp: false, memory: false, capabilities: false },
   notificationsEnabled: readNotificationsEnabled(),
   authLogin: undefined,
@@ -172,17 +177,18 @@ function notify(title: string, body: string, sessionId?: string): void {
   if (!get().notificationsEnabled || document.hasFocus() || typeof Notification === "undefined" || Notification.permission !== "granted") return;
   const notification = new Notification(title, { body });
   notification.onclick = () => {
-    set({ settingsOpen: false, paletteOpen: false });
-    const target = sessionId ? get().sessions[sessionId] : undefined;
-    if (target) {
+    window.lila.focus();
+    actions.closeSettingsThen(() => {
+      actions.setPaletteOpen(false);
+      const target = sessionId ? get().sessions[sessionId] : undefined;
+      if (!target) return;
       if (target.readOnly && target.parentId && get().sessions[target.parentId]) {
         actions.select(target.parentId);
         actions.previewSubsession(target.id);
       } else if (!target.readOnly) {
         actions.select(target.id);
       }
-    }
-    window.lila.focus();
+    });
   };
 }
 
@@ -222,7 +228,7 @@ function forget(sessionId: string): void {
     safeLocalRemove(SELECTED_KEY);
     unwatchSession("main");
   }
-  persistDrafts(get().drafts);
+  persistComposerDrafts();
 }
 
 let queuedModelsLoad: { refresh: boolean } | undefined;
@@ -362,29 +368,56 @@ function writeDraft(state: State, key: string, draft: Draft): Pick<State, "draft
   return { drafts, draftImages };
 }
 
+function mergeDrafts(first: Draft, next: Draft): Draft {
+  return {
+    text: [first.text, next.text].filter(Boolean).join("\n\n"),
+    images: [...first.images, ...next.images],
+  };
+}
+
+let lastSavedImages = savedDraftImages;
+let lastSavedSubmissions = get().sendingDrafts;
+
+function persistComposerDrafts(): void {
+  const { drafts, draftImages, sendingDrafts } = get();
+  const savedText = { ...drafts };
+  for (const [key, draft] of Object.entries(sendingDrafts)) {
+    savedText[key] = [draft.text, drafts[key]].filter(Boolean).join("\n\n");
+  }
+  persistDrafts(savedText);
+
+  if (lastSavedImages === draftImages && lastSavedSubmissions === sendingDrafts) return;
+  lastSavedImages = draftImages;
+  lastSavedSubmissions = sendingDrafts;
+  const savedImages = { ...draftImages };
+  for (const [key, draft] of Object.entries(sendingDrafts)) {
+    if (draft.images.length) savedImages[key] = [...draft.images, ...(draftImages[key] ?? [])];
+  }
+  void saveDraftImages(savedImages);
+}
+
 function beginDraftSubmission(key: string): Draft | undefined {
   const state = get();
   const draft = readDraft(key, state);
   if (state.sendingDrafts[key] || (!draft.text.trim() && !draft.images.length)) return;
-  set({ ...writeDraft(state, key, EMPTY_DRAFT), sendingDrafts: { ...state.sendingDrafts, [key]: true } });
+  set({ ...writeDraft(state, key, EMPTY_DRAFT), sendingDrafts: { ...state.sendingDrafts, [key]: draft } });
+  persistComposerDrafts();
   return draft;
 }
 
-function finishDraftSubmission(key: string, unsent?: Draft): void {
+function finishDraftSubmission(key: string, accepted: boolean): void {
   set((state) => {
-    if (!state.sendingDrafts[key]) return state;
+    const submitted = state.sendingDrafts[key];
+    if (!submitted) return state;
     const sendingDrafts = { ...state.sendingDrafts };
     delete sendingDrafts[key];
-    if (!unsent) return { sendingDrafts };
-    const next = readDraft(key, state);
+    if (accepted) return { sendingDrafts };
     return {
-      ...writeDraft(state, key, {
-        text: [unsent.text, next.text].filter(Boolean).join("\n\n"),
-        images: [...unsent.images, ...next.images],
-      }),
+      ...writeDraft(state, key, mergeDrafts(submitted, readDraft(key, state))),
       sendingDrafts,
     };
   });
+  persistComposerDrafts();
 }
 
 async function sendDraftContents(sessionId: string, draft: Draft, mode?: DeliveryMode): Promise<void> {
@@ -397,7 +430,7 @@ async function sendDraftContents(sessionId: string, draft: Draft, mode?: Deliver
       mode,
     );
   } finally {
-    finishDraftSubmission(sessionId, accepted ? undefined : draft);
+    finishDraftSubmission(sessionId, accepted);
   }
 }
 
@@ -548,11 +581,21 @@ export const actions = {
   setScrollTop: (sessionId: string, scrollTop: number | undefined) => viewCache.setScrollTop(sessionId, scrollTop),
 
   startNew(projectId?: string): void {
+    set({ newSessionApprovalMode: undefined });
     if (projectId) setNewSession({ projectId });
     actions.select(undefined);
   },
 
   setNewSession,
+
+  setNewSessionApprovalMode(approvalMode: ApprovalMode): void {
+    set({ newSessionApprovalMode: approvalMode });
+  },
+
+  setDefaultApprovalMode(approvalMode: ApprovalMode): void {
+    set({ defaultApprovalMode: approvalMode });
+    safeLocalSet(DEFAULT_APPROVAL_KEY, approvalMode);
+  },
 
   captureDraftTarget(key: string): () => string {
     const target = key === NEW_DRAFT ? newDraftTarget : { key };
@@ -562,7 +605,7 @@ export const actions = {
   setDraft(key: string, text: string): void {
     const drafts = { ...get().drafts, [key]: text };
     set({ drafts });
-    persistDrafts(drafts);
+    persistComposerDrafts();
   },
 
   mentionFileInDraft(path: string): void {
@@ -572,7 +615,7 @@ export const actions = {
     const spacer = current && !/\s$/.test(current) ? " " : "";
     const drafts = { ...state.drafts, [key]: `${current}${spacer}@${path} ` };
     set({ drafts });
-    persistDrafts(drafts);
+    persistComposerDrafts();
   },
 
   bumpWorkspaceRefresh(): void {
@@ -588,13 +631,12 @@ export const actions = {
       else delete draftImages[key];
       return { draftImages };
     });
+    persistComposerDrafts();
   },
 
   setPaletteOpen(open: boolean): void {
-    set((state) => ({
-      paletteOpen: open,
-      ...(open && state.settingsOpen ? { settingsOpen: false } : {}),
-    }));
+    if (open && get().settingsOpen) settingsActions.closeSettingsThen(() => set({ paletteOpen: true }));
+    else set({ paletteOpen: open });
   },
 
   reconnectNow(): void {
@@ -618,7 +660,7 @@ export const actions = {
   },
 
   async addProject(): Promise<Project | undefined> {
-    const path = await window.lila.pickDirectory();
+    const path = await attempt(() => window.lila.pickDirectory("project"));
     if (!path) return undefined;
     const result = await attempt(() => client.call({ type: "projects.add", path }));
     if (!result) return undefined;
@@ -673,12 +715,13 @@ export const actions = {
       unwatchSession("main");
     }
     if (nextNewSession !== state.newSession) safeLocalSet(NEW_SESSION_KEY, JSON.stringify(nextNewSession));
-    persistDrafts(get().drafts);
+    persistComposerDrafts();
     return true;
   },
 
   async createAndPrompt(projectId: string, modelId: string, thinkingLevel?: ThinkingLevel): Promise<void> {
-    const { approvalMode } = get().newSession;
+    const { newSessionApprovalMode, defaultApprovalMode } = get();
+    const approvalMode = newSessionApprovalMode ?? defaultApprovalMode;
     const submitted = beginDraftSubmission(NEW_DRAFT);
     if (!submitted) return;
     const version = selectionVersion;
@@ -686,7 +729,7 @@ export const actions = {
       client.call({ type: "session.create", projectId, modelId, approvalMode, ...(thinkingLevel ? { thinkingLevel } : {}) }),
     );
     if (!created) {
-      finishDraftSubmission(NEW_DRAFT, submitted);
+      finishDraftSubmission(NEW_DRAFT, false);
       void loadModels();
       return;
     }
@@ -697,7 +740,7 @@ export const actions = {
       newDraftTarget = { key: NEW_DRAFT };
     }
     set((state) => {
-      const sendingDrafts = { ...state.sendingDrafts, [session.id]: true as const };
+      const sendingDrafts = { ...state.sendingDrafts, [session.id]: submitted };
       delete sendingDrafts[NEW_DRAFT];
       const transferred = followSession
         ? writeDraft({ ...state, ...writeDraft(state, NEW_DRAFT, EMPTY_DRAFT) }, session.id, readDraft(NEW_DRAFT, state))
@@ -706,23 +749,20 @@ export const actions = {
         ...withSessions({ ...state.sessions, [session.id]: session }),
         ...transferred,
         sendingDrafts,
-        ...(followSession ? { selectedId: session.id } : {}),
+        ...(followSession ? { selectedId: session.id, newSessionApprovalMode: undefined } : {}),
       };
     });
+    persistComposerDrafts();
     if (followSession) {
       safeLocalSet(SELECTED_KEY, session.id);
       if (get().connection === "connected") await openSession(session.id);
     }
-    persistDrafts(get().drafts);
     await sendDraftContents(session.id, submitted);
   },
 
   async sendDraft(sessionId: string, mode?: DeliveryMode): Promise<void> {
     const draft = beginDraftSubmission(sessionId);
-    if (draft) {
-      persistDrafts(get().drafts);
-      await sendDraftContents(sessionId, draft, mode);
-    }
+    if (draft) await sendDraftContents(sessionId, draft, mode);
   },
 
   async continueSubsession(sessionId: string): Promise<void> {

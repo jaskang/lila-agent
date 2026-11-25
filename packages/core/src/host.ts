@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { type AgentSessionServices, createAgentSessionFromServices, SessionManager } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_APPROVAL_MODE } from "@lila/protocol";
 import type {
   ApprovalMode,
   AuthLoginEvent,
@@ -12,6 +13,7 @@ import type {
   GitStatus,
   McpConfigSnapshot,
   McpExposure,
+  McpImportEntry,
   McpScope,
   McpServerInput,
   MemorySnapshot,
@@ -256,6 +258,9 @@ export class SessionHost {
   upsertMcp(scope: McpScope, name: string, config: McpServerInput, projectId?: string): Promise<McpConfigSnapshot> {
     return this.#extensions.upsertMcp(scope, name, config, projectId);
   }
+  importMcp(scope: McpScope, entries: readonly McpImportEntry[], projectId?: string): Promise<McpConfigSnapshot> {
+    return this.#extensions.importMcp(scope, entries, projectId);
+  }
   toggleMcp(
     scope: McpScope,
     name: string,
@@ -403,7 +408,7 @@ export class SessionHost {
   async createSession(options: { projectId: string; modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode?: ApprovalMode }): Promise<SessionSummary> {
     const project = this.#project(options.projectId);
     const manager = SessionManager.create(project.path);
-    this.store.setApprovalMode(manager.getSessionId(), options.approvalMode ?? "auto");
+    this.store.setApprovalMode(manager.getSessionId(), options.approvalMode ?? DEFAULT_APPROVAL_MODE);
     try {
       const live = await this.#start(project, manager, options);
       const summary = live.summary();

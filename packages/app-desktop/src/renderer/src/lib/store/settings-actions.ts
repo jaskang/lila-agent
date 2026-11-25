@@ -5,6 +5,7 @@ import type {
   CoreSettings,
   McpConfigSnapshot,
   McpExposure,
+  McpImportEntry,
   McpScope,
   McpServerInput,
   MemorySnapshot,
@@ -37,21 +38,63 @@ export function createSettingsActions({ client, get, set, loadModels, setNewSess
     }
   };
 
+  let pendingSettingsNavigation: (() => void) | undefined;
+
+  function requestSettingsNavigation(navigate: () => void): void {
+    if (pendingSettingsNavigation) return;
+    const { settingsOpen, settingsTab, settingsDraftStatus } = get();
+    if (settingsOpen && settingsTab === "mcp") {
+      if (settingsDraftStatus === "saving") {
+        toast.info("请等待 MCP 配置保存完成");
+        return;
+      }
+      if (settingsDraftStatus === "dirty") {
+        pendingSettingsNavigation = navigate;
+        set({ confirmSettingsDiscard: true });
+        return;
+      }
+    }
+    navigate();
+  }
+
+  function closeSettingsThen(afterClose?: () => void): void {
+    requestSettingsNavigation(() => {
+      set((state) => ({
+        settingsOpen: false,
+        ...(state.authLogin?.status !== "running" ? { authLogin: undefined } : {}),
+      }));
+      afterClose?.();
+    });
+  }
+
   return {
     openSettings(tab?: SettingsTab): void {
-      set((state) => ({ settingsOpen: true, paletteOpen: false, settingsTab: tab ?? state.settingsTab }));
+      const next = () => set((state) => ({ settingsOpen: true, paletteOpen: false, settingsTab: tab ?? state.settingsTab }));
+      if (tab && tab !== get().settingsTab) requestSettingsNavigation(next);
+      else next();
     },
 
     setSettingsOpen(open: boolean): void {
-      set((state) => ({
-        settingsOpen: open,
-        ...(open ? { paletteOpen: false } : {}),
-        ...(!open && state.authLogin?.status !== "running" ? { authLogin: undefined } : {}),
-      }));
+      if (open) set({ settingsOpen: true, paletteOpen: false });
+      else closeSettingsThen();
     },
 
+    closeSettingsThen,
+    requestSettingsNavigation,
+
     setSettingsTab(tab: SettingsTab): void {
-      set({ settingsTab: tab });
+      if (tab !== get().settingsTab) requestSettingsNavigation(() => set({ settingsTab: tab }));
+    },
+
+    setSettingsDraftStatus(status: State["settingsDraftStatus"]): void {
+      set({ settingsDraftStatus: status });
+    },
+
+    resolveSettingsDiscard(discard: boolean): void {
+      const navigate = pendingSettingsNavigation;
+      pendingSettingsNavigation = undefined;
+      set({ confirmSettingsDiscard: false });
+      if (discard) navigate?.();
     },
 
     setSettingsDirty(part: "mcp" | "memory" | "capabilities", dirty: boolean): void {
@@ -170,11 +213,14 @@ export function createSettingsActions({ client, get, set, loadModels, setNewSess
       return (await client.call({ type: "mcp.list", ...(projectId ? { projectId } : {}) })).config;
     },
 
-    async upsertMcp(scope: McpScope, name: string, config: McpServerInput, projectId?: string): Promise<McpConfigSnapshot | undefined> {
-      const result = await attempt(() =>
-        client.call({ type: "mcp.upsert", scope, name, config, ...(projectId ? { projectId } : {}) }),
-      );
-      return result?.config;
+    async upsertMcp(scope: McpScope, name: string, config: McpServerInput, projectId?: string): Promise<McpConfigSnapshot> {
+      const result = await client.call({ type: "mcp.upsert", scope, name, config, ...(projectId ? { projectId } : {}) });
+      return result.config;
+    },
+
+    async importMcp(scope: McpScope, entries: McpImportEntry[], projectId?: string): Promise<McpConfigSnapshot> {
+      const result = await client.call({ type: "mcp.import", scope, entries, ...(projectId ? { projectId } : {}) });
+      return result.config;
     },
 
     async toggleMcp(

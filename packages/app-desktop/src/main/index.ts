@@ -15,6 +15,7 @@ const coreHost = process.env.LILA_CORE_HOST || "127.0.0.1";
 const coreUrlHost = coreHost.includes(":") && !coreHost.startsWith("[") ? `[${coreHost}]` : coreHost;
 const coreUrl = `http://${coreUrlHost}:${port}`;
 const dataDir = process.env.LILA_DATA_DIR ?? join(app.getPath("appData"), "Lila");
+const useWindowVibrancy = process.platform === "darwin";
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const MAX_MEDIA_BYTES = 20 * 1024 * 1024;
 const LOCK_STALE_MS = 30_000;
@@ -133,7 +134,7 @@ function readSavedTheme(): ThemeMode {
 
 function applyTheme(mode: ThemeMode, persist: boolean): void {
   nativeTheme.themeSource = mode;
-  if (window && !window.isDestroyed()) {
+  if (!useWindowVibrancy && window && !window.isDestroyed()) {
     window.setBackgroundColor(windowBackgroundColor());
   }
   if (!persist) return;
@@ -484,7 +485,7 @@ function createWindow(): void {
     minWidth: 760,
     minHeight: 520,
     show: false,
-    backgroundColor: windowBackgroundColor(),
+    ...(useWindowVibrancy ? { vibrancy: "sidebar" } : { backgroundColor: windowBackgroundColor() }),
     title: "Lila",
     titleBarStyle: "hiddenInset",
     trafficLightPosition: { x: 18, y: 20 },
@@ -583,10 +584,28 @@ ipcMain.handle("lila:connection", async () => {
   return { url: `ws://${coreUrlHost}:${port}/ws`, token };
 });
 
-ipcMain.handle("lila:pick-directory", async () => {
-  const options: Electron.OpenDialogOptions = { title: "选择项目目录", properties: ["openDirectory", "createDirectory"] };
+ipcMain.handle("lila:pick-directory", async (_event, purpose?: "project") => {
+  const options: Electron.OpenDialogOptions = {
+    title: purpose === "project" ? "选择项目目录" : "选择目录",
+    properties: ["openDirectory", "createDirectory"],
+  };
   const result = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
-  return result.canceled ? undefined : result.filePaths[0];
+  const path = result.canceled ? undefined : result.filePaths[0];
+  if (!path || purpose !== "project") return path;
+
+  const trustOptions: Electron.MessageBoxOptions = {
+    type: "question",
+    title: "信任项目",
+    message: "信任并添加此项目？",
+    detail: `${path}
+
+Lila 会读取该目录的 .pi 配置，并加载其中的扩展和 MCP 服务器。请确认你信任此目录的来源。`,
+    buttons: ["取消", "信任并添加"],
+    defaultId: 0,
+    cancelId: 0,
+  };
+  const trust = window ? await dialog.showMessageBox(window, trustOptions) : await dialog.showMessageBox(trustOptions);
+  return trust.response === 1 ? path : undefined;
 });
 
 ipcMain.handle("lila:open-path", async (_event, path: string) => {
@@ -726,9 +745,11 @@ if (!singleInstanceLock) {
 
   void app.whenReady().then(() => {
     applyTheme(readSavedTheme(), false);
-    nativeTheme.on("updated", () => {
-      if (window && !window.isDestroyed()) window.setBackgroundColor(windowBackgroundColor());
-    });
+    if (!useWindowVibrancy) {
+      nativeTheme.on("updated", () => {
+        if (window && !window.isDestroyed()) window.setBackgroundColor(windowBackgroundColor());
+      });
+    }
     installApplicationMenu();
     registerMediaProtocol();
     createWindow();

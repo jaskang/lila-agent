@@ -25,7 +25,7 @@ export type SessionView = {
 };
 
 /** Settings for a session that does not exist yet; remembered between new sessions. */
-export type NewSessionOptions = { projectId?: string; modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode: ApprovalMode };
+export type NewSessionOptions = { projectId?: string; modelId?: string; thinkingLevel?: ThinkingLevel };
 export type DraftImage = ImageInput & { id: string; name: string };
 export type Draft = { text: string; images: DraftImage[] };
 export type DeliveryMode = "steer" | "followUp";
@@ -65,14 +65,18 @@ export type State = {
   /** When user navigates from a sub-session preview into files/review, remembers which sub-session to return to. */
   returnToPreviewId?: string;
   newSession: NewSessionOptions;
+  defaultApprovalMode: ApprovalMode;
+  newSessionApprovalMode?: ApprovalMode | undefined;
   /** Composer text per session; `new` is the new-session composer. */
   drafts: Record<string, string>;
-  /** Pending image attachments per session; preserved across session switches. */
+  /** Pending image attachments per session; preserved across session switches and refreshes. */
   draftImages: Record<string, DraftImage[]>;
-  sendingDrafts: Record<string, true>;
+  sendingDrafts: Record<string, Draft>;
   paletteOpen: boolean;
   settingsOpen: boolean;
   settingsTab: SettingsTab;
+  settingsDraftStatus?: "dirty" | "saving" | undefined;
+  confirmSettingsDiscard: boolean;
   settingsDirty: { mcp: boolean; memory: boolean; capabilities: boolean };
   notificationsEnabled: boolean;
   authLogin?: AuthLoginFlowState | undefined;
@@ -88,6 +92,7 @@ export type State = {
 export const NEW_DRAFT = "new";
 export const SELECTED_KEY = "lila.selectedSession";
 export const NEW_SESSION_KEY = "lila.newSession";
+export const DEFAULT_APPROVAL_KEY = "lila.defaultApprovalMode";
 export const NOTIFICATIONS_KEY = "lila.notificationsEnabled";
 export const DRAFTS_SESSION_KEY = "lila.drafts";
 export const OPEN_LIMIT = 300;
@@ -96,9 +101,9 @@ export const MAX_CACHED_VIEWS = 10;
 export const MAX_SCROLL_POSITIONS = 50;
 
 export const APPROVAL_LABEL: Record<ApprovalMode, string> = {
-  auto: "自动执行",
-  "ask-exec": "命令前询问",
-  "ask-all": "修改与命令都询问",
+  "ask-all": "请求批准",
+  "ask-exec": "帮我批准",
+  auto: "完全访问权限",
 };
 
 export const EMPTY_DRAFT: Draft = { text: "", images: [] };

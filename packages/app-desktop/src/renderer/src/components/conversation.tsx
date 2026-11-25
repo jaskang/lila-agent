@@ -28,20 +28,10 @@ import { Spinner } from "@/components/ui/spinner";
 import { Trace, TraceIcon, TraceLine, TraceTitle } from "@/components/ui/trace";
 import { cn } from "cn";
 import { layoutTranscript } from "@/lib/transcript-layout";
+import { hasOpenShortcutOverlay } from "@/lib/shortcuts";
 import { actions, EMPTY_VIEW, useLila } from "@/lib/store";
 
 const ABORT_ARM_MS = 1_500;
-const BLOCKING_OVERLAY_SELECTOR = [
-  '[data-slot="dialog-content"]',
-  '[data-slot="alert-dialog-content"]',
-  '[data-slot="sheet-content"]',
-  '[data-slot="popover-content"]',
-  '[data-slot="select-content"]',
-  '[data-slot="combobox-content"]',
-  '[data-slot="dropdown-menu-content"]',
-  "[data-composer-suggest]",
-].join(", ");
-
 function SessionToolbar({
   sessionId,
   gitChanges,
@@ -364,7 +354,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
       if (event.key !== "Escape" || event.isComposing || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
       const store = useLila.getState();
       if (store.paletteOpen || store.settingsOpen) return;
-      if (document.querySelector(BLOCKING_OVERLAY_SELECTOR) || document.querySelector("[data-pending-panel]")) return;
+      if (hasOpenShortcutOverlay() || document.querySelector("[data-pending-panel]")) return;
       event.preventDefault();
       if (abortArmedRef.current) {
         handleAbort();
@@ -453,7 +443,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
 
   React.useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.isComposing || event.defaultPrevented || document.querySelector(BLOCKING_OVERLAY_SELECTOR)) return;
+      if (event.isComposing || event.defaultPrevented || hasOpenShortcutOverlay()) return;
       if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "f") {
         event.preventDefault();
         openSearch();

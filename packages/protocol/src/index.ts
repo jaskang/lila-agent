@@ -6,8 +6,9 @@
  * frequent to validate one by one.
  */
 
-export const PROTOCOL_VERSION = 15;
+export const PROTOCOL_VERSION = 17;
 export const DEFAULT_CORE_PORT = 7457;
+export const MAX_CORE_MESSAGE_BYTES = 64 * 1024 * 1024;
 
 export * from "./settings.js";
 export * from "./session.js";

@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ApprovalMode, Project } from "@lila/protocol";
+import { ApprovalMode, DEFAULT_APPROVAL_MODE, type Project } from "@lila/protocol";
 
 type State = { projects: Project[]; approvalModes: Record<string, ApprovalMode> };
 
@@ -56,7 +56,8 @@ export class Store {
   }
 
   approvalMode(sessionId: string): ApprovalMode {
-    return this.#state.approvalModes[sessionId] ?? "auto";
+    const saved = ApprovalMode.safeParse(this.#state.approvalModes[sessionId]);
+    return saved.success ? saved.data : DEFAULT_APPROVAL_MODE;
   }
 
   setApprovalMode(sessionId: string, mode: ApprovalMode): void {

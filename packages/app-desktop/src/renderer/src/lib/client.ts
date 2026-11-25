@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION, type ClientCommand, type CommandResults, type CommandType, type ServerMessage } from "@lila/protocol";
+import { MAX_CORE_MESSAGE_BYTES, PROTOCOL_VERSION, type ClientCommand, type CommandResults, type CommandType, type ServerMessage } from "@lila/protocol";
 import type { LilaShell } from "../../../preload/index.ts";
 
 declare global {
@@ -95,6 +95,10 @@ export class CoreClient {
       return Promise.reject(new Error("与 core 的连接已断开，正在重连…"));
     }
     const requestId = crypto.randomUUID();
+    const payload = JSON.stringify({ ...command, requestId });
+    if (payload.length > MAX_CORE_MESSAGE_BYTES / 3 && new Blob([payload]).size > MAX_CORE_MESSAGE_BYTES) {
+      return Promise.reject(new Error("请求超过大小上限，请减少文字或附件后重试"));
+    }
     const limit = timeoutMs ?? (LONG_COMMANDS.has(command.type) ? LONG_CALL_TIMEOUT_MS : DEFAULT_CALL_TIMEOUT_MS);
     const result = new Promise<CommandResults[T]>((resolve, reject) => {
       const timer = window.setTimeout(() => {
@@ -104,7 +108,7 @@ export class CoreClient {
       this.#pending.set(requestId, { resolve: resolve as (data: unknown) => void, reject, timer });
     });
     try {
-      socket.send(JSON.stringify({ ...command, requestId }));
+      socket.send(payload);
     } catch (error) {
       const pending = this.#pending.get(requestId);
       if (pending) {

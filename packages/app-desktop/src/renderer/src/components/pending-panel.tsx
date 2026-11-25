@@ -21,21 +21,15 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "cn";
-import { actions, useLila } from "@/lib/store";
-
-const BLOCKING_OVERLAY_SELECTOR =
-  "[data-slot=dialog-content], [data-slot=alert-dialog-content], [data-slot=sheet-content], [data-slot=popover-content], [data-slot=select-content], [data-slot=dropdown-menu-content], [data-composer-suggest]";
+import { actions } from "@/lib/store";
 
 type Answer = (answer: PendingAnswer) => void;
 type Choice = { label: string; answer: PendingAnswer; variant: "default" | "secondary" | "outline" };
 
-function approvalChoices(toolName?: string): Choice[] {
-  return [
-    { label: "允许", answer: { type: "option", value: "allow" }, variant: "default" },
-    { label: toolName ? `本会话始终允许 ${toolName}` : "本会话始终允许", answer: { type: "option", value: "always" }, variant: "secondary" },
-    { label: "拒绝", answer: { type: "option", value: "deny" }, variant: "outline" },
-  ];
-}
+const APPROVAL_CHOICES: Choice[] = [
+  { label: "允许本次", answer: { type: "option", value: "allow" }, variant: "default" },
+  { label: "拒绝", answer: { type: "option", value: "deny" }, variant: "outline" },
+];
 
 const CONFIRM_CHOICES: Choice[] = [
   { label: "确认", answer: { type: "confirm", confirmed: true }, variant: "default" },
@@ -152,7 +146,6 @@ function Shell({
   );
 }
 
-/** Buttons answered with ⌘1-9 anywhere (including while typing), or bare 1-9 when focus is not in a text field. */
 function Choices({
   choices,
   busy,
@@ -169,39 +162,26 @@ function Choices({
   const [denyNoteOpen, setDenyNoteOpen] = React.useState(false);
   const [denyNote, setDenyNote] = React.useState("");
 
-  React.useEffect(() => {
-    if (busy || denyNoteOpen) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.isComposing || event.keyCode === 229 || event.defaultPrevented || event.altKey || event.shiftKey) return;
-      const store = useLila.getState();
-      if (store.paletteOpen || store.settingsOpen || document.querySelector(BLOCKING_OVERLAY_SELECTOR)) return;
-      if (!/^[1-9]$/.test(event.key)) return;
-      const choice = choices[Number(event.key) - 1];
-      if (!choice) return;
-      if (event.metaKey || event.ctrlKey) {
-        event.preventDefault();
-        onAnswer(choice.answer);
-        return;
-      }
-      const target = event.target as HTMLElement | null;
-      if (target?.closest("textarea, input, [contenteditable=true]")) return;
-      event.preventDefault();
-      onAnswer(choice.answer);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [choices, onAnswer, busy, denyNoteOpen]);
+  const handleChoiceKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (busy || denyNoteOpen || event.repeat || event.nativeEvent.isComposing || event.keyCode === 229) return;
+    if (event.defaultPrevented || event.altKey || event.shiftKey || !/^[1-9]$/.test(event.key)) return;
+    const choice = choices[Number(event.key) - 1];
+    if (!choice) return;
+    event.preventDefault();
+    onAnswer(choice.answer);
+  };
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-2" onKeyDown={handleChoiceKey}>
         {choices.map((choice, index) => (
           <Button
             key={`${choice.label}-${index}`}
             size="sm"
             variant={choice.variant}
             disabled={busy}
-            title={index < 9 ? `快捷键 ⌘${index + 1}` : undefined}
+            title={index < 9 ? `聚焦此组按钮时按 ${index + 1}` : undefined}
+            aria-keyshortcuts={index < 9 ? String(index + 1) : undefined}
             onClick={() => onAnswer(choice.answer)}
           >
             {choice.label}
@@ -382,14 +362,13 @@ function PendingCard({ sessionId, item, queuedItems }: { sessionId: string; item
     () => item.options.map((option, index) => ({ label: option, answer: { type: "option", value: option }, variant: index === 0 ? "default" : "secondary" })),
     [item.options],
   );
-  const approvalOptions = React.useMemo(() => approvalChoices(item.toolName), [item.toolName]);
   const approval = item.kind === "approval";
   const icon = approval ? <ShieldAlert className="size-4" /> : <MessageCircleQuestion className="size-4" />;
   const title = item.title || (approval ? `Agent 想要运行 ${item.toolName ?? "工具"}` : "Agent 有个问题");
   return (
     <div className={busy ? "pointer-events-none opacity-60" : undefined}>
       <Shell icon={icon} title={title} message={item.message} queuedItems={queuedItems} busy={busy}>
-        {item.kind === "approval" ? <Choices choices={approvalOptions} busy={busy} onAnswer={onAnswer} allowDenyNote /> : null}
+        {item.kind === "approval" ? <Choices choices={APPROVAL_CHOICES} busy={busy} onAnswer={onAnswer} allowDenyNote /> : null}
         {item.kind === "select" ? <Choices choices={selectChoices} busy={busy} onAnswer={onAnswer} onCancel={cancel} /> : null}
         {item.kind === "confirm" ? <Choices choices={CONFIRM_CHOICES} busy={busy} onAnswer={onAnswer} /> : null}
         {item.kind === "input" || item.kind === "editor" ? <TextAnswer item={item} multiline={item.kind === "editor"} onAnswer={onAnswer} /> : null}

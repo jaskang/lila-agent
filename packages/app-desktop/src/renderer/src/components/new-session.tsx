@@ -3,6 +3,8 @@ import { Folder, FolderOpen, FolderPlus } from "lucide-react";
 import { Composer } from "@/components/composer";
 import { ApprovalSelect, COMPOSER_CHIP, ModelPicker, ModelSetup } from "@/components/session-controls";
 import { Button } from "@/components/ui/button";
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
+import { useNewSessionProjectId } from "@/hooks/use-current-project";
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { cn } from "cn";
@@ -12,7 +14,8 @@ const ADD_PROJECT = "__add__";
 
 export function NewSession() {
   const projects = useLila((state) => state.projects);
-  const sessions = useLila((state) => state.sessions);
+  const projectId = useNewSessionProjectId();
+  const approvalMode = useLila((state) => state.newSessionApprovalMode ?? state.defaultApprovalMode);
   const models = useLila((state) => state.models);
   const defaultModelId = useLila((state) => state.defaultModelId);
   const modelsError = useLila((state) => state.modelsError);
@@ -21,19 +24,6 @@ export function NewSession() {
   const options = useLila((state) => state.newSession);
   const { open, isMobile } = useSidebar();
 
-  const recentProjectId = useMemo(() => {
-    const projectIds = new Set(projects.map((p) => p.id));
-    let best: { id: string; updatedAt: string } | undefined;
-    for (const session of Object.values(sessions)) {
-      if (session.parentId || !projectIds.has(session.projectId)) continue;
-      if (!best || session.updatedAt > best.updatedAt) {
-        best = { id: session.projectId, updatedAt: session.updatedAt };
-      }
-    }
-    return best?.id ?? projects.at(-1)?.id;
-  }, [projects, sessions]);
-
-  const projectId = projects.some((project) => project.id === options.projectId) ? options.projectId : recentProjectId;
   const enabledModels = useMemo(() => {
     const enabled = models.filter((item) => item.enabled);
     return enabled.length ? enabled : models;
@@ -57,13 +47,26 @@ export function NewSession() {
       <div className="flex min-h-0 flex-1 flex-col">
         {header}
         <div className="flex flex-1 items-center justify-center px-6">
-          <Button
-            disabled={!connected}
-            onClick={() => void actions.addProject().then((project) => project && actions.setNewSession({ projectId: project.id }))}
-          >
-            <FolderOpen />
-            选择项目目录
-          </Button>
+          <Empty>
+            <EmptyHeader>
+              <EmptyTitle>开始新会话</EmptyTitle>
+              <EmptyDescription>选择 Agent 要工作的目录。添加时，你需要确认是否信任项目中的 .pi 配置和扩展。</EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent className="flex-row flex-wrap justify-center">
+              <Button
+                disabled={!connected}
+                onClick={() => void actions.addProject().then((project) => project && actions.setNewSession({ projectId: project.id }))}
+              >
+                <FolderOpen data-icon="inline-start" />
+                选择项目目录
+              </Button>
+              {!modelsLoading && !model ? (
+                <Button variant="outline" disabled={!connected} onClick={() => actions.openSettings("providers")}>
+                  配置模型
+                </Button>
+              ) : null}
+            </EmptyContent>
+          </Empty>
         </div>
       </div>
     );
@@ -126,7 +129,7 @@ export function NewSession() {
                     return true;
                   }}
                 />
-                <ApprovalSelect value={options.approvalMode} onChange={(approvalMode) => actions.setNewSession({ approvalMode })} />
+                <ApprovalSelect value={approvalMode} onChange={actions.setNewSessionApprovalMode} />
               </>
             }
           />

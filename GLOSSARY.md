@@ -25,7 +25,7 @@ _Avoid_: Event（旧版自存的事件日志已取消）。
 _Avoid_: Prompt、Dialog。
 
 **Approval mode**:
-会话级配置，决定哪些工具调用要用户确认：`auto`（不问）、`ask-exec`（文件与长期记忆写入直接运行，命令、MCP、子 Agent、脚本前问）、`ask-all`（除只读工具外都问）。
+会话级工具审批配置。请求批准（`ask-all`）审查项目外写入、联网和范围不明的调用；帮我批准（`ask-exec`）同时放行可识别的低风险 MCP 调用；完全访问权限（`auto`）跳过 Lila 审批。前两档允许内置文件工具进行只读访问及项目内写入。
 _Avoid_: Permission level、Security mode。
 
 **Steer / Follow-up**:

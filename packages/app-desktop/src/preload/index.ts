@@ -6,8 +6,9 @@ export type AppInfo = { appVersion: string; electronVersion: string; platform: s
 
 /** The only desktop-shell capabilities the window gets; Lila's protocol itself goes over WebSocket. */
 const shell = {
+  windowMaterial: process.platform === "darwin" ? "vibrant" : "solid",
   connection: (): Promise<{ url: string; token: string }> => ipcRenderer.invoke("lila:connection"),
-  pickDirectory: (): Promise<string | undefined> => ipcRenderer.invoke("lila:pick-directory"),
+  pickDirectory: (purpose?: "project"): Promise<string | undefined> => ipcRenderer.invoke("lila:pick-directory", purpose),
   /** Opens a file (mcp.json, SKILL.md) in its default app; a missing mcp.json is created empty first. */
   openPath: (path: string): Promise<void> => ipcRenderer.invoke("lila:open-path", path),
   revealPath: (path: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke("lila:reveal-path", path),

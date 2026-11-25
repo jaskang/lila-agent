@@ -18,7 +18,7 @@ import { SearchInput } from "@/components/search-input";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Progress } from "@/components/ui/progress";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { actions, APPROVAL_LABEL, useLila } from "@/lib/store";
@@ -261,10 +261,26 @@ export function ModelPicker({
 }
 
 const APPROVAL_MODES = Object.keys(APPROVAL_LABEL) as ApprovalMode[];
-const APPROVAL_SHORT: Record<ApprovalMode, string> = { auto: "自动", "ask-exec": "命令前询问", "ask-all": "都询问" };
-const APPROVAL_ICON = { auto: ShieldCheck, "ask-exec": ShieldQuestion, "ask-all": ShieldAlert } as const;
+const APPROVAL_ICON = { auto: ShieldAlert, "ask-exec": ShieldCheck, "ask-all": ShieldQuestion } as const;
+const APPROVAL_DESCRIPTION: Record<ApprovalMode, string> = {
+  "ask-all": "写入项目外文件、联网或影响范围不明确时询问",
+  "ask-exec": "自动放行可识别的低风险操作，其他调用询问",
+  auto: "工具以当前系统账号权限运行，跳过 Lila 审批",
+};
 
-export function ApprovalSelect({ value, disabled, onChange }: { value: ApprovalMode; disabled?: boolean; onChange: (mode: ApprovalMode) => void }) {
+export function ApprovalSelect({
+  value,
+  disabled,
+  onChange,
+  label = "审批方式",
+  inSettings = false,
+}: {
+  value: ApprovalMode;
+  disabled?: boolean;
+  onChange: (mode: ApprovalMode) => void;
+  label?: string;
+  inSettings?: boolean;
+}) {
   const Icon = APPROVAL_ICON[value];
   return (
     <Select
@@ -273,18 +289,33 @@ export function ApprovalSelect({ value, disabled, onChange }: { value: ApprovalM
       onValueChange={(next) => {
         if (next && next !== value) onChange(next as ApprovalMode);
       }}
-      items={APPROVAL_MODES.map((mode) => ({ value: mode, label: APPROVAL_SHORT[mode] }))}
+      items={APPROVAL_MODES.map((mode) => ({ value: mode, label: APPROVAL_LABEL[mode] }))}
     >
-      <SelectTrigger size="sm" className={COMPOSER_CHIP} aria-label="审批方式" title={APPROVAL_LABEL[value]}>
+      <SelectTrigger
+        size="sm"
+        className={inSettings ? "w-44" : COMPOSER_CHIP}
+        aria-label={label}
+        title={APPROVAL_DESCRIPTION[value]}
+      >
         <Icon />
         <SelectValue />
       </SelectTrigger>
-      <SelectContent alignItemWithTrigger={false} align="start" side="top">
-        {APPROVAL_MODES.map((mode) => (
-          <SelectItem key={mode} value={mode}>
-            {APPROVAL_LABEL[mode]}
-          </SelectItem>
-        ))}
+      <SelectContent
+        alignItemWithTrigger={false}
+        align={inSettings ? "end" : "start"}
+        side={inSettings ? "bottom" : "top"}
+        className="w-[min(23rem,calc(100vw-2rem))]"
+      >
+        <SelectGroup>
+          {APPROVAL_MODES.map((mode) => (
+            <SelectItem key={mode} value={mode}>
+              <div className="flex min-w-0 flex-col gap-0.5 whitespace-normal">
+                <span>{APPROVAL_LABEL[mode]}</span>
+                <span className="text-xs text-muted-foreground">{APPROVAL_DESCRIPTION[mode]}</span>
+              </div>
+            </SelectItem>
+          ))}
+        </SelectGroup>
       </SelectContent>
     </Select>
   );

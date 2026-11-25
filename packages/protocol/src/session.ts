@@ -3,12 +3,24 @@ import type { ThinkingLevel } from "./settings.js";
 
 const Id = z.string().min(1);
 
-/** auto: never ask. ask-exec: ask before commands, MCP, subagents and scripts; file edits run. ask-all: ask before every tool that is not read-only. */
+/** Persisted IDs: auto is full access, ask-exec is risk-based approval, ask-all is request approval. */
 export const ApprovalMode = z.enum(["auto", "ask-exec", "ask-all"]);
 export type ApprovalMode = z.infer<typeof ApprovalMode>;
+export const DEFAULT_APPROVAL_MODE: ApprovalMode = "ask-exec";
 
-export const ImageInput = z.object({ mimeType: z.string().regex(/^image\//), data: z.string().min(1).max(14_000_000) });
+export const MAX_PROMPT_IMAGES = 10;
+export const MAX_PROMPT_IMAGE_BYTES = 10 * 1024 * 1024;
+export const MAX_PROMPT_IMAGE_BASE64_BYTES = 48 * 1024 * 1024;
+
+export const ImageInput = z.object({
+  mimeType: z.string().regex(/^image\//),
+  data: z.string().min(1).max(Math.ceil(MAX_PROMPT_IMAGE_BYTES / 3) * 4),
+});
 export type ImageInput = z.infer<typeof ImageInput>;
+
+export function promptImageBytes(images: readonly ImageInput[]): number {
+  return images.reduce((total, image) => total + image.data.length, 0);
+}
 
 export type Project = { id: string; path: string; name: string };
 export type SessionStatus = "idle" | "running" | "waiting" | "error";
@@ -112,7 +124,7 @@ export type PendingRequest = {
   kind: "approval" | "select" | "confirm" | "input" | "editor" | "ask";
   title: string;
   message?: string;
-  /** select: the option texts. approval: always allow / always / deny, rendered by the client. */
+  /** select: the option texts. approval: allow / deny, rendered by the client. */
   options: string[];
   placeholder?: string;
   prefill?: string;
@@ -125,7 +137,7 @@ export type PendingRequest = {
 
 export const PendingAnswer = z.discriminatedUnion("type", [
   z.object({ type: z.literal("cancel") }),
-  /** approval: "allow" | "always" | "deny". select: the option text. */
+  /** approval: "allow" | "deny". select: the option text. */
   z.object({ type: z.literal("option"), value: z.string(), note: z.string().optional() }),
   z.object({ type: z.literal("confirm"), confirmed: z.boolean() }),
   z.object({ type: z.literal("text"), value: z.string() }),

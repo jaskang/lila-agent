@@ -2,6 +2,9 @@ import { z } from "zod";
 import {
   ApprovalMode,
   ImageInput,
+  MAX_PROMPT_IMAGE_BASE64_BYTES,
+  MAX_PROMPT_IMAGES,
+  promptImageBytes,
   PendingAnswer,
   type Project,
   type SessionState,
@@ -18,8 +21,10 @@ import {
   type CoreSettings,
   type McpConfigSnapshot,
   McpExposure,
+  McpImportEntry,
   McpScope,
   McpServerInput,
+  McpServerName,
   type MemorySnapshot,
   MemoryTarget,
   type ModelInfo,
@@ -65,8 +70,18 @@ export const ClientCommand = z.discriminatedUnion("type", [
     requestId: RequestId,
     scope: McpScope,
     projectId: Id.optional(),
-    name: z.string().trim().min(1).max(120),
+    name: McpServerName,
     config: McpServerInput,
+  }),
+  z.object({
+    type: z.literal("mcp.import"),
+    requestId: RequestId,
+    scope: McpScope,
+    projectId: Id.optional(),
+    entries: z.array(McpImportEntry).min(1).refine(
+      (entries) => new Set(entries.map((entry) => entry.name)).size === entries.length,
+      { error: "同一批导入不能包含同名服务器" },
+    ),
   }),
   z.object({
     type: z.literal("mcp.toggle"),
@@ -131,7 +146,10 @@ export const ClientCommand = z.discriminatedUnion("type", [
     type: z.literal("session.prompt"),
     ...SessionRef,
     text: z.string(),
-    images: z.array(ImageInput).max(10).optional(),
+    images: z.array(ImageInput).max(MAX_PROMPT_IMAGES).refine(
+      (images) => promptImageBytes(images) <= MAX_PROMPT_IMAGE_BASE64_BYTES,
+      { error: "图片总量超过单条消息的附件上限" },
+    ).optional(),
     mode: z.enum(["steer", "followUp"]).optional(),
   }),
   z.object({ type: z.literal("session.abort"), ...SessionRef }),
@@ -185,6 +203,7 @@ export interface CommandResults {
   "auth.logout": Empty;
   "mcp.list": { config: McpConfigSnapshot };
   "mcp.upsert": { config: McpConfigSnapshot };
+  "mcp.import": { config: McpConfigSnapshot };
   "mcp.toggle": { config: McpConfigSnapshot };
   "mcp.remove": { config: McpConfigSnapshot };
   "capabilities.get": { capabilities: CapabilitiesSnapshot };

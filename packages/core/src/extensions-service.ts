@@ -15,6 +15,7 @@ import type {
   CapabilitiesSnapshot,
   McpConfigSnapshot,
   McpExposure,
+  McpImportEntry,
   McpScope,
   McpServerInput,
   MemorySnapshot,
@@ -25,7 +26,7 @@ import type {
 import { UserError } from "./errors.ts";
 import { createLilaExtension } from "./lila-extension.ts";
 import type { LiveSession } from "./live-session.ts";
-import { loadMcpSnapshot, patchMcpServer, removeMcpServer, upsertMcpServer } from "./mcp-config.ts";
+import { loadMcpSnapshot, patchMcpServer, removeMcpServer, upsertMcpServers } from "./mcp-config.ts";
 import {
   addMemoryEntry,
   createBuiltinMemoryExtension,
@@ -86,7 +87,7 @@ export function createServices(cwd: string, live?: LiveSession): Promise<AgentSe
         ...(memoryEnabled
           ? [{ name: BUILTIN_MEMORY_NAME, factory: createBuiltinMemoryExtension(agentDir), replaceable: true, builtin: true }]
           : []),
-        ...(live ? [{ name: "lila", factory: createLilaExtension(live), hidden: true }] : []),
+        ...(live ? [{ name: "lila", factory: createLilaExtension(live, cwd), hidden: true }] : []),
       ],
       extensionsOverride: withoutDuplicateBuiltins,
     },
@@ -122,9 +123,13 @@ export class ExtensionsService {
     return loadMcpSnapshot(getAgentDir(), project?.path);
   }
 
-  async upsertMcp(scope: McpScope, name: string, config: McpServerInput, projectId?: string): Promise<McpConfigSnapshot> {
+  upsertMcp(scope: McpScope, name: string, config: McpServerInput, projectId?: string): Promise<McpConfigSnapshot> {
+    return this.importMcp(scope, [{ name, config }], projectId);
+  }
+
+  async importMcp(scope: McpScope, entries: readonly McpImportEntry[], projectId?: string): Promise<McpConfigSnapshot> {
     const { targetPath, projectDir } = this.#resolveMcpTargetPath(scope, projectId);
-    upsertMcpServer(targetPath, name, config);
+    upsertMcpServers(targetPath, entries);
     this.#deps.invalidateProjectServices(scope === "project" ? projectId : undefined);
     return loadMcpSnapshot(getAgentDir(), projectDir);
   }

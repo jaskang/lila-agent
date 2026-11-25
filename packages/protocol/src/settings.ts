@@ -73,10 +73,14 @@ export type McpScope = z.infer<typeof McpScope>;
 export const McpExposure = z.enum(["codemode", "deferred", "direct", "hidden"]);
 export type McpExposure = z.infer<typeof McpExposure>;
 
+export const McpServerName = z.string().trim()
+  .min(1, { error: "请输入服务器名称" })
+  .max(120, { error: "服务器名称最多 120 个字符" });
+
 export const McpServerInput = z.discriminatedUnion("transport", [
   z.object({
     transport: z.literal("stdio"),
-    command: z.string().trim().min(1),
+    command: z.string().trim().min(1, { error: "请输入命令" }),
     args: z.array(z.string()).optional(),
     env: z.record(z.string(), z.string()).optional(),
     cwd: z.string().trim().min(1).optional(),
@@ -86,7 +90,7 @@ export const McpServerInput = z.discriminatedUnion("transport", [
   }),
   z.object({
     transport: z.literal("http"),
-    url: z.string().trim().min(1),
+    url: z.string().trim().pipe(z.url({ protocol: /^https?$/, error: "请输入有效的 HTTP 或 HTTPS 地址" })),
     headers: z.record(z.string(), z.string()).optional(),
     description: z.string().trim().optional(),
     exposure: McpExposure.optional(),
@@ -94,6 +98,9 @@ export const McpServerInput = z.discriminatedUnion("transport", [
   }),
 ]);
 export type McpServerInput = z.infer<typeof McpServerInput>;
+
+export const McpImportEntry = z.object({ name: McpServerName, config: McpServerInput });
+export type McpImportEntry = z.infer<typeof McpImportEntry>;
 
 export type McpServerItem = {
   name: string;

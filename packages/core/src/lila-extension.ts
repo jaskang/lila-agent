@@ -1,6 +1,7 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import type { ApprovalMode, PendingAnswer, PendingRequest } from "@lila/protocol";
 import { Type } from "typebox";
+import { approvalReason } from "./approval-policy.ts";
 
 export type SubagentBusEvent =
   | { type: "created"; id: string; agentType: string; description: string; isBackground: boolean }
@@ -26,37 +27,15 @@ export type SubagentBusEvent =
 /** What the inline extension needs from the live session that hosts it. */
 export interface LilaBridge {
   readonly approvalMode: ApprovalMode;
-  /** Tools the user answered "always" for, in this session. */
-  readonly allowedTools: Set<string>;
   request(request: Omit<PendingRequest, "id">, options?: { signal?: AbortSignal; timeout?: number }): Promise<PendingAnswer | undefined>;
   onSubagentEvent?(event: SubagentBusEvent): void;
   onProviderResponse?(providerId: string | undefined, status: number, headers: Record<string, string>): void;
 }
 
-const READ_ONLY_TOOLS: Record<string, true> = {
-  read: true,
-  grep: true,
-  find: true,
-  ls: true,
-  list_mcp_resources: true,
-  list_mcp_resource_templates: true,
-  read_mcp_resource: true,
-  tool_search: true,
-  get_subagent_result: true,
-  ask_user: true,
-  memory_read: true,
-};
-const FILE_TOOLS: Record<string, true> = {
-  edit: true,
-  write: true,
-  memory_add: true,
-  memory_replace: true,
-  memory_remove: true,
-};
 const SUMMARY_LIMIT = 4_000;
 
 function summarize(toolName: string, input: Record<string, unknown>): string {
-  if (toolName === "bash" && typeof input.command === "string") return input.command;
+  if ((toolName === "bash" || toolName === "powershell") && typeof input.command === "string") return input.command;
   if ((toolName === "edit" || toolName === "write") && typeof input.path === "string") return input.path;
   if (toolName === "memory_add" || toolName === "memory_replace" || toolName === "memory_remove") {
     const target = input.target === "user" ? "用户画像 (USER.md)" : "Agent 笔记 (MEMORY.md)";
@@ -106,7 +85,7 @@ function usageSummary(rawUsage: unknown, rawTokens?: unknown): { tokens: number;
 }
 
 /** Tool approvals, `ask_user`, and live subagent progress forwarding bound to one live session. */
-export function createLilaExtension(bridge: LilaBridge): ExtensionFactory {
+export function createLilaExtension(bridge: LilaBridge, projectRoot: string): ExtensionFactory {
   return (pi: ExtensionAPI) => {
     const unsubs: Array<() => void> = [];
     if (bridge.onSubagentEvent) {
@@ -226,30 +205,32 @@ export function createLilaExtension(bridge: LilaBridge): ExtensionFactory {
     }
 
     pi.on("tool_call", async (event, ctx) => {
-      // Calls a tool makes (codemode scripts) follow the decision about the calling tool.
-      if (event.parentToolCallId) return;
       const mode = bridge.approvalMode;
+      if (mode === "auto") return;
       const name = event.toolName;
-      if (mode === "auto" || READ_ONLY_TOOLS[name] || bridge.allowedTools.has(name)) return;
-      if (mode === "ask-exec" && FILE_TOOLS[name]) return;
-      if (pi.getAllTools().find((tool) => tool.name === name)?.annotations?.readOnlyHint) return;
+      const input = event.input as Record<string, unknown>;
+      const reason = approvalReason({
+        mode,
+        projectRoot,
+        cwd: ctx.cwd,
+        name,
+        input,
+        tool: pi.getAllTools().find((tool) => tool.name === name),
+      });
+      if (!reason) return;
 
       const answer = await bridge.request(
         {
           kind: "approval",
           title: `运行 ${name}`,
-          message: summarize(name, event.input as Record<string, unknown>),
-          options: ["allow", "always", "deny"],
+          message: `${reason}\n\n${summarize(name, input)}`,
+          options: ["allow", "deny"],
           toolCallId: event.toolCallId,
           toolName: name,
         },
         ctx.signal ? { signal: ctx.signal } : {},
       );
       if (answer?.type === "option" && answer.value === "allow") return;
-      if (answer?.type === "option" && answer.value === "always") {
-        bridge.allowedTools.add(name);
-        return;
-      }
       if (answer?.type === "option") {
         const note = answer.note?.trim();
         return {

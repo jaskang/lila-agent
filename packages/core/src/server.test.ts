@@ -428,6 +428,27 @@ test("manages global and project MCP servers and reads capabilities snapshot", a
   }
 }, 30_000);
 
+test("MCP import validates the whole batch before writing and replaces entries together", async () => {
+  const client = await connect();
+  const projectDir = mkdtempSync(join(tmpdir(), "lila-mcp-import-"));
+  try {
+    const { project } = await client.call({ type: "projects.add", requestId: "import-project", path: projectDir });
+    const request = { type: "mcp.import", requestId: "import", scope: "project", projectId: project.id } as const;
+    const docs = { name: "docs", config: { transport: "http", url: "http://localhost:9999/mcp", enabled: false } } as const;
+    const invalid = { name: "invalid", config: { transport: "http", url: "file:///tmp/invalid", enabled: false } } as const;
+    await expect(client.call({ ...request, entries: [docs, invalid] })).rejects.toThrow("请输入有效的 HTTP 或 HTTPS 地址");
+    expect(existsSync(join(projectDir, ".pi", "mcp.json"))).toBe(false);
+
+    const reference = { name: "reference", config: { transport: "stdio", command: "fixture", enabled: false } } as const;
+    const { config } = await client.call({ ...request, entries: [docs, reference] });
+    const servers = config.servers.filter((item) => item.scope === "project");
+    expect(servers.map((item) => item.name)).toEqual(["docs", "reference"]);
+    expect(servers.every((item) => !item.enabled)).toBe(true);
+  } finally {
+    client.ws.close();
+  }
+});
+
 test("manages persistent memory entries, config, and registers built-in pi-memory extension", async () => {
   const client = await connect();
   const projectDir = mkdtempSync(join(tmpdir(), "lila-memory-proj-"));

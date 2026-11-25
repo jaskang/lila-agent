@@ -9,11 +9,22 @@ import { McpSettingsTab } from "@/components/settings/mcp-tab";
 import { MemorySettingsTab } from "@/components/settings/memory-tab";
 import { ProvidersTab } from "@/components/settings/providers-tab";
 import { UsageSettingsTab } from "@/components/settings/usage-tab";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "cn";
+import { useNewSessionProjectId } from "@/hooks/use-current-project";
 import { actions, type SettingsTab, useLila } from "@/lib/store";
 
 const NAV_ITEMS: Array<{ id: SettingsTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
@@ -32,10 +43,11 @@ export function SettingsDialog() {
   const connected = useLila((state) => state.connection === "connected");
   const authRunning = useLila((state) => state.authLogin?.status === "running");
   const settingsDirty = useLila((state) => state.settingsDirty);
+  const confirmDiscard = useLila((state) => state.confirmSettingsDiscard);
   const selectedId = useLila((state) => state.selectedId);
-  const activeProjectId = useLila((state) =>
-    state.selectedId ? state.sessions[state.selectedId]?.projectId : state.newSession.projectId,
-  );
+  const newSessionProjectId = useNewSessionProjectId();
+  const sessionProjectId = useLila((state) => (state.selectedId ? state.sessions[state.selectedId]?.projectId : undefined));
+  const activeProjectId = selectedId ? sessionProjectId : newSessionProjectId;
   const activeProjectName = useLila((state) =>
     activeProjectId ? state.projects.find((item) => item.id === activeProjectId)?.name : undefined,
   );
@@ -165,6 +177,20 @@ export function SettingsDialog() {
             </div>
           </ScrollArea>
         </div>
+        <AlertDialog open={confirmDiscard} onOpenChange={(open) => { if (!open) actions.resolveSettingsDiscard(false); }}>
+          <AlertDialogContent size="sm">
+            <AlertDialogHeader>
+              <AlertDialogTitle>放弃未保存的 MCP 更改？</AlertDialogTitle>
+              <AlertDialogDescription>离开后会丢失当前表单内容。</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>继续编辑</AlertDialogCancel>
+              <AlertDialogAction variant="destructive" onClick={() => actions.resolveSettingsDiscard(true)}>
+                放弃更改
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </DialogContent>
     </Dialog>
   );

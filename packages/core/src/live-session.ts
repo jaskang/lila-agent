@@ -122,7 +122,6 @@ export function findModel(services: AgentSessionServices, modelId: string): Mode
 export class LiveSession implements LilaBridge {
   readonly id: string;
   readonly projectId: string;
-  readonly allowedTools = new Set<string>();
   lastActivity = Date.now();
   readonly #store: Store;
   readonly #clients: Clients;

@@ -1,4 +1,11 @@
-import type { McpExposure, McpScope, McpServerInput, McpServerItem } from "@lila/protocol";
+import {
+  McpImportEntry,
+  McpServerInput,
+  McpServerName,
+  type McpExposure,
+  type McpScope,
+  type McpServerItem,
+} from "@lila/protocol";
 
 export const EXPOSURE_OPTIONS: Array<{ value: McpExposure; label: string }> = [
   { value: "codemode", label: "脚本模式" },
@@ -107,68 +114,91 @@ export function parseKeyValues(raw: string, separator: "=" | ":"): { data?: Reco
   return { data: Object.keys(result).length ? result : undefined, invalidLines };
 }
 
-export function parseMcpJsonImport(raw: string): Array<{ name: string; input: McpServerInput }> {
-  const parsed = JSON.parse(raw) as unknown;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("请输入合法的 JSON 对象");
-  }
-  const root = parsed as Record<string, unknown>;
-  const serversObj =
-    root.mcpServers && typeof root.mcpServers === "object" && !Array.isArray(root.mcpServers)
-      ? (root.mcpServers as Record<string, unknown>)
-      : root;
+export type McpFormErrors = Partial<Record<"name" | "command" | "url" | "envText" | "headersText", string>>;
 
-  const items: Array<{ name: string; input: McpServerInput }> = [];
-  for (const [name, entry] of Object.entries(serversObj)) {
-    if (!name.trim() || !entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-    const rec = entry as Record<string, unknown>;
-    const url =
-      typeof rec.url === "string" && rec.url.trim()
-        ? rec.url.trim()
-        : typeof rec.serverUrl === "string" && rec.serverUrl.trim()
-          ? rec.serverUrl.trim()
-          : undefined;
-    const command = typeof rec.command === "string" && rec.command.trim() ? rec.command.trim() : undefined;
-    const enabled = typeof rec.disabled === "boolean" ? !rec.disabled : typeof rec.enabled === "boolean" ? rec.enabled : true;
-    const description = typeof rec.description === "string" && rec.description.trim() ? rec.description.trim() : undefined;
-    if (url) {
-      const headers =
-        rec.headers && typeof rec.headers === "object" && !Array.isArray(rec.headers)
-          ? Object.fromEntries(Object.entries(rec.headers as Record<string, unknown>).map(([k, v]) => [k, String(v)]))
-          : undefined;
-      items.push({
-        name: name.trim(),
-        input: {
-          transport: "http",
-          url,
-          ...(headers && Object.keys(headers).length ? { headers } : {}),
-          ...(description ? { description } : {}),
-          enabled,
-          exposure: "codemode",
-        },
-      });
-    } else if (command) {
-      const args = Array.isArray(rec.args) ? rec.args.map((v) => String(v)) : undefined;
-      const env =
-        rec.env && typeof rec.env === "object" && !Array.isArray(rec.env)
-          ? Object.fromEntries(Object.entries(rec.env as Record<string, unknown>).map(([k, v]) => [k, String(v)]))
-          : undefined;
-      const cwd = typeof rec.cwd === "string" && rec.cwd.trim() ? rec.cwd.trim() : undefined;
-      items.push({
-        name: name.trim(),
-        input: {
-          transport: "stdio",
-          command,
-          ...(args?.length ? { args } : {}),
-          ...(env && Object.keys(env).length ? { env } : {}),
-          ...(cwd ? { cwd } : {}),
-          ...(description ? { description } : {}),
-          enabled,
-          exposure: "codemode",
-        },
-      });
-    }
+export function parseMcpForm(form: McpFormState): { entry: McpImportEntry } | { errors: McpFormErrors } {
+  const errors: McpFormErrors = {};
+  const name = McpServerName.safeParse(form.name);
+  if (!name.success) errors.name = name.error.issues[0]?.message ?? "服务器名称无效";
+
+  const description = form.description.trim() || undefined;
+  const shared = { description, exposure: form.exposure, enabled: form.enabled };
+  let input: McpServerInput;
+  if (form.transport === "http") {
+    const headers = parseKeyValues(form.headersText, ":");
+    if (headers.invalidLines.length) errors.headersText = `第 ${headers.invalidLines.join("、")} 行需要使用「名称: 值」格式`;
+    input = { ...shared, transport: "http", url: form.url, headers: headers.data };
+  } else {
+    const env = parseKeyValues(form.envText, "=");
+    if (env.invalidLines.length) errors.envText = `第 ${env.invalidLines.join("、")} 行需要使用「名称=值」格式`;
+    input = { ...shared, transport: "stdio", command: form.command, args: parseArgs(form.argsText), cwd: form.cwd.trim() || undefined, env: env.data };
   }
-  if (!items.length) throw new Error("未识别到包含 command 或 url 的 MCP 服务器配置");
-  return items;
+
+  const config = McpServerInput.safeParse(input);
+  if (!config.success) errors[input.transport === "http" ? "url" : "command"] = config.error.issues[0]?.message ?? "连接配置无效";
+  if (!name.success || !config.success || Object.keys(errors).length) return { errors };
+  return { entry: { name: name.data, config: config.data } };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function parseMcpJsonImport(raw: string): McpImportEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("JSON 格式有误，请检查引号、逗号和括号");
+  }
+  if (!isRecord(parsed)) throw new Error("请输入包含服务器配置的 JSON 对象");
+  const servers = Object.hasOwn(parsed, "mcpServers") ? parsed.mcpServers : parsed;
+  if (!isRecord(servers)) throw new Error("mcpServers 必须是一个对象");
+
+  const imports: McpImportEntry[] = [];
+  const issues: string[] = [];
+  const names = new Set<string>();
+  for (const [rawName, entry] of Object.entries(servers)) {
+    const name = rawName.trim();
+    const label = name.length > 48 ? `${name.slice(0, 48)}…` : name || "未命名服务器";
+    if (!isRecord(entry)) {
+      issues.push(`「${label}」的配置必须是一个对象`);
+      continue;
+    }
+
+    const url = [entry.url, entry.serverUrl].find((value): value is string => typeof value === "string" && Boolean(value.trim()));
+    const command = typeof entry.command === "string" ? entry.command.trim() : "";
+    const enabled = typeof entry.disabled === "boolean" ? !entry.disabled : typeof entry.enabled === "boolean" ? entry.enabled : true;
+    const description = typeof entry.description === "string" ? entry.description : undefined;
+    const exposure = entry.exposure === "direct" || entry.exposure === "deferred" || entry.exposure === "hidden" ? entry.exposure : "codemode";
+    const shared = { enabled, description, exposure };
+    const config = url ? {
+      ...shared,
+      transport: "http",
+      url,
+      headers: isRecord(entry.headers) ? Object.fromEntries(Object.entries(entry.headers).map(([key, value]) => [key, String(value)])) : undefined,
+    } : {
+      ...shared,
+      transport: "stdio",
+      command,
+      args: Array.isArray(entry.args) ? entry.args.map(String) : undefined,
+      env: isRecord(entry.env) ? Object.fromEntries(Object.entries(entry.env).map(([key, value]) => [key, String(value)])) : undefined,
+      cwd: typeof entry.cwd === "string" ? entry.cwd.trim() || undefined : undefined,
+    };
+    const result = McpImportEntry.safeParse({ name, config });
+    if (!result.success) {
+      for (const issue of result.error.issues) issues.push(`「${label}」${issue.message}`);
+      continue;
+    }
+    if (names.has(name)) {
+      issues.push(`导入内容包含同名服务器「${label}」`);
+      continue;
+    }
+    names.add(name);
+    imports.push(result.data);
+  }
+
+  if (issues.length) throw new Error(issues.join("\n"));
+  if (!imports.length) throw new Error("未找到可导入的 MCP 服务器");
+  return imports;
 }

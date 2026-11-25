@@ -1,6 +1,7 @@
 import { toast } from "sonner";
-import type { ImageInput, SessionSummary } from "@lila/protocol";
+import { ApprovalMode, DEFAULT_APPROVAL_MODE, type ImageInput, type SessionSummary } from "@lila/protocol";
 import {
+  DEFAULT_APPROVAL_KEY,
   DRAFTS_SESSION_KEY,
   type DraftImage,
   NEW_SESSION_KEY,
@@ -61,14 +62,25 @@ export function persistDrafts(drafts: Record<string, string>): void {
   }
 }
 
-export function readNewSession(): NewSessionOptions {
+export function readNewSession(): Pick<State, "newSession" | "defaultApprovalMode"> {
+  const savedDefault = ApprovalMode.safeParse(safeLocalGet(DEFAULT_APPROVAL_KEY));
+  let newSession: NewSessionOptions = {};
+  let defaultApprovalMode = DEFAULT_APPROVAL_MODE;
   try {
-    const saved = JSON.parse(safeLocalGet(NEW_SESSION_KEY) ?? "null") as Partial<NewSessionOptions> | null;
-    if (saved && typeof saved === "object") return { ...saved, approvalMode: saved.approvalMode ?? "auto" };
+    const saved = JSON.parse(safeLocalGet(NEW_SESSION_KEY) ?? "null") as (NewSessionOptions & { approvalMode?: unknown }) | null;
+    if (saved && typeof saved === "object") {
+      const { approvalMode, ...options } = saved;
+      newSession = options;
+      const legacyDefault = ApprovalMode.safeParse(approvalMode);
+      if (legacyDefault.success && !savedDefault.success) {
+        defaultApprovalMode = legacyDefault.data;
+        safeLocalSet(DEFAULT_APPROVAL_KEY, defaultApprovalMode);
+      }
+    }
   } catch {
     // A broken entry falls back to the defaults.
   }
-  return { approvalMode: "auto" };
+  return { newSession, defaultApprovalMode: savedDefault.success ? savedDefault.data : defaultApprovalMode };
 }
 
 export function readNotificationsEnabled(): boolean {

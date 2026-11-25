@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { McpConfigSnapshot, McpExposure, McpScope, McpServerInput, McpServerItem } from "@lila/protocol";
+import type { McpConfigSnapshot, McpExposure, McpImportEntry, McpScope, McpServerInput, McpServerItem } from "@lila/protocol";
 import { UserError } from "./errors.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -122,12 +123,20 @@ function editMcpFile(path: string, edit: (servers: Record<string, unknown>, root
   if (!isRecord(parsed) || (parsed.mcpServers !== undefined && !isRecord(parsed.mcpServers))) {
     throw new UserError(`${path} 格式不正确，顶层需要包含 "mcpServers" 对象`);
   }
-  const servers: Record<string, unknown> = isRecord(parsed.mcpServers) ? { ...parsed.mcpServers } : {};
+  const servers: Record<string, unknown> = Object.assign(Object.create(null), parsed.mcpServers);
   if (!edit(servers, parsed)) return;
   parsed.mcpServers = servers;
   const indent = (text && /^([ \t]+)\S/m.exec(text)?.[1]) || "  ";
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(parsed, null, indent)}\n`);
+  const target = text === undefined ? path : realpathSync(path);
+  const mode = text === undefined ? 0o600 : statSync(target).mode & 0o777;
+  mkdirSync(dirname(target), { recursive: true });
+  const temp = `${target}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(parsed, null, indent)}\n`, { mode, flag: "wx" });
+    renameSync(temp, target);
+  } finally {
+    rmSync(temp, { force: true });
+  }
 }
 
 function toJsonServerEntry(input: McpServerInput, existing?: Record<string, unknown>): Record<string, unknown> {
@@ -171,12 +180,12 @@ function toJsonServerEntry(input: McpServerInput, existing?: Record<string, unkn
   return base;
 }
 
-export function upsertMcpServer(path: string, name: string, input: McpServerInput): void {
-  const trimmed = name.trim();
-  if (!trimmed) throw new UserError("服务器名称不能为空");
+export function upsertMcpServers(path: string, entries: readonly McpImportEntry[]): void {
   editMcpFile(path, (servers) => {
-    const existing = isRecord(servers[trimmed]) ? servers[trimmed] : undefined;
-    servers[trimmed] = toJsonServerEntry(input, existing);
+    for (const { name, config } of entries) {
+      const existing = isRecord(servers[name]) ? servers[name] : undefined;
+      servers[name] = toJsonServerEntry(config, existing);
+    }
     return true;
   });
 }

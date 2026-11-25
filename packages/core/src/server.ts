@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
-import { ClientCommand, type CommandResults, type CommandType, PROTOCOL_VERSION, type ServerMessage, type WatchSlot } from "@lila/protocol";
+import { ClientCommand, type CommandResults, type CommandType, MAX_CORE_MESSAGE_BYTES, PROTOCOL_VERSION, type ServerMessage, type WatchSlot } from "@lila/protocol";
 import { type WebSocket, WebSocketServer } from "ws";
 import pkg from "../package.json" with { type: "json" };
 import { errorMessage, UserError } from "./errors.ts";
@@ -157,6 +157,8 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         return { config: host.listMcp(command.projectId) };
       case "mcp.upsert":
         return { config: await host.upsertMcp(command.scope, command.name, command.config, command.projectId) };
+      case "mcp.import":
+        return { config: await host.importMcp(command.scope, command.entries, command.projectId) };
       case "mcp.toggle":
         return {
           config: await host.toggleMcp(
@@ -322,7 +324,7 @@ export async function startCore(options: CoreOptions): Promise<Core> {
 
   const wss = new WebSocketServer({
     noServer: true,
-    maxPayload: 64 * 1024 * 1024,
+    maxPayload: MAX_CORE_MESSAGE_BYTES,
     handleProtocols: (protocols) => {
       for (const candidate of protocols) if (protocolMatches(candidate, expectedProtocolBytes)) return expectedProtocol;
       return false;
