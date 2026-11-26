@@ -114,7 +114,7 @@ function TreeNodeView({
             />
           }
         >
-          <ChevronRight className="size-3.5 shrink-0 transition-transform group-data-panel-open/button:rotate-90" />
+          <ChevronRight className="size-3.5 shrink-0 transition-transform duration-150 ease-(--ease-ui-out) motion-reduce:transition-none group-data-panel-open/button:rotate-90" />
           <Folder className="size-3.5 shrink-0" />
           <span className="truncate">{node.name}</span>
         </CollapsibleTrigger>

@@ -1,9 +1,10 @@
 import * as React from "react";
-import { Bot, CheckCircle2, CircleAlert, PanelRightOpen } from "lucide-react";
+import { Bot, CheckCircle2, CircleAlert, MessageSquareShare, PanelRightOpen, Send, Square } from "lucide-react";
 import type { SessionSummary, SubagentProgress, TranscriptItem } from "@lila/protocol";
 import { Markdown } from "@/components/markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import {
   Trace,
@@ -181,6 +182,11 @@ export function SubSessionLink({
 }
 
 function AgentDetailsBody({ info, sessionId, showSubLink = true }: { info: ResolvedAgent; sessionId: string; showSubLink?: boolean }) {
+  const [steerOpen, setSteerOpen] = React.useState(false);
+  const [steerText, setSteerText] = React.useState("");
+  const [controlling, setControlling] = React.useState(false);
+  const canControl = info.active && Boolean(info.agentId);
+
   const stats = [
     info.modelName,
     info.turnCount ? (info.maxTurns ? `第 ${info.turnCount}/${info.maxTurns} 轮` : `${info.turnCount} 轮`) : undefined,
@@ -189,6 +195,31 @@ function AgentDetailsBody({ info, sessionId, showSubLink = true }: { info: Resol
     info.cost > 0 ? `$${info.cost.toFixed(4)}` : undefined,
     info.durationText,
   ].filter(Boolean);
+
+  const handleStop = async () => {
+    if (!info.agentId || controlling) return;
+    setControlling(true);
+    try {
+      await actions.stopSubagent(sessionId, info.agentId);
+    } finally {
+      setControlling(false);
+    }
+  };
+
+  const handleSteer = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const trimmed = steerText.trim();
+    if (!info.agentId || !trimmed || controlling) return;
+    setControlling(true);
+    try {
+      if (await actions.steerSubagent(sessionId, info.agentId, trimmed)) {
+        setSteerText("");
+        setSteerOpen(false);
+      }
+    } finally {
+      setControlling(false);
+    }
+  };
 
   return (
     <div className="flex flex-col gap-2">
@@ -201,17 +232,67 @@ function AgentDetailsBody({ info, sessionId, showSubLink = true }: { info: Resol
             {stat}
           </span>
         ))}
-        {showSubLink ? (
-          <SubSessionLink
-            sessionId={sessionId}
-            agentId={info.agentId}
-            description={info.description}
-            prompt={info.prompt}
-            showLabel
-            className="ms-auto"
-          />
-        ) : null}
+        <div className="ms-auto flex items-center gap-1">
+          {canControl ? (
+            <>
+              <Button
+                type="button"
+                size="xs"
+                variant={steerOpen ? "secondary" : "ghost"}
+                disabled={controlling}
+                className="h-6 gap-1 px-1.5 text-[11px] font-normal text-muted-foreground hover:text-foreground"
+                onClick={() => setSteerOpen((v) => !v)}
+              >
+                <MessageSquareShare className="size-3" />
+                引导
+              </Button>
+              <Button
+                type="button"
+                size="xs"
+                variant="ghost"
+                disabled={controlling}
+                className="h-6 gap-1 px-1.5 text-[11px] font-normal text-muted-foreground hover:text-destructive"
+                onClick={() => void handleStop()}
+              >
+                <Square className="size-2.5 fill-current" />
+                停止
+              </Button>
+            </>
+          ) : null}
+          {showSubLink ? (
+            <SubSessionLink
+              sessionId={sessionId}
+              agentId={info.agentId}
+              description={info.description}
+              prompt={info.prompt}
+              showLabel
+            />
+          ) : null}
+        </div>
       </div>
+      {canControl && steerOpen ? (
+        <form onSubmit={(event) => void handleSteer(event)} className="surface-enter flex items-center gap-1.5">
+          <Input
+            autoFocus
+            value={steerText}
+            disabled={controlling}
+            placeholder="向运行中的子 Agent 发送纠偏/补充指令…"
+            aria-label="引导子 Agent"
+            className="h-7 flex-1 bg-background text-xs"
+            onChange={(event) => setSteerText(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setSteerOpen(false);
+              }
+            }}
+          />
+          <Button type="submit" size="xs" disabled={controlling || !steerText.trim()}>
+            <Send className="size-3" />
+            发送
+          </Button>
+        </form>
+      ) : null}
       {info.active && info.activity ? (
         <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground">
           <Spinner className="size-3.5 shrink-0" />

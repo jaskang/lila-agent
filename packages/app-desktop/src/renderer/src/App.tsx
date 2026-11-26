@@ -47,7 +47,7 @@ function ConnectionBanner() {
   }, [disconnected]);
   if (!visible || !disconnected) return null;
   return (
-    <div className="absolute inset-x-0 top-12 z-20 mx-auto w-fit max-w-lg px-4">
+    <div className="surface-enter absolute inset-x-0 top-12 z-20 mx-auto w-fit max-w-lg px-4">
       <Alert variant={connection === "incompatible" ? "destructive" : "default"} className="shadow-md">
         {connection === "connecting" ? <Spinner /> : <WifiOff />}
         <AlertTitle>{connection === "incompatible" ? "core 版本不匹配" : connection === "connecting" ? "正在连接 core…" : "与 core 的连接断开了"}</AlertTitle>

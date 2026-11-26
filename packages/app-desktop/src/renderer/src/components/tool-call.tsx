@@ -19,6 +19,7 @@ import {
   Plug,
   Search,
   SquareTerminal,
+  Undo2,
   Wrench,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -172,7 +173,10 @@ function TerminalCall({ tool, sessionId, reveal }: { tool: ToolItem; sessionId: 
                         title="复制执行的命令"
                         onClick={copyCommand}
                       >
-                        {copiedCmd ? <Check className="size-3" /> : <Copy className="size-3" />}
+                        <span className="swap-icon" aria-hidden="true">
+                          <Copy className="size-3" data-state={copiedCmd ? "hidden" : "visible"} />
+                          <Check className="size-3" data-state={copiedCmd ? "visible" : "hidden"} />
+                        </span>
                         命令
                       </Button>
                     ) : null}
@@ -269,6 +273,55 @@ export function FileActions({ sessionId, path }: { sessionId: string; path: stri
       >
         <FolderOpen />
         定位
+      </Button>
+    </div>
+  );
+}
+
+function MemoryUndoAction({ tool }: { tool: ToolItem }) {
+  const [undone, setUndone] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  if (tool.status !== "done") return null;
+  const target = tool.args.target === "user" ? "user" : "memory";
+  const content = str(tool.args.content);
+  const oldText = str(tool.args.oldText);
+  const newContent = str(tool.args.newContent);
+
+  const canUndo =
+    (tool.name === "memory_add" && Boolean(content)) ||
+    (tool.name === "memory_replace" && Boolean(oldText && newContent)) ||
+    (tool.name === "memory_remove" && Boolean(oldText));
+  if (!canUndo) return null;
+
+  const handleUndo = async () => {
+    if (busy || undone) return;
+    setBusy(true);
+    try {
+      let ok = false;
+      if (tool.name === "memory_add" && content) ok = Boolean(await actions.removeMemory(target, content));
+      else if (tool.name === "memory_replace" && oldText && newContent) ok = Boolean(await actions.replaceMemory(target, newContent, oldText));
+      else if (tool.name === "memory_remove" && oldText) ok = Boolean(await actions.addMemory(target, oldText));
+      if (ok) {
+        setUndone(true);
+        toast.success("已撤销这条长期记忆变更");
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center justify-end">
+      <Button
+        type="button"
+        size="xs"
+        variant="ghost"
+        disabled={busy || undone}
+        className="h-6 px-1.5 text-[11px] font-normal text-muted-foreground hover:text-foreground"
+        onClick={() => void handleUndo()}
+      >
+        {busy ? <Spinner className="size-3" /> : <Undo2 className="size-3" />}
+        {undone ? "已撤销" : "撤销此次记忆变更"}
       </Button>
     </div>
   );
@@ -392,6 +445,7 @@ function viewOf(tool: ToolItem, sessionId: string, projectPath: string | undefin
                 {str(args.oldText)}
               </div>
             ) : null}
+            <MemoryUndoAction tool={tool} />
             {tool.status === "error" ? (
               <Output tool={tool} sessionId={sessionId} title="错误" />
             ) : detailEntries ? (

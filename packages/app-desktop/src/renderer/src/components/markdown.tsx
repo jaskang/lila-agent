@@ -488,7 +488,10 @@ function MermaidBlock({ code, streaming }: { code: string; streaming: boolean })
                 .catch(() => toast.error("复制失败"));
             }}
           >
-            {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+            <span className="swap-icon" aria-hidden="true">
+              <Copy className="size-3" data-state={copied ? "hidden" : "visible"} />
+              <Check className="size-3" data-state={copied ? "visible" : "hidden"} />
+            </span>
             {copied ? "已复制" : "复制"}
           </Button>
         </div>
@@ -537,9 +540,12 @@ function MarkdownTable({ children }: { children?: React.ReactNode }) {
         aria-label="复制表格"
         title="复制表格（制表符分隔）"
         onClick={copyTable}
-        className="absolute top-1 right-1 size-6 opacity-0 transition-opacity group-hover/table:opacity-100 focus-visible:opacity-100"
+        className="absolute top-1 right-1 size-6 opacity-0 transition-opacity duration-150 group-hover/table:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100"
       >
-        {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+        <span className="swap-icon" aria-hidden="true">
+          <Copy className="size-3" data-state={copied ? "hidden" : "visible"} />
+          <Check className="size-3" data-state={copied ? "visible" : "hidden"} />
+        </span>
       </Button>
     </div>
   );

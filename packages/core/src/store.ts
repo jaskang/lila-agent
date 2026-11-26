@@ -2,9 +2,13 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { join } from "node:path";
 import { ApprovalMode, DEFAULT_APPROVAL_MODE, type Project } from "@lila/protocol";
 
-type State = { projects: Project[]; approvalModes: Record<string, ApprovalMode> };
+type State = {
+  projects: Project[];
+  approvalModes: Record<string, ApprovalMode>;
+  approvalRules: Record<string, string[]>;
+};
 
-/** Lila's own state: projects and per-session approval modes. Transcripts live in Pi's session files. */
+/** Lila's own state: projects, per-session approval modes, and per-project reusable approval rules. */
 export class Store {
   readonly #path: string;
   #state: State;
@@ -16,6 +20,7 @@ export class Store {
     this.#state = {
       projects: Array.isArray(loaded.projects) ? loaded.projects : [],
       approvalModes: loaded.approvalModes && typeof loaded.approvalModes === "object" ? loaded.approvalModes : {},
+      approvalRules: loaded.approvalRules && typeof loaded.approvalRules === "object" ? loaded.approvalRules : {},
     };
   }
 
@@ -52,6 +57,34 @@ export class Store {
 
   removeProject(id: string): void {
     this.#state.projects = this.#state.projects.filter((project) => project.id !== id);
+    delete this.#state.approvalRules[id];
+    this.#save();
+  }
+
+  approvalRules(projectId: string): string[] {
+    const list = this.#state.approvalRules[projectId];
+    return Array.isArray(list) ? list.filter((item): item is string => typeof item === "string" && item.length > 0) : [];
+  }
+
+  addApprovalRule(projectId: string, pattern: string): void {
+    const current = this.approvalRules(projectId);
+    if (current.includes(pattern)) return;
+    this.#state.approvalRules[projectId] = [...current, pattern];
+    this.#save();
+  }
+
+  removeApprovalRule(projectId: string, pattern: string): void {
+    const current = this.approvalRules(projectId);
+    const next = current.filter((item) => item !== pattern);
+    if (next.length === current.length) return;
+    if (next.length) this.#state.approvalRules[projectId] = next;
+    else delete this.#state.approvalRules[projectId];
+    this.#save();
+  }
+
+  clearApprovalRules(projectId: string): void {
+    if (!(projectId in this.#state.approvalRules)) return;
+    delete this.#state.approvalRules[projectId];
     this.#save();
   }
 

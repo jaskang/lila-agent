@@ -10,6 +10,7 @@ import {
   FolderPlus,
   FolderTree,
   GitBranch,
+  GitBranchPlus,
   KeyRound,
   MessageCircleQuestion,
   MessageSquare,
@@ -42,6 +43,7 @@ export function CommandPalette() {
   const sessions = useLila((state) => state.sessions);
   const projects = useLila((state) => state.projects);
   const selectedId = useLila((state) => state.selectedId);
+  const unreadCompletedIds = useLila((state) => state.unreadCompletedIds);
   const rightPanel = useLila((state) => state.rightPanel);
   const activeView = useLila((state) => (state.selectedId ? state.views[state.selectedId] : undefined));
   const activeState = activeView?.state;
@@ -58,6 +60,14 @@ export function CommandPalette() {
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
     [sessions],
   );
+  const nextAttention = React.useMemo(() => {
+    const candidates = sorted.filter(
+      (session) =>
+        session.id !== selectedId &&
+        (session.status === "waiting" || session.status === "error" || Boolean(unreadCompletedIds[session.id])),
+    );
+    return candidates.find((s) => s.status === "waiting") ?? candidates.find((s) => s.status === "error") ?? candidates[0];
+  }, [sorted, selectedId, unreadCompletedIds]);
   const ready = activeState?.access === "ready";
   const failed = activeState?.access === "failed";
   const canStop = ready && (activeState.runActive || activeState.compacting);
@@ -110,10 +120,25 @@ export function CommandPalette() {
                 </CommandItem>
               ) : null}
               {activeProject ? (
-                <CommandItem value={`reveal-project 打开项目目录 访达 finder dakai ${activeProject.name}`} onSelect={() => run(() => void actions.revealPath(activeProject.path))}>
-                  <FolderOpen />
-                  在文件夹中显示当前项目
-                </CommandItem>
+                <>
+                  <CommandItem
+                    value={`new-worktree 新建隔离 worktree 分支 并行 fenzhi bingxing ${activeProject.name}`}
+                    onSelect={() =>
+                      run(() => {
+                        void actions.createWorktreeProject(activeProject.id).then((created) => {
+                          if (created) actions.startNew(created.project.id);
+                        });
+                      })
+                    }
+                  >
+                    <GitBranchPlus />
+                    从当前项目新建隔离 Worktree
+                  </CommandItem>
+                  <CommandItem value={`reveal-project 打开项目目录 访达 finder dakai ${activeProject.name}`} onSelect={() => run(() => void actions.revealPath(activeProject.path))}>
+                    <FolderOpen />
+                    在文件夹中显示当前项目
+                  </CommandItem>
+                </>
               ) : null}
               {lastAssistantText ? (
                 <CommandItem
@@ -168,6 +193,15 @@ export function CommandPalette() {
             </CommandGroup>
           ) : null}
           <CommandGroup heading="命令">
+            {nextAttention ? (
+              <CommandItem
+                value={`next-attention 待处理 需要关注 审批 跳转 shenpi guanzhu ${nextAttention.title}`}
+                onSelect={() => run(() => actions.select(nextAttention.id))}
+              >
+                <MessageCircleQuestion className="text-warning-foreground" />
+                跳到待关注会话：{nextAttention.title || "新会话"}
+              </CommandItem>
+            ) : null}
             <CommandItem value="new-session 新会话 xinhuihua xhh" onSelect={() => run(() => actions.startNew())}>
               <SquarePen />
               新会话

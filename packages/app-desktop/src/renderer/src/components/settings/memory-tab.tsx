@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Check, ChevronDown, ChevronRight, ExternalLink, FolderOpen, Info, Pencil, Plus, RotateCw, Trash2, TriangleAlert, X } from "lucide-react";
+import { Check, ChevronRight, ExternalLink, FolderOpen, Info, Pencil, Plus, RotateCw, Trash2, TriangleAlert, X } from "lucide-react";
 import { toast } from "sonner";
 import type { MemorySnapshot, MemoryStoreSnapshot, MemoryTarget } from "@lila/protocol";
 import { IconButton } from "@/components/icon-button";
@@ -24,6 +24,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { cn } from "cn";
 import { actions, useLila } from "@/lib/store";
 
 const AUTO_MODEL_VALUE = "__auto__";
@@ -142,7 +143,7 @@ function MemoryNotesList({
                     <p className="min-w-0 flex-1 select-text whitespace-pre-wrap break-words text-[13px] leading-relaxed text-foreground">
                       {entry}
                     </p>
-                    <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/entry:opacity-100 focus-within:opacity-100">
+                    <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/entry:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100">
                       <IconButton
                         size="icon-xs"
                         label="编辑"
@@ -525,15 +526,21 @@ export function MemorySettingsTab({
             </SettingsRow>
 
             <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-              <CollapsibleTrigger className="flex w-full items-center justify-between gap-2 px-1 py-2.5 text-xs text-muted-foreground hover:text-foreground">
+              <CollapsibleTrigger className="flex w-full cursor-pointer items-center justify-between gap-2 px-1 py-2.5 text-xs text-muted-foreground transition-colors hover:text-foreground outline-none focus-visible:text-foreground">
                 <span>高级参数</span>
                 <span className="flex items-center gap-1 font-mono text-[11px] tabular-nums">
                   {data.dreaming.minHoursSinceLastRun}h · {data.dreaming.minTurnsSinceLastRun} 轮
-                  {advancedOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+                  <ChevronRight
+                    aria-hidden
+                    className={cn(
+                      "size-3.5 transition-transform duration-150 ease-(--ease-ui-out) motion-reduce:transition-none",
+                      advancedOpen && "rotate-90",
+                    )}
+                  />
                 </span>
               </CollapsibleTrigger>
-              <CollapsibleContent className="px-1 pb-3">
-                <div className="grid grid-cols-2 gap-3 pt-1 sm:grid-cols-4">
+              <CollapsibleContent className="h-(--collapsible-panel-height) overflow-hidden px-1 transition-[height,opacity] duration-200 ease-(--ease-ui-out) data-ending-style:duration-150 data-ending-style:h-0 data-ending-style:opacity-0 data-starting-style:h-0 data-starting-style:opacity-0 motion-reduce:transition-none">
+                <div className="grid grid-cols-2 gap-3 pt-1 pb-3 sm:grid-cols-4">
                   <label className="flex flex-col gap-1">
                     <span className="text-[11px] text-muted-foreground">间隔（小时）</span>
                     <Input

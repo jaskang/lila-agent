@@ -1,9 +1,12 @@
 import * as React from "react";
 import { ArrowLeft, ChevronDown, FileCode2, FileDiff, FileText, GitBranch, X } from "lucide-react";
-import { Code, DiffView, languageOf, parsePatch } from "@/components/code";
+import { Code, DiffView, type DiffLineComment, languageOf, parsePatch } from "@/components/code";
+import { focusComposer } from "@/components/composer";
 import { FileTree } from "@/components/file-tree";
+import { IconButton } from "@/components/icon-button";
 import { FileActions } from "@/components/tool-call";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "cn";
 import { actions, useLila, type ReplyReviewState } from "@/lib/store";
@@ -84,21 +87,21 @@ export const ReplyChanges = React.memo(function ReplyChanges({
   if (!files.length) return null;
 
   return (
-    <div className="not-typeset mt-2 overflow-hidden rounded-xl border border-border/80 bg-card/80">
+    <Collapsible open={open} onOpenChange={setOpen} className="not-typeset mt-2 overflow-hidden rounded-xl border border-border/80 bg-card/80">
       <div className="flex items-center gap-2 bg-muted/35 px-3 py-2">
-        <button
-          type="button"
-          aria-expanded={open}
-          onClick={() => setOpen((current) => !current)}
+        <CollapsibleTrigger
           className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left text-[13px] outline-none focus-visible:text-foreground"
         >
           <span className="font-medium text-foreground">{files.length} 个文件已改动</span>
           <DiffStat added={totalAdded} removed={totalRemoved} />
           <ChevronDown
             aria-hidden
-            className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform duration-150", !open && "-rotate-90")}
+            className={cn(
+              "size-3.5 shrink-0 text-muted-foreground transition-transform duration-150 ease-(--ease-ui-out) motion-reduce:transition-none",
+              !open && "-rotate-90",
+            )}
           />
-        </button>
+        </CollapsibleTrigger>
         <Button
           type="button"
           variant="outline"
@@ -110,7 +113,7 @@ export const ReplyChanges = React.memo(function ReplyChanges({
           查看
         </Button>
       </div>
-      {open ? (
+      <CollapsibleContent className="h-(--collapsible-panel-height) overflow-hidden transition-[height,opacity] duration-200 ease-(--ease-ui-out) data-ending-style:duration-150 data-ending-style:h-0 data-ending-style:opacity-0 data-starting-style:h-0 data-starting-style:opacity-0 motion-reduce:transition-none">
         <div className="max-h-64 divide-y divide-border/50 overflow-y-auto border-t border-border/60">
           {files.map((file) => (
             <button
@@ -127,8 +130,8 @@ export const ReplyChanges = React.memo(function ReplyChanges({
             </button>
           ))}
         </div>
-      ) : null}
-    </div>
+      </CollapsibleContent>
+    </Collapsible>
   );
 });
 
@@ -148,6 +151,13 @@ export function ReplyChangesPanel({ review }: { review: ReplyReviewState }) {
     setNarrowView("diff");
   };
 
+  const handleCommentLine = React.useCallback((comment: DiffLineComment) => {
+    const loc = comment.lineNumber ? `${comment.path}#L${comment.lineNumber}` : comment.path;
+    const prefix = comment.variant === "added" ? "+" : comment.variant === "removed" ? "-" : " ";
+    actions.appendToDraft(`关于 @${loc}：\n\`\`\`\n${prefix}${comment.lineText}\n\`\`\`\n${comment.note}`);
+    focusComposer();
+  }, []);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border/60 px-3">
@@ -163,17 +173,11 @@ export function ReplyChangesPanel({ review }: { review: ReplyReviewState }) {
             返回子会话
           </Button>
         ) : files.length > 1 && narrowView === "diff" ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label="返回文件列表"
-            title="返回文件列表"
-            className="text-muted-foreground @min-[42rem]:hidden"
-            onClick={() => setNarrowView("list")}
-          >
-            <ArrowLeft />
-          </Button>
+          <span className="@min-[42rem]:hidden">
+            <IconButton label="返回文件列表" onClick={() => setNarrowView("list")}>
+              <ArrowLeft />
+            </IconButton>
+          </span>
         ) : (
           <FileDiff aria-hidden className="size-4 shrink-0 text-muted-foreground" />
         )}
@@ -191,40 +195,19 @@ export function ReplyChangesPanel({ review }: { review: ReplyReviewState }) {
           <DiffStat added={totalAdded} removed={totalRemoved} className="hidden @min-[26rem]:inline-flex" />
         </div>
         {selected ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            title="在文件面板打开"
-            aria-label="在文件面板打开"
-            className="text-muted-foreground"
-            onClick={() => actions.openFilePreview(selected.path)}
-          >
+          <IconButton label="在文件面板打开" onClick={() => actions.openFilePreview(selected.path)}>
             <FileText />
-          </Button>
+          </IconButton>
         ) : null}
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          title="查看完整 Git 改动"
-          aria-label="查看完整 Git 改动"
-          className="text-muted-foreground"
+        <IconButton
+          label="查看完整 Git 改动"
           onClick={() => (selected ? actions.openChangesForFile(selected.path) : actions.openRightPanel("changes"))}
         >
           <GitBranch />
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label="关闭本轮改动"
-          title="关闭"
-          className="text-muted-foreground"
-          onClick={() => actions.closeRightPanel()}
-        >
+        </IconButton>
+        <IconButton label="关闭本轮改动" onClick={() => actions.closeRightPanel()}>
           <X />
-        </Button>
+        </IconButton>
       </header>
 
       <div className="grid min-h-0 flex-1 grid-cols-1 @min-[42rem]:grid-cols-[minmax(11rem,15rem)_minmax(0,1fr)]">
@@ -254,7 +237,7 @@ export function ReplyChangesPanel({ review }: { review: ReplyReviewState }) {
               </div>
               {selected.changes.map((change) =>
                 change.kind === "patch" ? (
-                  <DiffView key={change.itemId} patch={change.patch} path={change.path} maxHeight="none" />
+                  <DiffView key={change.itemId} patch={change.patch} path={change.path} maxHeight="none" onCommentLine={handleCommentLine} />
                 ) : (
                   <Code key={change.itemId} code={change.content} language={languageOf(change.path)} title="写入内容" maxHeight="none" />
                 ),

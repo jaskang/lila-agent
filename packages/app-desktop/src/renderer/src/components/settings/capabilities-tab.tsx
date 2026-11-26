@@ -50,7 +50,7 @@ function ResourceRow({
         <IconButton
           size="icon-xs"
           label={revealOnly ? "在访达中显示" : "打开"}
-          className="shrink-0 opacity-60 group-hover/row:opacity-100 focus-visible:opacity-100"
+          className="shrink-0 opacity-60 transition-opacity duration-150 group-hover/row:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100"
           onClick={() => {
             if (revealOnly) void actions.revealPath(path);
             else void window.lila.openPath(path).catch((error: unknown) => toast.error(error instanceof Error ? error.message : String(error)));

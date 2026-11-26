@@ -1,9 +1,9 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolInfo } from "@earendil-works/pi-coding-agent";
-import { approvalReason } from "./approval-policy.ts";
+import { approvalReason, isSafeReadonlyBash, matchesApprovalRule, suggestApprovalRule } from "./approval-policy.ts";
 
 const builtin = (name: string, annotations?: ToolInfo["annotations"]): Pick<ToolInfo, "sourceInfo" | "annotations"> => ({
   sourceInfo: { path: `builtin:${name}`, source: "builtin", scope: "temporary", origin: "top-level" },
@@ -56,4 +56,43 @@ test("preserves built-in read access and treats overridden tools as extensions",
     ...read,
     tool: { sourceInfo: { ...builtin("read").sourceInfo, path: "project-extension.ts" }, annotations: { readOnlyHint: true } },
   })).toContain("无法确认");
+});
+
+test("auto-allows statically verified read-only bash and memory tools in ask-exec mode", () => {
+  const context = { projectRoot: process.cwd(), cwd: process.cwd() };
+  expect(isSafeReadonlyBash("git status")).toBe(true);
+  expect(isSafeReadonlyBash("git log -n 5 | head -n 3")).toBe(true);
+  expect(isSafeReadonlyBash("find src -name '*.ts'")).toBe(true);
+  expect(isSafeReadonlyBash("node --version")).toBe(true);
+
+  expect(isSafeReadonlyBash("git status > out.txt")).toBe(false);
+  expect(isSafeReadonlyBash("echo $(whoami)")).toBe(false);
+  expect(isSafeReadonlyBash("git -c core.pager=sh log")).toBe(false);
+  expect(isSafeReadonlyBash("find . -delete")).toBe(false);
+  expect(isSafeReadonlyBash("npm test")).toBe(false);
+
+  expect(approvalReason({ ...context, mode: "ask-exec", name: "bash", input: { command: "git diff --stat" }, tool: builtin("bash") })).toBeUndefined();
+  expect(approvalReason({ ...context, mode: "ask-all", name: "bash", input: { command: "git diff --stat" }, tool: builtin("bash") })).toContain("无法确认");
+
+  const memTool = { sourceInfo: { ...builtin("memory_add").sourceInfo, path: "pi-memory.ts" } };
+  expect(approvalReason({ ...context, mode: "ask-exec", name: "memory_add", input: { content: "x" }, tool: memTool })).toBeUndefined();
+  expect(approvalReason({ ...context, mode: "ask-all", name: "memory_add", input: { content: "x" }, tool: memTool })).toContain("长期记忆");
+});
+
+test("suggests and matches scoped approval rules without allowing chained shell bypasses", () => {
+  const context = { projectRoot: process.cwd(), cwd: process.cwd() };
+  const bashTool = builtin("bash");
+
+  expect(suggestApprovalRule("bash", { command: "pnpm test --run" }, bashTool)).toEqual({
+    pattern: "bash:pnpm test",
+    label: "pnpm test *",
+  });
+  expect(suggestApprovalRule("bash", { command: "rm -rf /tmp/x" }, bashTool)).toBeUndefined();
+  expect(suggestApprovalRule("bash", { command: "pnpm test && rm -rf /tmp/x" }, bashTool)).toBeUndefined();
+
+  const rules = ["bash:pnpm test"];
+  expect(matchesApprovalRule(rules, "bash", { command: "pnpm test src/git.test.ts" }, bashTool)).toBe(true);
+  expect(matchesApprovalRule(rules, "bash", { command: "pnpm test && rm -rf /" }, bashTool)).toBe(false);
+  expect(approvalReason({ ...context, mode: "ask-exec", name: "bash", input: { command: "pnpm test" }, tool: bashTool, rules })).toBeUndefined();
+  expect(approvalReason({ ...context, mode: "ask-exec", name: "bash", input: { command: "pnpm build" }, tool: bashTool, rules })).toContain("无法确认");
 });

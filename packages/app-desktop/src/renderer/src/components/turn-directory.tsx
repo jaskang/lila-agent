@@ -7,6 +7,7 @@ import { cn } from "cn";
 import type { TranscriptBlock } from "@/lib/transcript-layout";
 
 const PREVIEW_TICK_WIDTHS = [26, 19, 13, 9];
+const MAX_TICK_WIDTH = PREVIEW_TICK_WIDTHS[0]!;
 
 type TurnPreview = { itemId: string; number: number; prompt: string; reply?: string };
 
@@ -90,6 +91,7 @@ export function TurnRail({ items, blocks, onJump }: {
                 {turns.map((turn, index) => {
                   const current = turn.itemId === effectiveTurnId;
                   const previewWidth = hovered >= 0 ? PREVIEW_TICK_WIDTHS[Math.abs(hovered - index)] : undefined;
+                  const tickWidth = Math.max(current ? 13 : 7, previewWidth ?? 0);
                   return (
                     <HoverCardTrigger
                       key={turn.itemId}
@@ -112,11 +114,11 @@ export function TurnRail({ items, blocks, onJump }: {
                       <span
                         aria-hidden
                         className={cn(
-                          "h-0.5 rounded-full bg-muted-foreground/45 transition-[width,background-color] duration-150 motion-reduce:transition-none",
+                          "h-0.5 w-[26px] origin-left rounded-full bg-muted-foreground/45 transition-[transform,background-color] duration-150 ease-(--ease-ui-out) motion-reduce:transition-colors",
                           current && "bg-info",
                           hovered === index && "bg-foreground",
                         )}
-                        style={{ width: Math.max(current ? 13 : 7, previewWidth ?? 0) }}
+                        style={{ transform: `scaleX(${tickWidth / MAX_TICK_WIDTH})` }}
                       />
                     </HoverCardTrigger>
                   );

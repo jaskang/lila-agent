@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowUp, Clock3, MessageCircleQuestion, ShieldAlert, Trash2, X } from "lucide-react";
+import { ArrowUp, Clock3, MessageCircleQuestion, ShieldAlert, Square, Trash2, X } from "lucide-react";
 import type { SessionState, SubagentProgress } from "@lila/protocol";
 import { SubSessionLink } from "@/components/agent-card";
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,7 @@ import { actions } from "@/lib/store";
 
 function ActiveSubagentRow({ sessionId, subagent, now }: { sessionId: string; subagent: SubagentProgress; now: number }) {
   const elapsed = formatElapsed(subagent.startedAt, now);
+  const [stopping, setStopping] = React.useState(false);
 
   return (
     <div className="flex items-center gap-2 rounded-lg px-2 py-1 text-xs hover:bg-muted/50">
@@ -19,6 +20,21 @@ function ActiveSubagentRow({ sessionId, subagent, now }: { sessionId: string; su
         {subagent.activity ? <span className="ms-1.5 font-mono text-muted-foreground">· {subagent.activity}</span> : null}
       </span>
       {elapsed ? <span className="shrink-0 text-muted-foreground tabular-nums">{elapsed}</span> : null}
+      <Button
+        type="button"
+        size="icon-xs"
+        variant="ghost"
+        disabled={stopping}
+        title="停止该子 Agent"
+        aria-label={`停止 ${subagent.description || "子 Agent"}`}
+        className="size-6 shrink-0 text-muted-foreground hover:text-destructive"
+        onClick={() => {
+          setStopping(true);
+          void actions.stopSubagent(sessionId, subagent.id).finally(() => setStopping(false));
+        }}
+      >
+        <Square className="size-2.5 fill-current" />
+      </Button>
       <SubSessionLink sessionId={sessionId} agentId={subagent.id} description={subagent.description} />
     </div>
   );

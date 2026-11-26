@@ -1,10 +1,12 @@
 import * as React from "react";
 import { Button } from "@/components/ui/button";
+import { Kbd } from "@/components/ui/kbd";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "cn";
 
 export function IconButton({
   label,
+  shortcut,
   disabled,
   size = "icon-sm",
   ariaPressed,
@@ -14,6 +16,7 @@ export function IconButton({
   children,
 }: {
   label: string;
+  shortcut?: string | undefined;
   disabled?: boolean;
   size?: "icon-xs" | "icon-sm";
   ariaPressed?: boolean;
@@ -41,7 +44,10 @@ export function IconButton({
       >
         {children}
       </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
+      <TooltipContent>
+        {label}
+        {shortcut ? <Kbd>{shortcut}</Kbd> : null}
+      </TooltipContent>
     </Tooltip>
   );
 }

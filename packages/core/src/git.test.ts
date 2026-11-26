@@ -1,9 +1,9 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gitDiff, gitStatus } from "./git.ts";
+import { gitCommit, gitCreateWorktree, gitDiff, gitDiscard, gitStage, gitStatus, gitUnstage } from "./git.ts";
 
 function git(cwd: string, args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });
@@ -91,4 +91,41 @@ test("uses project-relative paths and preserves renames inside a repository subd
   expect(diff.patch).toContain("rename from old.ts");
   expect(diff.patch).toContain("rename to new.ts");
   expect((await gitDiff(dir, "untracked.ts")).patch).toContain("+inside");
+});
+
+test("supports stage, unstage, discard, commit, and worktree creation within repository bounds", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "lila-git-ops-"));
+  const dir = join(parent, "repo");
+  mkdirSync(dir);
+  git(dir, ["init", "-b", "main"]);
+  git(dir, ["config", "user.email", "test@example.com"]);
+  git(dir, ["config", "user.name", "Test"]);
+  writeFileSync(join(dir, "a.ts"), "export const a = 1;\n");
+  git(dir, ["add", "a.ts"]);
+  git(dir, ["commit", "-m", "init"]);
+
+  writeFileSync(join(dir, "a.ts"), "export const a = 2;\n");
+  writeFileSync(join(dir, "temp.ts"), "export const tmp = 1;\n");
+
+  await gitStage(dir, ["a.ts"]);
+  expect((await gitStatus(dir)).files.find((f) => f.path === "a.ts")).toMatchObject({ staged: true, unstaged: false });
+
+  await gitUnstage(dir, ["a.ts"]);
+  expect((await gitStatus(dir)).files.find((f) => f.path === "a.ts")).toMatchObject({ staged: false, unstaged: true });
+
+  await gitDiscard(dir, "a.ts");
+  await gitDiscard(dir, "temp.ts");
+  expect(readFileSync(join(dir, "a.ts"), "utf8")).toBe("export const a = 1;\n");
+  expect(existsSync(join(dir, "temp.ts"))).toBe(false);
+  await expect(gitDiscard(dir, "../escape.ts")).rejects.toThrow("不在项目目录内");
+
+  writeFileSync(join(dir, "a.ts"), "export const a = 3;\n");
+  await gitStage(dir, ["a.ts"]);
+  const committed = await gitCommit(dir, "update a");
+  expect(committed.hash.length).toBeGreaterThanOrEqual(7);
+  expect((await gitStatus(dir)).files).toEqual([]);
+
+  const wt = await gitCreateWorktree(dir, "feat/demo");
+  expect(wt.branch).toBe("feat/demo");
+  expect(existsSync(join(wt.path, "a.ts"))).toBe(true);
 });

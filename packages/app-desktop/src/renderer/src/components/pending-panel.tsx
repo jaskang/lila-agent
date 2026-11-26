@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Check, ChevronDown, ChevronUp, Copy, MessageCircleQuestion, MessageSquareText, ShieldAlert } from "lucide-react";
+import { Check, ChevronDown, Copy, MessageCircleQuestion, MessageSquareText, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 import type { PendingAnswer, PendingRequest } from "@lila/protocol";
 import { Button } from "@/components/ui/button";
@@ -74,7 +74,7 @@ function Shell({
       role="region"
       aria-label={title}
       data-pending-panel=""
-      className="items-start gap-2 border-warning/35 bg-warning/8 dark:bg-warning/10"
+      className="surface-enter items-start gap-2 border-warning/35 bg-warning/8 dark:bg-warning/10"
     >
       <ItemMedia variant="icon" className="mt-0.5 text-warning-foreground">
         {busy ? <Spinner className="size-4" /> : icon}
@@ -85,11 +85,18 @@ function Shell({
           {queuedItems.length > 0 ? (
             <button
               type="button"
+              aria-expanded={showQueue}
               onClick={() => setShowQueue((open) => !open)}
-              className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground hover:bg-background/60 hover:text-foreground"
+              className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-[color,background-color,scale] duration-150 ease-(--ease-ui-out) outline-none hover:bg-background/60 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 motion-safe:active:scale-[0.97]"
             >
               还有 {queuedItems.length} 个
-              {showQueue ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
+              <ChevronDown
+                aria-hidden
+                className={cn(
+                  "size-3 transition-transform duration-150 ease-(--ease-ui-out) motion-reduce:transition-none",
+                  showQueue && "rotate-180",
+                )}
+              />
             </button>
           ) : null}
         </div>
@@ -123,7 +130,13 @@ function Shell({
                   aria-label={expandedMsg ? "收起" : "展开完整内容"}
                   onClick={() => setExpandedMsg((v) => !v)}
                 >
-                  {expandedMsg ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
+                  <ChevronDown
+                    aria-hidden
+                    className={cn(
+                      "size-3 transition-transform duration-150 ease-(--ease-ui-out) motion-reduce:transition-none",
+                      expandedMsg && "rotate-180",
+                    )}
+                  />
                 </Button>
               ) : null}
               <Button
@@ -135,7 +148,10 @@ function Shell({
                 aria-label="复制内容"
                 onClick={copyMessage}
               >
-                {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+                <span className="swap-icon" aria-hidden="true">
+                  <Copy className="size-3" data-state={copied ? "hidden" : "visible"} />
+                  <Check className="size-3" data-state={copied ? "visible" : "hidden"} />
+                </span>
               </Button>
             </div>
           </div>
@@ -362,13 +378,22 @@ function PendingCard({ sessionId, item, queuedItems }: { sessionId: string; item
     () => item.options.map((option, index) => ({ label: option, answer: { type: "option", value: option }, variant: index === 0 ? "default" : "secondary" })),
     [item.options],
   );
+  const approvalChoices = React.useMemo<Choice[]>(() => {
+    if (!item.ruleSuggestion) return APPROVAL_CHOICES;
+    return [
+      { label: "允许本次", answer: { type: "option", value: "allow" }, variant: "default" },
+      { label: `本会话允许 ${item.ruleSuggestion.label}`, answer: { type: "option", value: "allow-session" }, variant: "secondary" },
+      { label: "项目永久允许", answer: { type: "option", value: "allow-project" }, variant: "outline" },
+      { label: "拒绝", answer: { type: "option", value: "deny" }, variant: "outline" },
+    ];
+  }, [item.ruleSuggestion]);
   const approval = item.kind === "approval";
   const icon = approval ? <ShieldAlert className="size-4" /> : <MessageCircleQuestion className="size-4" />;
   const title = item.title || (approval ? `Agent 想要运行 ${item.toolName ?? "工具"}` : "Agent 有个问题");
   return (
-    <div className={busy ? "pointer-events-none opacity-60" : undefined}>
+    <div className={cn("transition-opacity duration-150", busy && "pointer-events-none opacity-60")}>
       <Shell icon={icon} title={title} message={item.message} queuedItems={queuedItems} busy={busy}>
-        {item.kind === "approval" ? <Choices choices={APPROVAL_CHOICES} busy={busy} onAnswer={onAnswer} allowDenyNote /> : null}
+        {item.kind === "approval" ? <Choices choices={approvalChoices} busy={busy} onAnswer={onAnswer} allowDenyNote /> : null}
         {item.kind === "select" ? <Choices choices={selectChoices} busy={busy} onAnswer={onAnswer} onCancel={cancel} /> : null}
         {item.kind === "confirm" ? <Choices choices={CONFIRM_CHOICES} busy={busy} onAnswer={onAnswer} /> : null}
         {item.kind === "input" || item.kind === "editor" ? <TextAnswer item={item} multiline={item.kind === "editor"} onAnswer={onAnswer} /> : null}

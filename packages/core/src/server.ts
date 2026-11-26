@@ -222,6 +222,16 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         return { status: await host.gitStatus(command.projectId) };
       case "git.diff":
         return { diff: await host.gitDiff(command.projectId, command.path, command.staged) };
+      case "git.stage":
+        return { status: await host.gitStage(command.projectId, command.paths) };
+      case "git.unstage":
+        return { status: await host.gitUnstage(command.projectId, command.paths) };
+      case "git.discard":
+        return { status: await host.gitDiscard(command.projectId, command.path) };
+      case "git.commit":
+        return await host.gitCommit(command.projectId, command.message);
+      case "git.worktree.create":
+        return await host.createWorktreeProject(command.projectId, command.branch);
       case "session.delete":
         await host.deleteSession(command.sessionId);
         return {};
@@ -265,12 +275,20 @@ export async function startCore(options: CoreOptions): Promise<Core> {
       case "session.rename":
         return { session: live.rename(command.title) };
       case "session.compact":
-        live.compact();
+        live.compact(command.instructions);
         return {};
       case "session.rewind":
         return { text: await live.rewind(command.itemId) };
       case "session.respond":
         live.respond(command.pendingId, command.answer);
+        return {};
+      case "session.rules.update":
+        return { state: live.updateRules(command.scope, command.action, command.pattern) };
+      case "session.subagent.stop":
+        await live.stopSubagent(command.agentId);
+        return {};
+      case "session.subagent.steer":
+        await live.steerSubagent(command.agentId, command.message);
         return {};
       case "session.queue.update":
         return { state: await live.updateQueue(command.action, command.kind, command.index) };

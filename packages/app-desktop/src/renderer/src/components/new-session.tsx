@@ -4,9 +4,11 @@ import { Composer } from "@/components/composer";
 import { ApprovalSelect, COMPOSER_CHIP, ModelPicker, ModelSetup } from "@/components/session-controls";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
+import { Kbd } from "@/components/ui/kbd";
 import { useNewSessionProjectId } from "@/hooks/use-current-project";
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "cn";
 import { actions, NEW_DRAFT, useLila } from "@/lib/store";
 
@@ -38,7 +40,15 @@ export function NewSession() {
   const showTrigger = !open || isMobile;
   const header = (
     <header className={cn("flex h-11 shrink-0 items-center px-4 [-webkit-app-region:drag]", showTrigger && "pl-[74px]")}>
-      {showTrigger ? <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" /> : null}
+      {showTrigger ? (
+        <Tooltip>
+          <TooltipTrigger render={<SidebarTrigger className="[-webkit-app-region:no-drag]" />} />
+          <TooltipContent side="bottom">
+            切换侧边栏
+            <Kbd>⌘B</Kbd>
+          </TooltipContent>
+        </Tooltip>
+      ) : null}
     </header>
   );
 

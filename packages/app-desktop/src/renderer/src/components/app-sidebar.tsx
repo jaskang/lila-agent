@@ -1,10 +1,11 @@
 import * as React from "react";
 import {
-  ChevronDown,
+  CheckCircle2,
   ChevronRight,
   CircleAlert,
   FolderOpen,
   FolderPlus,
+  GitBranchPlus,
   MessageCircleQuestion,
   Moon,
   MoreHorizontal,
@@ -16,6 +17,7 @@ import {
   Trash2,
 } from "lucide-react";
 import type { Project, SessionSummary } from "@lila/protocol";
+import { IconButton } from "@/components/icon-button";
 import { SearchInput } from "@/components/search-input";
 import {
   AlertDialog,
@@ -30,6 +32,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Kbd } from "@/components/ui/kbd";
 import {
   Sidebar,
   SidebarContent,
@@ -47,6 +50,8 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn } from "cn";
 import { actions, useLila } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -270,9 +275,15 @@ function ProjectGroup({
       <SidebarGroupLabel
         title={project.path}
         render={<button type="button" aria-expanded={!isCollapsed} onClick={onToggle} />}
-        className="cursor-pointer gap-1 pr-12 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+        className="cursor-pointer gap-1 pr-12 transition-colors duration-150 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
       >
-        {isCollapsed ? <ChevronRight /> : <ChevronDown />}
+        <ChevronRight
+          aria-hidden
+          className={cn(
+            "transition-transform duration-150 ease-(--ease-ui-out) motion-reduce:transition-none",
+            !isCollapsed && "rotate-90",
+          )}
+        />
         <span className="truncate">{project.name}</span>
         {isCollapsed && status !== "idle" ? <StatusIcon status={status} /> : null}
       </SidebarGroupLabel>
@@ -280,15 +291,24 @@ function ProjectGroup({
         <DropdownMenuTrigger
           render={
             <SidebarGroupAction
-              className="right-8 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100 data-popup-open:opacity-100"
-              title="项目操作"
+              className="right-8 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100 data-popup-open:opacity-100 pointer-coarse:opacity-100"
               aria-label={`${project.name} 的操作`}
             />
           }
         >
           <MoreHorizontal />
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" side="right" className="w-40" finalFocus={false}>
+        <DropdownMenuContent align="start" side="right" className="w-44" finalFocus={false}>
+          <DropdownMenuItem
+            onClick={() => {
+              void actions.createWorktreeProject(project.id).then((created) => {
+                if (created) onStartNew(created.project.id);
+              });
+            }}
+          >
+            <GitBranchPlus />
+            新建隔离 Worktree
+          </DropdownMenuItem>
           <DropdownMenuItem onClick={() => void actions.revealPath(project.path)}>
             <FolderOpen />
             在访达中显示
@@ -300,10 +320,17 @@ function ProjectGroup({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      <SidebarGroupAction title={`在 ${project.name} 中新建会话`} onClick={() => onStartNew(project.id)}>
-        <Plus />
-        <span className="sr-only">新建会话</span>
-      </SidebarGroupAction>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <SidebarGroupAction aria-label={`在 ${project.name} 中新建会话`} onClick={() => onStartNew(project.id)} />
+          }
+        >
+          <Plus />
+          <span className="sr-only">新建会话</span>
+        </TooltipTrigger>
+        <TooltipContent side="right">在 {project.name} 中新建会话</TooltipContent>
+      </Tooltip>
       <AlertDialog open={removing} onOpenChange={setRemoving}>
         <AlertDialogContent size="sm">
           <AlertDialogHeader>
@@ -372,6 +399,7 @@ export function AppSidebar() {
   const projects = useLila((state) => state.projects);
   const sessions = useLila((state) => state.sessions);
   const selectedId = useLila((state) => state.selectedId);
+  const unreadCompletedIds = useLila((state) => state.unreadCompletedIds);
   const { setOpenMobile } = useSidebar();
   const [collapsed, setCollapsed] = React.useState<Record<string, boolean>>(readCollapsed);
   const [query, setQuery] = React.useState("");
@@ -400,6 +428,23 @@ export function AppSidebar() {
   );
 
   const projectNames = React.useMemo(() => new Map(projects.map((p) => [p.id, p.name.toLowerCase()])), [projects]);
+  const projectDisplayNames = React.useMemo(() => new Map(projects.map((p) => [p.id, p.name])), [projects]);
+
+  const attentionSessions = React.useMemo(() => {
+    const rank = (session: SessionSummary): number => {
+      if (session.status === "waiting") return 0;
+      if (session.status === "error") return 1;
+      return 2;
+    };
+    return Object.values(sessions)
+      .filter(
+        (session) =>
+          !session.parentId &&
+          !session.readOnly &&
+          (session.status === "waiting" || session.status === "error" || Boolean(unreadCompletedIds[session.id])),
+      )
+      .sort((a, b) => rank(a) - rank(b) || b.updatedAt.localeCompare(a.updatedAt));
+  }, [sessions, unreadCompletedIds]);
 
   const { groups, allByProject } = React.useMemo(() => {
     const groups: Record<string, SessionSummary[]> = {};
@@ -434,7 +479,13 @@ export function AppSidebar() {
   return (
     <Sidebar variant="inset" className="p-1.5">
       <SidebarHeader className="mt-1.5 h-11 shrink-0 flex-row items-center gap-1 p-0 pr-1 pl-[74px] [-webkit-app-region:drag] md:mt-0">
-        <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" />
+        <Tooltip>
+          <TooltipTrigger render={<SidebarTrigger className="[-webkit-app-region:no-drag]" />} />
+          <TooltipContent side="bottom">
+            切换侧边栏
+            <Kbd>⌘B</Kbd>
+          </TooltipContent>
+        </Tooltip>
       </SidebarHeader>
       <SidebarContent>
         <SidebarGroup className="gap-2">
@@ -448,6 +499,49 @@ export function AppSidebar() {
           </SidebarMenu>
           <SearchInput variant="sidebar" value={query} onChange={setQuery} placeholder="搜索" ariaLabel="搜索项目或会话" />
         </SidebarGroup>
+        {!filtering && attentionSessions.length > 0 ? (
+          <SidebarGroup className="pb-1">
+            <SidebarGroupLabel className="justify-between">
+              <span>需要关注</span>
+              <span className="font-mono text-[11px] tabular-nums">{attentionSessions.length}</span>
+            </SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {attentionSessions.map((session) => {
+                  const isWaiting = session.status === "waiting";
+                  const isError = session.status === "error";
+                  const projectName = projectDisplayNames.get(session.projectId);
+                  return (
+                    <SidebarMenuItem key={`inbox:${session.id}`}>
+                      <SidebarMenuButton
+                        isActive={session.id === selectedId}
+                        onClick={() => handleSelectSession(session.id)}
+                        className="h-auto py-1.5"
+                      >
+                        {isWaiting ? (
+                          <MessageCircleQuestion className="text-warning-foreground" />
+                        ) : isError ? (
+                          <CircleAlert className="text-destructive-foreground" />
+                        ) : (
+                          <CheckCircle2 className="text-success-foreground" />
+                        )}
+                        <div className="flex min-w-0 flex-1 flex-col">
+                          <span className="truncate" title={session.title || "新会话"}>
+                            {session.title || "新会话"}
+                          </span>
+                          <span className="truncate text-[11px] text-muted-foreground">
+                            {isWaiting ? "等待处理" : isError ? "运行出错" : "刚完成"}
+                            {projectName ? ` · ${projectName}` : ""}
+                          </span>
+                        </div>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  );
+                })}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ) : null}
         {projects.map((project) => {
           const list = groups[project.id] ?? [];
           const projectMatched = filtering && project.name.toLowerCase().includes(filter);
@@ -480,17 +574,14 @@ export function AppSidebar() {
             </SidebarMenuItem>
           </SidebarMenu>
           <ThemeSwitcher />
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label="设置"
-            title="设置（⌘,）"
+          <IconButton
+            label="设置"
+            shortcut="⌘,"
             onClick={() => actions.openSettings()}
             className="shrink-0 text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
           >
             <Settings />
-          </Button>
+          </IconButton>
         </div>
       </SidebarFooter>
     </Sidebar>
@@ -503,16 +594,12 @@ function ThemeSwitcher() {
   const label = isDark ? "切换到浅色模式" : "切换到暗黑模式";
 
   return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon-sm"
-      aria-label={label}
-      title={label}
+    <IconButton
+      label={label}
       onClick={() => setTheme(isDark ? "light" : "dark")}
       className="shrink-0 text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
     >
       {isDark ? <Sun /> : <Moon />}
-    </Button>
+    </IconButton>
   );
 }

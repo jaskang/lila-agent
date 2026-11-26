@@ -1,14 +1,25 @@
 import * as React from "react";
-import { ArrowLeft, AtSign, ExternalLink, FileCode, FolderOpen, FolderTree, GitBranch, List, RotateCw, TriangleAlert, X } from "lucide-react";
+import { ArrowLeft, AtSign, Check, ExternalLink, FileCode, FolderOpen, FolderTree, GitBranch, GitCommitHorizontal, List, Minus, Plus, RotateCw, Sparkles, TriangleAlert, Undo2, X } from "lucide-react";
 import { toast } from "sonner";
 import type { GitFileChange, GitFileDiff, GitFileStatus, GitStatus } from "@lila/protocol";
-import { DiffView } from "@/components/code";
+import { DiffView, type DiffLineComment } from "@/components/code";
 import { focusComposer } from "@/components/composer";
 import { FileTree } from "@/components/file-tree";
 import { IconButton } from "@/components/icon-button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
+import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -69,6 +80,9 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
   const [diffLoading, setDiffLoading] = React.useState(false);
   const [diffError, setDiffError] = React.useState<string>();
   const [refreshNonce, setRefreshNonce] = React.useState(0);
+  const [mutating, setMutating] = React.useState(false);
+  const [commitMessage, setCommitMessage] = React.useState("");
+  const [confirmDiscard, setConfirmDiscard] = React.useState<GitFileChange>();
 
   const statusReqRef = React.useRef(0);
   const diffReqRef = React.useRef(0);
@@ -178,6 +192,50 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
     setSelectedPath(path);
     setShowDiff(true);
   };
+
+  const applyGitStatus = (next: GitStatus) => {
+    setStatus(next);
+    setRefreshNonce((nonce) => nonce + 1);
+  };
+
+  const runGitMutation = async (fn: () => Promise<GitStatus>, successText?: string) => {
+    if (mutating) return;
+    setMutating(true);
+    try {
+      const next = await fn();
+      applyGitStatus(next);
+      if (successText) toast.success(successText);
+    } catch (failure) {
+      toast.error(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const handleCommit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const trimmed = commitMessage.trim();
+    if (!trimmed || mutating) return;
+    setMutating(true);
+    try {
+      const res = await actions.gitCommit(projectId, trimmed);
+      applyGitStatus(res.status);
+      setCommitMessage("");
+      toast.success(`已提交 ${res.hash || ""}`.trim());
+    } catch (failure) {
+      toast.error(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const handleCommentLine = React.useCallback((comment: DiffLineComment) => {
+    const loc = comment.lineNumber ? `${comment.path}#L${comment.lineNumber}` : comment.path;
+    const prefix = comment.variant === "added" ? "+" : comment.variant === "removed" ? "-" : " ";
+    const snippet = `关于 @${loc}：\n\`\`\`\n${prefix}${comment.lineText}\n\`\`\`\n${comment.note}`;
+    actions.appendToDraft(snippet);
+    focusComposer();
+  }, []);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -304,7 +362,7 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
                         type="button"
                         onClick={() => handleSelectFile(file.path)}
                         className={cn(
-                          "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-muted/70",
+                          "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-[color,background-color,scale] duration-150 ease-(--ease-ui-out) outline-none hover:bg-muted/70 focus-visible:ring-2 focus-visible:ring-ring/50 motion-safe:active:scale-[0.99]",
                           active && "bg-muted text-foreground",
                         )}
                       >
@@ -341,31 +399,63 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
                       {selectedFile.from ? (
                         <span className="truncate font-mono text-[11px] text-muted-foreground">← {selectedFile.from}</span>
                       ) : null}
-                      {fullPath && selectedFile.status !== "deleted" ? (
+                      {fullPath ? (
                         <div className="flex items-center gap-0.5">
-                          <IconButton
-                            label="引用到对话"
-                            onClick={() => {
-                              actions.mentionFileInDraft(selectedFile.path);
-                              focusComposer();
-                            }}
-                          >
-                            <AtSign />
-                          </IconButton>
-                          <IconButton label="在文件面板预览" onClick={() => actions.openFilePreview(fullPath)}>
-                            <FileCode />
-                          </IconButton>
-                          <IconButton
-                            label="用默认应用打开"
-                            onClick={() =>
-                              void window.lila.openPath(fullPath).catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)))
-                            }
-                          >
-                            <ExternalLink />
-                          </IconButton>
-                          <IconButton label="在文件夹中显示" onClick={() => void actions.revealPath(fullPath)}>
-                            <FolderOpen />
-                          </IconButton>
+                          {selectedFile.unstaged ? (
+                            <IconButton
+                              label="暂存此文件"
+                              disabled={mutating}
+                              onClick={() => void runGitMutation(() => actions.gitStage(projectId, [selectedFile.path]), "已暂存")}
+                            >
+                              <Plus />
+                            </IconButton>
+                          ) : null}
+                          {selectedFile.staged ? (
+                            <IconButton
+                              label="取消暂存"
+                              disabled={mutating}
+                              onClick={() => void runGitMutation(() => actions.gitUnstage(projectId, [selectedFile.path]), "已取消暂存")}
+                            >
+                              <Minus />
+                            </IconButton>
+                          ) : null}
+                          {selectedFile.unstaged ? (
+                            <IconButton
+                              label="丢弃此文件改动"
+                              disabled={mutating}
+                              className="hover:text-destructive"
+                              onClick={() => setConfirmDiscard(selectedFile)}
+                            >
+                              <Undo2 />
+                            </IconButton>
+                          ) : null}
+                          {selectedFile.status !== "deleted" ? (
+                            <>
+                              <IconButton
+                                label="引用到对话"
+                                onClick={() => {
+                                  actions.mentionFileInDraft(selectedFile.path);
+                                  focusComposer();
+                                }}
+                              >
+                                <AtSign />
+                              </IconButton>
+                              <IconButton label="在文件面板预览" onClick={() => actions.openFilePreview(fullPath)}>
+                                <FileCode />
+                              </IconButton>
+                              <IconButton
+                                label="用默认应用打开"
+                                onClick={() =>
+                                  void window.lila.openPath(fullPath).catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)))
+                                }
+                              >
+                                <ExternalLink />
+                              </IconButton>
+                              <IconButton label="在文件夹中显示" onClick={() => void actions.revealPath(fullPath)}>
+                                <FolderOpen />
+                              </IconButton>
+                            </>
+                          ) : null}
                         </div>
                       ) : null}
                     </div>
@@ -392,7 +482,7 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
                         {diff.truncated ? (
                           <p className="text-xs text-muted-foreground">差异已截断</p>
                         ) : null}
-                        <DiffView patch={diff.patch} path={selectedFile.path} maxHeight="none" />
+                        <DiffView patch={diff.patch} path={selectedFile.path} maxHeight="none" onCommentLine={handleCommentLine} />
                       </>
                     ) : (
                       <Empty className="py-12">
@@ -406,8 +496,97 @@ export function ChangesPanel({ projectId }: { projectId: string }) {
               </div>
             </ScrollArea>
           </div>
+
+          <div className="flex shrink-0 flex-col gap-2 border-t border-border/60 bg-muted/20 px-3 py-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div className="flex items-center gap-1.5">
+                {hasUnstaged ? (
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="outline"
+                    disabled={mutating}
+                    onClick={() => void runGitMutation(() => actions.gitStage(projectId), "已暂存全部改动")}
+                  >
+                    <Plus className="size-3" />
+                    全部暂存
+                  </Button>
+                ) : null}
+                {hasStaged ? (
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    disabled={mutating}
+                    onClick={() => void runGitMutation(() => actions.gitUnstage(projectId), "已取消全部暂存")}
+                  >
+                    <Minus className="size-3" />
+                    全部取消暂存
+                  </Button>
+                ) : null}
+              </div>
+              {hasStaged ? (
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    actions.appendToDraft("请查看当前已暂存的 Git 改动，总结一条规范的提交信息并帮我执行提交。");
+                    focusComposer();
+                  }}
+                >
+                  <Sparkles className="size-3" />
+                  让 Agent 写提交信息
+                </Button>
+              ) : null}
+            </div>
+            {hasStaged ? (
+              <form onSubmit={(event) => void handleCommit(event)} className="flex items-center gap-1.5">
+                <Input
+                  value={commitMessage}
+                  disabled={mutating}
+                  placeholder="提交说明（如 feat: 支持智能审批规则）"
+                  aria-label="Git 提交说明"
+                  className="h-8 min-w-0 flex-1 bg-background text-xs"
+                  onChange={(event) => setCommitMessage(event.target.value)}
+                />
+                <Button type="submit" size="sm" disabled={mutating || !commitMessage.trim()}>
+                  {mutating ? <Spinner /> : <GitCommitHorizontal />}
+                  提交
+                </Button>
+              </form>
+            ) : null}
+          </div>
         </div>
       )}
+
+      <AlertDialog open={Boolean(confirmDiscard)} onOpenChange={(open) => !open && setConfirmDiscard(undefined)}>
+        <AlertDialogContent size="sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>丢弃文件改动？</AlertDialogTitle>
+            <AlertDialogDescription>
+              {confirmDiscard?.status === "untracked"
+                ? `将永久删除未跟踪文件「${confirmDiscard.path}」，此操作无法恢复。`
+                : `将还原「${confirmDiscard?.path}」的未暂存修改，此操作无法恢复。`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                const target = confirmDiscard;
+                setConfirmDiscard(undefined);
+                if (target) void runGitMutation(() => actions.gitDiscard(projectId, target.path), `已丢弃 ${target.path} 的改动`);
+              }}
+            >
+              <Check />
+              确认丢弃
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

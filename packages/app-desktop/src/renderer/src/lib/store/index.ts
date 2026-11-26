@@ -88,6 +88,7 @@ export const useLila = create<State>(() => ({
   activeFile: undefined,
   activeChangePath: undefined,
   gitChangeCounts: {},
+  unreadCompletedIds: {},
   workspaceRefreshSeq: 0,
   commandsRefreshSeq: 0,
 }));
@@ -215,12 +216,15 @@ function forget(sessionId: string): void {
     delete draftImages[sessionId];
     const sendingDrafts = { ...state.sendingDrafts };
     delete sendingDrafts[sessionId];
+    const unreadCompletedIds = { ...state.unreadCompletedIds };
+    delete unreadCompletedIds[sessionId];
     return {
       ...withSessions(sessions),
       views,
       drafts,
       draftImages,
       sendingDrafts,
+      unreadCompletedIds,
       ...(wasSelected ? { selectedId: undefined, rightPanel: undefined, activeFile: undefined } : {}),
     };
   });
@@ -272,7 +276,18 @@ function handlePush(frame: PushMessage): void {
       return;
     case "session": {
       const previous = get().sessions[frame.session.id];
-      set((state) => withSessions({ ...state.sessions, [frame.session.id]: frame.session }));
+      const finishedInBackground =
+        !frame.session.parentId &&
+        !frame.session.readOnly &&
+        previous?.status === "running" &&
+        frame.session.status === "idle" &&
+        get().selectedId !== frame.session.id;
+      set((state) => ({
+        ...withSessions({ ...state.sessions, [frame.session.id]: frame.session }),
+        ...(finishedInBackground
+          ? { unreadCompletedIds: { ...state.unreadCompletedIds, [frame.session.id]: true as const } }
+          : {}),
+      }));
       notifyTransition(previous, frame.session);
       return;
     }
@@ -452,10 +467,20 @@ export const actions = {
     const nextProjectId = sessionId ? prev.sessions[sessionId]?.projectId : undefined;
     const sameProject = Boolean(prevProjectId && prevProjectId === nextProjectId);
     if (prev.selectedId !== sessionId) closePreview();
-    set({
-      selectedId: sessionId,
-      ...(prev.selectedId !== sessionId ? { replyReview: undefined, ...(prev.rightPanel === "review" ? { rightPanel: undefined } : {}) } : {}),
-      ...(!sessionId || !sameProject ? { rightPanel: undefined, activeFile: undefined, replyReview: undefined } : {}),
+    set((state) => {
+      const unreadCompletedIds = sessionId && state.unreadCompletedIds[sessionId]
+        ? (() => {
+            const next = { ...state.unreadCompletedIds };
+            delete next[sessionId];
+            return next;
+          })()
+        : state.unreadCompletedIds;
+      return {
+        selectedId: sessionId,
+        unreadCompletedIds,
+        ...(prev.selectedId !== sessionId ? { replyReview: undefined, ...(prev.rightPanel === "review" ? { rightPanel: undefined } : {}) } : {}),
+        ...(!sessionId || !sameProject ? { rightPanel: undefined, activeFile: undefined, replyReview: undefined } : {}),
+      };
     });
     if (sessionId) safeLocalSet(SELECTED_KEY, sessionId);
     else safeLocalRemove(SELECTED_KEY);
@@ -618,6 +643,25 @@ export const actions = {
     persistComposerDrafts();
   },
 
+  appendToDraft(snippet: string): void {
+    const state = get();
+    const key = state.selectedId ?? NEW_DRAFT;
+    const current = state.drafts[key] ?? "";
+    const next = current.trimEnd() ? `${current.trimEnd()}\n\n${snippet}` : snippet;
+    const drafts = { ...state.drafts, [key]: next };
+    set({ drafts });
+    persistComposerDrafts();
+  },
+
+  clearUnreadCompleted(sessionId: string): void {
+    if (!get().unreadCompletedIds[sessionId]) return;
+    set((state) => {
+      const unreadCompletedIds = { ...state.unreadCompletedIds };
+      delete unreadCompletedIds[sessionId];
+      return { unreadCompletedIds };
+    });
+  },
+
   bumpWorkspaceRefresh(): void {
     set((state) => ({ workspaceRefreshSeq: state.workspaceRefreshSeq + 1 }));
   },
@@ -691,12 +735,14 @@ export const actions = {
       const drafts = { ...current.drafts };
       const draftImages = { ...current.draftImages };
       const sendingDrafts = { ...current.sendingDrafts };
+      const unreadCompletedIds = { ...current.unreadCompletedIds };
       for (const id of removedSessionIds) {
         delete sessions[id];
         delete views[id];
         delete drafts[id];
         delete draftImages[id];
         delete sendingDrafts[id];
+        delete unreadCompletedIds[id];
       }
       return {
         projects: remainingProjects,
@@ -705,6 +751,7 @@ export const actions = {
         drafts,
         draftImages,
         sendingDrafts,
+        unreadCompletedIds,
         newSession: nextNewSession,
         ...(wasSelected ? { selectedId: undefined, rightPanel: undefined, activeFile: undefined } : {}),
       };
@@ -807,7 +854,10 @@ export const actions = {
 
   async prompt(sessionId: string, text: string, images: ImageInput[] = [], mode?: "steer" | "followUp"): Promise<boolean> {
     const trimmed = text.trim();
-    if (trimmed === "/compact") return Boolean(await actions.compact(sessionId));
+    if (trimmed === "/compact" || trimmed.startsWith("/compact ")) {
+      const instructions = trimmed.slice("/compact".length).trim();
+      return Boolean(await actions.compact(sessionId, instructions || undefined));
+    }
     if (trimmed === "/reload") return Boolean(await actions.reload(sessionId));
     const result = await attempt(() =>
       client.call({ type: "session.prompt", sessionId, text, ...(images.length ? { images } : {}), ...(mode ? { mode } : {}) }),
@@ -840,8 +890,34 @@ export const actions = {
     return true;
   },
 
-  async compact(sessionId: string): Promise<boolean> {
-    return (await attempt(() => client.call({ type: "session.compact", sessionId }))) !== undefined;
+  async compact(sessionId: string, instructions?: string): Promise<boolean> {
+    return (await attempt(() => client.call({ type: "session.compact", sessionId, ...(instructions ? { instructions } : {}) }))) !== undefined;
+  },
+
+  async updateApprovalRules(
+    sessionId: string,
+    scope: "session" | "project",
+    action: "remove" | "clear",
+    pattern?: string,
+  ): Promise<boolean> {
+    const result = await attempt(() =>
+      client.call({ type: "session.rules.update", sessionId, scope, action, ...(pattern ? { pattern } : {}) }),
+    );
+    if (!result) return false;
+    setView(sessionId, (view) => ({ ...view, state: result.state }));
+    return true;
+  },
+
+  async stopSubagent(sessionId: string, agentId: string): Promise<boolean> {
+    const result = await attempt(() => client.call({ type: "session.subagent.stop", sessionId, agentId }));
+    if (result !== undefined) toast.info("已发送停止信号给子 Agent");
+    return result !== undefined;
+  },
+
+  async steerSubagent(sessionId: string, agentId: string, text: string): Promise<boolean> {
+    const result = await attempt(() => client.call({ type: "session.subagent.steer", sessionId, agentId, message: text }));
+    if (result !== undefined) toast.success("已向子 Agent 发送引导消息");
+    return result !== undefined;
   },
 
   async reload(sessionId: string): Promise<boolean> {
@@ -895,6 +971,44 @@ export const actions = {
 
   async gitDiff(projectId: string, path: string, staged?: boolean) {
     return (await client.call({ type: "git.diff", projectId, path, ...(staged !== undefined ? { staged } : {}) })).diff;
+  },
+
+  async gitStage(projectId: string, paths?: string[]) {
+    const { status } = await client.call({ type: "git.stage", projectId, ...(paths?.length ? { paths } : {}) });
+    actions.setGitChangeCount(projectId, status.isRepo ? status.files.length : undefined);
+    return status;
+  },
+
+  async gitUnstage(projectId: string, paths?: string[]) {
+    const { status } = await client.call({ type: "git.unstage", projectId, ...(paths?.length ? { paths } : {}) });
+    actions.setGitChangeCount(projectId, status.isRepo ? status.files.length : undefined);
+    return status;
+  },
+
+  async gitDiscard(projectId: string, path: string) {
+    const { status } = await client.call({ type: "git.discard", projectId, path });
+    actions.setGitChangeCount(projectId, status.isRepo ? status.files.length : undefined);
+    actions.bumpWorkspaceRefresh();
+    return status;
+  },
+
+  async gitCommit(projectId: string, commitMessage: string) {
+    const res = await client.call({ type: "git.commit", projectId, message: commitMessage });
+    actions.setGitChangeCount(projectId, res.status.isRepo ? res.status.files.length : undefined);
+    actions.bumpWorkspaceRefresh();
+    return res;
+  },
+
+  async createWorktreeProject(projectId: string, branch?: string): Promise<{ project: Project; branch: string } | undefined> {
+    const result = await attempt(() =>
+      client.call({ type: "git.worktree.create", projectId, ...(branch?.trim() ? { branch: branch.trim() } : {}) }),
+    );
+    if (!result) return undefined;
+    set((state) => ({
+      projects: state.projects.some((item) => item.id === result.project.id) ? state.projects : [...state.projects, result.project],
+    }));
+    toast.success(`已创建隔离 Worktree 分支 ${result.branch}`);
+    return result;
   },
 
   async searchTranscript(sessionId: string, query: string, offset: number) {

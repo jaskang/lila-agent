@@ -163,9 +163,18 @@ export const ClientCommand = z.discriminatedUnion("type", [
   z.object({ type: z.literal("session.rename"), ...SessionRef, title: z.string().trim().min(1).max(120) }),
   z.object({ type: z.literal("session.delete"), ...SessionRef }),
   z.object({ type: z.literal("session.fork"), ...SessionRef, itemId: Id.optional() }),
-  z.object({ type: z.literal("session.compact"), ...SessionRef }),
+  z.object({ type: z.literal("session.compact"), ...SessionRef, instructions: z.string().trim().min(1).max(2_000).optional() }),
   z.object({ type: z.literal("session.rewind"), ...SessionRef, itemId: Id }),
   z.object({ type: z.literal("session.respond"), ...SessionRef, pendingId: Id, answer: PendingAnswer }),
+  z.object({
+    type: z.literal("session.rules.update"),
+    ...SessionRef,
+    scope: z.enum(["session", "project"]),
+    action: z.enum(["remove", "clear"]),
+    pattern: z.string().min(1).optional(),
+  }),
+  z.object({ type: z.literal("session.subagent.stop"), ...SessionRef, agentId: Id }),
+  z.object({ type: z.literal("session.subagent.steer"), ...SessionRef, agentId: Id, message: z.string().trim().min(1).max(20_000) }),
   z.object({
     type: z.literal("session.queue.update"),
     ...SessionRef,
@@ -181,6 +190,11 @@ export const ClientCommand = z.discriminatedUnion("type", [
   z.object({ type: z.literal("files.read"), requestId: RequestId, projectId: Id, path: z.string().min(1) }),
   z.object({ type: z.literal("git.status"), requestId: RequestId, projectId: Id }),
   z.object({ type: z.literal("git.diff"), requestId: RequestId, projectId: Id, path: z.string().min(1), staged: z.boolean().optional() }),
+  z.object({ type: z.literal("git.stage"), requestId: RequestId, projectId: Id, paths: z.array(z.string().min(1)).optional() }),
+  z.object({ type: z.literal("git.unstage"), requestId: RequestId, projectId: Id, paths: z.array(z.string().min(1)).optional() }),
+  z.object({ type: z.literal("git.discard"), requestId: RequestId, projectId: Id, path: z.string().min(1) }),
+  z.object({ type: z.literal("git.commit"), requestId: RequestId, projectId: Id, message: z.string().trim().min(1).max(4_000) }),
+  z.object({ type: z.literal("git.worktree.create"), requestId: RequestId, projectId: Id, branch: z.string().trim().min(1).max(120).optional() }),
 ]);
 export type ClientCommand = z.infer<typeof ClientCommand>;
 export type CommandType = ClientCommand["type"];
@@ -235,6 +249,9 @@ export interface CommandResults {
   "session.compact": Empty;
   "session.rewind": { text: string };
   "session.respond": Empty;
+  "session.rules.update": { state: SessionState };
+  "session.subagent.stop": Empty;
+  "session.subagent.steer": Empty;
   "session.queue.update": { state: SessionState };
   "session.retry": Empty;
   "commands.list": { commands: SlashCommand[] };
@@ -244,6 +261,11 @@ export interface CommandResults {
   "files.read": { file: ProjectFileContent };
   "git.status": { status: GitStatus };
   "git.diff": { diff: GitFileDiff };
+  "git.stage": { status: GitStatus };
+  "git.unstage": { status: GitStatus };
+  "git.discard": { status: GitStatus };
+  "git.commit": { status: GitStatus; hash: string };
+  "git.worktree.create": { project: Project; branch: string };
 }
 
 export type ServerMessage =

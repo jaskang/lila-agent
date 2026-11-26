@@ -31,7 +31,7 @@ function DialogOverlay({
     <DialogPrimitive.Backdrop
       data-slot="dialog-overlay"
       className={cn(
-        "fixed inset-0 isolate z-50 bg-black/10 supports-backdrop-filter:backdrop-blur-xs transition-opacity duration-200 ease-(--ease-ui-out) data-starting-style:opacity-0 data-ending-style:opacity-0 data-ending-style:duration-150",
+        "fixed inset-0 isolate z-50 bg-black/30 supports-backdrop-filter:backdrop-blur-[2px] dark:bg-black/55 transition-opacity duration-200 ease-(--ease-ui-out) data-starting-style:opacity-0 data-ending-style:opacity-0 data-ending-style:duration-150",
         className
       )}
       {...props}
@@ -55,7 +55,7 @@ function DialogContent({
       <DialogPrimitive.Popup
         data-slot="dialog-content"
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 outline-none sm:max-w-sm",
+          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl bg-popover p-4 text-sm text-popover-foreground shadow-2xl shadow-black/15 ring-1 ring-border/80 outline-none dark:shadow-black/50 sm:max-w-sm",
           animated && "dialog-transition",
           className
         )}
@@ -100,7 +100,6 @@ function DialogFooter({
   ...props
 }: React.ComponentProps<"div"> & {
   showCloseButton?: boolean
-  animated?: boolean
 }) {
   return (
     <div

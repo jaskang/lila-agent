@@ -24,6 +24,7 @@ import { IconButton } from "@/components/icon-button";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Spinner } from "@/components/ui/spinner";
+import { cn } from "cn";
 import { actions, useLila } from "@/lib/store";
 
 const TREE_OPEN_STORAGE_KEY = "lila.filesTreeOpen";
@@ -557,31 +558,40 @@ export function FilesPanel({ projectId }: { projectId: string }) {
         ) : (
           <>
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">{previewNode}</div>
-            {narrowOverlayOpen ? (
-              <>
-                <div
-                  aria-hidden
-                  className="absolute inset-0 z-10 bg-background/55 backdrop-blur-[1px]"
-                  onClick={() => setNarrowTreeOpen(false)}
-                />
-                <FileTreePane
-                  files={files}
-                  filteredFiles={filteredFiles}
-                  gitStatusMap={gitStatusMap}
-                  treeTruncated={treeTruncated}
-                  treeLoading={treeLoading}
-                  searching={remoteSearching}
-                  treeError={treeError}
-                  filter={filter}
-                  selectedPath={displayPath || undefined}
-                  showRefresh
-                  onFilterChange={setFilter}
-                  onRefresh={() => void loadTree(true)}
-                  onSelect={handleSelectFile}
-                  className="absolute inset-y-0 start-0 z-20 w-[min(17rem,85%)] border-e border-border/80 bg-background shadow-lg"
-                />
-              </>
-            ) : null}
+            <div
+              aria-hidden
+              className={cn(
+                "absolute inset-0 z-10 bg-background/55 backdrop-blur-[1px] transition-opacity ease-(--ease-ui-drawer)",
+                narrowOverlayOpen ? "opacity-100 duration-200" : "pointer-events-none opacity-0 duration-150",
+              )}
+              onClick={() => setNarrowTreeOpen(false)}
+            />
+            <div
+              inert={!narrowOverlayOpen}
+              className={cn(
+                "absolute inset-y-0 start-0 z-20 flex w-[min(17rem,85%)] transition-[transform,opacity] ease-(--ease-ui-drawer) motion-reduce:transition-opacity",
+                narrowOverlayOpen
+                  ? "translate-x-0 opacity-100 duration-[240ms]"
+                  : "pointer-events-none opacity-0 duration-180 motion-safe:-translate-x-full",
+              )}
+            >
+              <FileTreePane
+                files={files}
+                filteredFiles={filteredFiles}
+                gitStatusMap={gitStatusMap}
+                treeTruncated={treeTruncated}
+                treeLoading={treeLoading}
+                searching={remoteSearching}
+                treeError={treeError}
+                filter={filter}
+                selectedPath={displayPath || undefined}
+                showRefresh
+                onFilterChange={setFilter}
+                onRefresh={() => void loadTree(true)}
+                onSelect={handleSelectFile}
+                className="min-w-0 flex-1 border-e border-border/80 bg-background shadow-lg"
+              />
+            </div>
           </>
         )}
       </div>

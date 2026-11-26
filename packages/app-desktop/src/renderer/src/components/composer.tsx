@@ -10,8 +10,10 @@ import {
 } from "@lila/protocol";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentGroup, AttachmentMedia } from "@/components/ui/attachment";
 import { Command, CommandEmpty, CommandGroup, CommandItem, CommandList } from "@/components/ui/command";
+import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } from "@/components/ui/input-group";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "cn";
 import { actions, type DraftImage, useLila } from "@/lib/store";
 
@@ -373,7 +375,7 @@ export function Composer({
   return (
     <InputGroup
       className={cn(
-        "rounded-[22px] border-border bg-card shadow-[0_2px_12px_-3px_rgb(0_0_0/0.07)] transition-[border-color,box-shadow] has-disabled:bg-card has-disabled:opacity-100 has-[[data-slot=input-group-control]:focus-visible]:border-foreground/20 has-[[data-slot=input-group-control]:focus-visible]:ring-2 has-[[data-slot=input-group-control]:focus-visible]:ring-ring/15 dark:bg-card dark:shadow-[0_4px_18px_-4px_rgb(0_0_0/0.4)] dark:has-disabled:bg-card",
+        "rounded-[22px] border-border bg-card shadow-[0_2px_12px_-3px_rgb(0_0_0/0.07)] transition-[border-color,box-shadow] duration-150 ease-(--ease-ui-out) has-disabled:bg-card has-disabled:opacity-100 has-[[data-slot=input-group-control]:focus-visible]:border-foreground/20 has-[[data-slot=input-group-control]:focus-visible]:ring-2 has-[[data-slot=input-group-control]:focus-visible]:ring-ring/15 dark:bg-card dark:shadow-[0_4px_18px_-4px_rgb(0_0_0/0.4)] dark:has-disabled:bg-card",
         dragging && "border-primary/60 ring-2 ring-primary/20",
       )}
       onDragOver={(event) => {
@@ -439,7 +441,7 @@ export function Composer({
       {dragging ? (
         <div
           aria-hidden
-          className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center gap-2 rounded-[22px] bg-card/90 text-sm font-medium text-foreground backdrop-blur-xs"
+          className="surface-enter pointer-events-none absolute inset-0 z-20 flex items-center justify-center gap-2 rounded-[22px] bg-card/90 text-sm font-medium text-foreground backdrop-blur-xs"
         >
           <Paperclip className="size-4 text-muted-foreground" />
           松开以添加图片或文件
@@ -497,18 +499,24 @@ export function Composer({
         className="max-h-72 min-h-12 w-full flex-none px-4 pt-3.5 pb-2 text-[14.5px] leading-relaxed"
       />
       <InputGroupAddon align="block-end" className="flex-wrap gap-1 px-2.5 pt-1 pb-2">
-        <InputGroupButton
-          type="button"
-          size="icon-sm"
-          variant="ghost"
-          className="shrink-0 text-muted-foreground"
-          disabled={disabled}
-          aria-label="添加图片或文件"
-          title="添加图片或文件"
-          onClick={() => fileInput.current?.click()}
-        >
-          <Paperclip />
-        </InputGroupButton>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <InputGroupButton
+                type="button"
+                size="icon-sm"
+                variant="ghost"
+                className="shrink-0 text-muted-foreground"
+                disabled={disabled}
+                aria-label="添加图片或文件"
+                onClick={() => fileInput.current?.click()}
+              />
+            }
+          >
+            <Paperclip />
+          </TooltipTrigger>
+          <TooltipContent>添加图片或文件</TooltipContent>
+        </Tooltip>
         <input
           ref={fileInput}
           type="file"
@@ -521,55 +529,89 @@ export function Composer({
         />
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-0.5">{footer}</div>
         <div className="ms-auto flex shrink-0 items-center gap-1">
-          {abortArmed ? <span className="shrink-0 px-1 text-xs text-warning-foreground">再按一次 Esc 停止</span> : null}
+          {abortArmed ? <span className="surface-enter shrink-0 px-1 text-xs text-warning-foreground">再按一次 Esc 停止</span> : null}
           {running ? (
-            <InputGroupButton
-              size="xs"
-              variant="ghost"
-              title="当前 Run 结束后发送（⌥↵）"
-              aria-keyshortcuts="Alt+Enter"
-              disabled={!canSend}
-              onClick={() => void submit("followUp")}
-            >
-              <Clock3 />
-              排队
-            </InputGroupButton>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <InputGroupButton
+                    size="xs"
+                    variant="ghost"
+                    aria-keyshortcuts="Alt+Enter"
+                    disabled={!canSend}
+                    onClick={() => void submit("followUp")}
+                  />
+                }
+              >
+                <Clock3 />
+                排队
+              </TooltipTrigger>
+              <TooltipContent>
+                当前 Run 结束后发送
+                <Kbd>⌥↵</Kbd>
+              </TooltipContent>
+            </Tooltip>
           ) : null}
           {trailing}
           {onAbort ? (
-            <InputGroupButton
-              type="button"
-              size="icon-sm"
-              variant={hasText ? "secondary" : "default"}
-              className="rounded-full"
-              aria-label="停止"
-              title="停止（双击 Esc）"
-              onClick={onAbort}
-            >
-              <Square className="size-3 fill-current" />
-            </InputGroupButton>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <InputGroupButton
+                    type="button"
+                    size="icon-sm"
+                    variant={hasText ? "secondary" : "default"}
+                    className="rounded-full"
+                    aria-label="停止"
+                    onClick={onAbort}
+                  />
+                }
+              >
+                <Square className="size-3 fill-current" />
+              </TooltipTrigger>
+              <TooltipContent>
+                停止
+                <Kbd>Esc×2</Kbd>
+              </TooltipContent>
+            </Tooltip>
           ) : null}
           {!running || hasText || images.length > 0 ? (
-            <InputGroupButton
-              type="button"
-              size="icon-sm"
-              variant="default"
-              className="rounded-full"
-              disabled={!canSend}
-              aria-label={running ? "插话" : "发送"}
-              title={
-                sendDisabled
-                  ? "会话正在准备中…"
-                  : running
-                    ? hasText
-                      ? "插话：当前工具结束后送达（↵），⌥↵ 排到这一轮之后"
-                      : "运行中插话请先输入文字"
-                    : "发送（↵），⇧↵ 换行"
-              }
-              onClick={() => void submit("steer")}
-            >
-              {sending ? <Spinner /> : <ArrowUp />}
-            </InputGroupButton>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <InputGroupButton
+                    type="button"
+                    size="icon-sm"
+                    variant="default"
+                    className="rounded-full"
+                    disabled={!canSend}
+                    aria-label={running ? "插话" : "发送"}
+                    onClick={() => void submit("steer")}
+                  />
+                }
+              >
+                {sending ? <Spinner /> : <ArrowUp />}
+              </TooltipTrigger>
+              <TooltipContent>
+                {sendDisabled ? (
+                  "会话正在准备中…"
+                ) : running ? (
+                  hasText ? (
+                    <>
+                      插话（当前工具结束后送达）
+                      <Kbd>↵</Kbd>
+                    </>
+                  ) : (
+                    "运行中插话请先输入文字"
+                  )
+                ) : (
+                  <>
+                    发送
+                    <Kbd>↵</Kbd>
+                  </>
+                )}
+              </TooltipContent>
+            </Tooltip>
           ) : null}
         </div>
       </InputGroupAddon>

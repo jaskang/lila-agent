@@ -6,7 +6,7 @@
  * frequent to validate one by one.
  */
 
-export const PROTOCOL_VERSION = 17;
+export const PROTOCOL_VERSION = 18;
 export const DEFAULT_CORE_PORT = 7457;
 export const MAX_CORE_MESSAGE_BYTES = 64 * 1024 * 1024;
 

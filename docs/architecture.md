@@ -34,10 +34,10 @@ core（packages/core，独立常驻 Node 进程）←─────────
 - **Lila 自己只存很少的状态。** 数据目录（macOS 为 `~/Library/Application Support/Lila`）里只有 `core-token`、`core.pid`、`state.json`（项目列表、各会话的审批方式）、`quotas.json`（服务商响应头配额快照）、`window-state.json`（窗口位置与尺寸）、`core.log` 和删除会话时移入的 `trash/`。没有自己的消息库。
 - **core 是独立的 Node 进程。** 用 Electron 自带的 Node（`ELECTRON_RUN_AS_NODE=1`）运行，Node 24 原生剥离 TS 类型，开发和运行不需要额外编译步骤。应用退出后 core 继续跑完任务；应用启动时复用已在运行的 core，协议版本不一致时自动替换。
 - **所有客户端都走 WebSocket 并鉴权。** core 首次启动生成 `core-token`（0600），客户端用 `lila.<token>` 子协议连接；core 拒绝非本地网页 `Origin`，客户端带心跳保活与自动重连。
-- **界面只认 Lila 的协议。** `packages/protocol`（当前协议 v17）定义命令（Zod 校验）和推送消息（TS 类型）。Pi 的消息结构只在 core 的 transcript 投影里出现，以后的手机端不必理解 Pi 内部类型。
+- **界面只认 Lila 的协议。** `packages/protocol`（当前协议 v18）定义命令（Zod 校验）和推送消息（TS 类型）。Pi 的消息结构只在 core 的 transcript 投影里出现，以后的手机端不必理解 Pi 内部类型。
 - **打开会话 = 拿快照 + 收推送。** `session.open` 返回最近的条目和当前状态（含流式输出部分），之后 core 推 `item`、`delta`、`state`。断线重连直接重新 open。支持会话内全文查找与窗口定位、轮次目录跳转、从任意用户消息编辑重发（`session.rewind`）或分叉为新会话（`session.fork`）、排队消息管理（插话/追加移除与提权）及启动失败重试。
-- **审批和提问是 Pi 扩展。** Lila 内置扩展在 `tool_call` 钩子里按会话审批方式检查工具调用和可见的嵌套调用。请求批准时，项目内的内置文件修改和只读文件工具直接运行，项目外写入、联网及无法判断范围的调用等待用户批准。帮我批准额外放行部分可识别的低风险 MCP 调用。完全访问权限跳过 Lila 的审批。工具获准后使用其执行进程的系统权限；任何 Pi 扩展调用 `ctx.ui.select/confirm/input/editor` 也会变成同样的待处理卡片。待处理项只在内存里，core 重启时正在跑的任务本来也会中断。
-- **子 Agent 与右侧多模式面板。** 子 Agent 的原会话由 `pi-subagents` 写入，core 转发实时进度事件并在桌面实时读取已落盘记录；运行中默认展开第一层，结束后可从子会话继续为新会话。右侧面板支持文件树与代码预览、工作区 Git Diff、本轮回复改动审阅、子 Agent 只读预览四种视图。
+- **审批和提问是 Pi 扩展。** Lila 内置扩展在 `tool_call` 钩子里按会话审批方式检查工具调用和可见的嵌套调用。请求批准时，项目内的内置文件修改和只读文件工具直接运行，项目外写入、联网及无法判断范围的调用等待用户批准，并支持将安全前缀命令/MCP/扩展工具加入本会话或项目级白名单。帮我批准额外放行静态可证的只读 Shell 命令、记忆工具（可事后撤销）及低风险 MCP 调用。完全访问权限跳过 Lila 的审批。工具获准后使用其执行进程的系统权限；任何 Pi 扩展调用 `ctx.ui.select/confirm/input/editor` 也会变成同样的待处理卡片。待处理项只在内存里，core 重启时正在跑的任务本来也会中断。
+- **子 Agent 与右侧多模式面板。** 子 Agent 的原会话由 `pi-subagents` 写入，core 转发实时进度事件并在桌面实时读取已落盘记录，同时经跨扩展 RPC 支持运行中停止与中途引导（Steer）；运行中默认展开第一层，结束后可从子会话继续为新会话。右侧面板支持文件树与代码预览、工作区 Git Diff（含暂存/取消暂存/丢弃/提交、Worktree 隔离与行内批注）、本轮回复改动审阅、子 Agent 只读预览四种视图。
 - **界面线程只管渲染。** Shiki 代码高亮跑在 Web Worker，流式帧按动画帧合并，KaTeX 数学公式与 Mermaid 图表按需懒加载。
 - **界面组件用现成的。** 统一基于 shadcn/ui（Base UI 版）及其 AI 组件（Message Scroller、Message、Bubble、Trace、Code Block、Questionnaire、Marker、Attachment 等），避免重复造轮子。
 
@@ -61,7 +61,7 @@ core（packages/core，独立常驻 Node 进程）←─────────
 
 | 部分 | 选择 |
 | --- | --- |
-| 仓库与工具链 | Bun workspace（`packages/protocol`、`packages/core`、`packages/app-desktop`）、TypeScript、oxlint、oxfmt |
+| 仓库与工具链 | pnpm workspace（`packages/protocol`、`packages/core`、`packages/app-desktop`）、TypeScript、Vitest、oxlint、oxfmt |
 | 桌面壳 | Electron + electron-vite |
 | core 运行时 | Node 24（Electron 自带），WebSocket 用 `ws` |
 | Agent 内核与内置包 | `@earendil-works/pi-coding-agent` SDK、`@tintinweb/pi-subagents`、`@amaster.ai/pi-memory` |

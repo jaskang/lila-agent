@@ -36,7 +36,7 @@ async function waitUntilGone(url: string, timeoutMs: number): Promise<boolean> {
   return false;
 }
 
-/** In dev mode, replace any stale detached core holding the port so `bun run dev` always runs latest code. */
+/** In dev mode, replace any stale detached core holding the port so `pnpm dev` always runs latest code. */
 async function stopExistingCoreIfNeeded(): Promise<void> {
   if (!replaceExisting) return;
   const urlHost = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname;

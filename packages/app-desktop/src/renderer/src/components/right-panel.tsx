@@ -59,6 +59,7 @@ export function RightPanelShell({
   const panelWidthPct = clampWidthPct(widthPct, minWidthPct);
   const [dragging, setDragging] = React.useState(false);
   const panelId = React.useId();
+  const panelWrapRef = React.useRef<HTMLDivElement>(null);
   const finishDrag = React.useRef<(() => void) | undefined>(undefined);
 
   React.useLayoutEffect(() => () => finishDrag.current?.(), [wide, open]);
@@ -101,7 +102,12 @@ export function RightPanelShell({
       const fromRight = rect.right - moveEvent.clientX;
       const rawPct = (fromRight / rect.width) * 100;
       latest = clampWidthPct(rawPct, minWidthPct);
-      setWidthPct(latest);
+      const rounded = Math.round(latest);
+      if (panelWrapRef.current) {
+        panelWrapRef.current.style.width = `clamp(${MIN_PANEL_WIDTH_REM}rem, ${latest}%, 100%)`;
+      }
+      target.setAttribute("aria-valuenow", String(rounded));
+      target.setAttribute("aria-valuetext", `${rounded}%`);
     };
 
     const finish = () => {
@@ -112,6 +118,7 @@ export function RightPanelShell({
       if (target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
       finishDrag.current = undefined;
       setDragging(false);
+      setWidthPct(latest);
       persistWidth(latest);
     };
     const onUp = (pointerEvent: PointerEvent) => {
@@ -182,16 +189,16 @@ export function RightPanelShell({
         />
       </div>
       <div
-        style={{ "--right-panel-width": `${panelWidthPct}%`, "--right-panel-min": `${MIN_PANEL_WIDTH_REM}rem` } as React.CSSProperties}
-        className="flex min-h-0 w-[clamp(var(--right-panel-min),var(--right-panel-width),100%)] shrink-0"
+        ref={panelWrapRef}
+        style={{ width: `clamp(${MIN_PANEL_WIDTH_REM}rem, ${panelWidthPct}%, 100%)` }}
+        className="flex min-h-0 shrink-0"
       >
         <aside
           data-surface="panel"
           id={panelId}
           aria-label={label}
           className={cn(
-            "@container flex size-full min-h-0 flex-col overflow-hidden rounded-xl bg-workspace-surface shadow-[var(--panel-shadow)] ring-1 ring-[var(--panel-border)]",
-            "min-w-(--right-panel-min)",
+            "@container flex size-full min-h-0 min-w-[20rem] flex-col overflow-hidden rounded-xl bg-workspace-surface shadow-[var(--panel-shadow)] ring-1 ring-[var(--panel-border)]",
             dragging && "pointer-events-none select-none",
           )}
           onKeyDown={(event) => {

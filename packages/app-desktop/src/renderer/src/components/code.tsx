@@ -1,6 +1,7 @@
 import * as React from "react";
-import { Columns2, FileDiff as FileDiffIcon, Maximize2, Minimize2, Rows2, WrapText } from "lucide-react";
+import { Columns2, FileDiff as FileDiffIcon, Maximize2, MessageSquarePlus, Minimize2, Rows2, Send, WrapText, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   CodeBlock,
   CodeBlockActions,
@@ -477,21 +478,65 @@ function buildSplitRows(lines: DiffLine[], spans: Map<number, [number, number]>)
   return rows;
 }
 
-export function DiffView({ patch, path, maxHeight = "24rem" }: { patch: string; path: string; maxHeight?: string }) {
+export type DiffLineComment = {
+  path: string;
+  lineNumber?: number | undefined;
+  variant: "added" | "removed" | "default";
+  lineText: string;
+  note: string;
+};
+
+export function DiffView({
+  patch,
+  path,
+  maxHeight = "24rem",
+  onCommentLine,
+}: {
+  patch: string;
+  path: string;
+  maxHeight?: string;
+  onCommentLine?: ((comment: DiffLineComment) => void) | undefined;
+}) {
   const [split, setSplit] = React.useState(false);
+  const [commentTarget, setCommentTarget] = React.useState<{
+    fileKey: string;
+    lineIndex: number;
+    path: string;
+    lineNumber?: number | undefined;
+    variant: "added" | "removed" | "default";
+    lineText: string;
+  }>();
+  const [commentText, setCommentText] = React.useState("");
   const files = React.useMemo(() => parsePatch(patch, path), [patch, path]);
   // A pure mode change has Git headers and no line hunks.
   if (!files.length && patch.trim()) return <Code code={patch.trimEnd()} language="diff" title={path} maxHeight={maxHeight} />;
+
+  const submitComment = (event: React.FormEvent) => {
+    event.preventDefault();
+    const note = commentText.trim();
+    if (!commentTarget || !note || !onCommentLine) return;
+    onCommentLine({
+      path: commentTarget.path,
+      lineNumber: commentTarget.lineNumber,
+      variant: commentTarget.variant,
+      lineText: commentTarget.lineText,
+      note,
+    });
+    setCommentTarget(undefined);
+    setCommentText("");
+  };
+
   return (
     <>
       {files.map((file, fileIndex) => {
+        const fileKey = `${file.path}-${fileIndex}`;
         const hasNumbers = file.maxLine > 0;
         const digits = Math.max(2, String(file.maxLine).length);
         const colStyle = { width: `${digits}ch` } as React.CSSProperties;
         const spans = computeLineInlineMap(file.lines);
         const splitRows = split ? buildSplitRows(file.lines, spans) : undefined;
         return (
-          <CodeBlock key={`${file.path}-${fileIndex}`} size="sm" className="not-typeset">
+          <CodeBlock key={fileKey} size="sm" className="not-typeset">
             <CodeBlockHeader>
               <CodeBlockTitle className="min-w-0 flex-1">
                 <FileDiffIcon />
@@ -575,44 +620,104 @@ export function DiffView({ patch, path, maxHeight = "24rem" }: { patch: string; 
                 {file.lines.map((line, index) => {
                   const sign = line.variant === "added" ? "+" : line.variant === "removed" ? "−" : " ";
                   const span = spans.get(index);
+                  const canComment = Boolean(onCommentLine) && line.variant !== "highlighted";
+                  const commenting = commentTarget?.fileKey === fileKey && commentTarget.lineIndex === index;
+                  const lineNumber = line.newLine ?? line.oldLine;
                   return (
-                    <CodeBlockLine
-                      key={index}
-                      variant={line.variant}
-                      className={cn(
-                        "ps-0! group-data-[size=sm]/code-block:ps-0!",
-                        line.variant === "highlighted" && "text-muted-foreground",
-                      )}
-                    >
-                      <span
-                        aria-hidden="true"
+                    <React.Fragment key={index}>
+                      <CodeBlockLine
+                        variant={line.variant}
                         className={cn(
-                          "sticky left-0 z-10 me-2.5 inline-flex shrink-0 select-none items-center gap-1.5 border-e border-border/35 bg-background/95 px-2 text-right text-[11px] text-muted-foreground/55 tabular-nums",
-                          line.variant === "added" && "bg-success/12 text-success-foreground/80",
-                          line.variant === "removed" && "bg-destructive/12 text-destructive-foreground/80",
-                          line.variant === "highlighted" && "bg-muted/60",
+                          "group/diffline ps-0! group-data-[size=sm]/code-block:ps-0!",
+                          line.variant === "highlighted" && "text-muted-foreground",
                         )}
                       >
-                        {hasNumbers ? (
-                          <>
-                            <span className="inline-block" style={colStyle}>
-                              {line.variant === "highlighted" ? "" : (line.oldLine ?? "")}
-                            </span>
-                            <span className="inline-block" style={colStyle}>
-                              {line.variant === "highlighted" ? "" : (line.newLine ?? "")}
-                            </span>
-                          </>
-                        ) : null}
-                        <span className="inline-block w-2.5 text-center font-semibold">
-                          {line.variant === "highlighted" ? "" : sign}
+                        <span
+                          aria-hidden="true"
+                          className={cn(
+                            "sticky left-0 z-10 me-2.5 inline-flex shrink-0 select-none items-center gap-1.5 border-e border-border/35 bg-background/95 px-2 text-right text-[11px] text-muted-foreground/55 tabular-nums",
+                            line.variant === "added" && "bg-success/12 text-success-foreground/80",
+                            line.variant === "removed" && "bg-destructive/12 text-destructive-foreground/80",
+                            line.variant === "highlighted" && "bg-muted/60",
+                          )}
+                        >
+                          {canComment ? (
+                            <button
+                              type="button"
+                              title="对此行写评审意见并引用到对话"
+                              aria-label={`对第 ${lineNumber ?? index + 1} 行添加评审意见`}
+                              onClick={() => {
+                                if (commenting) {
+                                  setCommentTarget(undefined);
+                                  return;
+                                }
+                                setCommentTarget({
+                                  fileKey,
+                                  lineIndex: index,
+                                  path: file.path,
+                                  lineNumber,
+                                  variant: line.variant as "added" | "removed" | "default",
+                                  lineText: line.text,
+                                });
+                                setCommentText("");
+                              }}
+                              className={cn(
+                                "inline-flex size-4 cursor-pointer items-center justify-center rounded text-muted-foreground opacity-0 transition-[opacity,color,background-color] duration-150 hover:bg-muted hover:text-foreground group-hover/diffline:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100",
+                                commenting && "bg-accent text-foreground opacity-100",
+                              )}
+                            >
+                              <MessageSquarePlus className="size-3" />
+                            </button>
+                          ) : null}
+                          {hasNumbers ? (
+                            <>
+                              <span className="inline-block" style={colStyle}>
+                                {line.variant === "highlighted" ? "" : (line.oldLine ?? "")}
+                              </span>
+                              <span className="inline-block" style={colStyle}>
+                                {line.variant === "highlighted" ? "" : (line.newLine ?? "")}
+                              </span>
+                            </>
+                          ) : null}
+                          <span className="inline-block w-2.5 text-center font-semibold">
+                            {line.variant === "highlighted" ? "" : sign}
+                          </span>
                         </span>
-                      </span>
-                      {line.variant === "added"
-                        ? renderWithSpan(line.text, span, "bg-success/25")
-                        : line.variant === "removed"
-                          ? renderWithSpan(line.text, span, "bg-destructive/25")
-                          : line.text}
-                    </CodeBlockLine>
+                        {line.variant === "added"
+                          ? renderWithSpan(line.text, span, "bg-success/25")
+                          : line.variant === "removed"
+                            ? renderWithSpan(line.text, span, "bg-destructive/25")
+                            : line.text}
+                      </CodeBlockLine>
+                      {commenting ? (
+                        <form
+                          onSubmit={submitComment}
+                          className="surface-enter sticky left-0 z-10 flex items-center gap-1.5 border-y border-border/70 bg-card px-2.5 py-1.5 font-sans"
+                        >
+                          <Input
+                            autoFocus
+                            value={commentText}
+                            placeholder={`针对 ${file.path}${lineNumber ? `:${lineNumber}` : ""} 的修改意见…`}
+                            aria-label="行内评审意见"
+                            className="h-7 min-w-0 flex-1 bg-background text-xs"
+                            onChange={(event) => setCommentText(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Escape") {
+                                event.preventDefault();
+                                setCommentTarget(undefined);
+                              }
+                            }}
+                          />
+                          <Button type="submit" size="xs" disabled={!commentText.trim()}>
+                            <Send className="size-3" />
+                            引用到对话
+                          </Button>
+                          <Button type="button" size="icon-xs" variant="ghost" aria-label="取消批注" onClick={() => setCommentTarget(undefined)}>
+                            <X className="size-3" />
+                          </Button>
+                        </form>
+                      ) : null}
+                    </React.Fragment>
                   );
                 })}
               </CodeBlockContent>

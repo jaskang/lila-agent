@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
-import { closeSync, lstatSync, openSync, readlinkSync, readSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { randomBytes } from "node:crypto";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readlinkSync, readSync, realpathSync, rmSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { GitFileChange, GitFileDiff, GitFileStatus, GitStatus } from "@lila/protocol";
 import { UserError } from "./errors.ts";
@@ -296,4 +297,101 @@ export async function gitDiff(cwd: string, filePath: string, staged?: boolean): 
     runGit(cwd, [...diff, "--", ...paths]),
   ]);
   return clipPatch(filePath, [cached.stdout.trimEnd(), work.stdout.trimEnd()].filter(Boolean).join("\n"));
+}
+
+function toRelPaths(cwd: string, paths: readonly string[]): string[] {
+  const root = resolve(cwd);
+  return paths.map((filePath) => {
+    const full = assertInsideRepo(cwd, filePath);
+    return relative(root, full).split(sep).join("/");
+  });
+}
+
+/** Stages specific files or the entire working tree within the project directory. */
+export async function gitStage(cwd: string, paths?: readonly string[]): Promise<GitStatus> {
+  const args = paths?.length ? ["add", "--", ...toRelPaths(cwd, paths)] : ["add", "-A", "--", "."];
+  const res = await runGit(cwd, args);
+  if (res.code !== 0) throw new UserError(`暂存失败：${res.stderr.trim() || "未知错误"}`);
+  return gitStatus(cwd);
+}
+
+/** Unstages specific files or all staged changes within the project directory. */
+export async function gitUnstage(cwd: string, paths?: readonly string[]): Promise<GitStatus> {
+  const rels = paths?.length ? toRelPaths(cwd, paths) : ["."];
+  const hasHead = (await runGit(cwd, ["rev-parse", "--verify", "HEAD"])).code === 0;
+  const args = hasHead ? ["reset", "HEAD", "--", ...rels] : ["rm", "--cached", "-r", "--quiet", "--", ...rels];
+  const res = await runGit(cwd, args);
+  if (res.code !== 0) throw new UserError(`取消暂存失败：${res.stderr.trim() || "未知错误"}`);
+  return gitStatus(cwd);
+}
+
+/** Discards working-tree changes for one file, or removes an untracked file safely inside the project. */
+export async function gitDiscard(cwd: string, filePath: string): Promise<GitStatus> {
+  const fullPath = assertInsideRepo(cwd, filePath);
+  const relPath = relative(resolve(cwd), fullPath).split(sep).join("/");
+
+  const untracked = await runGit(cwd, ["ls-files", "--others", "--exclude-standard", "--", relPath]);
+  if (untracked.code === 0 && untracked.stdout.length > 0) {
+    const repoRealRoot = realpathSync(resolve(cwd));
+    const parentReal = realpathSync(dirname(fullPath));
+    if (!isWithinReal(repoRealRoot, parentReal)) {
+      throw new UserError(`文件路径不在项目目录内：${filePath}`);
+    }
+    rmSync(fullPath, { recursive: true, force: true });
+    return gitStatus(cwd);
+  }
+
+  const res = await runGit(cwd, ["checkout", "--", relPath]);
+  if (res.code !== 0) {
+    // Newly staged file (added, not in HEAD yet): restore both index and worktree or remove from index.
+    const hasHead = (await runGit(cwd, ["rev-parse", "--verify", "HEAD"])).code === 0;
+    const fallback = hasHead
+      ? await runGit(cwd, ["checkout", "HEAD", "--", relPath])
+      : await runGit(cwd, ["rm", "--cached", "-f", "--", relPath]);
+    if (fallback.code !== 0) {
+      throw new UserError(`丢弃改动失败：${res.stderr.trim() || fallback.stderr.trim() || "未知错误"}`);
+    }
+  }
+  return gitStatus(cwd);
+}
+
+/** Creates a Git commit from currently staged changes. */
+export async function gitCommit(cwd: string, message: string): Promise<{ status: GitStatus; hash: string }> {
+  const trimmed = message.trim();
+  if (!trimmed) throw new UserError("提交说明不能为空");
+  const res = await runGit(cwd, ["commit", "-m", trimmed]);
+  if (res.code !== 0) {
+    throw new UserError(`提交失败：${res.stderr.trim() || res.stdout.trim() || "请先暂存要提交的文件"}`);
+  }
+  const rev = await runGit(cwd, ["rev-parse", "--short", "HEAD"]);
+  const status = await gitStatus(cwd);
+  return { status, hash: rev.stdout.trim() };
+}
+
+/** Creates a sibling Git worktree on a new (or existing) branch so parallel agents work in isolation. */
+export async function gitCreateWorktree(cwd: string, requestedBranch?: string): Promise<{ path: string; branch: string }> {
+  const top = await runGit(cwd, ["rev-parse", "--show-toplevel"]);
+  if (top.code !== 0 || !top.stdout.trim()) throw new UserError("当前项目不是 Git 仓库，无法创建 Worktree");
+  const repoRoot = top.stdout.trim();
+  const repoName = basename(repoRoot) || "repo";
+  const branch =
+    requestedBranch?.trim() ||
+    `lila/${new Date().toISOString().slice(5, 10).replace("-", "")}-${randomBytes(2).toString("hex")}`;
+  if (branch.startsWith("-") || /\s|\.\.|[~^:?*[\]\\]/.test(branch)) {
+    throw new UserError(`分支名不合法：${branch}`);
+  }
+  const safeDirName = branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "worktree";
+  const worktreesBase = join(dirname(repoRoot), `${repoName}-worktrees`);
+  mkdirSync(worktreesBase, { recursive: true });
+  let targetDir = join(worktreesBase, safeDirName);
+  if (existsSync(targetDir)) {
+    targetDir = join(worktreesBase, `${safeDirName}-${randomBytes(2).toString("hex")}`);
+  }
+  const branchExists = (await runGit(repoRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`])).code === 0;
+  const addArgs = branchExists
+    ? ["worktree", "add", targetDir, branch]
+    : ["worktree", "add", "-b", branch, targetDir];
+  const res = await runGit(repoRoot, addArgs);
+  if (res.code !== 0) throw new UserError(`创建 Worktree 失败：${res.stderr.trim() || res.stdout.trim() || "未知错误"}`);
+  return { path: targetDir, branch };
 }

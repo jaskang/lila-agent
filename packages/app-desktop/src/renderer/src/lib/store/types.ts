@@ -85,6 +85,8 @@ export type State = {
   activeChangePath?: string | undefined;
   replyReview?: ReplyReviewState | undefined;
   gitChangeCounts: Record<string, number | undefined>;
+  /** Background sessions that finished while unselected, awaiting user review. */
+  unreadCompletedIds: Record<string, true>;
   workspaceRefreshSeq: number;
   commandsRefreshSeq: number;
 };

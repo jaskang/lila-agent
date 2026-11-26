@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { earlier, parseUserItemId, projectBranch, RUN_SETTLED, RUN_STARTED, snapshot } from "./transcript.ts";
 

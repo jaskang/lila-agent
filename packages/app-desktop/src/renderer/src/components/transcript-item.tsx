@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Brain, Check, CheckCircle2, CircleAlert, CircleStop, Copy, GitFork, Info, PencilLine, Puzzle, RotateCw, TriangleAlert } from "lucide-react";
+import { BookmarkPlus, Brain, Check, CheckCircle2, CircleAlert, CircleStop, Copy, GitFork, Info, PencilLine, Puzzle, RotateCw, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import type { ImageInput, SubagentNotification, TranscriptItem } from "@lila/protocol";
 import { SubSessionLink } from "@/components/agent-card";
@@ -74,7 +74,37 @@ function CopyAction({ text }: { text: string }) {
           .catch(() => toast.error("复制失败"));
       }}
     >
-      {copied ? <Check /> : <Copy />}
+      <span className="swap-icon" aria-hidden="true">
+        <Copy data-state={copied ? "hidden" : "visible"} />
+        <Check data-state={copied ? "visible" : "hidden"} />
+      </span>
+    </IconAction>
+  );
+}
+
+function SaveMemoryAction({ text }: { text: string }) {
+  const [saved, setSaved] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  return (
+    <IconAction
+      label={saved ? "已存入长期记忆" : "存入长期记忆（用户画像）"}
+      disabled={busy || saved}
+      onClick={() => {
+        const trimmed = text.trim();
+        if (!trimmed || busy || saved) return;
+        setBusy(true);
+        void actions
+          .addMemory("user", trimmed.slice(0, 600))
+          .then((res) => {
+            if (res) {
+              setSaved(true);
+              toast.success("已存入长期记忆（用户画像）");
+            }
+          })
+          .finally(() => setBusy(false));
+      }}
+    >
+      {saved ? <Check /> : <BookmarkPlus />}
     </IconAction>
   );
 }
@@ -118,8 +148,9 @@ function UserMessage({ item, sessionId, running }: { item: Extract<TranscriptIte
           </Bubble>
         ) : null}
         {item.text || item.canRewind ? (
-          <MessageFooter className="pointer-events-none gap-0.5 px-0 opacity-0 transition-opacity group-hover/message:pointer-events-auto group-hover/message:opacity-100 group-focus-within/message:pointer-events-auto group-focus-within/message:opacity-100">
+          <MessageFooter className="pointer-events-none gap-0.5 px-0 opacity-0 transition-opacity duration-150 group-hover/message:pointer-events-auto group-hover/message:opacity-100 group-focus-within/message:pointer-events-auto group-focus-within/message:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100">
             {item.text ? <CopyAction text={item.text} /> : null}
+            {item.text ? <SaveMemoryAction text={item.text} /> : null}
             {item.canRewind ? (
               <>
                 <IconAction

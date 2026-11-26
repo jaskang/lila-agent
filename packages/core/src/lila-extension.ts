@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import type { AgentToolResult, ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import type { ApprovalMode, PendingAnswer, PendingRequest } from "@lila/protocol";
 import { Type } from "typebox";
-import { approvalReason } from "./approval-policy.ts";
+import { approvalReason, suggestApprovalRule } from "./approval-policy.ts";
 
 export type SubagentBusEvent =
   | { type: "created"; id: string; agentType: string; description: string; isBackground: boolean }
@@ -24,9 +25,17 @@ export type SubagentBusEvent =
     }
   | { type: "disposed" };
 
+export interface SubagentController {
+  stop(agentId: string): Promise<void>;
+  steer(agentId: string, message: string): Promise<void>;
+}
+
 /** What the inline extension needs from the live session that hosts it. */
 export interface LilaBridge {
   readonly approvalMode: ApprovalMode;
+  approvalRules(): readonly string[];
+  allowRule(scope: "session" | "project", pattern: string): void;
+  setSubagentController?(controller: SubagentController | undefined): void;
   request(request: Omit<PendingRequest, "id">, options?: { signal?: AbortSignal; timeout?: number }): Promise<PendingAnswer | undefined>;
   onSubagentEvent?(event: SubagentBusEvent): void;
   onProviderResponse?(providerId: string | undefined, status: number, headers: Record<string, string>): void;
@@ -193,7 +202,38 @@ export function createLilaExtension(bridge: LilaBridge, projectRoot: string): Ex
         pi.events.on("subagents:disposed", () => emit({ type: "disposed" })),
       );
       pi.on("session_shutdown", () => {
+        bridge.setSubagentController?.(undefined);
         for (const unsub of unsubs.splice(0)) unsub();
+      });
+    }
+
+    if (bridge.setSubagentController) {
+      const rpcCall = (channel: string, payload: Record<string, unknown>): Promise<void> =>
+        new Promise((resolve, reject) => {
+          const requestId = randomUUID();
+          const replyChannel = `${channel}:reply:${requestId}`;
+          let settled = false;
+          const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            unsub();
+            if (err) reject(err);
+            else resolve();
+          };
+          const unsub = pi.events.on(replyChannel, (raw) => {
+            const reply = asRecord(raw);
+            if (reply?.success === true) finish();
+            else finish(new Error(asStr(reply?.error) ?? "操作子 Agent 失败"));
+          });
+          const timer = setTimeout(() => finish(new Error("子 Agent 扩展未响应")), 5_000);
+          timer.unref();
+          pi.events.emit(channel, { requestId, ...payload });
+        });
+
+      bridge.setSubagentController({
+        stop: (agentId) => rpcCall("subagents:rpc:stop", { agentId }),
+        steer: (agentId, message) => rpcCall("subagents:rpc:steer", { agentId, message }),
       });
     }
 
@@ -209,16 +249,19 @@ export function createLilaExtension(bridge: LilaBridge, projectRoot: string): Ex
       if (mode === "auto") return;
       const name = event.toolName;
       const input = event.input as Record<string, unknown>;
+      const tool = pi.getAllTools().find((candidate) => candidate.name === name);
       const reason = approvalReason({
         mode,
         projectRoot,
         cwd: ctx.cwd,
         name,
         input,
-        tool: pi.getAllTools().find((tool) => tool.name === name),
+        tool,
+        rules: bridge.approvalRules(),
       });
       if (!reason) return;
 
+      const ruleSuggestion = suggestApprovalRule(name, input, tool);
       const answer = await bridge.request(
         {
           kind: "approval",
@@ -227,10 +270,15 @@ export function createLilaExtension(bridge: LilaBridge, projectRoot: string): Ex
           options: ["allow", "deny"],
           toolCallId: event.toolCallId,
           toolName: name,
+          ...(ruleSuggestion ? { ruleSuggestion } : {}),
         },
         ctx.signal ? { signal: ctx.signal } : {},
       );
-      if (answer?.type === "option" && answer.value === "allow") return;
+      if (answer?.type === "option" && (answer.value === "allow" || answer.value === "allow-session" || answer.value === "allow-project")) {
+        if (ruleSuggestion && answer.value === "allow-session") bridge.allowRule("session", ruleSuggestion.pattern);
+        else if (ruleSuggestion && answer.value === "allow-project") bridge.allowRule("project", ruleSuggestion.pattern);
+        return;
+      }
       if (answer?.type === "option") {
         const note = answer.note?.trim();
         return {

@@ -26,10 +26,12 @@ export function SearchInput({
   inputClassName?: string;
 }) {
   const Field = variant === "sidebar" ? SidebarInput : Input;
+  const inputRef = React.useRef<HTMLInputElement>(null);
   return (
     <div className={cn("relative min-w-0 flex-1", className)}>
       <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
       <Field
+        ref={inputRef}
         autoFocus={autoFocus}
         value={value}
         placeholder={placeholder}
@@ -49,8 +51,11 @@ export function SearchInput({
         <button
           type="button"
           aria-label="清空"
-          onClick={() => onChange("")}
-          className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-sm p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+          onClick={() => {
+            onChange("");
+            inputRef.current?.focus();
+          }}
+          className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-sm p-0.5 text-muted-foreground transition-[color,background-color,scale] duration-150 ease-(--ease-ui-out) outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 motion-safe:active:scale-[0.95]"
         >
           <X className="size-3.5" />
         </button>

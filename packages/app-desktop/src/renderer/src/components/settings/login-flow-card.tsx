@@ -86,7 +86,10 @@ export function LoginFlowCard({ flow, onDone }: { flow: AuthLoginFlowState; onDo
               打开登录页
             </Button>
             <Button type="button" size="sm" variant="outline" onClick={() => copyText("auth-url", flow.authUrl!.url)}>
-              {copiedKey === "auth-url" ? <Check /> : <Copy />}
+              <span className="swap-icon" aria-hidden="true">
+                <Copy data-state={copiedKey === "auth-url" ? "hidden" : "visible"} />
+                <Check data-state={copiedKey === "auth-url" ? "visible" : "hidden"} />
+              </span>
               {copiedKey === "auth-url" ? "已复制" : "复制链接"}
             </Button>
           </div>
@@ -100,7 +103,10 @@ export function LoginFlowCard({ flow, onDone }: { flow: AuthLoginFlowState; onDo
             <span className="font-mono text-lg font-semibold tracking-widest text-foreground">{flow.deviceCode.userCode}</span>
             <div className="flex items-center gap-2">
               <Button type="button" size="sm" variant="outline" onClick={() => copyText("device-code", flow.deviceCode!.userCode)}>
-                {copiedKey === "device-code" ? <Check /> : <Copy />}
+                <span className="swap-icon" aria-hidden="true">
+                  <Copy data-state={copiedKey === "device-code" ? "hidden" : "visible"} />
+                  <Check data-state={copiedKey === "device-code" ? "visible" : "hidden"} />
+                </span>
                 {copiedKey === "device-code" ? "已复制" : "复制验证码"}
               </Button>
               <Button type="button" size="sm" onClick={() => void actions.openExternalUrl(flow.deviceCode!.verificationUri)}>
@@ -184,7 +190,7 @@ export function LoginFlowCard({ flow, onDone }: { flow: AuthLoginFlowState; onDo
                     type="button"
                     aria-label={showSecret ? "隐藏内容" : "显示内容"}
                     onClick={() => setShowSecret((current) => !current)}
-                    className="absolute top-1/2 right-2 -translate-y-1/2 rounded-sm p-0.5 text-muted-foreground hover:text-foreground"
+                    className="absolute top-1/2 right-2 -translate-y-1/2 rounded-sm p-0.5 text-muted-foreground transition-[color,background-color,scale] duration-150 ease-(--ease-ui-out) outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 motion-safe:active:scale-[0.95]"
                   >
                     {showSecret ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
                   </button>

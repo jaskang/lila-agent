@@ -6,6 +6,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type {
   ClientCommand,
+  ContextBreakdown,
   PendingAnswer,
   PendingRequest,
   RunStatus,
@@ -18,7 +19,7 @@ import type {
   TranscriptItem,
 } from "@lila/protocol";
 import { errorMessage, UserError } from "./errors.ts";
-import type { LilaBridge, SubagentBusEvent } from "./lila-extension.ts";
+import type { LilaBridge, SubagentBusEvent, SubagentController } from "./lila-extension.ts";
 import { PendingBridge } from "./pending-bridge.ts";
 import type { Store } from "./store.ts";
 import { SubagentTracker } from "./subagent-tracker.ts";
@@ -118,6 +119,59 @@ export function findModel(services: AgentSessionServices, modelId: string): Mode
   return services.modelRuntime.getAvailableSnapshot().find((model) => `${model.provider}/${model.id}` === modelId);
 }
 
+/** Estimates token distribution across system/tools, dialogue text, tool I/O, and thinking blocks. */
+export function estimateContextBreakdown(messages: readonly AgentMessage[], totalTokens: number | null): ContextBreakdown | undefined {
+  let convChars = 0;
+  let toolChars = 0;
+  let thinkChars = 0;
+
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      convChars += contentText(msg.content).length;
+    } else if (msg.role === "assistant") {
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part.type === "text") convChars += part.text.length;
+          else if (part.type === "thinking") thinkChars += part.thinking.length;
+          else if (part.type === "toolCall") {
+            toolChars += part.name.length + JSON.stringify(part.arguments ?? {}).length;
+          }
+        }
+      }
+    } else if (msg.role === "toolResult") {
+      toolChars += contentText(msg.content).length + (msg.toolName?.length ?? 0);
+    } else {
+      convChars += contentText((msg as { content?: unknown }).content as Parameters<typeof contentText>[0]).length;
+    }
+  }
+
+  const estConv = Math.round(convChars / 3.5);
+  const estTool = Math.round(toolChars / 3.5);
+  const estThink = Math.round(thinkChars / 3.5);
+  const estMsgTotal = estConv + estTool + estThink;
+
+  if (totalTokens === null || totalTokens <= 0) {
+    if (estMsgTotal === 0) return undefined;
+    return { system: 0, conversation: estConv, toolOutputs: estTool, thinking: estThink };
+  }
+
+  if (estMsgTotal <= totalTokens) {
+    return {
+      system: Math.max(0, totalTokens - estMsgTotal),
+      conversation: estConv,
+      toolOutputs: estTool,
+      thinking: estThink,
+    };
+  }
+
+  // Scale down message estimates proportionally when totalTokens is smaller (e.g. post-compaction).
+  const scale = totalTokens / estMsgTotal;
+  const conversation = Math.round(estConv * scale);
+  const toolOutputs = Math.round(estTool * scale);
+  const thinking = Math.max(0, totalTokens - conversation - toolOutputs);
+  return { system: 0, conversation, toolOutputs, thinking };
+}
+
 /** One opened Pi session: its AgentSession, pending user requests and the mapping of its events to frames. */
 export class LiveSession implements LilaBridge {
   readonly id: string;
@@ -126,9 +180,12 @@ export class LiveSession implements LilaBridge {
   readonly #store: Store;
   readonly #clients: Clients;
   readonly #onReload?: () => void;
+  readonly #onProjectRulesChanged?: () => void;
   readonly #onProviderResponse?: (providerId: string | undefined, status: number, headers: Record<string, string>) => void;
   readonly #pending: PendingBridge;
   readonly #subagents: SubagentTracker;
+  readonly #sessionRules = new Set<string>();
+  #subagentController?: SubagentController;
   #session!: AgentSession;
   #services!: AgentSessionServices;
   #unsubscribe?: () => void;
@@ -157,6 +214,7 @@ export class LiveSession implements LilaBridge {
     store: Store;
     clients: Clients;
     onReload?: () => void;
+    onProjectRulesChanged?: () => void;
     onSubsessionsChanged?: () => void;
     onProviderResponse?: (providerId: string | undefined, status: number, headers: Record<string, string>) => void;
   }) {
@@ -165,6 +223,7 @@ export class LiveSession implements LilaBridge {
     this.#store = options.store;
     this.#clients = options.clients;
     this.#onReload = options.onReload;
+    this.#onProjectRulesChanged = options.onProjectRulesChanged;
     this.#onProviderResponse = options.onProviderResponse;
     this.#pending = new PendingBridge({
       onPendingChanged: () => {
@@ -202,6 +261,31 @@ export class LiveSession implements LilaBridge {
 
   get approvalMode() {
     return this.#store.approvalMode(this.id);
+  }
+
+  approvalRules(): readonly string[] {
+    const projectRules = this.#store.approvalRules(this.projectId);
+    if (!this.#sessionRules.size) return projectRules;
+    return [...this.#sessionRules, ...projectRules];
+  }
+
+  allowRule(scope: "session" | "project", pattern: string): void {
+    if (scope === "session") {
+      this.#sessionRules.add(pattern);
+      this.#pushState();
+      return;
+    }
+    this.#store.addApprovalRule(this.projectId, pattern);
+    this.#pushState();
+    this.#onProjectRulesChanged?.();
+  }
+
+  pushState(): void {
+    this.#pushState();
+  }
+
+  setSubagentController(controller: SubagentController | undefined): void {
+    this.#subagentController = controller;
   }
 
   get busy(): boolean {
@@ -305,6 +389,9 @@ export class LiveSession implements LilaBridge {
     const usage = session.getContextUsage();
     const model = session.model;
     const subagents = this.#subagents.snapshot();
+    const sessionRules = [...this.#sessionRules];
+    const projectRules = this.#store.approvalRules(this.projectId);
+    const breakdown = usage ? estimateContextBreakdown(session.messages, usage.tokens) : undefined;
     return {
       status: this.status,
       access: this.#access,
@@ -314,8 +401,10 @@ export class LiveSession implements LilaBridge {
       thinkingLevel: session.thinkingLevel,
       thinkingLevels: session.getAvailableThinkingLevels(),
       approvalMode: this.approvalMode,
+      ...(sessionRules.length ? { sessionRules } : {}),
+      ...(projectRules.length ? { projectRules } : {}),
       queue: { steering: [...session.getSteeringMessages()], followUp: [...session.getFollowUpMessages()] },
-      ...(usage ? { context: { tokens: usage.tokens, window: usage.contextWindow, percent: usage.percent } } : {}),
+      ...(usage ? { context: { tokens: usage.tokens, window: usage.contextWindow, percent: usage.percent, ...(breakdown ? { breakdown } : {}) } } : {}),
       cost: session.getSessionStats().cost,
       compacting: session.isCompacting,
       ...(this.#retry ? { retry: this.#retry } : {}),
@@ -391,7 +480,7 @@ export class LiveSession implements LilaBridge {
           if (!accepted) {
             const message = errorMessage(error);
             if (/^No API key found for the selected model|^No model selected/.test(message)) {
-              return reject(new UserError("没有可用模型。请在终端运行 pi，在 Pi 中输入 /login，然后回到 Lila 刷新模型。"));
+              return reject(new UserError("没有可用模型或凭据。请打开设置中心（⌘,）的「模型与服务商」登录或配置 API Key。"));
             }
             return reject(error);
           }
@@ -430,10 +519,47 @@ export class LiveSession implements LilaBridge {
     return this.#broadcastSummary(true);
   }
 
-  compact(): void {
+  compact(instructions?: string): void {
     this.#requireReady();
     this.touch();
-    this.#session.compact().catch((error: unknown) => this.#notify("error", `压缩失败：${errorMessage(error)}`));
+    this.#session.compact(instructions).catch((error: unknown) => this.#notify("error", `压缩失败：${errorMessage(error)}`));
+  }
+
+  updateRules(scope: "session" | "project", action: "remove" | "clear", pattern?: string): SessionState {
+    this.touch();
+    if (scope === "session") {
+      if (action === "clear") this.#sessionRules.clear();
+      else if (pattern) this.#sessionRules.delete(pattern);
+      this.#pushState();
+      return this.state();
+    }
+    if (action === "clear") this.#store.clearApprovalRules(this.projectId);
+    else if (pattern) this.#store.removeApprovalRule(this.projectId, pattern);
+    this.#pushState();
+    this.#onProjectRulesChanged?.();
+    return this.state();
+  }
+
+  async stopSubagent(agentId: string): Promise<void> {
+    this.#requireReady();
+    this.touch();
+    if (!this.#subagentController) throw new UserError("当前会话不支持控制子 Agent");
+    try {
+      await this.#subagentController.stop(agentId);
+    } catch (error) {
+      throw new UserError(errorMessage(error));
+    }
+  }
+
+  async steerSubagent(agentId: string, message: string): Promise<void> {
+    this.#requireReady();
+    this.touch();
+    if (!this.#subagentController) throw new UserError("当前会话不支持控制子 Agent");
+    try {
+      await this.#subagentController.steer(agentId, message);
+    } catch (error) {
+      throw new UserError(errorMessage(error));
+    }
   }
 
   findUserEntryId(itemId: string): string | undefined {

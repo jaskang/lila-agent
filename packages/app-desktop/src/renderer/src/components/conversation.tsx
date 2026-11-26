@@ -7,13 +7,14 @@ import type { ChangeSelection } from "@/components/reply-changes";
 import { Composer } from "@/components/composer";
 import { MarkdownBasePathProvider } from "@/components/markdown";
 import { PendingPanel } from "@/components/pending-panel";
-import { ApprovalSelect, ContextUsage, ModelPicker, ModelSetup } from "@/components/session-controls";
+import { ApprovalRulesBadge, ApprovalSelect, ContextUsage, ModelPicker, ModelSetup } from "@/components/session-controls";
 import { SubsessionActions } from "@/components/subsession-preview";
 import { TranscriptBlocks } from "@/components/transcript-blocks";
 import { TurnRail } from "@/components/turn-directory";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
+import { Kbd } from "@/components/ui/kbd";
 import {
   MessageScroller,
   MessageScrollerButton,
@@ -25,6 +26,7 @@ import {
 } from "@/components/ui/message-scroller";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Trace, TraceIcon, TraceLine, TraceTitle } from "@/components/ui/trace";
 import { cn } from "cn";
 import { hasAssistantContent, layoutTranscript } from "@/lib/transcript-layout";
@@ -89,7 +91,15 @@ function SessionToolbar({
 
   return (
     <header className={cn("flex h-11 shrink-0 items-center gap-2 border-b border-border/60 px-4 [-webkit-app-region:drag]", showTrigger && "pl-[74px]")}>
-      {showTrigger ? <SidebarTrigger className="[-webkit-app-region:no-drag]" title="切换侧边栏（⌘B）" /> : null}
+      {showTrigger ? (
+        <Tooltip>
+          <TooltipTrigger render={<SidebarTrigger className="[-webkit-app-region:no-drag]" />} />
+          <TooltipContent side="bottom">
+            切换侧边栏
+            <Kbd>⌘B</Kbd>
+          </TooltipContent>
+        </Tooltip>
+      ) : null}
       {parentSession ? (
         <Button
           variant="ghost"
@@ -137,38 +147,73 @@ function SessionToolbar({
           {project?.name}
         </span>
       </div>
-      <Button type="button" size="icon-sm" variant="ghost" aria-label="查找会话内容" title="查找会话内容（⌘F）" onClick={onSearch} className="text-muted-foreground [-webkit-app-region:no-drag]">
-        <Search />
-      </Button>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label="查找会话内容"
+              onClick={onSearch}
+              className="text-muted-foreground [-webkit-app-region:no-drag]"
+            />
+          }
+        >
+          <Search />
+        </TooltipTrigger>
+        <TooltipContent side="bottom">
+          查找会话内容
+          <Kbd>⌘F</Kbd>
+        </TooltipContent>
+      </Tooltip>
       {project ? (
         <>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            aria-label="项目文件"
-            title="项目文件（⌘E）"
-            aria-pressed={rightPanel === "files"}
-            className={cn("font-normal text-muted-foreground [-webkit-app-region:no-drag]", rightPanel === "files" && "bg-accent text-foreground")}
-            onClick={() => actions.toggleRightPanel("files")}
-          >
-            <FolderTree />
-            <span className="hidden @min-[30rem]:inline">文件</span>
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            aria-label="工作区改动"
-            title="工作区改动（⇧⌘G）"
-            aria-pressed={rightPanel === "changes"}
-            className={cn("font-normal text-muted-foreground [-webkit-app-region:no-drag]", rightPanel === "changes" && "bg-accent text-foreground")}
-            onClick={() => actions.toggleRightPanel("changes")}
-          >
-            <GitBranch />
-            <span className="hidden @min-[30rem]:inline">改动</span>
-            {gitChanges ? <span className="font-mono text-xs text-muted-foreground tabular-nums">{gitChanges}</span> : null}
-          </Button>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label="项目文件"
+                  aria-pressed={rightPanel === "files"}
+                  className={cn("font-normal text-muted-foreground [-webkit-app-region:no-drag]", rightPanel === "files" && "bg-accent text-foreground")}
+                  onClick={() => actions.toggleRightPanel("files")}
+                />
+              }
+            >
+              <FolderTree />
+              <span className="hidden @min-[30rem]:inline">文件</span>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              项目文件
+              <Kbd>⌘E</Kbd>
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label="工作区改动"
+                  aria-pressed={rightPanel === "changes"}
+                  className={cn("font-normal text-muted-foreground [-webkit-app-region:no-drag]", rightPanel === "changes" && "bg-accent text-foreground")}
+                  onClick={() => actions.toggleRightPanel("changes")}
+                />
+              }
+            >
+              <GitBranch />
+              <span className="hidden @min-[30rem]:inline">改动</span>
+              {gitChanges ? <span className="font-mono text-xs text-muted-foreground tabular-nums">{gitChanges}</span> : null}
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              工作区改动
+              <Kbd>⇧⌘G</Kbd>
+            </TooltipContent>
+          </Tooltip>
         </>
       ) : null}
     </header>
@@ -204,6 +249,7 @@ function SessionControls({ sessionId, state }: { sessionId: string; state: Sessi
         })}
       />
       <ApprovalSelect value={state.approvalMode} onChange={(approvalMode) => void actions.configure(sessionId, { approvalMode })} />
+      <ApprovalRulesBadge sessionId={sessionId} state={state} />
     </>
   );
 }

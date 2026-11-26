@@ -160,16 +160,21 @@ export function ProviderModelsView({
                 aria-checked={checked}
                 disabled={saving}
                 onClick={() => toggle(model.id)}
-                className="flex w-full items-center gap-3 px-1 py-2.5 text-left transition-colors hover:bg-muted/40 focus-visible:bg-muted/50 focus-visible:outline-none"
+                className="flex w-full items-center gap-3 px-1 py-2.5 text-left transition-colors duration-150 outline-none hover:bg-muted/40 focus-visible:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset"
               >
                 <span
                   aria-hidden
                   className={cn(
-                    "flex size-4 shrink-0 items-center justify-center rounded-[4px] border transition-colors",
+                    "flex size-4 shrink-0 items-center justify-center rounded-[4px] border transition-colors duration-150 ease-(--ease-ui-out)",
                     checked ? "border-primary bg-primary text-primary-foreground" : "border-input bg-background text-transparent",
                   )}
                 >
-                  <Check className="size-3 stroke-[2.5]" />
+                  <Check
+                    className={cn(
+                      "size-3 stroke-[2.5] transition-[opacity,transform] duration-150 ease-(--ease-ui-out) motion-reduce:transition-opacity",
+                      checked ? "scale-100 opacity-100" : "scale-75 opacity-0",
+                    )}
+                  />
                 </span>
                 <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                   <span className="truncate text-sm text-foreground">{model.label}</span>

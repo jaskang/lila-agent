@@ -1,24 +1,22 @@
 {
   "name": "lila",
   "private": true,
-  "workspaces": [
-    "packages/*"
-  ],
   "type": "module",
+  "packageManager": "pnpm@12.16.1",
   "scripts": {
-    "build:protocol": "bun run --filter @lila/protocol build",
-    "build": "bun run build:protocol && bun run --filter @lila/desktop build",
-    "dev": "bun run build:protocol && bun run --filter @lila/core --filter @lila/desktop dev",
+    "build:protocol": "pnpm --filter @lila/protocol build",
+    "build": "pnpm build:protocol && pnpm --filter @lila/desktop build",
+    "dev": "pnpm build:protocol && pnpm --parallel --filter @lila/core --filter @lila/desktop dev",
     "lint": "oxlint",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
-    "typecheck": "bun run build:protocol && bun run --filter '*' typecheck",
-    "test": "bun run build:protocol && bun test"
+    "typecheck": "pnpm build:protocol && pnpm -r typecheck",
+    "test": "pnpm build:protocol && vitest run"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.4",
     "oxfmt": "^0.78.0",
     "oxlint": "^1.93.0",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.2"
   }
 }

@@ -31,7 +31,15 @@ import type {
 } from "@lila/protocol";
 import { UserError } from "./errors.ts";
 import { createServices, ExtensionsService } from "./extensions-service.ts";
-import { gitDiff as readGitDiff, gitStatus as readGitStatus } from "./git.ts";
+import {
+  gitCommit as runGitCommit,
+  gitCreateWorktree,
+  gitDiff as readGitDiff,
+  gitDiscard as runGitDiscard,
+  gitStage as runGitStage,
+  gitStatus as readGitStatus,
+  gitUnstage as runGitUnstage,
+} from "./git.ts";
 import { type Clients, findModel, LiveSession, parseAutoSubagentName, sessionTitle, slashCommands } from "./live-session.ts";
 import type { MemoryConfigPatch } from "./memory.ts";
 import { SettingsService, settleServices } from "./settings-service.ts";
@@ -558,6 +566,11 @@ export class SessionHost {
       store: this.store,
       clients: this.#clients,
       onReload: () => this.#invalidateCaches(project.id),
+      onProjectRulesChanged: () => {
+        for (const other of this.#live.values()) {
+          if (other.id !== sessionId && other.projectId === project.id) other.pushState();
+        }
+      },
       onSubsessionsChanged: () => this.#scheduleSubsessionSync(project, sessionId),
       onProviderResponse: (providerId, _status, headers) => this.#settings.recordResponseHeaders(providerId, headers),
     });
@@ -764,5 +777,33 @@ export class SessionHost {
   }
   gitDiff(projectId: string, path: string, staged?: boolean): Promise<GitFileDiff> {
     return readGitDiff(this.#project(projectId).path, path, staged);
+  }
+  gitStage(projectId: string, paths?: readonly string[]): Promise<GitStatus> {
+    return runGitStage(this.#project(projectId).path, paths);
+  }
+  gitUnstage(projectId: string, paths?: readonly string[]): Promise<GitStatus> {
+    return runGitUnstage(this.#project(projectId).path, paths);
+  }
+  gitDiscard(projectId: string, path: string): Promise<GitStatus> {
+    const project = this.#project(projectId);
+    invalidateFileCache(project.path);
+    return runGitDiscard(project.path, path);
+  }
+  gitCommit(projectId: string, message: string): Promise<{ status: GitStatus; hash: string }> {
+    return runGitCommit(this.#project(projectId).path, message);
+  }
+  async createWorktreeProject(projectId: string, branch?: string): Promise<{ project: Project; branch: string }> {
+    const source = this.#project(projectId);
+    const created = await gitCreateWorktree(source.path, branch);
+    const existing = this.store.projects.find((item) => item.path === created.path);
+    if (existing) return { project: existing, branch: created.branch };
+    const project: Project = {
+      id: randomUUID(),
+      path: created.path,
+      name: `${source.name} (${created.branch})`,
+    };
+    this.store.addProject(project);
+    this.#clients.broadcast({ type: "projects", projects: [...this.store.projects] });
+    return { project, branch: created.branch };
   }
 }

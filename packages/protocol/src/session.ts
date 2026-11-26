@@ -119,6 +119,8 @@ export type ItemKind = TranscriptItem["kind"];
 
 export type PendingQuestion = { id: string; question: string; options: string[]; multiple: boolean };
 
+export type ApprovalRuleSuggestion = { pattern: string; label: string };
+
 export type PendingRequest = {
   id: string;
   kind: "approval" | "select" | "confirm" | "input" | "editor" | "ask";
@@ -131,6 +133,8 @@ export type PendingRequest = {
   /** approval: the tool call that waits. */
   toolCallId?: string;
   toolName?: string;
+  /** approval: reusable rule the user may approve for the session or project. */
+  ruleSuggestion?: ApprovalRuleSuggestion;
   /** ask: one or more questions. */
   questions?: PendingQuestion[];
 };
@@ -166,6 +170,17 @@ export type SubagentProgress = {
   error?: string;
 };
 
+export type ContextBreakdown = {
+  /** Estimated tokens for system prompt, AGENTS.md, skills, and tool definitions. */
+  system: number;
+  /** Estimated tokens for user & assistant dialogue text. */
+  conversation: number;
+  /** Estimated tokens for tool calls and tool outputs. */
+  toolOutputs: number;
+  /** Estimated tokens for assistant thinking blocks. */
+  thinking: number;
+};
+
 export type SessionState = {
   status: SessionStatus;
   access: "starting" | "ready" | "read-only" | "failed";
@@ -177,9 +192,13 @@ export type SessionState = {
   /** Levels the current model accepts; ["off"] for a model without reasoning. */
   thinkingLevels: ThinkingLevel[];
   approvalMode: ApprovalMode;
+  /** Reusable approval rules granted for this session only. */
+  sessionRules?: string[];
+  /** Reusable approval rules persisted for this project. */
+  projectRules?: string[];
   /** Messages typed while the agent ran, waiting to be delivered. */
   queue: { steering: string[]; followUp: string[] };
-  context?: { tokens: number | null; window: number; percent: number | null };
+  context?: { tokens: number | null; window: number; percent: number | null; breakdown?: ContextBreakdown };
   /** Total cost of the session in USD. */
   cost: number;
   compacting: boolean;

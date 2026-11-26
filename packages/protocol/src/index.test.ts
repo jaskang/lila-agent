@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { ClientCommand, MAX_PROMPT_IMAGE_BASE64_BYTES } from "./index.ts";
 
 test("a prompt sent while the agent runs carries its delivery mode", () => {
