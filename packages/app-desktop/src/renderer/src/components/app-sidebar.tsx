@@ -168,7 +168,7 @@ function SessionRow({
 
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton isActive={active} onClick={() => onSelectSession(session.id)} className="h-auto py-1.5">
+      <SidebarMenuButton isActive={active} aria-current={active ? "true" : undefined} onClick={() => onSelectSession(session.id)} className="h-auto py-1.5">
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="truncate" title={session.title || "新会话"}>
             {session.title || "新会话"}

@@ -12,6 +12,10 @@ export default defineConfig({
     },
   },
   renderer: {
+    build: {
+      // Keep small KaTeX fonts as local files so the renderer's CSP can load them.
+      assetsInlineLimit: (filePath) => (/\.(woff2?|ttf)$/.test(filePath) ? false : undefined),
+    },
     resolve: {
       alias: {
         "@": resolve(import.meta.dirname, "src/renderer/src"),

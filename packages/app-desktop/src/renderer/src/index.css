@@ -9,6 +9,8 @@
 :root {
   color-scheme: light;
   --radius: 0.625rem;
+  --ease-ui-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-ui-drawer: cubic-bezier(0.32, 0.72, 0, 1);
   --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
   --font-heading: var(--font-sans);
@@ -189,6 +191,50 @@
   code {
     -webkit-user-select: text;
     user-select: text;
+  }
+}
+
+@layer components {
+  .floating-transition,
+  .dialog-transition {
+    transition-property: opacity, scale;
+    transition-duration: 160ms;
+    transition-timing-function: var(--ease-ui-out);
+
+    &:is([data-starting-style], [data-ending-style]) {
+      opacity: 0;
+      scale: 0.97;
+    }
+
+    &[data-ending-style] {
+      transition-duration: 100ms;
+    }
+  }
+
+  .floating-transition[data-instant] {
+    transition-duration: 0ms;
+  }
+
+  .floating-transition[data-slot="tooltip-content"]:not([data-instant], [data-ending-style]) {
+    transition-duration: 125ms;
+  }
+
+  .dialog-transition {
+    transition-duration: 200ms;
+
+    &[data-ending-style] {
+      transition-duration: 140ms;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    :is(.floating-transition, .dialog-transition) {
+      transition-property: opacity;
+
+      &:is([data-starting-style], [data-ending-style]) {
+        scale: none;
+      }
+    }
   }
 }
 

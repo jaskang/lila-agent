@@ -1,3 +1,4 @@
+import type { TooltipRootActions, TooltipRootProps } from "@base-ui/react/tooltip";
 import * as React from "react";
 import { Check, Code2, Copy, ExternalLink, Eye, FileText, Image as ImageIcon, ImageOff } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -289,6 +290,26 @@ function MarkdownLink({ href, children }: { href?: string | undefined; children?
   const linkRef = React.useRef<HTMLAnchorElement>(null);
   const pointerRef = React.useRef<{ x: number; y: number } | null>(null);
   const [anchor, setAnchor] = React.useState<{ getBoundingClientRect: () => DOMRect } | undefined>(undefined);
+  const tooltipActions = React.useRef<TooltipRootActions>(null);
+  const [hoverTooltipOpen, setHoverTooltipOpen] = React.useState(false);
+
+  const onTooltipOpenChange: TooltipRootProps["onOpenChange"] = (open, { reason }) => {
+    setHoverTooltipOpen(open && reason === "trigger-hover");
+  };
+
+  React.useEffect(() => {
+    const link = linkRef.current;
+    if (!hoverTooltipOpen || !link) return;
+
+    // Scrolling can move the link away without the mousemove that completes hover dismissal.
+    const handleScroll = (event: Event) => {
+      if (event.target instanceof Node && event.target.contains(link)) {
+        tooltipActions.current?.close();
+      }
+    };
+    link.ownerDocument.addEventListener("scroll", handleScroll, { capture: true, passive: true });
+    return () => link.ownerDocument.removeEventListener("scroll", handleScroll, true);
+  }, [hoverTooltipOpen]);
 
   const syncAnchor = React.useCallback((event?: React.PointerEvent<HTMLAnchorElement>) => {
     if (event) pointerRef.current = { x: event.clientX, y: event.clientY };
@@ -305,7 +326,7 @@ function MarkdownLink({ href, children }: { href?: string | undefined; children?
     const range = parseLineRange(href);
     const tip = displayLocalPath(localPath, activeProjectPath ?? basePath, range);
     return (
-      <Tooltip>
+      <Tooltip actionsRef={tooltipActions} onOpenChange={onTooltipOpenChange}>
         <TooltipTrigger
           render={
             <a
@@ -340,7 +361,7 @@ function MarkdownLink({ href, children }: { href?: string | undefined; children?
     );
   }
   return (
-    <Tooltip>
+    <Tooltip actionsRef={tooltipActions} onOpenChange={onTooltipOpenChange}>
       <TooltipTrigger
         render={
           <a

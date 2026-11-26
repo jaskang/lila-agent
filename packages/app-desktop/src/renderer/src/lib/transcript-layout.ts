@@ -17,6 +17,10 @@ function isSubagentTool(item: TranscriptItem): item is AgentToolItem {
   return item.kind === "tool" && Boolean(item.subagent);
 }
 
+export function hasAssistantContent(item: Extract<TranscriptItem, { kind: "assistant" }>): boolean {
+  return Boolean(item.text || item.thinking || item.error);
+}
+
 function isRoutineActivity(item: TranscriptItem): boolean {
   if (item.kind === "tool") return item.status !== "error" && item.name !== "ask_user" && !item.subagent;
   if (item.kind === "assistant") return Boolean(item.thinking && !item.text && !item.error && !item.streaming);
@@ -73,6 +77,7 @@ export function layoutTranscript(items: readonly TranscriptItem[], projectPath?:
   }
 
   for (const item of items) {
+    if (item.kind === "assistant" && !hasAssistantContent(item)) continue;
     if (item.kind === "user") {
       flushActivity();
       flushAgents();

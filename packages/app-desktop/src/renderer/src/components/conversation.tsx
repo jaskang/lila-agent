@@ -27,7 +27,7 @@ import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { Trace, TraceIcon, TraceLine, TraceTitle } from "@/components/ui/trace";
 import { cn } from "cn";
-import { layoutTranscript } from "@/lib/transcript-layout";
+import { hasAssistantContent, layoutTranscript } from "@/lib/transcript-layout";
 import { hasOpenShortcutOverlay } from "@/lib/shortcuts";
 import { actions, EMPTY_VIEW, useLila } from "@/lib/store";
 
@@ -294,10 +294,12 @@ export function Conversation({ sessionId }: { sessionId: string }) {
     [sessionId],
   );
   const latestItem = view.items.at(-1);
-  const replyVisible = latestItem?.kind === "assistant" && latestItem.streaming && Boolean(latestItem.text || latestItem.thinking);
+  const replyVisible = latestItem?.kind === "assistant" && hasAssistantContent(latestItem);
   const toolRunning = latestItem?.kind === "tool" && latestItem.status === "running";
+  // The final reply and Run marker can arrive before the idle state.
   const showResponseStatus = running && connected && !readOnly && !history
-    && !state.pending.length && !state.retry && !state.compacting && !replyVisible && !toolRunning;
+    && !state.pending.length && !state.retry && !state.compacting
+    && latestItem?.kind !== "run" && !replyVisible && !toolRunning;
   const searchVersion = React.useRef(0);
   const scrollToLatest = React.useRef(false);
   const abortTimerRef = React.useRef<number | undefined>(undefined);
@@ -554,7 +556,7 @@ export function Conversation({ sessionId }: { sessionId: string }) {
                   />
                   {showResponseStatus ? (
                     <MessageScrollerItem messageId="response-status">
-                      <Trace className="py-1">
+                      <Trace>
                         <TraceLine status="running" className="text-[13px]">
                           <TraceIcon>
                             <Spinner aria-hidden className="size-3.5" />

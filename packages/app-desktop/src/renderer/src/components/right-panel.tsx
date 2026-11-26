@@ -6,7 +6,6 @@ const WIDTH_STORAGE_KEY = "lila.rightPanelWidth";
 const DEFAULT_WIDTH_PCT = 44;
 const MIN_WIDTH_PCT = 26;
 const MAX_WIDTH_PCT = 70;
-const TRANSITION_MS = 220;
 const WIDE_PANEL_QUERY = "(min-width: 64rem)";
 const KEYBOARD_WIDTH_STEP = 2;
 const MIN_PANEL_WIDTH_REM = 20;
@@ -59,50 +58,10 @@ export function RightPanelShell({
   const [minWidthPct, setMinWidthPct] = React.useState(MIN_WIDTH_PCT);
   const panelWidthPct = clampWidthPct(widthPct, minWidthPct);
   const [dragging, setDragging] = React.useState(false);
-  const [mounted, setMounted] = React.useState(open);
-  const [shown, setShown] = React.useState(open);
-  const [animating, setAnimating] = React.useState(false);
   const panelId = React.useId();
-  const mountedRef = React.useRef(mounted);
-  mountedRef.current = mounted;
-  const lastContentRef = React.useRef<{ label: string; children: React.ReactNode } | undefined>(
-    open && label ? { label, children } : undefined,
-  );
+  const finishDrag = React.useRef<(() => void) | undefined>(undefined);
 
-  if (open && label) {
-    lastContentRef.current = { label, children };
-  }
-
-  React.useEffect(() => {
-    if (open) {
-      setMounted(true);
-      setAnimating(true);
-      let frame2 = 0;
-      const frame1 = window.requestAnimationFrame(() => {
-        frame2 = window.requestAnimationFrame(() => {
-          setShown(true);
-        });
-      });
-      const timer = window.setTimeout(() => {
-        setAnimating(false);
-      }, TRANSITION_MS + 40);
-      return () => {
-        window.cancelAnimationFrame(frame1);
-        window.cancelAnimationFrame(frame2);
-        window.clearTimeout(timer);
-      };
-    }
-
-    if (!mountedRef.current) return;
-    setAnimating(true);
-    setShown(false);
-    const timer = window.setTimeout(() => {
-      setMounted(false);
-      setAnimating(false);
-      lastContentRef.current = undefined;
-    }, TRANSITION_MS + 20);
-    return () => window.clearTimeout(timer);
-  }, [open]);
+  React.useLayoutEffect(() => () => finishDrag.current?.(), [wide, open]);
 
   React.useLayoutEffect(() => {
     const container = containerRef.current;
@@ -128,65 +87,59 @@ export function RightPanelShell({
 
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     const container = containerRef.current;
-    if (!container) return;
+    if (!container || event.button !== 0 || !event.isPrimary || finishDrag.current) return;
     event.preventDefault();
     const target = event.currentTarget;
-    target.setPointerCapture(event.pointerId);
+    const { pointerId } = event;
+    target.setPointerCapture(pointerId);
     setDragging(true);
     const rect = container.getBoundingClientRect();
     let latest = panelWidthPct;
 
     const onMove = (moveEvent: PointerEvent) => {
-      if (rect.width <= 0) return;
+      if (moveEvent.pointerId !== pointerId || rect.width <= 0) return;
       const fromRight = rect.right - moveEvent.clientX;
       const rawPct = (fromRight / rect.width) * 100;
       latest = clampWidthPct(rawPct, minWidthPct);
       setWidthPct(latest);
     };
 
-    const onUp = () => {
-      setDragging(false);
-      persistWidth(latest);
+    const finish = () => {
       target.removeEventListener("pointermove", onMove);
       target.removeEventListener("pointerup", onUp);
       target.removeEventListener("pointercancel", onUp);
+      target.removeEventListener("lostpointercapture", onUp);
+      if (target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
+      finishDrag.current = undefined;
+      setDragging(false);
+      persistWidth(latest);
     };
+    const onUp = (pointerEvent: PointerEvent) => {
+      if (pointerEvent.pointerId === pointerId) finish();
+    };
+    finishDrag.current = finish;
 
     target.addEventListener("pointermove", onMove);
     target.addEventListener("pointerup", onUp);
     target.addEventListener("pointercancel", onUp);
+    target.addEventListener("lostpointercapture", onUp);
   };
 
   if (!wide) {
-    const content = lastContentRef.current;
     return (
-      <Sheet open={open} onOpenChange={(next) => { if (!next) onClose(); }}>
-        <SheetContent
-          showCloseButton={false}
-          aria-modal="true"
-          data-workspace-sheet
-          className="@container min-h-0 gap-0 overflow-hidden data-[side=right]:w-[min(32rem,calc(100%-2rem))] data-[side=right]:sm:max-w-none"
-        >
-          <SheetTitle className="sr-only">{content?.label ?? "工作区面板"}</SheetTitle>
-          {content?.children}
-        </SheetContent>
-      </Sheet>
+      <WorkspaceSheet open={open} label={label} onClose={onClose}>
+        {children}
+      </WorkspaceSheet>
     );
   }
 
-  if (!mounted) return null;
-  const active = open && label ? { label, children } : lastContentRef.current;
-  if (!active) return null;
-
-  const transitionClass = dragging
-    ? "transition-none"
-    : "transition-[width,transform,opacity] duration-[220ms] ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none";
+  if (!open || !label) return null;
 
   return (
     <>
       <div
         role="separator"
-        tabIndex={shown ? 0 : -1}
+        tabIndex={0}
         aria-orientation="vertical"
         aria-label="右侧面板宽度"
         aria-controls={panelId}
@@ -218,11 +171,7 @@ export function RightPanelShell({
           setWidthPct(DEFAULT_WIDTH_PCT);
           persistWidth(DEFAULT_WIDTH_PCT);
         }}
-        className={cn(
-          "group/sash flex shrink-0 cursor-col-resize items-center justify-center select-none focus-visible:outline-none",
-          transitionClass,
-          shown ? "w-2 opacity-100" : "pointer-events-none w-0 opacity-0",
-        )}
+        className="group/sash flex w-2 shrink-0 cursor-col-resize items-center justify-center select-none focus-visible:outline-none"
       >
         <span
           aria-hidden
@@ -234,21 +183,12 @@ export function RightPanelShell({
       </div>
       <div
         style={{ "--right-panel-width": `${panelWidthPct}%`, "--right-panel-min": `${MIN_PANEL_WIDTH_REM}rem` } as React.CSSProperties}
-        className={cn(
-          "flex min-h-0 shrink-0",
-          transitionClass,
-          animating ? "overflow-hidden" : "overflow-visible",
-          shown
-            ? "w-[clamp(var(--right-panel-min),var(--right-panel-width),100%)] opacity-100"
-            : "pointer-events-none w-0 opacity-0",
-        )}
+        className="flex min-h-0 w-[clamp(var(--right-panel-min),var(--right-panel-width),100%)] shrink-0"
       >
         <aside
           data-surface="panel"
           id={panelId}
-          aria-label={active.label}
-          aria-hidden={!shown || undefined}
-          inert={!shown}
+          aria-label={label}
           className={cn(
             "@container flex size-full min-h-0 flex-col overflow-hidden rounded-xl bg-workspace-surface shadow-[var(--panel-shadow)] ring-1 ring-[var(--panel-border)]",
             "min-w-(--right-panel-min)",
@@ -261,9 +201,40 @@ export function RightPanelShell({
             onClose();
           }}
         >
-          {active.children}
+          {children}
         </aside>
       </div>
     </>
+  );
+}
+
+function WorkspaceSheet({ open, label, onClose, children }: {
+  open: boolean;
+  label?: string;
+  onClose: () => void;
+  children?: React.ReactNode;
+}) {
+  const content = React.useRef<{ label: string; children: React.ReactNode } | undefined>(undefined);
+  const popup = React.useRef<HTMLDivElement>(null);
+  if (open && label) content.current = { label, children };
+
+  return (
+    <Sheet
+      open={open}
+      onOpenChange={(next) => { if (!next) onClose(); }}
+      onOpenChangeComplete={(next) => { if (!next) content.current = undefined; }}
+    >
+      <SheetContent
+        ref={popup}
+        initialFocus={popup}
+        showCloseButton={false}
+        aria-modal="true"
+        data-workspace-sheet
+        className="@container min-h-0 gap-0 overflow-hidden data-[side=right]:w-[min(32rem,calc(100%-2rem))] data-[side=right]:sm:max-w-none"
+      >
+        <SheetTitle className="sr-only">{content.current?.label ?? "工作区面板"}</SheetTitle>
+        {content.current?.children}
+      </SheetContent>
+    </Sheet>
   );
 }

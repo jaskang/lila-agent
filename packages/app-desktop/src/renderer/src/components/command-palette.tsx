@@ -79,7 +79,7 @@ export function CommandPalette() {
 
   return (
     <CommandDialog open={open} onOpenChange={actions.setPaletteOpen} title="命令面板" description="切换会话或执行命令">
-      <Command>
+      <Command label="搜索会话、项目或命令">
         <CommandInput placeholder="搜索会话、项目或命令（支持中英文/拼音）…" />
         <CommandList>
           <CommandEmpty>没有匹配的结果</CommandEmpty>
