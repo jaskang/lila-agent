@@ -1,14 +1,15 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ApprovalMode, DEFAULT_APPROVAL_MODE, type Project } from "@lila/protocol";
+import { ApprovalMode, DEFAULT_APPROVAL_MODE, DEFAULT_SANDBOX_MODE, type Project, SandboxMode } from "@lila/protocol";
 
 type State = {
   projects: Project[];
   approvalModes: Record<string, ApprovalMode>;
   approvalRules: Record<string, string[]>;
+  sandboxModes: Record<string, SandboxMode>;
 };
 
-/** Lila's own state: projects, per-session approval modes, and per-project reusable approval rules. */
+/** Lila's own state: projects, per-session approval & sandbox modes, and per-project reusable approval rules. */
 export class Store {
   readonly #path: string;
   #state: State;
@@ -21,6 +22,7 @@ export class Store {
       projects: Array.isArray(loaded.projects) ? loaded.projects : [],
       approvalModes: loaded.approvalModes && typeof loaded.approvalModes === "object" ? loaded.approvalModes : {},
       approvalRules: loaded.approvalRules && typeof loaded.approvalRules === "object" ? loaded.approvalRules : {},
+      sandboxModes: loaded.sandboxModes && typeof loaded.sandboxModes === "object" ? loaded.sandboxModes : {},
     };
   }
 
@@ -98,9 +100,27 @@ export class Store {
     this.#save();
   }
 
+  sandboxMode(sessionId: string): SandboxMode {
+    const saved = SandboxMode.safeParse(this.#state.sandboxModes[sessionId]);
+    return saved.success ? saved.data : DEFAULT_SANDBOX_MODE;
+  }
+
+  setSandboxMode(sessionId: string, mode: SandboxMode): void {
+    if (mode === DEFAULT_SANDBOX_MODE) {
+      if (!(sessionId in this.#state.sandboxModes)) return;
+      delete this.#state.sandboxModes[sessionId];
+    } else {
+      this.#state.sandboxModes[sessionId] = mode;
+    }
+    this.#save();
+  }
+
   forgetSession(sessionId: string): void {
-    if (!(sessionId in this.#state.approvalModes)) return;
+    const hadApproval = sessionId in this.#state.approvalModes;
+    const hadSandbox = sessionId in this.#state.sandboxModes;
+    if (!hadApproval && !hadSandbox) return;
     delete this.#state.approvalModes[sessionId];
+    delete this.#state.sandboxModes[sessionId];
     this.#save();
   }
 

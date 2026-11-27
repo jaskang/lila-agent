@@ -28,6 +28,9 @@ _Avoid_: Prompt、Dialog。
 会话级工具审批配置。请求批准（`ask-all`）审查项目外写入、联网和范围不明的调用；帮我批准（`ask-exec`）同时放行可识别的低风险 MCP 调用；完全访问权限（`auto`）跳过 Lila 审批。前两档允许内置文件工具进行只读访问及项目内写入。
 _Avoid_: Permission level、Security mode。
 
+**Sandbox mode**:
+与审批方式正交的会话/定时任务级 OS 进程沙箱边界（`off` / `workspace-write`）。开启 `workspace-write` 时由操作系统内核（macOS Seatbelt / Linux bubblewrap）强制限制 `bash` 子进程树仅可写入项目目录与临时目录，并屏蔽敏感凭据读取。普通会话默认 `off`，后台定时任务默认 `workspace-write`。
+
 **Steer / Follow-up**:
 Run 进行中发送的消息。Steer 在当前工具轮次后插入，Follow-up 等 Run 结束后开始下一轮。
 

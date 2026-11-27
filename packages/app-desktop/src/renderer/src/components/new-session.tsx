@@ -1,7 +1,8 @@
 import { useMemo } from "react";
 import { Folder, FolderOpen, FolderPlus } from "lucide-react";
 import { Composer } from "@/components/composer";
-import { ApprovalSelect, COMPOSER_CHIP, ModelPicker, ModelSetup } from "@/components/session-controls";
+import { DEFAULT_SANDBOX_MODE } from "@lila/protocol";
+import { ApprovalSelect, COMPOSER_CHIP, ModelPicker, ModelSetup, SandboxSelect } from "@/components/session-controls";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Kbd } from "@/components/ui/kbd";
@@ -18,6 +19,7 @@ export function NewSession() {
   const projects = useLila((state) => state.projects);
   const projectId = useNewSessionProjectId();
   const approvalMode = useLila((state) => state.newSessionApprovalMode ?? state.defaultApprovalMode);
+  const sandboxMode = useLila((state) => state.newSessionSandboxMode ?? DEFAULT_SANDBOX_MODE);
   const models = useLila((state) => state.models);
   const defaultModelId = useLila((state) => state.defaultModelId);
   const modelsError = useLila((state) => state.modelsError);
@@ -140,6 +142,7 @@ export function NewSession() {
                   }}
                 />
                 <ApprovalSelect value={approvalMode} onChange={actions.setNewSessionApprovalMode} />
+                <SandboxSelect value={sandboxMode} onChange={actions.setNewSessionSandboxMode} />
               </>
             }
           />

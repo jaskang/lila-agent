@@ -1,11 +1,13 @@
 import { create } from "zustand";
 import { toast } from "sonner";
+import { DEFAULT_SANDBOX_MODE } from "@lila/protocol";
 import type {
   ApprovalMode,
   AssistantTask,
   ImageInput,
   PendingAnswer,
   Project,
+  SandboxMode,
   ScheduleCreateInput,
   ScheduledJob,
   ScheduleUpdatePatch,
@@ -58,6 +60,7 @@ export {
   APPROVAL_LABEL,
   EMPTY_VIEW,
   NEW_DRAFT,
+  SANDBOX_LABEL,
   emptyView,
   type AuthLoginFlowState,
   type AutomationTab,
@@ -627,7 +630,7 @@ export const actions = {
   setScrollTop: (sessionId: string, scrollTop: number | undefined) => viewCache.setScrollTop(sessionId, scrollTop),
 
   startNew(projectId?: string): void {
-    set({ newSessionApprovalMode: undefined });
+    set({ newSessionApprovalMode: undefined, newSessionSandboxMode: undefined });
     if (projectId) setNewSession({ projectId });
     actions.select(undefined);
   },
@@ -636,6 +639,10 @@ export const actions = {
 
   setNewSessionApprovalMode(approvalMode: ApprovalMode): void {
     set({ newSessionApprovalMode: approvalMode });
+  },
+
+  setNewSessionSandboxMode(sandboxMode: SandboxMode): void {
+    set({ newSessionSandboxMode: sandboxMode });
   },
 
   setDefaultApprovalMode(approvalMode: ApprovalMode): void {
@@ -871,13 +878,21 @@ export const actions = {
   },
 
   async createAndPrompt(projectId: string, modelId: string, thinkingLevel?: ThinkingLevel): Promise<void> {
-    const { newSessionApprovalMode, defaultApprovalMode } = get();
+    const { newSessionApprovalMode, newSessionSandboxMode, defaultApprovalMode } = get();
     const approvalMode = newSessionApprovalMode ?? defaultApprovalMode;
+    const sandboxMode = newSessionSandboxMode ?? DEFAULT_SANDBOX_MODE;
     const submitted = beginDraftSubmission(NEW_DRAFT);
     if (!submitted) return;
     const version = selectionVersion;
     const created = await attempt(() =>
-      client.call({ type: "session.create", projectId, modelId, approvalMode, ...(thinkingLevel ? { thinkingLevel } : {}) }),
+      client.call({
+        type: "session.create",
+        projectId,
+        modelId,
+        approvalMode,
+        sandboxMode,
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+      }),
     );
     if (!created) {
       finishDraftSubmission(NEW_DRAFT, false);
@@ -973,7 +988,10 @@ export const actions = {
     await attempt(() => client.call({ type: "session.abort", sessionId }));
   },
 
-  async configure(sessionId: string, patch: { modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode?: ApprovalMode }): Promise<boolean> {
+  async configure(
+    sessionId: string,
+    patch: { modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode?: ApprovalMode; sandboxMode?: SandboxMode },
+  ): Promise<boolean> {
     const result = await attempt(() => client.call({ type: "session.configure", sessionId, ...patch }));
     if (!result) return false;
     setView(sessionId, (view) => ({ ...view, state: result.state }));

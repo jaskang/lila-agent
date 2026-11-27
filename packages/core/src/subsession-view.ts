@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { parseSessionEntries, SessionManager } from "@earendil-works/pi-coding-agent";
-import { ThinkingLevel, type ApprovalMode, type SessionState, type SessionStatus } from "@lila/protocol";
+import { DEFAULT_SANDBOX_MODE, ThinkingLevel, type ApprovalMode, type SessionState, type SessionStatus } from "@lila/protocol";
 import { UserError } from "./errors.ts";
 import { aroundTranscriptItem, earlier, projectBranch, searchTranscript, snapshot, transcriptTurns } from "./transcript.ts";
 
@@ -27,6 +27,7 @@ export function readSubsessionView(path: string, cwd: string, status: SessionSta
     thinkingLevel: thinking.success ? thinking.data : "off",
     thinkingLevels: ["off"],
     approvalMode,
+    sandboxMode: DEFAULT_SANDBOX_MODE,
     queue: { steering: [], followUp: [] },
     cost: 0,
     compacting: false,

@@ -1,10 +1,16 @@
 import { randomUUID } from "node:crypto";
-import type { AgentToolResult, ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import {
+  type AgentToolResult,
+  createBashToolDefinition,
+  type ExtensionAPI,
+  type ExtensionFactory,
+} from "@earendil-works/pi-coding-agent";
 import type {
   ApprovalMode,
   AssistantTask,
   PendingAnswer,
   PendingRequest,
+  SandboxMode,
   ScheduleCreateInput,
   ScheduledJob,
   ScheduleUpdatePatch,
@@ -13,6 +19,10 @@ import type {
 } from "@lila/protocol";
 import { Type } from "typebox";
 import { approvalReason, suggestApprovalRule } from "./approval-policy.ts";
+import { DisposableScope } from "./disposable.ts";
+import { createSandboxedBashOperations, type SandboxService } from "./sandbox-service.ts";
+
+const SUBAGENT_SPAWN_TOOLS = new Set(["Agent", "SubagentWorkflow"]);
 
 export interface AutomationBridge {
   readonly defaultProjectId: string;
@@ -53,6 +63,10 @@ export interface SubagentController {
 /** What the inline extension needs from the live session that hosts it. */
 export interface LilaBridge {
   readonly approvalMode: ApprovalMode;
+  readonly sandboxMode: SandboxMode;
+  readonly sandbox?: SandboxService | undefined;
+  readonly hasExternalSandbox?: boolean;
+  readonly isWatched?: () => boolean;
   readonly automation?: AutomationBridge | undefined;
   approvalRules(): readonly string[];
   allowRule(scope: "session" | "project", pattern: string): void;
@@ -117,10 +131,10 @@ function usageSummary(rawUsage: unknown, rawTokens?: unknown): { tokens: number;
 /** Tool approvals, `ask_user`, and live subagent progress forwarding bound to one live session. */
 export function createLilaExtension(bridge: LilaBridge, projectRoot: string): ExtensionFactory {
   return (pi: ExtensionAPI) => {
-    const unsubs: Array<() => void> = [];
+    const scope = new DisposableScope();
     if (bridge.onSubagentEvent) {
       const emit = bridge.onSubagentEvent.bind(bridge);
-      unsubs.push(
+      scope.add(
         pi.events.on("subagents:created", (raw) => {
           const data = asRecord(raw);
           const id = asStr(data?.id);
@@ -222,11 +236,14 @@ export function createLilaExtension(bridge: LilaBridge, projectRoot: string): Ex
         }),
         pi.events.on("subagents:disposed", () => emit({ type: "disposed" })),
       );
-      pi.on("session_shutdown", () => {
-        bridge.setSubagentController?.(undefined);
-        for (const unsub of unsubs.splice(0)) unsub();
-      });
     }
+
+    if (bridge.setSubagentController) {
+      scope.add(() => bridge.setSubagentController?.(undefined));
+    }
+    pi.on("session_shutdown", () => {
+      void scope.dispose();
+    });
 
     if (bridge.setSubagentController) {
       const rpcCall = (channel: string, payload: Record<string, unknown>): Promise<void> =>
@@ -265,11 +282,61 @@ export function createLilaExtension(bridge: LilaBridge, projectRoot: string): Ex
       });
     }
 
+    if (bridge.sandbox) {
+      const bashOperations = createSandboxedBashOperations({
+        sandbox: bridge.sandbox,
+        getSandboxMode: () => (bridge.hasExternalSandbox ? "off" : bridge.sandboxMode),
+        projectRoot,
+      });
+      pi.registerTool(createBashToolDefinition(projectRoot, { operations: bashOperations }));
+      pi.on("user_bash", () => {
+        if (bridge.hasExternalSandbox || bridge.sandboxMode === "off") return;
+        return { operations: bashOperations };
+      });
+    }
+
     pi.on("tool_call", async (event, ctx) => {
-      const mode = bridge.approvalMode;
-      if (mode === "auto") return;
       const name = event.toolName;
       const input = event.input as Record<string, unknown>;
+
+      // Fail-closed gate for sub-agents when OS sandbox is enabled: pi-subagents spawns
+      // child sessions with a fresh DefaultResourceLoader that does not inherit Lila's inline sandbox.
+      if (
+        bridge.sandboxMode === "workspace-write" &&
+        !bridge.hasExternalSandbox &&
+        SUBAGENT_SPAWN_TOOLS.has(name)
+      ) {
+        const watched = bridge.isWatched?.() ?? true;
+        if (!watched && bridge.approvalMode === "auto") {
+          return {
+            block: true,
+            reason:
+              "当前会话启用了 OS 沙箱（workspace-write），但子 Agent 暂无法继承沙箱隔离边界，且当前处于无人值守模式，已拒绝派发。请直接在当前主会话中执行。",
+          };
+        }
+        const answer = await bridge.request(
+          {
+            kind: "approval",
+            title: `在沙箱外运行 ${name}`,
+            message: `当前会话已开启 OS 沙箱（workspace-write），但子 Agent 内部的 bash 暂不受沙箱隔离保护。是否仍允许派发此子 Agent？\n\n${summarize(name, input)}`,
+            options: ["allow", "deny"],
+            toolCallId: event.toolCallId,
+            toolName: name,
+          },
+          ctx.signal ? { signal: ctx.signal } : {},
+        );
+        if (answer?.type === "option" && answer.value === "allow") return;
+        const note = answer?.type === "option" ? answer.note?.trim() : undefined;
+        return {
+          block: true,
+          reason: note
+            ? `用户拒绝在沙箱外运行子 Agent，并补充说明：${note}`
+            : "用户拒绝在沙箱外运行子 Agent，请在当前主会话中直接执行。",
+        };
+      }
+
+      const mode = bridge.approvalMode;
+      if (mode === "auto") return;
       const tool = pi.getAllTools().find((candidate) => candidate.name === name);
       const reason = approvalReason({
         mode,
@@ -368,6 +435,7 @@ export function createLilaExtension(bridge: LilaBridge, projectRoot: string): Ex
           prompt: Type.String({ description: "The exact prompt to send to the agent when this schedule fires." }),
           sessionMode: Type.Optional(Type.Union([Type.Literal("new"), Type.Literal("reuse")], { description: "Default 'new' creates a clean session each run; 'reuse' appends to one persistent session." })),
           approvalMode: Type.Optional(Type.Union([Type.Literal("ask-all"), Type.Literal("ask-exec"), Type.Literal("auto")])),
+          sandboxMode: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("workspace-write")])),
           enabled: Type.Optional(Type.Boolean()),
         }),
         async execute(_toolCallId, params) {
@@ -378,6 +446,7 @@ export function createLilaExtension(bridge: LilaBridge, projectRoot: string): Ex
             prompt: params.prompt,
             ...(params.sessionMode ? { sessionMode: params.sessionMode } : {}),
             ...(params.approvalMode ? { approvalMode: params.approvalMode } : {}),
+            ...(params.sandboxMode ? { sandboxMode: params.sandboxMode } : {}),
             ...(params.enabled !== undefined ? { enabled: params.enabled } : {}),
           });
           return {
@@ -405,6 +474,7 @@ export function createLilaExtension(bridge: LilaBridge, projectRoot: string): Ex
           enabled: Type.Optional(Type.Boolean()),
           sessionMode: Type.Optional(Type.Union([Type.Literal("new"), Type.Literal("reuse")])),
           approvalMode: Type.Optional(Type.Union([Type.Literal("ask-all"), Type.Literal("ask-exec"), Type.Literal("auto")])),
+          sandboxMode: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("workspace-write")])),
         }),
         async execute(_toolCallId, params) {
           const { id, ...patch } = params;

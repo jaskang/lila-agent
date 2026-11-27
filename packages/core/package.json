@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@amaster.ai/pi-memory": "0.1.40",
+    "@anthropic-ai/sandbox-runtime": "0.0.83",
     "@earendil-works/pi-ai": "1.5.2",
     "@earendil-works/pi-coding-agent": "1.5.2",
     "@lila/protocol": "workspace:*",

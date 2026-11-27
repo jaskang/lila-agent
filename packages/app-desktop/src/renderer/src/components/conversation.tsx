@@ -7,7 +7,7 @@ import type { ChangeSelection } from "@/components/reply-changes";
 import { Composer } from "@/components/composer";
 import { MarkdownBasePathProvider } from "@/components/markdown";
 import { PendingPanel } from "@/components/pending-panel";
-import { ApprovalRulesBadge, ApprovalSelect, ContextUsage, ModelPicker, ModelSetup } from "@/components/session-controls";
+import { ApprovalRulesBadge, ApprovalSelect, ContextUsage, ModelPicker, ModelSetup, SandboxSelect } from "@/components/session-controls";
 import { SubsessionActions } from "@/components/subsession-preview";
 import { TranscriptBlocks } from "@/components/transcript-blocks";
 import { TurnRail } from "@/components/turn-directory";
@@ -249,6 +249,11 @@ function SessionControls({ sessionId, state }: { sessionId: string; state: Sessi
         })}
       />
       <ApprovalSelect value={state.approvalMode} onChange={(approvalMode) => void actions.configure(sessionId, { approvalMode })} />
+      <SandboxSelect
+        value={state.sandboxMode}
+        status={state.sandbox}
+        onChange={(sandboxMode) => void actions.configure(sessionId, { sandboxMode })}
+      />
       <ApprovalRulesBadge sessionId={sessionId} state={state} />
     </>
   );

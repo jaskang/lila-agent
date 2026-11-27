@@ -14,6 +14,7 @@ import {
   GitBranchPlus,
   Inbox,
   KeyRound,
+  Lock,
   MessageCircleQuestion,
   MessageSquare,
   Minimize2,
@@ -31,14 +32,15 @@ import {
   Sun,
 } from "lucide-react";
 import { toast } from "sonner";
-import type { ApprovalMode } from "@lila/protocol";
+import type { ApprovalMode, SandboxMode } from "@lila/protocol";
 import { CommandDialog, Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList, CommandShortcut } from "@/components/ui/command";
 import { useSidebar } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
-import { actions, APPROVAL_LABEL, useLila } from "@/lib/store";
+import { actions, APPROVAL_LABEL, SANDBOX_LABEL, useLila } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
 const APPROVAL_MODES = Object.keys(APPROVAL_LABEL) as ApprovalMode[];
+const SANDBOX_MODES = Object.keys(SANDBOX_LABEL) as SandboxMode[];
 
 export function CommandPalette() {
   const open = useLila((state) => state.paletteOpen);
@@ -190,6 +192,20 @@ export function CommandPalette() {
                       {activeState.approvalMode === mode ? <Check className="ms-auto size-4 text-muted-foreground" /> : null}
                     </CommandItem>
                   ))}
+                  {!activeState.sandbox?.external
+                    ? SANDBOX_MODES.map((mode) => (
+                        <CommandItem
+                          key={`sandbox-${mode}`}
+                          disabled={mode === "workspace-write" && activeState.sandbox?.available === false}
+                          value={`sandbox ${mode} 沙箱 shaxiang ${SANDBOX_LABEL[mode]}`}
+                          onSelect={() => run(() => void actions.configure(selectedId, { sandboxMode: mode }))}
+                        >
+                          <Lock />
+                          OS 沙箱：{SANDBOX_LABEL[mode]}
+                          {activeState.sandboxMode === mode ? <Check className="ms-auto size-4 text-muted-foreground" /> : null}
+                        </CommandItem>
+                      ))
+                    : null}
                 </>
               ) : null}
             </CommandGroup>

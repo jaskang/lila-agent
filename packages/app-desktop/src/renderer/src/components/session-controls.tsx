@@ -6,6 +6,8 @@ import {
   Check,
   ChevronDown,
   KeyRound,
+  Lock,
+  LockOpen,
   Minimize2,
   RotateCw,
   Settings2,
@@ -15,7 +17,7 @@ import {
   SlidersHorizontal,
   X,
 } from "lucide-react";
-import type { ApprovalMode, ModelInfo, SessionState, ThinkingLevel } from "@lila/protocol";
+import type { ApprovalMode, ModelInfo, SandboxMode, SandboxStatus, SessionState, ThinkingLevel } from "@lila/protocol";
 import { SearchInput } from "@/components/search-input";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,7 +26,7 @@ import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
-import { actions, APPROVAL_LABEL, useLila } from "@/lib/store";
+import { actions, APPROVAL_LABEL, SANDBOX_LABEL, useLila } from "@/lib/store";
 
 export function ModelSetup() {
   const connected = useLila((state) => state.connection === "connected");
@@ -431,6 +433,85 @@ export function ApprovalSelect({
               </div>
             </SelectItem>
           ))}
+        </SelectGroup>
+      </SelectContent>
+    </Select>
+  );
+}
+
+const SANDBOX_MODES = Object.keys(SANDBOX_LABEL) as SandboxMode[];
+const SANDBOX_ICON = { off: LockOpen, "workspace-write": Lock } as const;
+const SANDBOX_DESCRIPTION: Record<SandboxMode, string> = {
+  off: "不启用 OS 沙箱，子进程以宿主机当前用户权限运行",
+  "workspace-write": "OS 内核强制仅可写入项目与临时目录，禁止读取 ~/.ssh、auth.json 与 core-token",
+};
+
+export function SandboxSelect({
+  value,
+  status,
+  disabled,
+  onChange,
+  label = "OS 沙箱",
+  inSettings = false,
+}: {
+  value: SandboxMode;
+  status?: SandboxStatus | undefined;
+  disabled?: boolean;
+  onChange: (mode: SandboxMode) => void;
+  label?: string;
+  inSettings?: boolean;
+}) {
+  const external = Boolean(status?.external);
+  const unavailable = status !== undefined && !status.available;
+  const effectiveDisabled = disabled || external;
+  const Icon = SANDBOX_ICON[value];
+  const triggerTitle = external
+    ? status?.reason ?? "已由外部 Pi 沙箱扩展接管"
+    : unavailable
+      ? `沙箱不可用：${status?.reason ?? "当前环境不支持"}`
+      : SANDBOX_DESCRIPTION[value];
+
+  return (
+    <Select
+      value={value}
+      disabled={effectiveDisabled}
+      onValueChange={(next) => {
+        if (next && next !== value) onChange(next as SandboxMode);
+      }}
+      items={SANDBOX_MODES.map((mode) => ({ value: mode, label: external ? "外部沙箱" : SANDBOX_LABEL[mode] }))}
+    >
+      <SelectTrigger
+        size="sm"
+        className={cn(
+          inSettings ? "w-44" : COMPOSER_CHIP,
+          !inSettings && value === "workspace-write" && "text-foreground",
+        )}
+        aria-label={label}
+        title={triggerTitle}
+      >
+        <Icon className={cn(value === "workspace-write" && "text-emerald-600 dark:text-emerald-400")} />
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent
+        alignItemWithTrigger={false}
+        align={inSettings ? "end" : "start"}
+        side={inSettings ? "bottom" : "top"}
+        className="w-[min(23rem,calc(100vw-2rem))]"
+      >
+        <SelectGroup>
+          {SANDBOX_MODES.map((mode) => {
+            const optionDisabled = mode === "workspace-write" && unavailable;
+            return (
+              <SelectItem key={mode} value={mode} disabled={optionDisabled}>
+                <div className="flex min-w-0 flex-col gap-0.5 whitespace-normal">
+                  <span>{SANDBOX_LABEL[mode]}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {optionDisabled ? `当前不可用：${status?.reason ?? "不支持"}` : SANDBOX_DESCRIPTION[mode]}
+                  </span>
+                </div>
+              </SelectItem>
+            );
+          })}
         </SelectGroup>
       </SelectContent>
     </Select>

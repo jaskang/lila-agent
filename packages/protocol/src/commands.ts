@@ -15,6 +15,7 @@ import {
   promptImageBytes,
   PendingAnswer,
   type Project,
+  SandboxMode,
   type SessionState,
   type SessionSummary,
   type SlashCommand,
@@ -143,6 +144,7 @@ export const ClientCommand = z.discriminatedUnion("type", [
     modelId: Id.optional(),
     thinkingLevel: ThinkingLevel.optional(),
     approvalMode: ApprovalMode.optional(),
+    sandboxMode: SandboxMode.optional(),
   }),
   z.object({ type: z.literal("session.open"), ...SessionRef, slot: WatchSlot.optional(), limit: z.number().int().positive().max(1000).optional() }),
   z.object({ type: z.literal("session.unwatch"), requestId: RequestId, slot: WatchSlot.optional() }),
@@ -167,6 +169,7 @@ export const ClientCommand = z.discriminatedUnion("type", [
     modelId: Id.optional(),
     thinkingLevel: ThinkingLevel.optional(),
     approvalMode: ApprovalMode.optional(),
+    sandboxMode: SandboxMode.optional(),
   }),
   z.object({ type: z.literal("session.rename"), ...SessionRef, title: z.string().trim().min(1).max(120) }),
   z.object({ type: z.literal("session.delete"), ...SessionRef }),
@@ -222,6 +225,7 @@ export const ClientCommand = z.discriminatedUnion("type", [
     modelId: Id.optional(),
     thinkingLevel: ThinkingLevel.optional(),
     approvalMode: ApprovalMode.optional(),
+    sandboxMode: SandboxMode.optional(),
   }),
 ]);
 export type ClientCommand = z.infer<typeof ClientCommand>;

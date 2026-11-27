@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { Cron } from "croner";
 import {
   DEFAULT_APPROVAL_MODE,
+  DEFAULT_SCHEDULE_SANDBOX_MODE,
+  SandboxMode,
   type ScheduleCreateInput,
   type ScheduledJob,
   type ScheduleKind,
@@ -144,6 +146,7 @@ export class SchedulerService {
       ...(input.modelId ? { modelId: input.modelId } : {}),
       ...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
       approvalMode: input.approvalMode ?? DEFAULT_APPROVAL_MODE,
+      sandboxMode: input.sandboxMode ?? DEFAULT_SCHEDULE_SANDBOX_MODE,
       createdAt: now,
       updatedAt: now,
       ...(enabled && parsed.nextRunAt ? { nextRunAt: parsed.nextRunAt } : {}),
@@ -187,6 +190,7 @@ export class SchedulerService {
       enabled: patch.enabled ?? existing.enabled,
       sessionMode: patch.sessionMode ?? existing.sessionMode,
       approvalMode: patch.approvalMode ?? existing.approvalMode,
+      sandboxMode: patch.sandboxMode ?? existing.sandboxMode,
       updatedAt: new Date().toISOString(),
     };
 
@@ -460,8 +464,10 @@ export class SchedulerService {
       for (const job of parsed.jobs) {
         if (!job || typeof job.id !== "string" || typeof job.projectId !== "string" || typeof job.schedule !== "string") continue;
         // Clear stale running state from a crashed core process.
+        const parsedSandbox = SandboxMode.safeParse((job as { sandboxMode?: unknown }).sandboxMode);
         const normalized: ScheduledJob = {
           ...job,
+          sandboxMode: parsedSandbox.success ? parsedSandbox.data : DEFAULT_SCHEDULE_SANDBOX_MODE,
           lastStatus: job.lastStatus === "running" ? "error" : (job.lastStatus ?? "idle"),
           ...(job.lastStatus === "running" ? { lastError: "上次运行期间 core 中断" } : {}),
           recentRuns: Array.isArray(job.recentRuns) ? job.recentRuns.slice(0, MAX_RECENT_RUNS) : [],

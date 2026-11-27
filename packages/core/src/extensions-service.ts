@@ -37,6 +37,7 @@ import {
   replaceMemoryEntry,
   updateMemoryConfig,
 } from "./memory.ts";
+import { isExternalSandboxExtension } from "./sandbox-service.ts";
 
 /** pi-subagents' extension entry, loaded unless the user installed the package into Pi themselves. */
 const SUBAGENTS_ENTRY = join(dirname(createRequire(import.meta.url).resolve("@tintinweb/pi-subagents/package.json")), "src", "index.ts");
@@ -55,7 +56,7 @@ function isBuiltinMemoryExtension(extension: { path: string }): boolean {
   return extension.path === `builtin:${BUILTIN_MEMORY_NAME}` || extension.path === BUILTIN_MEMORY_NAME;
 }
 
-function withoutDuplicateBuiltins(result: LoadExtensionsResult): LoadExtensionsResult {
+function withoutDuplicateBuiltins(result: LoadExtensionsResult, live?: LiveSession): LoadExtensionsResult {
   let { extensions, errors } = result;
   const userSubagents = extensions.some((extension) => extension.path !== SUBAGENTS_ENTRY && extension.path.includes("pi-subagents"));
   if (userSubagents) {
@@ -66,6 +67,20 @@ function withoutDuplicateBuiltins(result: LoadExtensionsResult): LoadExtensionsR
   if (userMemory) {
     extensions = extensions.filter((extension) => !isBuiltinMemoryExtension(extension));
     errors = errors.filter((error) => error.path !== BUILTIN_MEMORY_NAME);
+  }
+  const userSandbox = extensions.some((extension) => isExternalSandboxExtension(extension));
+  live?.setExternalSandbox(userSandbox);
+  if (userSandbox) {
+    // Let the user's external sandbox extension own the `bash` tool override.
+    extensions = extensions.map((extension) => {
+      if (extension.path !== "lila" && extension.path !== "<inline:lila>" && extension.path !== "builtin:lila") {
+        return extension;
+      }
+      if (!extension.tools.has("bash")) return extension;
+      const tools = new Map(extension.tools);
+      tools.delete("bash");
+      return { ...extension, tools };
+    });
   }
   if (extensions === result.extensions && errors === result.errors) return result;
   return { ...result, extensions, errors };
@@ -89,7 +104,7 @@ export function createServices(cwd: string, live?: LiveSession): Promise<AgentSe
           : []),
         ...(live ? [{ name: "lila", factory: createLilaExtension(live, cwd), hidden: true }] : []),
       ],
-      extensionsOverride: withoutDuplicateBuiltins,
+      extensionsOverride: (result) => withoutDuplicateBuiltins(result, live),
     },
     resourceLoaderReloadOptions: { resolveProjectTrust: async () => true },
   });

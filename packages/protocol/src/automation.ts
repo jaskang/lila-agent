@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ApprovalMode } from "./session.js";
+import { ApprovalMode, SandboxMode } from "./session.js";
 import { ThinkingLevel } from "./settings.js";
 
 export const ScheduleKind = z.enum(["cron", "interval", "once"]);
@@ -37,6 +37,7 @@ export interface ScheduledJob {
   modelId?: string;
   thinkingLevel?: ThinkingLevel;
   approvalMode: ApprovalMode;
+  sandboxMode: SandboxMode;
   createdAt: string;
   updatedAt: string;
   lastRunAt?: string;
@@ -59,6 +60,7 @@ export const ScheduleCreateInput = z.object({
   modelId: z.string().min(1).optional(),
   thinkingLevel: ThinkingLevel.optional(),
   approvalMode: ApprovalMode.optional(),
+  sandboxMode: SandboxMode.optional(),
 });
 export type ScheduleCreateInput = z.infer<typeof ScheduleCreateInput>;
 
@@ -73,6 +75,7 @@ export const ScheduleUpdatePatch = z.object({
   modelId: z.string().min(1).nullable().optional(),
   thinkingLevel: ThinkingLevel.nullable().optional(),
   approvalMode: ApprovalMode.optional(),
+  sandboxMode: SandboxMode.optional(),
 });
 export type ScheduleUpdatePatch = z.infer<typeof ScheduleUpdatePatch>;
 

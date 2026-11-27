@@ -8,6 +8,20 @@ export const ApprovalMode = z.enum(["auto", "ask-exec", "ask-all"]);
 export type ApprovalMode = z.infer<typeof ApprovalMode>;
 export const DEFAULT_APPROVAL_MODE: ApprovalMode = "ask-exec";
 
+/** OS-level process sandbox boundary for bash execution, orthogonal to ApprovalMode. */
+export const SandboxMode = z.enum(["off", "workspace-write"]);
+export type SandboxMode = z.infer<typeof SandboxMode>;
+export const DEFAULT_SANDBOX_MODE: SandboxMode = "off";
+export const DEFAULT_SCHEDULE_SANDBOX_MODE: SandboxMode = "workspace-write";
+
+export type SandboxStatus = {
+  available: boolean;
+  backend?: "seatbelt" | "bubblewrap" | "windows";
+  /** True when a user-installed external sandbox extension takes precedence over Lila's built-in sandbox. */
+  external?: boolean;
+  reason?: string;
+};
+
 export const MAX_PROMPT_IMAGES = 10;
 export const MAX_PROMPT_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_PROMPT_IMAGE_BASE64_BYTES = 48 * 1024 * 1024;
@@ -192,6 +206,8 @@ export type SessionState = {
   /** Levels the current model accepts; ["off"] for a model without reasoning. */
   thinkingLevels: ThinkingLevel[];
   approvalMode: ApprovalMode;
+  sandboxMode: SandboxMode;
+  sandbox?: SandboxStatus;
   /** Reusable approval rules granted for this session only. */
   sessionRules?: string[];
   /** Reusable approval rules persisted for this project. */

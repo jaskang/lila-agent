@@ -6,6 +6,7 @@ import type {
   ImageInput,
   ModelInfo,
   Project,
+  SandboxMode,
   ScheduledJob,
   SessionState,
   SessionSummary,
@@ -70,6 +71,7 @@ export type State = {
   newSession: NewSessionOptions;
   defaultApprovalMode: ApprovalMode;
   newSessionApprovalMode?: ApprovalMode | undefined;
+  newSessionSandboxMode?: SandboxMode | undefined;
   /** Composer text per session; `new` is the new-session composer. */
   drafts: Record<string, string>;
   /** Pending image attachments per session; preserved across session switches and refreshes. */
@@ -114,6 +116,11 @@ export const APPROVAL_LABEL: Record<ApprovalMode, string> = {
   "ask-all": "请求批准",
   "ask-exec": "帮我批准",
   auto: "完全访问权限",
+};
+
+export const SANDBOX_LABEL: Record<SandboxMode, string> = {
+  off: "无沙箱",
+  "workspace-write": "项目沙箱",
 };
 
 export const EMPTY_DRAFT: Draft = { text: "", images: [] };

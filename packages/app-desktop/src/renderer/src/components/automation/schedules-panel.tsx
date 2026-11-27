@@ -1,8 +1,8 @@
 import * as React from "react";
-import { Clock, MessageSquare, Pencil, Play, Plus, Trash2 } from "lucide-react";
+import { Clock, Lock, MessageSquare, Pencil, Play, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import type { ApprovalMode, ScheduledJob, ScheduleSessionMode } from "@lila/protocol";
-import { ApprovalSelect } from "@/components/session-controls";
+import { DEFAULT_SCHEDULE_SANDBOX_MODE, type ApprovalMode, type SandboxMode, type ScheduledJob, type ScheduleSessionMode } from "@lila/protocol";
+import { ApprovalSelect, SandboxSelect } from "@/components/session-controls";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -66,6 +66,7 @@ interface ScheduleFormState {
   prompt: string;
   sessionMode: ScheduleSessionMode;
   approvalMode: ApprovalMode;
+  sandboxMode: SandboxMode;
   modelId: string;
   enabled: boolean;
 }
@@ -78,6 +79,7 @@ function emptyScheduleForm(projectId: string, approvalMode: ApprovalMode): Sched
     prompt: "",
     sessionMode: "new",
     approvalMode,
+    sandboxMode: DEFAULT_SCHEDULE_SANDBOX_MODE,
     modelId: "__default__",
     enabled: true,
   };
@@ -92,6 +94,7 @@ function scheduleToForm(job: ScheduledJob): ScheduleFormState {
     prompt: job.prompt,
     sessionMode: job.sessionMode,
     approvalMode: job.approvalMode,
+    sandboxMode: job.sandboxMode,
     modelId: job.modelId ?? "__default__",
     enabled: job.enabled,
   };
@@ -182,6 +185,7 @@ export function SchedulesPanel({
           prompt: form.prompt.trim(),
           sessionMode: form.sessionMode,
           approvalMode: form.approvalMode,
+          sandboxMode: form.sandboxMode,
           modelId: modelId ?? null,
           enabled: form.enabled,
         });
@@ -197,6 +201,7 @@ export function SchedulesPanel({
           prompt: form.prompt.trim(),
           sessionMode: form.sessionMode,
           approvalMode: form.approvalMode,
+          sandboxMode: form.sandboxMode,
           ...(modelId ? { modelId } : {}),
           enabled: form.enabled,
         });
@@ -360,9 +365,26 @@ export function SchedulesPanel({
                   inSettings
                 />
                 {form.approvalMode === "auto" ? (
-                  <span className="text-xs text-warning-foreground">完全访问会在无人值守时跳过 Lila 审批，请仅用于可信的只读/巡检任务。</span>
+                  <span className="text-xs text-warning-foreground">完全访问会在无人值守时跳过 Lila 审批，建议保持 OS 沙箱开启。</span>
                 ) : (
                   <span className="text-xs text-muted-foreground">遇到需确认操作时会暂停并进入侧栏「需要关注」。</span>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-1.5 sm:col-span-2">
+              <Label>OS 沙箱</Label>
+              <div className="flex flex-wrap items-center gap-3">
+                <SandboxSelect
+                  value={form.sandboxMode}
+                  onChange={(sandboxMode) => setForm((curr) => ({ ...curr, sandboxMode }))}
+                  label="定时任务 OS 沙箱"
+                  inSettings
+                />
+                {form.sandboxMode === "workspace-write" ? (
+                  <span className="text-xs text-muted-foreground">默认开启：内核限制仅可写入项目目录，屏蔽 ~/.ssh、auth.json 与未沙箱子 Agent。</span>
+                ) : (
+                  <span className="text-xs text-warning-foreground">已关闭沙箱：后台命令将以当前系统用户完整权限执行。</span>
                 )}
               </div>
             </div>
@@ -428,6 +450,16 @@ export function SchedulesPanel({
                         <Badge variant="secondary" className="h-5 px-1.5 text-[11px] font-normal">
                           {job.sessionMode === "reuse" ? "复用会话" : "每次新建"}
                         </Badge>
+                        {job.sandboxMode === "workspace-write" ? (
+                          <Badge variant="outline" className="h-5 gap-1 border-emerald-500/30 bg-emerald-500/10 px-1.5 text-[11px] font-normal text-emerald-700 dark:text-emerald-300">
+                            <Lock className="size-3" />
+                            项目沙箱
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline" className="h-5 px-1.5 text-[11px] font-normal text-muted-foreground">
+                            无沙箱
+                          </Badge>
+                        )}
                         <Badge variant="outline" className={cn("h-5 px-1.5 text-[11px]", status.className)}>
                           {status.label}
                         </Badge>

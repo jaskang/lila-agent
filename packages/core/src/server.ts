@@ -5,8 +5,10 @@ import { ClientCommand, type CommandResults, type CommandType, MAX_CORE_MESSAGE_
 import { type WebSocket, WebSocketServer } from "ws";
 import pkg from "../package.json" with { type: "json" };
 import { errorMessage, UserError } from "./errors.ts";
+import { gitCommit, gitDiff, gitDiscard, gitStage, gitStatus, gitUnstage } from "./git.ts";
 import { SessionHost } from "./host.ts";
 import type { Clients } from "./live-session.ts";
+import { invalidateFileCache, listTreeFiles, readPreviewFile, searchProjectFiles } from "./workspace-service.ts";
 
 export interface CoreOptions {
   port: number;
@@ -121,14 +123,14 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         await host.removeProject(command.projectId);
         return {};
       case "models.list":
-        return await host.listModels(command.refresh ?? false);
+        return await host.settings.listModels(command.refresh ?? false);
       case "provider.models.set":
-        return await host.setProviderModels(command.providerId, command.modelIds);
+        return await host.settings.setProviderModels(command.providerId, command.modelIds);
       case "settings.get":
-        return { settings: await host.getSettings() };
+        return { settings: await host.settings.getSettings() };
       case "settings.update":
         return {
-          settings: await host.updateSettings({
+          settings: await host.settings.updateSettings({
             defaultModelId: command.defaultModelId,
             defaultThinkingLevel: command.defaultThinkingLevel,
             autoCompaction: command.autoCompaction,
@@ -136,32 +138,32 @@ export async function startCore(options: CoreOptions): Promise<Core> {
           }),
         };
       case "providers.list":
-        return { providers: await host.listProviders() };
+        return { providers: await host.settings.listProviders() };
       case "auth.login.start": {
         let loginId = "";
-        loginId = await host.startProviderLogin(ws, command.providerId, command.method, (event) => {
+        loginId = await host.settings.startProviderLogin(ws, command.providerId, command.method, (event) => {
           send(ws, { type: "auth.login", loginId, providerId: command.providerId, event });
         });
         return { loginId };
       }
       case "auth.login.respond":
-        host.respondProviderLogin(command.loginId, command.promptId, command.value);
+        host.settings.respondProviderLogin(command.loginId, command.promptId, command.value);
         return {};
       case "auth.login.cancel":
-        host.cancelProviderLogin(command.loginId);
+        host.settings.cancelProviderLogin(command.loginId);
         return {};
       case "auth.logout":
-        await host.logoutProvider(command.providerId);
+        await host.settings.logoutProvider(command.providerId);
         return {};
       case "mcp.list":
-        return { config: host.listMcp(command.projectId) };
+        return { config: host.extensions.listMcp(command.projectId) };
       case "mcp.upsert":
-        return { config: await host.upsertMcp(command.scope, command.name, command.config, command.projectId) };
+        return { config: await host.extensions.upsertMcp(command.scope, command.name, command.config, command.projectId) };
       case "mcp.import":
-        return { config: await host.importMcp(command.scope, command.entries, command.projectId) };
+        return { config: await host.extensions.importMcp(command.scope, command.entries, command.projectId) };
       case "mcp.toggle":
         return {
-          config: await host.toggleMcp(
+          config: await host.extensions.toggleMcp(
             command.scope,
             command.name,
             { enabled: command.enabled, exposure: command.exposure },
@@ -169,20 +171,20 @@ export async function startCore(options: CoreOptions): Promise<Core> {
           ),
         };
       case "mcp.remove":
-        return { config: await host.removeMcp(command.scope, command.name, command.projectId) };
+        return { config: await host.extensions.removeMcp(command.scope, command.name, command.projectId) };
       case "capabilities.get":
-        return { capabilities: await host.getCapabilities(command.projectId, command.sessionId) };
+        return { capabilities: await host.extensions.getCapabilities(command.projectId, command.sessionId) };
       case "memory.get":
-        return { memory: await host.getMemory(command.projectId, command.sessionId) };
+        return { memory: await host.extensions.getMemory(command.projectId, command.sessionId) };
       case "memory.add":
-        return { memory: await host.addMemory(command.target, command.content) };
+        return { memory: await host.extensions.addMemory(command.target, command.content) };
       case "memory.replace":
-        return { memory: await host.replaceMemory(command.target, command.oldText, command.newContent) };
+        return { memory: await host.extensions.replaceMemory(command.target, command.oldText, command.newContent) };
       case "memory.remove":
-        return { memory: await host.removeMemory(command.target, command.oldText) };
+        return { memory: await host.extensions.removeMemory(command.target, command.oldText) };
       case "memory.config.update":
         return {
-          memory: await host.updateMemorySettings({
+          memory: await host.extensions.updateMemorySettings({
             enabled: command.enabled,
             memoryCharLimit: command.memoryCharLimit,
             userCharLimit: command.userCharLimit,
@@ -193,18 +195,18 @@ export async function startCore(options: CoreOptions): Promise<Core> {
           }),
         };
       case "packages.install":
-        return { capabilities: await host.installPackage(command.source, command.scope, command.projectId) };
+        return { capabilities: await host.extensions.installPackage(command.source, command.scope, command.projectId) };
       case "packages.remove":
-        return { capabilities: await host.removePackage(command.source, command.scope, command.projectId) };
+        return { capabilities: await host.extensions.removePackage(command.source, command.scope, command.projectId) };
       case "packages.update":
-        return { capabilities: await host.updatePackages(command.source, command.projectId) };
+        return { capabilities: await host.extensions.updatePackages(command.source, command.projectId) };
       case "workspace.reload":
         await host.reloadWorkspace(command.projectId, command.sessionId);
         return {};
       case "usage.summary":
-        return { summary: await host.getUsageSummary(command.range, command.onlyConfigured ?? true) };
+        return { summary: await host.settings.getUsageSummary(command.range, command.onlyConfigured ?? true) };
       case "quotas.list":
-        return { quotas: await host.listQuotas(command.refresh ?? false) };
+        return { quotas: await host.settings.listQuotas(command.refresh ?? false) };
       case "sessions.list":
         return { sessions: await host.listSessions() };
       case "session.create":
@@ -213,44 +215,49 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         unwatch(ws, command.slot ?? "main");
         return {};
       case "files.search":
-        return { files: await host.searchFiles(command.projectId, command.query, command.limit) };
+        return { files: await searchProjectFiles(host.project(command.projectId).path, command.query, command.limit) };
       case "files.list":
-        return await host.listProjectFiles(command.projectId, command.refresh);
+        return await listTreeFiles(host.project(command.projectId).path, command.refresh);
       case "files.read":
-        return { file: await host.readProjectFile(command.projectId, command.path) };
+        return { file: await readPreviewFile(host.project(command.projectId).path, command.path) };
       case "git.status":
-        return { status: await host.gitStatus(command.projectId) };
+        return { status: await gitStatus(host.project(command.projectId).path) };
       case "git.diff":
-        return { diff: await host.gitDiff(command.projectId, command.path, command.staged) };
+        return { diff: await gitDiff(host.project(command.projectId).path, command.path, command.staged) };
       case "git.stage":
-        return { status: await host.gitStage(command.projectId, command.paths) };
+        return { status: await gitStage(host.project(command.projectId).path, command.paths) };
       case "git.unstage":
-        return { status: await host.gitUnstage(command.projectId, command.paths) };
-      case "git.discard":
-        return { status: await host.gitDiscard(command.projectId, command.path) };
+        return { status: await gitUnstage(host.project(command.projectId).path, command.paths) };
+      case "git.discard": {
+        const projectPath = host.project(command.projectId).path;
+        invalidateFileCache(projectPath);
+        return { status: await gitDiscard(projectPath, command.path) };
+      }
       case "git.commit":
-        return await host.gitCommit(command.projectId, command.message);
+        return await gitCommit(host.project(command.projectId).path, command.message);
       case "git.worktree.create":
         return await host.createWorktreeProject(command.projectId, command.branch);
       case "schedules.list":
-        return { schedules: host.listSchedules() };
+        return { schedules: host.scheduler.list() };
       case "schedules.create":
-        return { schedule: host.createSchedule(command.input) };
+        return { schedule: host.scheduler.create(command.input) };
       case "schedules.update":
-        return { schedule: host.updateSchedule(command.id, command.patch) };
+        return { schedule: host.scheduler.update(command.id, command.patch) };
       case "schedules.delete":
-        host.deleteSchedule(command.id);
+        host.scheduler.delete(command.id);
         return {};
       case "schedules.run":
-        return await host.runSchedule(command.id);
+        return await host.scheduler.runNow(command.id);
       case "tasks.list":
-        return { tasks: host.listTasks() };
+        return { tasks: host.tasks.list() };
       case "tasks.create":
-        return { task: host.createTask(command.input) };
+        if (command.input.projectId) host.project(command.input.projectId);
+        return { task: host.tasks.create(command.input) };
       case "tasks.update":
-        return { task: host.updateTask(command.id, command.patch) };
+        if (command.patch.projectId) host.project(command.patch.projectId);
+        return { task: host.tasks.update(command.id, command.patch) };
       case "tasks.delete":
-        host.deleteTask(command.id);
+        host.tasks.delete(command.id);
         return {};
       case "tasks.start":
         return await host.startTask(command);
@@ -392,7 +399,7 @@ export async function startCore(options: CoreOptions): Promise<Core> {
       ws.on("close", () => {
         unwatch(ws, "main");
         unwatch(ws, "preview");
-        host.cancelLoginsForOwner(ws);
+        host.settings.cancelLoginsForOwner(ws);
       });
       send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, coreVersion: pkg.version });
     });

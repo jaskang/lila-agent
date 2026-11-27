@@ -10,6 +10,7 @@ import type {
   PendingAnswer,
   PendingRequest,
   RunStatus,
+  SandboxMode,
   ServerMessage,
   SessionState,
   SessionStatus,
@@ -18,9 +19,11 @@ import type {
   SubagentProgress,
   TranscriptItem,
 } from "@lila/protocol";
+import { DisposableScope } from "./disposable.ts";
 import { errorMessage, UserError } from "./errors.ts";
 import type { AutomationBridge, LilaBridge, SubagentBusEvent, SubagentController } from "./lila-extension.ts";
 import { PendingBridge } from "./pending-bridge.ts";
+import type { SandboxService } from "./sandbox-service.ts";
 import type { Store } from "./store.ts";
 import { SubagentTracker } from "./subagent-tracker.ts";
 import {
@@ -184,6 +187,9 @@ export class LiveSession implements LilaBridge {
   readonly #onProviderResponse?: (providerId: string | undefined, status: number, headers: Record<string, string>) => void;
   readonly #onStatusChange?: (previous: SessionStatus | undefined, next: SessionStatus) => void;
   readonly #automation?: AutomationBridge;
+  readonly #sandbox: SandboxService;
+  readonly #scope = new DisposableScope();
+  #externalSandbox = false;
   readonly #pending: PendingBridge;
   readonly #subagents: SubagentTracker;
   readonly #sessionRules = new Set<string>();
@@ -191,11 +197,9 @@ export class LiveSession implements LilaBridge {
   #lastStatus?: SessionStatus;
   #session!: AgentSession;
   #services!: AgentSessionServices;
-  #unsubscribe?: () => void;
   #access: SessionState["access"] = "starting";
   #startupError?: string;
   #initialization!: Promise<void>;
-  #disposed = false;
   #statusLines: Record<string, string> = {};
   #retry: SessionState["retry"];
   #updatedAt = new Date().toISOString();
@@ -222,6 +226,7 @@ export class LiveSession implements LilaBridge {
     onProviderResponse?: (providerId: string | undefined, status: number, headers: Record<string, string>) => void;
     onStatusChange?: (previous: SessionStatus | undefined, next: SessionStatus) => void;
     automation?: AutomationBridge;
+    sandbox: SandboxService;
   }) {
     this.id = options.id;
     this.projectId = options.projectId;
@@ -232,6 +237,7 @@ export class LiveSession implements LilaBridge {
     this.#onProviderResponse = options.onProviderResponse;
     this.#onStatusChange = options.onStatusChange;
     this.#automation = options.automation;
+    this.#sandbox = options.sandbox;
     this.#pending = new PendingBridge({
       onPendingChanged: () => {
         this.touch();
@@ -252,6 +258,12 @@ export class LiveSession implements LilaBridge {
       },
       onSubsessionsChanged: () => options.onSubsessionsChanged?.(),
     });
+    this.#scope.add(() => {
+      for (const throttle of this.#throttles.values()) clearTimeout(throttle.timer);
+      this.#throttles.clear();
+    });
+    this.#scope.add(() => this.#subagents.dispose());
+    this.#scope.add(() => this.#pending.close());
   }
 
   get session(): AgentSession {
@@ -273,6 +285,24 @@ export class LiveSession implements LilaBridge {
   get approvalMode() {
     return this.#store.approvalMode(this.id);
   }
+
+  get sandboxMode(): SandboxMode {
+    return this.#store.sandboxMode(this.id);
+  }
+
+  get sandbox(): SandboxService {
+    return this.#sandbox;
+  }
+
+  get hasExternalSandbox(): boolean {
+    return this.#externalSandbox;
+  }
+
+  setExternalSandbox(value: boolean): void {
+    this.#externalSandbox = value;
+  }
+
+  isWatched = (): boolean => this.#clients.isWatched(this.id);
 
   approvalRules(): readonly string[] {
     const projectRules = this.#store.approvalRules(this.projectId);
@@ -314,11 +344,24 @@ export class LiveSession implements LilaBridge {
       }
     }
     this.#syncIdCounts();
-    this.#unsubscribe = session.subscribe((event) => this.#onEvent(event));
+    this.#scope.add(() => this.#services.modelRuntime.settleCredentialWrites());
+    this.#scope.add(() => this.#session.dispose());
+    this.#scope.add(session.subscribe((event) => this.#onEvent(event)));
+    this.#scope.add(async () => {
+      try {
+        await this.#session.abort();
+        // Lets extensions such as MCP close their connections and child processes.
+        if (this.#session.extensionRunner.hasHandlers("session_shutdown")) {
+          await this.#session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        }
+      } catch (error) {
+        console.error(`[core] shutting down ${this.id} failed`, error);
+      }
+    });
     // The host registers the session immediately. An extension can ask a question
     // during startup, so clients need to open it and answer before this resolves.
     this.#initialization = Promise.resolve()
-      .then(() => this.#disposed ? undefined : session.bindExtensions({
+      .then(() => this.#scope.disposed ? undefined : session.bindExtensions({
         uiContext: this.#pending.createUIContext(),
         mode: "rpc",
         commandContextActions: {
@@ -345,14 +388,14 @@ export class LiveSession implements LilaBridge {
         },
       )
       .then(() => {
-        if (this.#disposed) return;
+        if (this.#scope.disposed) return;
         this.#pushState();
         this.#broadcastSummary();
       });
   }
 
   #requireReady(): void {
-    if (this.#disposed) throw new UserError("会话已关闭");
+    if (this.#scope.disposed) throw new UserError("会话已关闭");
     if (this.#access === "starting") throw new UserError("请先完成会话初始化");
     if (this.#access === "failed") throw new UserError(this.#startupError ?? "会话初始化失败");
   }
@@ -412,6 +455,8 @@ export class LiveSession implements LilaBridge {
       thinkingLevel: session.thinkingLevel,
       thinkingLevels: session.getAvailableThinkingLevels(),
       approvalMode: this.approvalMode,
+      sandboxMode: this.sandboxMode,
+      sandbox: this.#sandbox.status(this.#externalSandbox),
       ...(sessionRules.length ? { sessionRules } : {}),
       ...(projectRules.length ? { projectRules } : {}),
       queue: { steering: [...session.getSteeringMessages()], followUp: [...session.getFollowUpMessages()] },
@@ -521,6 +566,15 @@ export class LiveSession implements LilaBridge {
     }
     if (command.thinkingLevel) this.#session.setThinkingLevel(command.thinkingLevel);
     if (command.approvalMode) this.#store.setApprovalMode(this.id, command.approvalMode);
+    if (command.sandboxMode) {
+      if (command.sandboxMode === "workspace-write" && !this.#externalSandbox) {
+        const status = this.#sandbox.status(false);
+        if (!status.available) {
+          throw new UserError(`无法开启沙箱：${status.reason ?? "当前环境不支持 OS 沙箱"}`);
+        }
+      }
+      this.#store.setSandboxMode(this.id, command.sandboxMode);
+    }
     this.#pushState();
     return this.state();
   }
@@ -647,7 +701,7 @@ export class LiveSession implements LilaBridge {
   }
 
   async reloadIfIdle(): Promise<boolean> {
-    if (this.#disposed || this.#access !== "ready" || this.#session.isStreaming || this.#session.isCompacting) return false;
+    if (this.#scope.disposed || this.#access !== "ready" || this.#session.isStreaming || this.#session.isCompacting) return false;
     await this.#session.reload();
     this.#onReload?.();
     this.#pushState();
@@ -655,29 +709,13 @@ export class LiveSession implements LilaBridge {
   }
 
   async refreshSettingsAndAuth(): Promise<void> {
-    if (this.#disposed) return;
+    if (this.#scope.disposed) return;
     await this.#services.settingsManager.reload().catch(() => undefined);
     await this.#services.modelRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
   }
 
-  async dispose(): Promise<void> {
-    this.#disposed = true;
-    this.#pending.close();
-    for (const throttle of this.#throttles.values()) clearTimeout(throttle.timer);
-    this.#throttles.clear();
-    this.#subagents.dispose();
-    try {
-      await this.#session.abort();
-      // Lets extensions such as MCP close their connections and child processes.
-      if (this.#session.extensionRunner.hasHandlers("session_shutdown")) {
-        await this.#session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-      }
-    } catch (error) {
-      console.error(`[core] shutting down ${this.id} failed`, error);
-    }
-    this.#unsubscribe?.();
-    this.#session.dispose();
-    await this.#services.modelRuntime.settleCredentialWrites();
+  dispose(): Promise<void> {
+    return this.#scope.dispose();
   }
 
   // -------------------------------------------------------------------------
@@ -704,7 +742,7 @@ export class LiveSession implements LilaBridge {
   }
 
   #pushState(): void {
-    if (this.#disposed) return;
+    if (this.#scope.disposed) return;
     this.#clients.toWatchers(this.id, { type: "state", sessionId: this.id, state: this.state() });
   }
 
@@ -722,10 +760,10 @@ export class LiveSession implements LilaBridge {
     const prevStatus = this.#lastStatus;
     if (prevStatus !== summary.status) {
       this.#lastStatus = summary.status;
-      if (!this.#disposed) this.#onStatusChange?.(prevStatus, summary.status);
+      if (!this.#scope.disposed) this.#onStatusChange?.(prevStatus, summary.status);
     }
     const key = `${summary.title}\n${summary.status}\n${summary.pendingCount}\n${summary.updatedAt}`;
-    if (!this.#disposed && (force || key !== this.#lastSummary)) {
+    if (!this.#scope.disposed && (force || key !== this.#lastSummary)) {
       this.#lastSummary = key;
       this.#clients.broadcast({ type: "session", session: summary });
     }

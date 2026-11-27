@@ -281,6 +281,9 @@ importers:
       '@amaster.ai/pi-memory':
         specifier: 0.1.40
         version: 0.1.40(@earendil-works/pi-agent-core@1.5.2(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(undici@8.12.3)(ws@8.23.0)(zod@4.6.7))(@earendil-works/pi-ai@1.5.2(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(undici@8.12.3)(ws@8.23.0)(zod@4.6.7))(@earendil-works/pi-coding-agent@1.5.2(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(ws@8.23.0)(zod@4.6.7))(typebox@1.3.27)
+      '@anthropic-ai/sandbox-runtime':
+        specifier: 0.0.83
+        version: 0.0.83
       '@earendil-works/pi-ai':
         specifier: 1.5.2
         version: 1.5.2(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(undici@8.12.3)(ws@8.23.0)(zod@4.6.7)
@@ -358,6 +361,16 @@ packages:
 
   '@antfu/install-pkg@2.1.0':
     resolution: {integrity: sha512-sdg9NxU3zR4Mnawfbc/x6GB5Wf17WYud5qOuEuxXjaKpYpMkISSJEjItGebXJ2bQ4DIcly4NYH23mtkGJjvKUw==}
+
+  '@anthropic-ai/sandbox-runtime@0.0.83':
+    resolution: {integrity: sha512-yEusORnVJrNseF/9fvjVYyk6tr79/aFbIB3T/X8p2puLZdaaiGNeYN50v0CE+1DT70v7XuzKOAnTivh1f5cksA==}
+    engines: {node: '>=22.12.0'}
+    hasBin: true
+    peerDependencies:
+      '@microsoft/mxc-sdk': ^1.0.1
+    peerDependenciesMeta:
+      '@microsoft/mxc-sdk':
+        optional: true
 
   '@anthropic-ai/sdk@0.129.0':
     resolution: {integrity: sha512-MH7LB20kNpGLUpPTe2OG5XvL/KhX8HUO9XyBaFjgFk6TLS4Xjt0VPIuMKywe7POKKPslX+QxSlVok9e+8kG5Nw==}
@@ -1019,6 +1032,9 @@ packages:
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [win32]
+
+  '@pondwader/socks5-server@1.0.10':
+    resolution: {integrity: sha512-bQY06wzzR8D2+vVCUoBsr5QS2U6UgPUQRmErNwtsuI6vLcyRKkafjkr3KxbtGFf9aBBIV2mcvlsKD1UYaIV+sg==}
 
   '@protobufjs/aspromise@1.1.2':
     resolution: {integrity: sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ==}
@@ -1988,6 +2004,10 @@ packages:
   commander@11.1.0:
     resolution: {integrity: sha512-yPVavfyCcRhmorC7rWlkHn15b4wDVgVmBA7kV4QVBsF7kv/9TKJAbAXVTxvTnwP8HHKjRCJDClKbciiYS7p0DQ==}
     engines: {node: '>=16'}
+
+  commander@12.1.0:
+    resolution: {integrity: sha512-Vw8qHK3bZM9y/P10u3Vib8o/DdkvA2OtPtZvD871QKjy74Wj1WSKFILMPRPSdUSx5RFK1arlJzEtA4PkFgnbuA==}
+    engines: {node: '>=18'}
 
   commander@14.0.3:
     resolution: {integrity: sha512-H+y0Jo/T1RZ9qPP4Eh1pkcQcLRglraJaSLoyOtHxu6AapkjWVCy2Sit1QQ4x3Dng8qDlSsZEet7g5Pq06MvTgw==}
@@ -3055,6 +3075,10 @@ packages:
     resolution: {integrity: sha512-dRB78srN/l6gqWulah9SrxeYnxeddIG30+GOqK/9OlLVyLg3HPnr6SqOWTWOXKRwC2eGYCkZ59NNuSgvSrpgOA==}
     engines: {node: ^12.20.0 || ^14.13.1 || >=16.0.0}
 
+  node-forge@1.4.4:
+    resolution: {integrity: sha512-T6VRRpF3+czIGcXW/LOeoD7Ej28d8CF1UMEAbJyJRUtYMvyXAgxUPW2kbUibumvV9LiUQAznJOFyeYclzSJMMg==}
+    engines: {node: '>= 6.13.0'}
+
   node-releases@2.0.65:
     resolution: {integrity: sha512-PfvofsGQ+MiOQIPkX9fU8ELUWmy5zL74CdQaph/ismKszfFkfwXaw0cGiwbwym2hT9k5+mdyl8O5WQ1MD8EHmA==}
     engines: {node: '>=18'}
@@ -3829,6 +3853,9 @@ packages:
     resolution: {integrity: sha512-xYqdZFUK/VYazNl/oCDYN+3WloWQwMfZxBoiNt6qNyk+xfOdi598muWE42rNZFp1kNOiqW936q5RhUdnpqElSg==}
     engines: {node: '>=18'}
 
+  zod@3.25.76:
+    resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
+
   zod@4.6.7:
     resolution: {integrity: sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==}
 
@@ -3873,6 +3900,13 @@ snapshots:
     dependencies:
       package-manager-detector: 1.9.0
       tinyexec: 1.4.0
+
+  '@anthropic-ai/sandbox-runtime@0.0.83':
+    dependencies:
+      '@pondwader/socks5-server': 1.0.10
+      commander: 12.1.0
+      node-forge: 1.4.4
+      zod: 3.25.76
 
   '@anthropic-ai/sdk@0.129.0(zod@4.6.7)':
     dependencies:
@@ -4651,6 +4685,8 @@ snapshots:
 
   '@oxlint/binding-win32-x64-msvc@1.95.0':
     optional: true
+
+  '@pondwader/socks5-server@1.0.10': {}
 
   '@protobufjs/aspromise@1.1.2': {}
 
@@ -5467,6 +5503,8 @@ snapshots:
   comma-separated-tokens@2.0.3: {}
 
   commander@11.1.0: {}
+
+  commander@12.1.0: {}
 
   commander@14.0.3: {}
 
@@ -6751,6 +6789,8 @@ snapshots:
       fetch-blob: 3.2.0
       formdata-polyfill: 4.0.10
 
+  node-forge@1.4.4: {}
+
   node-releases@2.0.65: {}
 
   npm-run-path@4.0.1:
@@ -7544,6 +7584,8 @@ snapshots:
       yoctocolors: 2.2.0
 
   yoctocolors@2.2.0: {}
+
+  zod@3.25.76: {}
 
   zod@4.6.7: {}
 

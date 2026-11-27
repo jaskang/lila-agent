@@ -2,59 +2,31 @@ import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { type AgentSessionServices, createAgentSessionFromServices, SessionManager } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_APPROVAL_MODE } from "@lila/protocol";
+import { DEFAULT_APPROVAL_MODE, DEFAULT_SANDBOX_MODE } from "@lila/protocol";
 import type {
   ApprovalMode,
   AssistantTask,
-  AuthLoginEvent,
-  AuthMethod,
-  CapabilitiesSnapshot,
-  CoreSettings,
-  GitFileDiff,
-  GitStatus,
-  McpConfigSnapshot,
-  McpExposure,
-  McpImportEntry,
-  McpScope,
-  McpServerInput,
-  MemorySnapshot,
-  MemoryTarget,
-  ModelInfo,
-  PackageScope,
   Project,
-  ProjectFileContent,
-  ProviderAuthInfo,
-  ProviderQuotaItem,
-  ScheduleCreateInput,
+  SandboxMode,
   ScheduledJob,
-  ScheduleUpdatePatch,
   SessionSummary,
   TaskCreateInput,
   TaskUpdatePatch,
   ThinkingLevel,
-  UsageRange,
-  UsageSummary,
 } from "@lila/protocol";
+import { DisposableScope } from "./disposable.ts";
 import { UserError } from "./errors.ts";
 import { createServices, ExtensionsService } from "./extensions-service.ts";
-import {
-  gitCommit as runGitCommit,
-  gitCreateWorktree,
-  gitDiff as readGitDiff,
-  gitDiscard as runGitDiscard,
-  gitStage as runGitStage,
-  gitStatus as readGitStatus,
-  gitUnstage as runGitUnstage,
-} from "./git.ts";
+import { gitCreateWorktree } from "./git.ts";
 import type { AutomationBridge } from "./lila-extension.ts";
 import { type Clients, findModel, LiveSession, parseAutoSubagentName, sessionTitle, slashCommands } from "./live-session.ts";
-import type { MemoryConfigPatch } from "./memory.ts";
+import { SandboxService } from "./sandbox-service.ts";
 import { SchedulerService } from "./scheduler-service.ts";
 import { SettingsService, settleServices } from "./settings-service.ts";
 import { Store } from "./store.ts";
 import { readSubsessionView, recordedSubagentIds } from "./subsession-view.ts";
 import { buildTaskExecutionPrompt, TaskService } from "./task-service.ts";
-import { invalidateFileCache, listTreeFiles, readPreviewFile, searchProjectFiles } from "./workspace-service.ts";
+import { invalidateFileCache } from "./workspace-service.ts";
 
 const IDLE_DISPOSE_MS = 15 * 60_000;
 const SWEEP_INTERVAL_MS = 60_000;
@@ -73,11 +45,17 @@ function moveToTrash(source: string, destination: string): void {
   }
 }
 
-/** Projects, the index of their Pi sessions, and the live AgentSessions of opened ones. */
+/** Projects, the index of their Pi sessions, the live AgentSessions, and owned domain services. */
 export class SessionHost {
   readonly store: Store;
+  readonly settings: SettingsService;
+  readonly extensions: ExtensionsService;
+  readonly scheduler: SchedulerService;
+  readonly tasks: TaskService;
+  readonly sandbox: SandboxService;
   readonly #dataDir: string;
   readonly #clients: Clients;
+  readonly #scope = new DisposableScope();
   readonly #live = new Map<string, LiveSession>();
   readonly #opening = new Map<string, Promise<LiveSession>>();
   readonly #openingProjects = new Map<string, string>();
@@ -85,40 +63,39 @@ export class SessionHost {
   readonly #removingProjects = new Set<string>();
   #index = new Map<string, IndexedSession>();
   readonly #projectServices = new Map<string, CachedServices>();
-  readonly #subsessionSyncTimers = new Map<string, { projectId: string; timer: NodeJS.Timeout }>();
-  readonly #sweeper: NodeJS.Timeout;
-  readonly #subsessionRefresh: NodeJS.Timeout;
+  readonly #subsessionSyncTimers = new Map<string, { projectId: string; cancel: () => void }>();
   readonly #watchedSubsessions = new Map<string, string>();
-  readonly #settings: SettingsService;
-  readonly #extensions: ExtensionsService;
-  readonly #scheduler: SchedulerService;
-  readonly #tasks: TaskService;
   #sweeping = false;
 
   constructor(dataDir: string, clients: Clients) {
     this.#dataDir = dataDir;
     this.#clients = clients;
     this.store = new Store(dataDir);
-    this.#settings = new SettingsService(dataDir, () => this.#syncLiveRuntime());
-    this.#extensions = new ExtensionsService({
-      project: (projectId) => this.#project(projectId),
+    this.sandbox = new SandboxService(dataDir);
+    this.settings = new SettingsService(dataDir, () => this.#syncLiveRuntime());
+    this.extensions = new ExtensionsService({
+      project: (projectId) => this.project(projectId),
       servicesForCapabilities: (projectId, sessionId) => this.#servicesForCapabilities(projectId, sessionId),
       invalidateProjectServices: (projectId) => this.#invalidateProjectServices(projectId),
       reloadIdleSessions: (projectId, sessionId) => this.#reloadIdleSessions(projectId, sessionId),
     });
-    this.#tasks = new TaskService(dataDir, (tasks) => {
+    this.tasks = new TaskService(dataDir, (tasks) => {
       this.#clients.broadcast({ type: "tasks", tasks });
     });
-    this.#scheduler = new SchedulerService(dataDir, {
+    this.scheduler = new SchedulerService(dataDir, {
       hasProject: (projectId) => Boolean(this.store.project(projectId)) && !this.#removingProjects.has(projectId),
       executeJob: (job, trigger) => this.#executeScheduledJob(job, trigger),
       onChange: (schedules) => {
         this.#clients.broadcast({ type: "schedules", schedules });
       },
     });
-    this.#sweeper = setInterval(() => void this.#sweep(), SWEEP_INTERVAL_MS);
-    this.#sweeper.unref();
-    this.#subsessionRefresh = setInterval(() => this.#refreshSubsessionViews(), SUBSESSION_REFRESH_MS).unref();
+
+    // Register owned resources in LIFO order so disposal unwinds timers -> scheduler -> settings -> sandbox.
+    this.#scope.add(() => this.sandbox.dispose());
+    this.#scope.add(() => this.settings.dispose());
+    this.#scope.add(() => this.scheduler.dispose());
+    this.#scope.setInterval(() => void this.#sweep(), SWEEP_INTERVAL_MS);
+    this.#scope.setInterval(() => this.#refreshSubsessionViews(), SUBSESSION_REFRESH_MS);
   }
 
   // -------------------------------------------------------------------------
@@ -142,7 +119,7 @@ export class SessionHost {
     try {
       for (const [parentId, entry] of Array.from(this.#subsessionSyncTimers.entries())) {
         if (entry.projectId === projectId) {
-          clearTimeout(entry.timer);
+          entry.cancel();
           this.#subsessionSyncTimers.delete(parentId);
         }
       }
@@ -164,25 +141,25 @@ export class SessionHost {
       }
       if (project) invalidateFileCache(project.path);
       this.store.removeProject(projectId);
-      this.#scheduler.removeByProject(projectId);
-      this.#tasks.onProjectRemoved(projectId);
+      this.scheduler.removeByProject(projectId);
+      this.tasks.onProjectRemoved(projectId);
       this.#clients.broadcast({ type: "projects", projects: [...this.store.projects] });
     } finally {
       this.#removingProjects.delete(projectId);
     }
   }
 
-  #project(projectId: string): Project {
+  project(projectId: string): Project {
     const project = this.store.project(projectId);
     if (!project) throw new UserError("项目不存在，可能已经被移除");
     return project;
   }
 
   // -------------------------------------------------------------------------
-  // Service caches & delegations
+  // Service caches & reloads
 
   #invalidateCaches(projectId?: string): void {
-    this.#settings.invalidate();
+    this.settings.invalidate();
     if (projectId) {
       const cached = this.#projectServices.get(projectId);
       if (cached) {
@@ -222,7 +199,7 @@ export class SessionHost {
       if (live) return { services: live.services, cwd: live.services.cwd };
     }
     if (projectId) {
-      const project = this.#project(projectId);
+      const project = this.project(projectId);
       const existingLive = Array.from(this.#live.values()).find((live) => live.projectId === project.id);
       if (existingLive) return { services: existingLive.services, cwd: project.path };
       let entry = this.#projectServices.get(project.id);
@@ -238,83 +215,9 @@ export class SessionHost {
       }
       return { services: await entry.promise, cwd: project.path };
     }
-    return { services: await this.#settings.getModelServices().promise };
+    return { services: await this.settings.getModelServices().promise };
   }
 
-  listModels(forceRefresh = false): Promise<{ models: ModelInfo[]; defaultModelId?: string }> {
-    return this.#settings.listModels(forceRefresh);
-  }
-  setProviderModels(providerId: string, modelIds: string[] | null): Promise<{ models: ModelInfo[]; defaultModelId?: string }> {
-    return this.#settings.setProviderModels(providerId, modelIds);
-  }
-  getSettings(): Promise<CoreSettings> {
-    return this.#settings.getSettings();
-  }
-  updateSettings(patch: {
-    defaultModelId?: string | undefined;
-    defaultThinkingLevel?: ThinkingLevel | undefined;
-    autoCompaction?: boolean | undefined;
-    autoRetry?: boolean | undefined;
-  }): Promise<CoreSettings> {
-    return this.#settings.updateSettings(patch);
-  }
-  listProviders(): Promise<ProviderAuthInfo[]> {
-    return this.#settings.listProviders();
-  }
-  startProviderLogin(owner: unknown, providerId: string, method: AuthMethod, emit: (event: AuthLoginEvent) => void): Promise<string> {
-    return this.#settings.startProviderLogin(owner, providerId, method, emit);
-  }
-  respondProviderLogin(loginId: string, promptId: string, value: string): void {
-    this.#settings.respondProviderLogin(loginId, promptId, value);
-  }
-  cancelProviderLogin(loginId: string): void {
-    this.#settings.cancelProviderLogin(loginId);
-  }
-  cancelLoginsForOwner(owner: unknown): void {
-    this.#settings.cancelLoginsForOwner(owner);
-  }
-  logoutProvider(providerId: string): Promise<void> {
-    return this.#settings.logoutProvider(providerId);
-  }
-  getUsageSummary(range: UsageRange, onlyConfigured = true): Promise<UsageSummary> {
-    return this.#settings.getUsageSummary(range, onlyConfigured);
-  }
-  listQuotas(refresh = false): Promise<ProviderQuotaItem[]> {
-    return this.#settings.listQuotas(refresh);
-  }
-
-  listMcp(projectId?: string): McpConfigSnapshot {
-    return this.#extensions.listMcp(projectId);
-  }
-  upsertMcp(scope: McpScope, name: string, config: McpServerInput, projectId?: string): Promise<McpConfigSnapshot> {
-    return this.#extensions.upsertMcp(scope, name, config, projectId);
-  }
-  importMcp(scope: McpScope, entries: readonly McpImportEntry[], projectId?: string): Promise<McpConfigSnapshot> {
-    return this.#extensions.importMcp(scope, entries, projectId);
-  }
-  toggleMcp(
-    scope: McpScope,
-    name: string,
-    patch: { enabled?: boolean | undefined; exposure?: McpExposure | undefined },
-    projectId?: string,
-  ): Promise<McpConfigSnapshot> {
-    return this.#extensions.toggleMcp(scope, name, patch, projectId);
-  }
-  removeMcp(scope: McpScope, name: string, projectId?: string): Promise<McpConfigSnapshot> {
-    return this.#extensions.removeMcp(scope, name, projectId);
-  }
-  getCapabilities(projectId?: string, sessionId?: string): Promise<CapabilitiesSnapshot> {
-    return this.#extensions.getCapabilities(projectId, sessionId);
-  }
-  installPackage(source: string, scope: PackageScope, projectId?: string): Promise<CapabilitiesSnapshot> {
-    return this.#extensions.installPackage(source, scope, projectId);
-  }
-  removePackage(source: string, scope: PackageScope, projectId?: string): Promise<CapabilitiesSnapshot> {
-    return this.#extensions.removePackage(source, scope, projectId);
-  }
-  updatePackages(source?: string, projectId?: string): Promise<CapabilitiesSnapshot> {
-    return this.#extensions.updatePackages(source, projectId);
-  }
   async reloadWorkspace(projectId?: string, sessionId?: string): Promise<void> {
     if (sessionId) {
       const live = this.#live.get(sessionId);
@@ -324,21 +227,6 @@ export class SessionHost {
       }
     }
     await this.#reloadIdleSessions(projectId);
-  }
-  getMemory(projectId?: string, sessionId?: string): Promise<MemorySnapshot> {
-    return this.#extensions.getMemory(projectId, sessionId);
-  }
-  addMemory(target: MemoryTarget, content: string): Promise<MemorySnapshot> {
-    return this.#extensions.addMemory(target, content);
-  }
-  replaceMemory(target: MemoryTarget, oldText: string, newContent: string): Promise<MemorySnapshot> {
-    return this.#extensions.replaceMemory(target, oldText, newContent);
-  }
-  removeMemory(target: MemoryTarget, oldText: string): Promise<MemorySnapshot> {
-    return this.#extensions.removeMemory(target, oldText);
-  }
-  updateMemorySettings(patch: MemoryConfigPatch): Promise<MemorySnapshot> {
-    return this.#extensions.updateMemorySettings(patch);
   }
 
   // -------------------------------------------------------------------------
@@ -436,10 +324,17 @@ export class SessionHost {
   // -------------------------------------------------------------------------
   // Live sessions
 
-  async createSession(options: { projectId: string; modelId?: string; thinkingLevel?: ThinkingLevel; approvalMode?: ApprovalMode }): Promise<SessionSummary> {
-    const project = this.#project(options.projectId);
+  async createSession(options: {
+    projectId: string;
+    modelId?: string;
+    thinkingLevel?: ThinkingLevel;
+    approvalMode?: ApprovalMode;
+    sandboxMode?: SandboxMode;
+  }): Promise<SessionSummary> {
+    const project = this.project(options.projectId);
     const manager = SessionManager.create(project.path);
     this.store.setApprovalMode(manager.getSessionId(), options.approvalMode ?? DEFAULT_APPROVAL_MODE);
+    this.store.setSandboxMode(manager.getSessionId(), options.sandboxMode ?? DEFAULT_SANDBOX_MODE);
     try {
       const live = await this.#start(project, manager, options);
       const summary = live.summary();
@@ -501,7 +396,7 @@ export class SessionHost {
     }
     const status = this.#subsessionStatus(entry);
     if (watch) this.#watchedSubsessions.set(sessionId, this.#subsessionVersion(entry, status));
-    const project = this.#project(entry.projectId);
+    const project = this.project(entry.projectId);
     return readSubsessionView(entry.path, project.path, status, this.store.approvalMode(sessionId));
   }
 
@@ -526,6 +421,7 @@ export class SessionHost {
       pendingCount: 0,
     };
     this.store.setApprovalMode(summary.id, this.store.approvalMode(sessionId));
+    this.store.setSandboxMode(summary.id, this.store.sandboxMode(sessionId));
     this.#index.set(summary.id, { id: summary.id, projectId: entry.projectId, path: branchPath, summary });
     this.#clients.broadcast({ type: "session", session: summary });
     return summary;
@@ -545,7 +441,7 @@ export class SessionHost {
     const entry = await this.#entry(sessionId);
     if (!entry.summary.readOnly) throw new UserError("只有子 Agent 会话可以用此方式继续");
     if (this.#subsessionStatus(entry) === "running") throw new UserError("请等子 Agent 结束后再继续");
-    const project = this.#project(entry.projectId);
+    const project = this.project(entry.projectId);
     const manager = SessionManager.forkFrom(entry.path, project.path);
     const title = `继续：${entry.summary.title}`;
     manager.appendSessionInfo(title);
@@ -560,6 +456,7 @@ export class SessionHost {
     const path = manager.getSessionFile();
     if (!path) throw new UserError("无法创建新会话文件");
     this.store.setApprovalMode(summary.id, this.store.approvalMode(sessionId));
+    this.store.setSandboxMode(summary.id, this.store.sandboxMode(sessionId));
     this.#index.set(summary.id, { id: summary.id, projectId: project.id, path, summary });
     this.#clients.broadcast({ type: "session", session: summary });
     return summary;
@@ -569,7 +466,7 @@ export class SessionHost {
     const entry = await this.#entry(sessionId);
     if (entry.summary.readOnly) throw new UserError("子 Agent 会话是只读的，结束后可继续为新会话");
     this.#openingProjects.set(sessionId, entry.projectId);
-    return this.#start(this.#project(entry.projectId), SessionManager.open(entry.path), {
+    return this.#start(this.project(entry.projectId), SessionManager.open(entry.path), {
       updatedAt: entry.summary.updatedAt,
     });
   }
@@ -595,9 +492,10 @@ export class SessionHost {
         }
       },
       onSubsessionsChanged: () => this.#scheduleSubsessionSync(project, sessionId),
-      onProviderResponse: (providerId, _status, headers) => this.#settings.recordResponseHeaders(providerId, headers),
-      onStatusChange: (previous, next) => this.#tasks.onSessionTransition(sessionId, previous, next),
+      onProviderResponse: (providerId, _status, headers) => this.settings.recordResponseHeaders(providerId, headers),
+      onStatusChange: (previous, next) => this.tasks.onSessionTransition(sessionId, previous, next),
       automation: this.#automationBridge(project.id),
+      sandbox: this.sandbox,
     });
     const services = await createServices(project.path, live);
     try {
@@ -639,7 +537,7 @@ export class SessionHost {
     try {
       const pendingTimer = this.#subsessionSyncTimers.get(sessionId);
       if (pendingTimer) {
-        clearTimeout(pendingTimer.timer);
+        pendingTimer.cancel();
         this.#subsessionSyncTimers.delete(sessionId);
       }
       const opening = this.#opening.get(sessionId);
@@ -665,8 +563,8 @@ export class SessionHost {
       this.#index.delete(sessionId);
       this.#watchedSubsessions.delete(sessionId);
       this.store.forgetSession(sessionId);
-      this.#scheduler.forgetSession(sessionId);
-      this.#tasks.forgetSession(sessionId);
+      this.scheduler.forgetSession(sessionId);
+      this.tasks.forgetSession(sessionId);
       this.#clients.broadcast({ type: "session.removed", sessionId });
     } finally {
       this.#deletingSessions.delete(sessionId);
@@ -703,15 +601,16 @@ export class SessionHost {
   }
 
   #scheduleSubsessionSync(project: Project, parentId: string): void {
-    if (this.#subsessionSyncTimers.has(parentId) || this.#deletingSessions.has(parentId) || this.#removingProjects.has(project.id)) return;
-    const timer = setTimeout(() => {
+    if (this.#scope.disposed || this.#subsessionSyncTimers.has(parentId) || this.#deletingSessions.has(parentId) || this.#removingProjects.has(project.id)) {
+      return;
+    }
+    const timer = this.#scope.setTimeout(() => {
       this.#subsessionSyncTimers.delete(parentId);
       void this.#syncSubsessions(project, parentId).catch((error: unknown) => {
         console.error(`[core] syncing sub-sessions for ${parentId} failed`, error);
       });
     }, 600);
-    timer.unref();
-    this.#subsessionSyncTimers.set(parentId, { projectId: project.id, timer });
+    this.#subsessionSyncTimers.set(parentId, { projectId: project.id, cancel: () => clearTimeout(timer) });
   }
 
   async #syncSubsessions(project: Project, parentId: string): Promise<void> {
@@ -774,54 +673,21 @@ export class SessionHost {
   }
 
   async dispose(): Promise<void> {
-    this.#scheduler.dispose();
-    clearInterval(this.#sweeper);
-    clearInterval(this.#subsessionRefresh);
-    for (const entry of this.#subsessionSyncTimers.values()) clearTimeout(entry.timer);
     this.#subsessionSyncTimers.clear();
     const projectServices = Array.from(this.#projectServices.values(), (entry) => entry.promise);
     this.#projectServices.clear();
     await Promise.all([
       ...Array.from(this.#live.values()).map((live) => this.#dispose(live, false)),
       ...projectServices.map(settleServices),
-      this.#settings.dispose(),
     ]);
+    await this.#scope.dispose();
   }
 
   // -------------------------------------------------------------------------
-  // Files & Git
+  // Cross-domain coordination (worktree projects, tasks, scheduled runs)
 
-  searchFiles(projectId: string, query: string, limit: number): Promise<string[]> {
-    return searchProjectFiles(this.#project(projectId).path, query, limit);
-  }
-  listProjectFiles(projectId: string, refresh = false): Promise<{ files: string[]; truncated: boolean }> {
-    return listTreeFiles(this.#project(projectId).path, refresh);
-  }
-  readProjectFile(projectId: string, rawPath: string): Promise<ProjectFileContent> {
-    return readPreviewFile(this.#project(projectId).path, rawPath);
-  }
-  gitStatus(projectId: string): Promise<GitStatus> {
-    return readGitStatus(this.#project(projectId).path);
-  }
-  gitDiff(projectId: string, path: string, staged?: boolean): Promise<GitFileDiff> {
-    return readGitDiff(this.#project(projectId).path, path, staged);
-  }
-  gitStage(projectId: string, paths?: readonly string[]): Promise<GitStatus> {
-    return runGitStage(this.#project(projectId).path, paths);
-  }
-  gitUnstage(projectId: string, paths?: readonly string[]): Promise<GitStatus> {
-    return runGitUnstage(this.#project(projectId).path, paths);
-  }
-  gitDiscard(projectId: string, path: string): Promise<GitStatus> {
-    const project = this.#project(projectId);
-    invalidateFileCache(project.path);
-    return runGitDiscard(project.path, path);
-  }
-  gitCommit(projectId: string, message: string): Promise<{ status: GitStatus; hash: string }> {
-    return runGitCommit(this.#project(projectId).path, message);
-  }
   async createWorktreeProject(projectId: string, branch?: string): Promise<{ project: Project; branch: string }> {
-    const source = this.#project(projectId);
+    const source = this.project(projectId);
     const created = await gitCreateWorktree(source.path, branch);
     const existing = this.store.projects.find((item) => item.path === created.path);
     if (existing) return { project: existing, branch: created.branch };
@@ -835,47 +701,6 @@ export class SessionHost {
     return { project, branch: created.branch };
   }
 
-  // -------------------------------------------------------------------------
-  // Background schedules & personal assistant task inbox
-
-  listSchedules(): ScheduledJob[] {
-    return this.#scheduler.list();
-  }
-
-  createSchedule(input: ScheduleCreateInput): ScheduledJob {
-    return this.#scheduler.create(input);
-  }
-
-  updateSchedule(id: string, patch: ScheduleUpdatePatch): ScheduledJob {
-    return this.#scheduler.update(id, patch);
-  }
-
-  deleteSchedule(id: string): void {
-    this.#scheduler.delete(id);
-  }
-
-  runSchedule(id: string): Promise<{ schedule: ScheduledJob; sessionId?: string }> {
-    return this.#scheduler.runNow(id);
-  }
-
-  listTasks(): AssistantTask[] {
-    return this.#tasks.list();
-  }
-
-  createTask(input: TaskCreateInput): AssistantTask {
-    if (input.projectId) this.#project(input.projectId);
-    return this.#tasks.create(input);
-  }
-
-  updateTask(id: string, patch: TaskUpdatePatch): AssistantTask {
-    if (patch.projectId) this.#project(patch.projectId);
-    return this.#tasks.update(id, patch);
-  }
-
-  deleteTask(id: string): void {
-    this.#tasks.delete(id);
-  }
-
   async startTask(options: {
     id: string;
     projectId?: string | undefined;
@@ -884,8 +709,9 @@ export class SessionHost {
     modelId?: string | undefined;
     thinkingLevel?: ThinkingLevel | undefined;
     approvalMode?: ApprovalMode | undefined;
+    sandboxMode?: SandboxMode | undefined;
   }): Promise<{ task: AssistantTask; session: SessionSummary; project?: Project }> {
-    const task = this.#tasks.get(options.id);
+    const task = this.tasks.get(options.id);
     if (!task) throw new UserError("任务不存在");
     const baseProjectId = options.projectId ?? task.projectId;
     if (!baseProjectId) throw new UserError("请先为该任务选择一个关联项目");
@@ -903,11 +729,12 @@ export class SessionHost {
       ...(options.modelId ? { modelId: options.modelId } : {}),
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
       ...(options.approvalMode ? { approvalMode: options.approvalMode } : {}),
+      ...(options.sandboxMode ? { sandboxMode: options.sandboxMode } : {}),
     });
     const live = await this.live(summary.id);
     const title = `[任务] ${task.title}`.slice(0, 120);
     const renamed = live.rename(title);
-    const runningTask = this.#tasks.update(task.id, {
+    const runningTask = this.tasks.update(task.id, {
       projectId: targetProjectId,
       sessionId: renamed.id,
       status: "running",
@@ -916,11 +743,11 @@ export class SessionHost {
     try {
       await live.prompt({ text: buildTaskExecutionPrompt(runningTask) });
     } catch (error) {
-      this.#tasks.update(task.id, { status: task.status });
+      this.tasks.update(task.id, { status: task.status });
       throw error;
     }
     return {
-      task: this.#tasks.get(task.id) ?? runningTask,
+      task: this.tasks.get(task.id) ?? runningTask,
       session: live.summary(),
       ...(createdProject ? { project: createdProject } : {}),
     };
@@ -929,21 +756,24 @@ export class SessionHost {
   #automationBridge(defaultProjectId: string): AutomationBridge {
     return {
       defaultProjectId,
-      listSchedules: () => this.listSchedules(),
-      createSchedule: (input) => this.createSchedule(input),
-      updateSchedule: (id, patch) => this.updateSchedule(id, patch),
-      deleteSchedule: (id) => this.deleteSchedule(id),
-      listTasks: () => this.listTasks(),
+      listSchedules: () => this.scheduler.list(),
+      createSchedule: (input) => this.scheduler.create(input),
+      updateSchedule: (id, patch) => this.scheduler.update(id, patch),
+      deleteSchedule: (id) => this.scheduler.delete(id),
+      listTasks: () => this.tasks.list(),
       upsertTask: (params) => {
         if (params.id) {
           const { id, ...patch } = params;
-          return this.updateTask(id, patch as TaskUpdatePatch);
+          if (patch.projectId) this.project(patch.projectId);
+          return this.tasks.update(id, patch as TaskUpdatePatch);
         }
         const createInput = params as Partial<TaskCreateInput>;
         if (!createInput.title?.trim()) throw new UserError("新建任务必须提供 title");
-        return this.createTask({
+        const projectId = createInput.projectId ?? defaultProjectId;
+        this.project(projectId);
+        return this.tasks.create({
           title: createInput.title,
-          projectId: createInput.projectId ?? defaultProjectId,
+          projectId,
           ...(createInput.status ? { status: createInput.status } : {}),
           ...(createInput.priority ? { priority: createInput.priority } : {}),
           ...(createInput.source ? { source: createInput.source } : {}),
@@ -968,6 +798,10 @@ export class SessionHost {
       if (live?.busy) {
         return { sessionId: live.id, skipped: "绑定的固定会话正在运行或等待审批，已跳过本次触发" };
       }
+      if (live && live.sandboxMode !== job.sandboxMode) {
+        this.store.setSandboxMode(live.id, job.sandboxMode);
+        live.pushState();
+      }
     }
 
     if (!live) {
@@ -976,10 +810,11 @@ export class SessionHost {
         ...(job.modelId ? { modelId: job.modelId } : {}),
         ...(job.thinkingLevel ? { thinkingLevel: job.thinkingLevel } : {}),
         approvalMode: job.approvalMode,
+        sandboxMode: job.sandboxMode,
       });
       live = await this.live(created.id);
       live.rename(`[定时] ${job.name}`.slice(0, 120));
-      if (job.sessionMode === "reuse") this.#scheduler.bindSession(job.id, live.id);
+      if (job.sessionMode === "reuse") this.scheduler.bindSession(job.id, live.id);
     }
 
     await live.prompt({ text: job.prompt });
