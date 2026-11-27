@@ -19,7 +19,7 @@ import type {
   TranscriptItem,
 } from "@lila/protocol";
 import { errorMessage, UserError } from "./errors.ts";
-import type { LilaBridge, SubagentBusEvent, SubagentController } from "./lila-extension.ts";
+import type { AutomationBridge, LilaBridge, SubagentBusEvent, SubagentController } from "./lila-extension.ts";
 import { PendingBridge } from "./pending-bridge.ts";
 import type { Store } from "./store.ts";
 import { SubagentTracker } from "./subagent-tracker.ts";
@@ -182,10 +182,13 @@ export class LiveSession implements LilaBridge {
   readonly #onReload?: () => void;
   readonly #onProjectRulesChanged?: () => void;
   readonly #onProviderResponse?: (providerId: string | undefined, status: number, headers: Record<string, string>) => void;
+  readonly #onStatusChange?: (previous: SessionStatus | undefined, next: SessionStatus) => void;
+  readonly #automation?: AutomationBridge;
   readonly #pending: PendingBridge;
   readonly #subagents: SubagentTracker;
   readonly #sessionRules = new Set<string>();
   #subagentController?: SubagentController;
+  #lastStatus?: SessionStatus;
   #session!: AgentSession;
   #services!: AgentSessionServices;
   #unsubscribe?: () => void;
@@ -217,6 +220,8 @@ export class LiveSession implements LilaBridge {
     onProjectRulesChanged?: () => void;
     onSubsessionsChanged?: () => void;
     onProviderResponse?: (providerId: string | undefined, status: number, headers: Record<string, string>) => void;
+    onStatusChange?: (previous: SessionStatus | undefined, next: SessionStatus) => void;
+    automation?: AutomationBridge;
   }) {
     this.id = options.id;
     this.projectId = options.projectId;
@@ -225,6 +230,8 @@ export class LiveSession implements LilaBridge {
     this.#onReload = options.onReload;
     this.#onProjectRulesChanged = options.onProjectRulesChanged;
     this.#onProviderResponse = options.onProviderResponse;
+    this.#onStatusChange = options.onStatusChange;
+    this.#automation = options.automation;
     this.#pending = new PendingBridge({
       onPendingChanged: () => {
         this.touch();
@@ -249,6 +256,10 @@ export class LiveSession implements LilaBridge {
 
   get session(): AgentSession {
     return this.#session;
+  }
+
+  get automation(): AutomationBridge | undefined {
+    return this.#automation;
   }
 
   get services(): AgentSessionServices {
@@ -453,7 +464,7 @@ export class LiveSession implements LilaBridge {
   // -------------------------------------------------------------------------
   // Commands
 
-  async prompt(command: Command<"session.prompt">): Promise<void> {
+  async prompt(command: Pick<Command<"session.prompt">, "text" | "images" | "mode">): Promise<void> {
     this.touch();
     const session = this.#session;
     await this.#initialization;
@@ -708,6 +719,11 @@ export class LiveSession implements LilaBridge {
   /** Broadcasts the list entry when something the sidebar shows changed. */
   #broadcastSummary(force = false): SessionSummary {
     const summary = this.summary();
+    const prevStatus = this.#lastStatus;
+    if (prevStatus !== summary.status) {
+      this.#lastStatus = summary.status;
+      if (!this.#disposed) this.#onStatusChange?.(prevStatus, summary.status);
+    }
     const key = `${summary.title}\n${summary.status}\n${summary.pendingCount}\n${summary.updatedAt}`;
     if (!this.#disposed && (force || key !== this.#lastSummary)) {
       this.#lastSummary = key;

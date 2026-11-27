@@ -293,6 +293,9 @@ importers:
       '@tintinweb/pi-subagents':
         specifier: 0.26.1
         version: 0.26.1(@earendil-works/pi-ai@1.5.2(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(undici@8.12.3)(ws@8.23.0)(zod@4.6.7))(@earendil-works/pi-coding-agent@1.5.2(@aws-sdk/credential-provider-node@3.972.99)(@smithy/signature-v4@5.7.5)(ws@8.23.0)(zod@4.6.7))(@earendil-works/pi-tui@1.5.2)(typebox@1.3.27)
+      croner:
+        specifier: 10.0.1
+        version: 10.0.1
       fuzzysort:
         specifier: ^4.0.2
         version: 4.0.2

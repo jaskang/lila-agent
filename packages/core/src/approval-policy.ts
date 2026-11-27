@@ -7,6 +7,8 @@ import type { ApprovalMode, ApprovalRuleSuggestion } from "@lila/protocol";
 const LOCAL_READS = new Set(["read", "grep", "find", "ls"]);
 const MCP_DISCOVERY = new Set(["list_mcp_resources", "list_mcp_resource_templates"]);
 const MEMORY_WRITES = new Set(["memory_add", "memory_replace", "memory_remove"]);
+const LILA_READS = new Set(["ask_user", "schedule_list", "task_list"]);
+const LILA_WRITES = new Set(["schedule_create", "schedule_update", "schedule_delete", "task_upsert"]);
 const NONSTANDARD_PATH = /[\u00a0\u2000-\u200a\u202f\u205f\u3000]/u;
 
 /** Characters that enable redirection, command substitution, backgrounding, or multi-statement chaining. */
@@ -313,7 +315,11 @@ export function approvalReason({
     }
   }
 
-  if (source === "builtin:lila" && name === "ask_user") return;
+  if (source === "builtin:lila" && LILA_READS.has(name)) return;
+  if (source === "builtin:lila" && LILA_WRITES.has(name)) {
+    if (mode === "ask-exec") return;
+    return "修改后台定时任务或任务收件箱";
+  }
   if (source === "builtin:tool-search" && name === "tool_search") return;
   if (name === "memory_read" && tool?.annotations?.readOnlyHint === true) return;
   if (name === "get_subagent_result" && tool?.annotations?.readOnlyHint === true) return;

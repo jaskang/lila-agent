@@ -5,12 +5,14 @@ import {
   Brain,
   Check,
   CircleAlert,
+  Clock,
   Copy,
   FolderOpen,
   FolderPlus,
   FolderTree,
   GitBranch,
   GitBranchPlus,
+  Inbox,
   KeyRound,
   MessageCircleQuestion,
   MessageSquare,
@@ -206,6 +208,35 @@ export function CommandPalette() {
               <SquarePen />
               新会话
               <CommandShortcut>⌘N</CommandShortcut>
+            </CommandItem>
+            <CommandItem
+              value="automation-tasks 任务收件箱 待办 需求 renwu inbox tasks"
+              onSelect={() => run(() => actions.openAutomation("tasks"))}
+            >
+              <Inbox />
+              打开任务收件箱
+              <CommandShortcut>⇧⌘J</CommandShortcut>
+            </CommandItem>
+            <CommandItem
+              value="automation-task-new 快速收集 新建任务 微信 whatsapp 设计稿 xinjianrenwu capture"
+              onSelect={() => run(() => actions.openAutomation("tasks", true))}
+            >
+              <Inbox />
+              快速收集新任务
+            </CommandItem>
+            <CommandItem
+              value="automation-schedules 定时任务 调度 cron 心跳 dingshi schedule"
+              onSelect={() => run(() => actions.openAutomation("schedules"))}
+            >
+              <Clock />
+              管理定时任务
+            </CommandItem>
+            <CommandItem
+              value="automation-schedule-new 新建定时任务 cron 周期 xinjiandingshi"
+              onSelect={() => run(() => actions.openAutomation("schedules", true))}
+            >
+              <Clock />
+              新建定时任务
             </CommandItem>
             <CommandItem value="toggle-sidebar 切换侧边栏 折叠 展开 cebianlan" onSelect={() => run(toggleSidebar)}>
               <PanelLeft />

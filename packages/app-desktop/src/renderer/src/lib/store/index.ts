@@ -2,11 +2,17 @@ import { create } from "zustand";
 import { toast } from "sonner";
 import type {
   ApprovalMode,
+  AssistantTask,
   ImageInput,
   PendingAnswer,
   Project,
+  ScheduleCreateInput,
+  ScheduledJob,
+  ScheduleUpdatePatch,
   SessionSummary,
   SlashCommand,
+  TaskCreateInput,
+  TaskUpdatePatch,
   ThinkingLevel,
   WatchSlot,
 } from "@lila/protocol";
@@ -30,6 +36,7 @@ import {
 } from "./storage.ts";
 import { applyFrameBatch, createViewCache, indexOf, type SessionFrame } from "./transcript.ts";
 import {
+  type AutomationTab,
   DEFAULT_APPROVAL_KEY,
   type DeliveryMode,
   type Draft,
@@ -53,6 +60,7 @@ export {
   NEW_DRAFT,
   emptyView,
   type AuthLoginFlowState,
+  type AutomationTab,
   type DraftImage,
   type FileHistoryEntry,
   type NewSessionOptions,
@@ -78,6 +86,9 @@ export const useLila = create<State>(() => ({
   draftImages: savedDraftImages,
   sendingDrafts: {},
   paletteOpen: false,
+  automationOpen: false,
+  automationTab: "tasks",
+  automationCreateToken: 0,
   settingsOpen: false,
   settingsTab: "general",
   confirmSettingsDiscard: false,
@@ -89,6 +100,8 @@ export const useLila = create<State>(() => ({
   activeChangePath: undefined,
   gitChangeCounts: {},
   unreadCompletedIds: {},
+  schedules: [],
+  tasks: [],
   workspaceRefreshSeq: 0,
   commandsRefreshSeq: 0,
 }));
@@ -274,6 +287,12 @@ function handlePush(frame: PushMessage): void {
     case "projects":
       set({ projects: frame.projects });
       return;
+    case "schedules":
+      set({ schedules: frame.schedules });
+      return;
+    case "tasks":
+      set({ tasks: frame.tasks });
+      return;
     case "session": {
       const previous = get().sessions[frame.session.id];
       const finishedInBackground =
@@ -338,14 +357,16 @@ function handlePush(frame: PushMessage): void {
 async function onReady(): Promise<void> {
   void loadModels();
   try {
-    const [{ projects }, { sessions }] = await Promise.all([
+    const [{ projects }, { sessions }, { schedules }, { tasks }] = await Promise.all([
       client.call({ type: "projects.list" }),
       client.call({ type: "sessions.list" }),
+      client.call({ type: "schedules.list" }),
+      client.call({ type: "tasks.list" }),
     ]);
     const byId = Object.fromEntries(sessions.map((session) => [session.id, session]));
     const selectedId = get().selectedId;
     const missing = selectedId !== undefined && !byId[selectedId];
-    set({ projects, ...withSessions(byId), ...(missing ? { selectedId: undefined } : {}) });
+    set({ projects, schedules, tasks, ...withSessions(byId), ...(missing ? { selectedId: undefined } : {}) });
     if (missing) {
       safeLocalRemove(SELECTED_KEY);
       unwatchSession("main");
@@ -681,6 +702,89 @@ export const actions = {
   setPaletteOpen(open: boolean): void {
     if (open && get().settingsOpen) settingsActions.closeSettingsThen(() => set({ paletteOpen: true }));
     else set({ paletteOpen: open });
+  },
+
+  openAutomation(tab?: AutomationTab, createNew = false): void {
+    const openNow = () =>
+      set((state) => ({
+        automationOpen: true,
+        automationTab: tab ?? state.automationTab,
+        paletteOpen: false,
+        ...(createNew ? { automationCreateToken: state.automationCreateToken + 1 } : {}),
+      }));
+    if (get().settingsOpen) settingsActions.closeSettingsThen(openNow);
+    else openNow();
+  },
+
+  setAutomationOpen(open: boolean): void {
+    set({ automationOpen: open });
+  },
+
+  setAutomationTab(tab: AutomationTab): void {
+    set({ automationTab: tab });
+  },
+
+  async createSchedule(input: ScheduleCreateInput): Promise<ScheduledJob | undefined> {
+    const result = await attempt(() => client.call({ type: "schedules.create", input }));
+    if (result) toast.success(`已创建定时任务「${result.schedule.name}」`);
+    return result?.schedule;
+  },
+
+  async updateSchedule(id: string, patch: ScheduleUpdatePatch): Promise<ScheduledJob | undefined> {
+    const result = await attempt(() => client.call({ type: "schedules.update", id, patch }));
+    return result?.schedule;
+  },
+
+  async deleteSchedule(id: string): Promise<boolean> {
+    const ok = await attempt(() => client.call({ type: "schedules.delete", id }));
+    if (ok) toast.success("已删除定时任务");
+    return Boolean(ok);
+  },
+
+  async runSchedule(id: string): Promise<{ schedule: ScheduledJob; sessionId?: string } | undefined> {
+    const result = await attempt(() => client.call({ type: "schedules.run", id }));
+    if (result) toast.success(`已触发「${result.schedule.name}」`);
+    return result;
+  },
+
+  async createTask(input: TaskCreateInput): Promise<AssistantTask | undefined> {
+    const result = await attempt(() => client.call({ type: "tasks.create", input }));
+    if (result) toast.success(`已记录任务「${result.task.title}」`);
+    return result?.task;
+  },
+
+  async updateTask(id: string, patch: TaskUpdatePatch): Promise<AssistantTask | undefined> {
+    const result = await attempt(() => client.call({ type: "tasks.update", id, patch }));
+    return result?.task;
+  },
+
+  async deleteTask(id: string): Promise<boolean> {
+    const ok = await attempt(() => client.call({ type: "tasks.delete", id }));
+    if (ok) toast.success("已删除任务");
+    return Boolean(ok);
+  },
+
+  async startTask(options: {
+    id: string;
+    projectId?: string;
+    useWorktree?: boolean;
+    branch?: string;
+    modelId?: string;
+    thinkingLevel?: ThinkingLevel;
+    approvalMode?: ApprovalMode;
+  }): Promise<boolean> {
+    const result = await attempt(() => client.call({ type: "tasks.start", ...options }));
+    if (!result) return false;
+    set((state) => ({
+      automationOpen: false,
+      ...(result.project && !state.projects.some((item) => item.id === result.project!.id)
+        ? { projects: [...state.projects, result.project] }
+        : {}),
+      ...withSessions({ ...state.sessions, [result.session.id]: result.session }),
+    }));
+    actions.select(result.session.id);
+    toast.success(options.useWorktree ? "已在隔离 Worktree 中启动任务" : "已启动任务执行");
+    return true;
   },
 
   reconnectNow(): void {

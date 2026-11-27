@@ -232,6 +232,28 @@ export async function startCore(options: CoreOptions): Promise<Core> {
         return await host.gitCommit(command.projectId, command.message);
       case "git.worktree.create":
         return await host.createWorktreeProject(command.projectId, command.branch);
+      case "schedules.list":
+        return { schedules: host.listSchedules() };
+      case "schedules.create":
+        return { schedule: host.createSchedule(command.input) };
+      case "schedules.update":
+        return { schedule: host.updateSchedule(command.id, command.patch) };
+      case "schedules.delete":
+        host.deleteSchedule(command.id);
+        return {};
+      case "schedules.run":
+        return await host.runSchedule(command.id);
+      case "tasks.list":
+        return { tasks: host.listTasks() };
+      case "tasks.create":
+        return { task: host.createTask(command.input) };
+      case "tasks.update":
+        return { task: host.updateTask(command.id, command.patch) };
+      case "tasks.delete":
+        host.deleteTask(command.id);
+        return {};
+      case "tasks.start":
+        return await host.startTask(command);
       case "session.delete":
         await host.deleteSession(command.sessionId);
         return {};

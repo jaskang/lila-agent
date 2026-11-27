@@ -3,9 +3,11 @@ import {
   CheckCircle2,
   ChevronRight,
   CircleAlert,
+  Clock,
   FolderOpen,
   FolderPlus,
   GitBranchPlus,
+  Inbox,
   MessageCircleQuestion,
   Moon,
   MoreHorizontal,
@@ -400,6 +402,8 @@ export function AppSidebar() {
   const sessions = useLila((state) => state.sessions);
   const selectedId = useLila((state) => state.selectedId);
   const unreadCompletedIds = useLila((state) => state.unreadCompletedIds);
+  const openTasksCount = useLila((state) => state.tasks.filter((task) => task.status !== "done").length);
+  const enabledSchedulesCount = useLila((state) => state.schedules.filter((job) => job.enabled).length);
   const { setOpenMobile } = useSidebar();
   const [collapsed, setCollapsed] = React.useState<Record<string, boolean>>(readCollapsed);
   const [query, setQuery] = React.useState("");
@@ -563,7 +567,32 @@ export function AppSidebar() {
           );
         })}
       </SidebarContent>
-      <SidebarFooter>
+      <SidebarFooter className="gap-1">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              title="任务收件箱与定时任务（⇧⌘J）"
+              onClick={() => {
+                actions.openAutomation(openTasksCount > 0 ? "tasks" : enabledSchedulesCount > 0 ? "schedules" : "tasks");
+                setOpenMobile(false);
+              }}
+            >
+              {openTasksCount > 0 ? <Inbox /> : <Clock />}
+              <span>任务与定时</span>
+              {openTasksCount > 0 || enabledSchedulesCount > 0 ? (
+                <span className="ms-auto flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground tabular-nums">
+                  {openTasksCount > 0 ? <span title="待处理任务">{openTasksCount}</span> : null}
+                  {enabledSchedulesCount > 0 ? (
+                    <span className="inline-flex items-center gap-0.5" title="已启用定时任务">
+                      <Clock className="size-3" />
+                      {enabledSchedulesCount}
+                    </span>
+                  ) : null}
+                </span>
+              ) : null}
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
         <div className="flex items-center gap-1">
           <SidebarMenu className="min-w-0 flex-1">
             <SidebarMenuItem>

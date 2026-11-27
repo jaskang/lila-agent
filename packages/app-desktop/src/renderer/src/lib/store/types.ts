@@ -1,10 +1,12 @@
 import type {
   ApprovalMode,
+  AssistantTask,
   AuthLoginPrompt,
   AuthMethod,
   ImageInput,
   ModelInfo,
   Project,
+  ScheduledJob,
   SessionState,
   SessionSummary,
   ThinkingLevel,
@@ -34,6 +36,7 @@ export type RightPanelKind = "files" | "changes" | "subsession" | "review";
 export type FileHistoryEntry = { path: string; line?: number | undefined; endLine?: number | undefined; scrollTop?: number | undefined };
 export type ReplyReviewState = { sessionId: string; changes: FileChange[]; path: string };
 export type SettingsTab = "general" | "providers" | "usage" | "mcp" | "memory" | "capabilities" | "about";
+export type AutomationTab = "tasks" | "schedules";
 export type AuthLoginFlowState = {
   loginId: string;
   providerId: string;
@@ -73,6 +76,9 @@ export type State = {
   draftImages: Record<string, DraftImage[]>;
   sendingDrafts: Record<string, Draft>;
   paletteOpen: boolean;
+  automationOpen: boolean;
+  automationTab: AutomationTab;
+  automationCreateToken: number;
   settingsOpen: boolean;
   settingsTab: SettingsTab;
   settingsDraftStatus?: "dirty" | "saving" | undefined;
@@ -87,6 +93,8 @@ export type State = {
   gitChangeCounts: Record<string, number | undefined>;
   /** Background sessions that finished while unselected, awaiting user review. */
   unreadCompletedIds: Record<string, true>;
+  schedules: ScheduledJob[];
+  tasks: AssistantTask[];
   workspaceRefreshSeq: number;
   commandsRefreshSeq: number;
 };

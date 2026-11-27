@@ -1,5 +1,13 @@
 import { z } from "zod";
 import {
+  type AssistantTask,
+  ScheduleCreateInput,
+  type ScheduledJob,
+  ScheduleUpdatePatch,
+  TaskCreateInput,
+  TaskUpdatePatch,
+} from "./automation.js";
+import {
   ApprovalMode,
   ImageInput,
   MAX_PROMPT_IMAGE_BASE64_BYTES,
@@ -195,6 +203,26 @@ export const ClientCommand = z.discriminatedUnion("type", [
   z.object({ type: z.literal("git.discard"), requestId: RequestId, projectId: Id, path: z.string().min(1) }),
   z.object({ type: z.literal("git.commit"), requestId: RequestId, projectId: Id, message: z.string().trim().min(1).max(4_000) }),
   z.object({ type: z.literal("git.worktree.create"), requestId: RequestId, projectId: Id, branch: z.string().trim().min(1).max(120).optional() }),
+  z.object({ type: z.literal("schedules.list"), requestId: RequestId }),
+  z.object({ type: z.literal("schedules.create"), requestId: RequestId, input: ScheduleCreateInput }),
+  z.object({ type: z.literal("schedules.update"), requestId: RequestId, id: Id, patch: ScheduleUpdatePatch }),
+  z.object({ type: z.literal("schedules.delete"), requestId: RequestId, id: Id }),
+  z.object({ type: z.literal("schedules.run"), requestId: RequestId, id: Id }),
+  z.object({ type: z.literal("tasks.list"), requestId: RequestId }),
+  z.object({ type: z.literal("tasks.create"), requestId: RequestId, input: TaskCreateInput }),
+  z.object({ type: z.literal("tasks.update"), requestId: RequestId, id: Id, patch: TaskUpdatePatch }),
+  z.object({ type: z.literal("tasks.delete"), requestId: RequestId, id: Id }),
+  z.object({
+    type: z.literal("tasks.start"),
+    requestId: RequestId,
+    id: Id,
+    projectId: Id.optional(),
+    useWorktree: z.boolean().optional(),
+    branch: z.string().trim().min(1).max(120).optional(),
+    modelId: Id.optional(),
+    thinkingLevel: ThinkingLevel.optional(),
+    approvalMode: ApprovalMode.optional(),
+  }),
 ]);
 export type ClientCommand = z.infer<typeof ClientCommand>;
 export type CommandType = ClientCommand["type"];
@@ -266,6 +294,16 @@ export interface CommandResults {
   "git.discard": { status: GitStatus };
   "git.commit": { status: GitStatus; hash: string };
   "git.worktree.create": { project: Project; branch: string };
+  "schedules.list": { schedules: ScheduledJob[] };
+  "schedules.create": { schedule: ScheduledJob };
+  "schedules.update": { schedule: ScheduledJob };
+  "schedules.delete": Empty;
+  "schedules.run": { schedule: ScheduledJob; sessionId?: string };
+  "tasks.list": { tasks: AssistantTask[] };
+  "tasks.create": { task: AssistantTask };
+  "tasks.update": { task: AssistantTask };
+  "tasks.delete": Empty;
+  "tasks.start": { task: AssistantTask; session: SessionSummary; project?: Project };
 }
 
 export type ServerMessage =
@@ -273,6 +311,8 @@ export type ServerMessage =
   | { type: "response"; requestId: string; ok: true; data: unknown }
   | { type: "response"; requestId: string; ok: false; error: string }
   | { type: "projects"; projects: Project[] }
+  | { type: "schedules"; schedules: ScheduledJob[] }
+  | { type: "tasks"; tasks: AssistantTask[] }
   | { type: "session"; session: SessionSummary }
   | { type: "session.removed"; sessionId: string }
   | { type: "item"; sessionId: string; item: TranscriptItem }

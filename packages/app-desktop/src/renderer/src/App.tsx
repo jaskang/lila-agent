@@ -1,6 +1,7 @@
 import * as React from "react";
 import { RotateCw, WifiOff } from "lucide-react";
 import { AppSidebar } from "@/components/app-sidebar";
+import { AutomationDialog } from "@/components/automation";
 import { ChangesPanel } from "@/components/changes-panel";
 import { CommandPalette } from "@/components/command-palette";
 import { Conversation } from "@/components/conversation";
@@ -109,7 +110,7 @@ export function App() {
           actions.setSettingsOpen(!state.settingsOpen);
           return;
         }
-        if (state.settingsOpen || state.paletteOpen) return;
+        if (state.settingsOpen || state.paletteOpen || state.automationOpen) return;
         if (key === "n") {
           event.preventDefault();
           actions.startNew();
@@ -117,7 +118,11 @@ export function App() {
           event.preventDefault();
           actions.toggleRightPanel("files");
         }
-      } else if (!state.settingsOpen && !state.paletteOpen && key === "g" && state.selectedId) {
+      } else if (key === "j") {
+        event.preventDefault();
+        if (state.automationOpen) actions.setAutomationOpen(false);
+        else actions.openAutomation();
+      } else if (!state.settingsOpen && !state.paletteOpen && !state.automationOpen && key === "g" && state.selectedId) {
         event.preventDefault();
         actions.toggleRightPanel("changes");
       }
@@ -171,6 +176,7 @@ export function App() {
           </div>
         </SidebarInset>
         <CommandPalette />
+        <AutomationDialog />
         <SettingsDialog />
       </SidebarProvider>
       <Toaster position="bottom-right" richColors closeButton />

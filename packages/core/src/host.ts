@@ -5,6 +5,7 @@ import { type AgentSessionServices, createAgentSessionFromServices, SessionManag
 import { DEFAULT_APPROVAL_MODE } from "@lila/protocol";
 import type {
   ApprovalMode,
+  AssistantTask,
   AuthLoginEvent,
   AuthMethod,
   CapabilitiesSnapshot,
@@ -24,7 +25,12 @@ import type {
   ProjectFileContent,
   ProviderAuthInfo,
   ProviderQuotaItem,
+  ScheduleCreateInput,
+  ScheduledJob,
+  ScheduleUpdatePatch,
   SessionSummary,
+  TaskCreateInput,
+  TaskUpdatePatch,
   ThinkingLevel,
   UsageRange,
   UsageSummary,
@@ -40,11 +46,14 @@ import {
   gitStatus as readGitStatus,
   gitUnstage as runGitUnstage,
 } from "./git.ts";
+import type { AutomationBridge } from "./lila-extension.ts";
 import { type Clients, findModel, LiveSession, parseAutoSubagentName, sessionTitle, slashCommands } from "./live-session.ts";
 import type { MemoryConfigPatch } from "./memory.ts";
+import { SchedulerService } from "./scheduler-service.ts";
 import { SettingsService, settleServices } from "./settings-service.ts";
 import { Store } from "./store.ts";
 import { readSubsessionView, recordedSubagentIds } from "./subsession-view.ts";
+import { buildTaskExecutionPrompt, TaskService } from "./task-service.ts";
 import { invalidateFileCache, listTreeFiles, readPreviewFile, searchProjectFiles } from "./workspace-service.ts";
 
 const IDLE_DISPOSE_MS = 15 * 60_000;
@@ -82,6 +91,8 @@ export class SessionHost {
   readonly #watchedSubsessions = new Map<string, string>();
   readonly #settings: SettingsService;
   readonly #extensions: ExtensionsService;
+  readonly #scheduler: SchedulerService;
+  readonly #tasks: TaskService;
   #sweeping = false;
 
   constructor(dataDir: string, clients: Clients) {
@@ -94,6 +105,16 @@ export class SessionHost {
       servicesForCapabilities: (projectId, sessionId) => this.#servicesForCapabilities(projectId, sessionId),
       invalidateProjectServices: (projectId) => this.#invalidateProjectServices(projectId),
       reloadIdleSessions: (projectId, sessionId) => this.#reloadIdleSessions(projectId, sessionId),
+    });
+    this.#tasks = new TaskService(dataDir, (tasks) => {
+      this.#clients.broadcast({ type: "tasks", tasks });
+    });
+    this.#scheduler = new SchedulerService(dataDir, {
+      hasProject: (projectId) => Boolean(this.store.project(projectId)) && !this.#removingProjects.has(projectId),
+      executeJob: (job, trigger) => this.#executeScheduledJob(job, trigger),
+      onChange: (schedules) => {
+        this.#clients.broadcast({ type: "schedules", schedules });
+      },
     });
     this.#sweeper = setInterval(() => void this.#sweep(), SWEEP_INTERVAL_MS);
     this.#sweeper.unref();
@@ -143,6 +164,8 @@ export class SessionHost {
       }
       if (project) invalidateFileCache(project.path);
       this.store.removeProject(projectId);
+      this.#scheduler.removeByProject(projectId);
+      this.#tasks.onProjectRemoved(projectId);
       this.#clients.broadcast({ type: "projects", projects: [...this.store.projects] });
     } finally {
       this.#removingProjects.delete(projectId);
@@ -573,6 +596,8 @@ export class SessionHost {
       },
       onSubsessionsChanged: () => this.#scheduleSubsessionSync(project, sessionId),
       onProviderResponse: (providerId, _status, headers) => this.#settings.recordResponseHeaders(providerId, headers),
+      onStatusChange: (previous, next) => this.#tasks.onSessionTransition(sessionId, previous, next),
+      automation: this.#automationBridge(project.id),
     });
     const services = await createServices(project.path, live);
     try {
@@ -640,6 +665,8 @@ export class SessionHost {
       this.#index.delete(sessionId);
       this.#watchedSubsessions.delete(sessionId);
       this.store.forgetSession(sessionId);
+      this.#scheduler.forgetSession(sessionId);
+      this.#tasks.forgetSession(sessionId);
       this.#clients.broadcast({ type: "session.removed", sessionId });
     } finally {
       this.#deletingSessions.delete(sessionId);
@@ -747,6 +774,7 @@ export class SessionHost {
   }
 
   async dispose(): Promise<void> {
+    this.#scheduler.dispose();
     clearInterval(this.#sweeper);
     clearInterval(this.#subsessionRefresh);
     for (const entry of this.#subsessionSyncTimers.values()) clearTimeout(entry.timer);
@@ -805,5 +833,156 @@ export class SessionHost {
     this.store.addProject(project);
     this.#clients.broadcast({ type: "projects", projects: [...this.store.projects] });
     return { project, branch: created.branch };
+  }
+
+  // -------------------------------------------------------------------------
+  // Background schedules & personal assistant task inbox
+
+  listSchedules(): ScheduledJob[] {
+    return this.#scheduler.list();
+  }
+
+  createSchedule(input: ScheduleCreateInput): ScheduledJob {
+    return this.#scheduler.create(input);
+  }
+
+  updateSchedule(id: string, patch: ScheduleUpdatePatch): ScheduledJob {
+    return this.#scheduler.update(id, patch);
+  }
+
+  deleteSchedule(id: string): void {
+    this.#scheduler.delete(id);
+  }
+
+  runSchedule(id: string): Promise<{ schedule: ScheduledJob; sessionId?: string }> {
+    return this.#scheduler.runNow(id);
+  }
+
+  listTasks(): AssistantTask[] {
+    return this.#tasks.list();
+  }
+
+  createTask(input: TaskCreateInput): AssistantTask {
+    if (input.projectId) this.#project(input.projectId);
+    return this.#tasks.create(input);
+  }
+
+  updateTask(id: string, patch: TaskUpdatePatch): AssistantTask {
+    if (patch.projectId) this.#project(patch.projectId);
+    return this.#tasks.update(id, patch);
+  }
+
+  deleteTask(id: string): void {
+    this.#tasks.delete(id);
+  }
+
+  async startTask(options: {
+    id: string;
+    projectId?: string | undefined;
+    useWorktree?: boolean | undefined;
+    branch?: string | undefined;
+    modelId?: string | undefined;
+    thinkingLevel?: ThinkingLevel | undefined;
+    approvalMode?: ApprovalMode | undefined;
+  }): Promise<{ task: AssistantTask; session: SessionSummary; project?: Project }> {
+    const task = this.#tasks.get(options.id);
+    if (!task) throw new UserError("任务不存在");
+    const baseProjectId = options.projectId ?? task.projectId;
+    if (!baseProjectId) throw new UserError("请先为该任务选择一个关联项目");
+
+    let createdProject: Project | undefined;
+    let targetProjectId = baseProjectId;
+    if (options.useWorktree) {
+      const worktree = await this.createWorktreeProject(baseProjectId, options.branch);
+      createdProject = worktree.project;
+      targetProjectId = worktree.project.id;
+    }
+
+    const summary = await this.createSession({
+      projectId: targetProjectId,
+      ...(options.modelId ? { modelId: options.modelId } : {}),
+      ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+      ...(options.approvalMode ? { approvalMode: options.approvalMode } : {}),
+    });
+    const live = await this.live(summary.id);
+    const title = `[任务] ${task.title}`.slice(0, 120);
+    const renamed = live.rename(title);
+    const runningTask = this.#tasks.update(task.id, {
+      projectId: targetProjectId,
+      sessionId: renamed.id,
+      status: "running",
+    });
+
+    try {
+      await live.prompt({ text: buildTaskExecutionPrompt(runningTask) });
+    } catch (error) {
+      this.#tasks.update(task.id, { status: task.status });
+      throw error;
+    }
+    return {
+      task: this.#tasks.get(task.id) ?? runningTask,
+      session: live.summary(),
+      ...(createdProject ? { project: createdProject } : {}),
+    };
+  }
+
+  #automationBridge(defaultProjectId: string): AutomationBridge {
+    return {
+      defaultProjectId,
+      listSchedules: () => this.listSchedules(),
+      createSchedule: (input) => this.createSchedule(input),
+      updateSchedule: (id, patch) => this.updateSchedule(id, patch),
+      deleteSchedule: (id) => this.deleteSchedule(id),
+      listTasks: () => this.listTasks(),
+      upsertTask: (params) => {
+        if (params.id) {
+          const { id, ...patch } = params;
+          return this.updateTask(id, patch as TaskUpdatePatch);
+        }
+        const createInput = params as Partial<TaskCreateInput>;
+        if (!createInput.title?.trim()) throw new UserError("新建任务必须提供 title");
+        return this.createTask({
+          title: createInput.title,
+          projectId: createInput.projectId ?? defaultProjectId,
+          ...(createInput.status ? { status: createInput.status } : {}),
+          ...(createInput.priority ? { priority: createInput.priority } : {}),
+          ...(createInput.source ? { source: createInput.source } : {}),
+          ...(createInput.summary !== undefined ? { summary: createInput.summary } : {}),
+          ...(createInput.links ? { links: createInput.links } : {}),
+          ...(createInput.blockingQuestions ? { blockingQuestions: createInput.blockingQuestions } : {}),
+          ...(createInput.draftReply !== undefined ? { draftReply: createInput.draftReply } : {}),
+        });
+      },
+    };
+  }
+
+  async #executeScheduledJob(job: ScheduledJob, _trigger: "schedule" | "manual"): Promise<{ sessionId?: string; skipped?: string }> {
+    let live: LiveSession | undefined;
+    if (job.sessionMode === "reuse" && job.sessionId) {
+      try {
+        live = await this.live(job.sessionId);
+      } catch {
+        // Bound session was removed; recreate cleanly below.
+        live = undefined;
+      }
+      if (live?.busy) {
+        return { sessionId: live.id, skipped: "绑定的固定会话正在运行或等待审批，已跳过本次触发" };
+      }
+    }
+
+    if (!live) {
+      const created = await this.createSession({
+        projectId: job.projectId,
+        ...(job.modelId ? { modelId: job.modelId } : {}),
+        ...(job.thinkingLevel ? { thinkingLevel: job.thinkingLevel } : {}),
+        approvalMode: job.approvalMode,
+      });
+      live = await this.live(created.id);
+      live.rename(`[定时] ${job.name}`.slice(0, 120));
+      if (job.sessionMode === "reuse") this.#scheduler.bindSession(job.id, live.id);
+    }
+
+    await live.prompt({ text: job.prompt });
+    return { sessionId: live.id };
   }
 }
