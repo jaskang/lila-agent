@@ -29,7 +29,7 @@ Baseline: `4fb5477`（协议 v20，2026-11-27）
 
 ## 3. 演进主线与工单拆解
 
-按投入产出比与依赖关系拆为 5 张独立工单（均位于 `.scratch/assistant-roadmap/issues/`）：
+按投入产出比与依赖关系拆为 6 张独立工单（均位于 `.scratch/assistant-roadmap/issues/`）：
 
 | 编号 | 工单 | 状态 | 核心交付 |
 | --- | --- | --- | --- |
@@ -38,13 +38,16 @@ Baseline: `4fb5477`（协议 v20，2026-11-27）
 | 03 | [03-cross-platform-polling-templates.md](issues/03-cross-platform-polling-templates.md) | `needs-triage` | GitHub / Asana 一键预设定时巡检模板 + 自动去重写入任务收件箱 |
 | 04 | [04-sandbox-network-approval-and-exceptions.md](issues/04-sandbox-network-approval-and-exceptions.md) | `needs-triage` | 沙箱 P0.2：基于 `PendingRequest` 审批卡的出网域名白名单 + 项目级额外可写目录 + 中文拦截高亮 |
 | 05 | [05-packaging-launchd-and-mobile-console.md](issues/05-packaging-launchd-and-mobile-console.md) | `needs-triage` | macOS `.app`/`.dmg` 打包实测 + `launchd` 开机常驻 + Tailscale 移动端轻审批控制台 |
+| 06 | [06-project-lead-and-team-channel.md](issues/06-project-lead-and-team-channel.md) | `needs-triage` | 项目主理人（Project Lead）+ Project Ledger 5 层省 Token 架构 + 受控团队群聊 UI（成员状态条、`@角色` 路由、线程折叠） |
 
 ### 推荐执行顺序
 
 - **首选路线（最快跑出“全自动个人工程助理”体验）**：先做 **Ticket 01**（补齐独立工作目录、快捷收集与任务开工沙箱对齐），紧接着做 **Ticket 02**（打穿公开 HTML 交互设计稿到代码落地与视觉对拍的端到端闭环），再按需叠加 **Ticket 03**（GitHub/Asana 定时巡检）。
+- **想优先解决多会话割裂、打造差异化交互形态**：可直接推进 **Ticket 06**（先立 `Project Lead + Project Ledger` 骨架，再叠加团队群聊状态条与 `@角色` 路由）。
 - **如果实测沙箱时发现需要更细的网络/缓存控制**：可优先切入 **Ticket 04**。
 - **准备把 Lila 当作每天开机主力使用时**：推进 **Ticket 05**。
 
 ## Comments
 
 - 2026-11-27：整合 CLI 会话（`e89b237d-ad6e-43e3-89aa-b26d105056c6`）与桌面端会话（`993b5990-63ac-4638-84e5-d2c6e2b0f1e3`）的规划与落地成果，形成统一路线图。
+- 2026-11-27：追加 Ticket 06（项目主理人 Project Lead、Project Ledger 5 层省 Token 架构与受控团队群聊 UI 方案）。
